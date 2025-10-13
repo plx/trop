@@ -1,7 +1,7 @@
 ---
 description: Implement an existing plan
 argument-hint: [description of the plan or where it can be found]
-disable-model-invocation: true
+disable-model-invocation: false
 ---
 
 We're going to implement a bit of work that has already been planned-out. 
