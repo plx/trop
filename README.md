@@ -1,2 +1,3 @@
 # trop
-CLI utility for managing "port reservations".
+
+`trop` is (will be) a CLI utility for managing "port reservations". 
