@@ -1,0 +1,22 @@
+[package]
+name = "trop"
+version = "0.1.0"
+edition = "2021"
+authors = ["trop contributors"]
+license = "MIT"
+description = "Library for managing ephemeral port reservations"
+repository = "https://github.com/prb/trop"
+
+[dependencies]
+clap = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3.13"
