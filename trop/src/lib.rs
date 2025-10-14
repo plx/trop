@@ -32,12 +32,14 @@
 //! assert_eq!(range.len(), 11);
 //! ```
 
+pub mod database;
 pub mod error;
 pub mod logging;
 pub mod port;
 pub mod reservation;
 
 // Re-export key types at crate root for convenience
+pub use database::{Database, DatabaseConfig};
 pub use error::{Error, Result};
 pub use logging::{init_logger, LogLevel, Logger};
 pub use port::{Port, PortRange};
