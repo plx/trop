@@ -3,6 +3,8 @@
 //! This module provides helper functions and fixture builders for testing
 //! the trop library.
 
+pub mod database;
+
 use std::path::PathBuf;
 use std::time::SystemTime;
 
