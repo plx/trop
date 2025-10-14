@@ -61,3 +61,20 @@ pub const SELECT_SCHEMA_VERSION: &str =
 /// SQL statement to insert or update the schema version in the metadata table.
 pub const INSERT_SCHEMA_VERSION: &str =
     "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)";
+
+/// SQL statement to insert or replace a reservation.
+///
+/// Used by both single and batch create operations.
+pub const INSERT_RESERVATION: &str = r"
+    INSERT OR REPLACE INTO reservations
+    (path, tag, port, project, task, created_at, last_used_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+";
+
+/// SQL statement to delete a reservation by key.
+///
+/// Used by both single and batch delete operations.
+pub const DELETE_RESERVATION: &str = r"
+    DELETE FROM reservations
+    WHERE path = ? AND tag IS ?
+";

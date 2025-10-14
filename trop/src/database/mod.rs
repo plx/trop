@@ -35,6 +35,9 @@ mod operations;
 mod schema;
 mod transaction;
 
+#[cfg(test)]
+pub mod test_util;
+
 // Re-export public API
 pub use config::{default_data_dir, resolve_database_path, DatabaseConfig};
 pub use connection::Database;

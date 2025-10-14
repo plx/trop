@@ -3,9 +3,6 @@
 //! This module implements all create, read, update, and delete operations
 //! for port reservations in the database.
 
-// Allow timestamp casts - we're converting between i64 (SQLite) and u64 (SystemTime)
-#![allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-
 use std::time::{Duration, SystemTime};
 
 use rusqlite::{params, TransactionBehavior};
@@ -16,14 +13,60 @@ use crate::error::Result;
 use crate::{Port, PortRange, Reservation, ReservationKey};
 
 use super::connection::Database;
+use super::schema::{DELETE_RESERVATION, INSERT_RESERVATION};
+
+/// Converts a `SystemTime` to Unix epoch seconds for database storage.
+///
+/// # Errors
+///
+/// Returns an error if the time is before the Unix epoch.
+#[allow(clippy::cast_possible_wrap)]
+pub(super) fn systemtime_to_unix_secs(time: SystemTime) -> Result<i64> {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|e| crate::error::Error::Validation {
+            field: "timestamp".into(),
+            message: format!("Invalid timestamp: {e}"),
+        })
+        .map(|d| d.as_secs() as i64)
+}
+
+/// Converts Unix epoch seconds from the database to a `SystemTime`.
+#[allow(clippy::cast_sign_loss)]
+pub(super) fn unix_secs_to_systemtime(secs: i64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64)
+}
+
+/// Helper function to deserialize a reservation from a database row.
+///
+/// Expects row fields in this order: path, tag, port, project, task, `created_at`, `last_used_at`
+fn row_to_reservation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reservation> {
+    let path: String = row.get(0)?;
+    let tag: Option<String> = row.get(1)?;
+    let port_value: u16 = row.get(2)?;
+    let project: Option<String> = row.get(3)?;
+    let task: Option<String> = row.get(4)?;
+    let created_secs: i64 = row.get(5)?;
+    let last_used_secs: i64 = row.get(6)?;
+
+    let key = ReservationKey::new(path.into(), tag)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+    let port = Port::try_from(port_value)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+    let created_at = unix_secs_to_systemtime(created_secs);
+    let last_used_at = unix_secs_to_systemtime(last_used_secs);
+
+    Reservation::builder(key, port)
+        .project(project)
+        .task(task)
+        .created_at(created_at)
+        .last_used_at(last_used_at)
+        .build()
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+}
 
 // SQL statements for CRUD operations
-const INSERT_RESERVATION: &str = r"
-    INSERT OR REPLACE INTO reservations
-    (path, tag, port, project, task, created_at, last_used_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-";
-
 const SELECT_RESERVATION: &str = r"
     SELECT port, project, task, created_at, last_used_at
     FROM reservations
@@ -33,11 +76,6 @@ const SELECT_RESERVATION: &str = r"
 const UPDATE_LAST_USED: &str = r"
     UPDATE reservations
     SET last_used_at = ?
-    WHERE path = ? AND tag IS ?
-";
-
-const DELETE_RESERVATION: &str = r"
-    DELETE FROM reservations
     WHERE path = ? AND tag IS ?
 ";
 
@@ -116,25 +154,9 @@ impl Database {
             ],
         )?;
 
-        let created_secs = reservation
-            .created_at()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| crate::error::Error::Validation {
-                field: "created_at".into(),
-                message: format!("Invalid timestamp: {e}"),
-            })?
-            .as_secs();
+        let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
+        let last_used_secs = systemtime_to_unix_secs(reservation.last_used_at())?;
 
-        let last_used_secs = reservation
-            .last_used_at()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| crate::error::Error::Validation {
-                field: "last_used_at".into(),
-                message: format!("Invalid timestamp: {e}"),
-            })?
-            .as_secs();
-
-        #[allow(clippy::cast_possible_wrap)]
         tx.execute(
             INSERT_RESERVATION,
             params![
@@ -143,8 +165,8 @@ impl Database {
                 reservation.port().value(),
                 reservation.project(),
                 reservation.task(),
-                created_secs as i64,
-                last_used_secs as i64,
+                created_secs,
+                last_used_secs,
             ],
         )?;
 
@@ -192,12 +214,8 @@ impl Database {
                 let created_secs: i64 = row.get(3)?;
                 let last_used_secs: i64 = row.get(4)?;
 
-                #[allow(clippy::cast_sign_loss)]
-                let created_at =
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(created_secs as u64);
-                #[allow(clippy::cast_sign_loss)]
-                let last_used_at =
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(last_used_secs as u64);
+                let created_at = unix_secs_to_systemtime(created_secs);
+                let last_used_at = unix_secs_to_systemtime(last_used_secs);
 
                 Reservation::builder(key.clone(), port)
                     .project(project)
@@ -243,13 +261,7 @@ impl Database {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| crate::error::Error::Validation {
-                field: "timestamp".into(),
-                message: format!("Invalid system time: {e}"),
-            })?
-            .as_secs() as i64;
+        let now = systemtime_to_unix_secs(SystemTime::now())?;
 
         let rows_affected = tx.execute(
             UPDATE_LAST_USED,
@@ -322,34 +334,7 @@ impl Database {
         let mut stmt = self.conn.prepare(LIST_RESERVATIONS)?;
 
         let reservations = stmt
-            .query_map([], |row| {
-                let path: String = row.get(0)?;
-                let tag: Option<String> = row.get(1)?;
-                let port_value: u16 = row.get(2)?;
-                let project: Option<String> = row.get(3)?;
-                let task: Option<String> = row.get(4)?;
-                let created_secs: i64 = row.get(5)?;
-                let last_used_secs: i64 = row.get(6)?;
-
-                let key = ReservationKey::new(path.into(), tag)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-                let port = Port::try_from(port_value)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-                let created_at =
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(created_secs as u64);
-                let last_used_at =
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(last_used_secs as u64);
-
-                Reservation::builder(key, port)
-                    .project(project)
-                    .task(task)
-                    .created_at(created_at)
-                    .last_used_at(last_used_at)
-                    .build()
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-            })?
+            .query_map([], row_to_reservation)?
             .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
 
         Ok(reservations)
@@ -417,34 +402,7 @@ impl Database {
         let mut stmt = self.conn.prepare(SELECT_BY_PATH_PREFIX)?;
 
         let reservations = stmt
-            .query_map([prefix.to_string_lossy().to_string()], |row| {
-                let path: String = row.get(0)?;
-                let tag: Option<String> = row.get(1)?;
-                let port_value: u16 = row.get(2)?;
-                let project: Option<String> = row.get(3)?;
-                let task: Option<String> = row.get(4)?;
-                let created_secs: i64 = row.get(5)?;
-                let last_used_secs: i64 = row.get(6)?;
-
-                let key = ReservationKey::new(path.into(), tag)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-                let port = Port::try_from(port_value)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-                let created_at =
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(created_secs as u64);
-                let last_used_at =
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(last_used_secs as u64);
-
-                Reservation::builder(key, port)
-                    .project(project)
-                    .task(task)
-                    .created_at(created_at)
-                    .last_used_at(last_used_at)
-                    .build()
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-            })?
+            .query_map([prefix.to_string_lossy().to_string()], row_to_reservation)?
             .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
 
         Ok(reservations)
@@ -471,46 +429,15 @@ impl Database {
     /// let expired = db.find_expired_reservations(max_age).unwrap();
     /// ```
     pub fn find_expired_reservations(&self, max_age: Duration) -> Result<Vec<Reservation>> {
-        let cutoff = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| crate::error::Error::Validation {
-                field: "timestamp".into(),
-                message: format!("Invalid system time: {e}"),
-            })?
-            .saturating_sub(max_age)
-            .as_secs() as i64;
+        let now_secs = systemtime_to_unix_secs(SystemTime::now())?;
+        #[allow(clippy::cast_possible_wrap)]
+        let max_age_secs = max_age.as_secs() as i64;
+        let cutoff = now_secs.saturating_sub(max_age_secs);
 
         let mut stmt = self.conn.prepare(SELECT_EXPIRED)?;
 
         let reservations = stmt
-            .query_map([cutoff], |row| {
-                let path: String = row.get(0)?;
-                let tag: Option<String> = row.get(1)?;
-                let port_value: u16 = row.get(2)?;
-                let project: Option<String> = row.get(3)?;
-                let task: Option<String> = row.get(4)?;
-                let created_secs: i64 = row.get(5)?;
-                let last_used_secs: i64 = row.get(6)?;
-
-                let key = ReservationKey::new(path.into(), tag)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-                let port = Port::try_from(port_value)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-                let created_at =
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(created_secs as u64);
-                let last_used_at =
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(last_used_secs as u64);
-
-                Reservation::builder(key, port)
-                    .project(project)
-                    .task(task)
-                    .created_at(created_at)
-                    .last_used_at(last_used_at)
-                    .build()
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-            })?
+            .query_map([cutoff], row_to_reservation)?
             .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
 
         Ok(reservations)
@@ -547,22 +474,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::DatabaseConfig;
+    use crate::database::test_util::{create_test_database, create_test_reservation};
     use std::path::PathBuf;
-    use tempfile::tempdir;
-
-    fn create_test_database() -> Database {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-        let config = DatabaseConfig::new(path);
-        Database::open(config).unwrap()
-    }
-
-    fn create_test_reservation(path: &str, port: u16) -> Reservation {
-        let key = ReservationKey::new(PathBuf::from(path), None).unwrap();
-        let port = Port::try_from(port).unwrap();
-        Reservation::builder(key, port).build().unwrap()
-    }
 
     #[test]
     fn test_create_reservation() {
