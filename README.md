@@ -173,6 +173,30 @@ The project is organized as a Rust workspace with two crates:
 
 This separation allows the core functionality to be used programmatically while providing a convenient CLI tool.
 
+### Agentic Navigation Guide
+
+This project includes an `AGENTIC_NAVIGATION_GUIDE.md` file that helps AI coding assistants navigate the project structure. The guide:
+
+- Lists all important files and directories with helpful comments
+- Explains the purpose of agents and slash commands in `.claude/`
+- Provides context about the project's development workflow
+- Is automatically validated in CI to ensure it stays up-to-date
+
+To maintain the navigation guide:
+
+```bash
+# Install the agentic-navigation-guide tool (if not already installed)
+cargo install agentic-navigation-guide
+
+# Verify the guide matches the filesystem
+agentic-navigation-guide verify
+
+# Regenerate the guide (if needed)
+agentic-navigation-guide init --output AGENTIC_NAVIGATION_GUIDE.md --exclude '.git/**' --exclude 'target/**'
+```
+
+The CI pipeline automatically checks that the navigation guide is valid on every pull request.
+
 ## Installation
 
 Not yet published to crates.io. Once development is further along, installation will be:
