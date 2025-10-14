@@ -1,6 +1,5 @@
 <agentic-navigation-guide>
-- AGENTS.md # Physical location of "memory file
- for coding agents
+- AGENTS.md # Physical location of "memory file" for coding agents
 - AGENTIC_NAVIGATION_GUIDE.md # This file - explains project structure
 - CLAUDE.md # Memory file for Claude (symlink to AGENTS.md)
 - LICENSE # Project license — do not modify
