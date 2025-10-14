@@ -84,8 +84,8 @@ fn test_concurrent_write_operations() {
                 let config = DatabaseConfig::new(path);
                 let mut db = Database::open(config).unwrap();
 
-                let key = ReservationKey::new(PathBuf::from(format!("/test/path/{i}")), None)
-                    .unwrap();
+                let key =
+                    ReservationKey::new(PathBuf::from(format!("/test/path/{i}")), None).unwrap();
                 let port = Port::try_from(5000 + i as u16).unwrap();
                 let reservation = Reservation::builder(key, port).build().unwrap();
 
@@ -117,8 +117,7 @@ fn test_concurrent_read_write_operations() {
         let mut db = Database::open(config).unwrap();
 
         for i in 0..5 {
-            let key = ReservationKey::new(PathBuf::from(format!("/test/path/{i}")), None)
-                .unwrap();
+            let key = ReservationKey::new(PathBuf::from(format!("/test/path/{i}")), None).unwrap();
             let port = Port::try_from(5000 + i as u16).unwrap();
             let reservation = Reservation::builder(key, port).build().unwrap();
             db.create_reservation(&reservation).unwrap();
@@ -209,8 +208,7 @@ fn test_full_lifecycle() {
     let mut db = Database::open(config).unwrap();
 
     // Create a reservation
-    let key = ReservationKey::new(PathBuf::from("/project/path"), Some("web".to_string()))
-        .unwrap();
+    let key = ReservationKey::new(PathBuf::from("/project/path"), Some("web".to_string())).unwrap();
     let port = Port::try_from(8080).unwrap();
     let reservation = Reservation::builder(key.clone(), port)
         .project(Some("my-project".to_string()))
@@ -261,11 +259,8 @@ fn test_query_operations() {
 
     // Create multiple reservations
     for i in 0..10 {
-        let key = ReservationKey::new(
-            PathBuf::from(format!("/home/user/project{i}")),
-            None,
-        )
-        .unwrap();
+        let key =
+            ReservationKey::new(PathBuf::from(format!("/home/user/project{i}")), None).unwrap();
         let port = Port::try_from(5000 + i as u16).unwrap();
         let reservation = Reservation::builder(key, port).build().unwrap();
         db.create_reservation(&reservation).unwrap();

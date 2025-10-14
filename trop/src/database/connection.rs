@@ -180,7 +180,9 @@ mod tests {
         let db = Database::open(config).unwrap();
 
         // Verify we can read but not write
-        let result = db.connection().execute("CREATE TABLE test (id INTEGER)", []);
+        let result = db
+            .connection()
+            .execute("CREATE TABLE test (id INTEGER)", []);
         assert!(result.is_err());
     }
 

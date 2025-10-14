@@ -462,11 +462,9 @@ impl Database {
     /// let is_reserved = db.is_port_reserved(port).unwrap();
     /// ```
     pub fn is_port_reserved(&self, port: Port) -> Result<bool> {
-        let count: i32 = self
-            .conn
-            .query_row(CHECK_PORT_RESERVED, params![port.value()], |row| {
-                row.get(0)
-            })?;
+        let count: i32 =
+            self.conn
+                .query_row(CHECK_PORT_RESERVED, params![port.value()], |row| row.get(0))?;
         Ok(count > 0)
     }
 }

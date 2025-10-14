@@ -126,11 +126,9 @@ impl DatabaseConfig {
 pub fn default_data_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| {
-            Error::Validation {
-                field: "home_directory".into(),
-                message: "Cannot determine home directory".into(),
-            }
+        .map_err(|_| Error::Validation {
+            field: "home_directory".into(),
+            message: "Cannot determine home directory".into(),
         })?;
     Ok(PathBuf::from(home).join(".trop"))
 }
@@ -177,8 +175,8 @@ mod tests {
 
     #[test]
     fn test_config_with_busy_timeout() {
-        let config = DatabaseConfig::new("/tmp/test.db")
-            .with_busy_timeout(Duration::from_millis(10000));
+        let config =
+            DatabaseConfig::new("/tmp/test.db").with_busy_timeout(Duration::from_millis(10000));
         assert_eq!(config.busy_timeout, Duration::from_millis(10000));
     }
 

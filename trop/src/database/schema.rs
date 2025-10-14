@@ -55,8 +55,7 @@ pub const CREATE_LAST_USED_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_reservations_last_used ON reservations(last_used_at)";
 
 /// SQL statement to select the schema version from the metadata table.
-pub const SELECT_SCHEMA_VERSION: &str =
-    "SELECT value FROM metadata WHERE key = 'schema_version'";
+pub const SELECT_SCHEMA_VERSION: &str = "SELECT value FROM metadata WHERE key = 'schema_version'";
 
 /// SQL statement to insert or update the schema version in the metadata table.
 pub const INSERT_SCHEMA_VERSION: &str =
