@@ -36,3 +36,4 @@ Additionally, this repository is an experiment in "hands off", "high-autonomy" a
 
 - Working On Initial Implementation (as per `specifications/ImplementationPlan.md`)
 - Phase 1 (Project Scaffold) is COMPLETED and merged
+- Phase 2 (SQLite Database Layer) is COMPLETED and ready for merge
