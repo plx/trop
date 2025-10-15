@@ -149,7 +149,7 @@ fn test_reserve_ancestor_directory_allowed() {
         let options = ReserveOptions::new(key, Some(port));
         let result = ReservePlan::new(options).build_plan(&db);
 
-        assert!(result.is_ok(), "Ancestor {:?} should be allowed", parent);
+        assert!(result.is_ok(), "Ancestor {parent:?} should be allowed");
 
         current = parent;
         tested_count += 1;
@@ -518,7 +518,7 @@ fn test_multiple_related_paths_all_allowed() {
     let mut db = create_test_database();
     let cwd = env::current_dir().unwrap();
 
-    let paths = vec![
+    let paths = [
         cwd.clone(),
         cwd.join("frontend"),
         cwd.join("backend"),
@@ -535,8 +535,7 @@ fn test_multiple_related_paths_all_allowed() {
 
         assert!(
             result.is_ok(),
-            "Should be able to reserve related path {:?}",
-            path
+            "Should be able to reserve related path {path:?}"
         );
     }
 

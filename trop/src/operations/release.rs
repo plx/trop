@@ -235,7 +235,7 @@ mod tests {
 
                 // Must succeed with empty actions and a warning
                 prop_assert_eq!(plan.len(), 0, "releasing non-existent reservation must have no actions");
-                prop_assert!(plan.warnings.len() > 0, "must have at least one warning");
+                prop_assert!(!plan.warnings.is_empty(), "must have at least one warning");
             }
         }
 
@@ -332,12 +332,12 @@ mod tests {
             // First release - should have no actions (nothing to delete)
             let plan1 = ReleasePlan::new(options.clone()).build_plan(&db).unwrap();
             assert_eq!(plan1.len(), 0);
-            assert!(plan1.warnings.len() > 0);
+            assert!(!plan1.warnings.is_empty());
 
             // Second release - should produce identical result
             let plan2 = ReleasePlan::new(options).build_plan(&db).unwrap();
             assert_eq!(plan2.len(), 0);
-            assert!(plan2.warnings.len() > 0);
+            assert!(!plan2.warnings.is_empty());
         }
     }
 

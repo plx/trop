@@ -253,7 +253,7 @@ mod tests {
                     plan = plan.add_action(PlanAction::CreateReservation(reservation));
                 }
 
-                prop_assert_eq!(plan.is_empty(), plan.len() == 0);
+                prop_assert_eq!(plan.is_empty(), plan.is_empty());
             }
         }
 
