@@ -424,10 +424,10 @@ mod tests {
                 let rel2 = PathRelationship::between(p2, p1);
 
                 match (rel1, rel2) {
-                    (PathRelationship::Ancestor, PathRelationship::Descendant) => {},
-                    (PathRelationship::Descendant, PathRelationship::Ancestor) => {},
-                    (PathRelationship::Same, PathRelationship::Same) => {},
-                    (PathRelationship::Unrelated, PathRelationship::Unrelated) => {},
+                    (PathRelationship::Ancestor, PathRelationship::Descendant)
+                    | (PathRelationship::Descendant, PathRelationship::Ancestor)
+                    | (PathRelationship::Same, PathRelationship::Same)
+                    | (PathRelationship::Unrelated, PathRelationship::Unrelated) => {},
                     _ => prop_assert!(false, "Invalid relationship symmetry: {:?} vs {:?}", rel1, rel2),
                 }
             }

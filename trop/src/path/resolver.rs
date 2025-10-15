@@ -275,75 +275,75 @@ mod tests {
     fn test_resolve_explicit_normalizes_only() {
         let resolver = PathResolver::new();
         let cwd = env::current_dir().unwrap();
-        let resolved = resolver.resolve_explicit(Path::new("./test")).unwrap();
+        let result = resolver.resolve_explicit(Path::new("./test")).unwrap();
 
         // Should be normalized (absolute)
-        assert!(resolved.path().is_absolute());
-        assert!(resolved.path().starts_with(&cwd));
+        assert!(result.path().is_absolute());
+        assert!(result.path().starts_with(&cwd));
 
         // Should NOT be canonicalized
-        assert!(!resolved.was_canonicalized());
+        assert!(!result.was_canonicalized());
 
         // Should have explicit provenance
-        assert_eq!(resolved.provenance(), PathProvenance::Explicit);
+        assert_eq!(result.provenance(), PathProvenance::Explicit);
     }
 
     #[test]
     fn test_resolve_implicit_canonicalizes() {
         let resolver = PathResolver::new().with_nonexistent_warning(false);
         let dir = tempdir().unwrap();
-        let resolved = resolver.resolve_implicit(dir.path()).unwrap();
+        let result = resolver.resolve_implicit(dir.path()).unwrap();
 
         // Should be normalized (absolute)
-        assert!(resolved.path().is_absolute());
+        assert!(result.path().is_absolute());
 
         // Should be canonicalized (for existing path)
-        assert!(resolved.was_canonicalized());
+        assert!(result.was_canonicalized());
 
         // Should have implicit provenance
-        assert_eq!(resolved.provenance(), PathProvenance::Implicit);
+        assert_eq!(result.provenance(), PathProvenance::Implicit);
     }
 
     #[test]
     fn test_resolve_implicit_nonexistent() {
         let resolver = PathResolver::new().with_nonexistent_warning(false);
         let path = Path::new("/nonexistent/path/xyz");
-        let resolved = resolver.resolve_implicit(path).unwrap();
+        let result = resolver.resolve_implicit(path).unwrap();
 
         // Should be normalized
-        assert!(resolved.path().is_absolute());
+        assert!(result.path().is_absolute());
 
         // Should NOT be canonicalized (path doesn't exist)
-        assert!(!resolved.was_canonicalized());
+        assert!(!result.was_canonicalized());
 
         // Should have implicit provenance
-        assert_eq!(resolved.provenance(), PathProvenance::Implicit);
+        assert_eq!(result.provenance(), PathProvenance::Implicit);
     }
 
     #[test]
     fn test_resolve_canonical_forces_canonicalization() {
         let resolver = PathResolver::new();
         let dir = tempdir().unwrap();
-        let resolved = resolver.resolve_canonical(dir.path()).unwrap();
+        let result = resolver.resolve_canonical(dir.path()).unwrap();
 
         // Should be canonicalized
-        assert!(resolved.was_canonicalized());
+        assert!(result.was_canonicalized());
 
         // Should be absolute
-        assert!(resolved.path().is_absolute());
+        assert!(result.path().is_absolute());
     }
 
     #[test]
     fn test_resolve_preserves_original() {
         let resolver = PathResolver::new();
         let original = Path::new("./test");
-        let resolved = resolver.resolve_explicit(original).unwrap();
+        let result = resolver.resolve_explicit(original).unwrap();
 
         // Original should be preserved
-        assert_eq!(resolved.original(), original);
+        assert_eq!(result.original(), original);
 
         // But resolved should be different (absolute)
-        assert_ne!(resolved.path(), original);
+        assert_ne!(result.path(), original);
     }
 
     #[cfg(unix)]
@@ -360,11 +360,11 @@ mod tests {
         symlink(&target, &link).unwrap();
 
         let resolver = PathResolver::new();
-        let resolved = resolver.resolve_explicit(&link).unwrap();
+        let result = resolver.resolve_explicit(&link).unwrap();
 
         // Explicit should not canonicalize - should end with "link"
-        assert!(resolved.path().ends_with("link"));
-        assert!(!resolved.was_canonicalized());
+        assert!(result.path().ends_with("link"));
+        assert!(!result.was_canonicalized());
     }
 
     #[cfg(unix)]
@@ -381,11 +381,11 @@ mod tests {
         symlink(&target, &link).unwrap();
 
         let resolver = PathResolver::new();
-        let resolved = resolver.resolve_implicit(&link).unwrap();
+        let result = resolver.resolve_implicit(&link).unwrap();
 
         // Implicit should canonicalize - should end with "target"
-        assert!(resolved.path().ends_with("target"));
-        assert!(resolved.was_canonicalized());
+        assert!(result.path().ends_with("target"));
+        assert!(result.was_canonicalized());
     }
 
     #[cfg(unix)]
@@ -402,11 +402,11 @@ mod tests {
         symlink(&target, &link).unwrap();
 
         let resolver = PathResolver::new();
-        let resolved = resolver.resolve_canonical(&link).unwrap();
+        let result = resolver.resolve_canonical(&link).unwrap();
 
         // Should always canonicalize
-        assert!(resolved.path().ends_with("target"));
-        assert!(resolved.was_canonicalized());
+        assert!(result.path().ends_with("target"));
+        assert!(result.was_canonicalized());
     }
 
     // Property-based tests
