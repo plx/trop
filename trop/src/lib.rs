@@ -35,6 +35,7 @@
 pub mod database;
 pub mod error;
 pub mod logging;
+pub mod path;
 pub mod port;
 pub mod reservation;
 
@@ -42,5 +43,6 @@ pub mod reservation;
 pub use database::{Database, DatabaseConfig};
 pub use error::{Error, Result};
 pub use logging::{init_logger, LogLevel, Logger};
+pub use path::{PathProvenance, PathRelationship, PathResolver};
 pub use port::{Port, PortRange};
 pub use reservation::{Reservation, ReservationKey};

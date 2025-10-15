@@ -3,13 +3,14 @@
 //! This module implements all create, read, update, and delete operations
 //! for port reservations in the database.
 
+use std::env;
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use rusqlite::{params, TransactionBehavior};
 
-use std::path::Path;
-
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::path::PathRelationship;
 use crate::{Port, PortRange, Reservation, ReservationKey};
 
 use super::connection::Database;
@@ -467,6 +468,49 @@ impl Database {
                 .query_row(CHECK_PORT_RESERVED, params![port.value()], |row| row.get(0))?;
         Ok(count > 0)
     }
+
+    /// Validates path relationship for database operations.
+    ///
+    /// This method checks if the operation on `target_path` from the current
+    /// working directory is allowed. By default, ancestor and descendant paths
+    /// are allowed (hierarchical relationships), but unrelated paths require
+    /// the `allow_unrelated` flag.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The current working directory cannot be determined
+    /// - The paths are unrelated and `allow_unrelated` is false
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use trop::database::{Database, DatabaseConfig};
+    /// use std::path::Path;
+    ///
+    /// let config = DatabaseConfig::new("/tmp/trop.db");
+    /// let db = Database::open(config).unwrap();
+    ///
+    /// // Check if we can operate on a path
+    /// let target = Path::new("/home/user/project");
+    /// let result = db.validate_path_relationship(target, false);
+    /// ```
+    pub fn validate_path_relationship(
+        &self,
+        target_path: &Path,
+        allow_unrelated: bool,
+    ) -> Result<()> {
+        let current_dir = env::current_dir()?;
+        let relationship = PathRelationship::between(target_path, &current_dir);
+
+        if !relationship.is_allowed_without_force() && !allow_unrelated {
+            return Err(Error::PathRelationshipViolation {
+                details: relationship.description(target_path, &current_dir),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -736,5 +780,74 @@ mod tests {
 
         // Different port still not reserved
         assert!(!db.is_port_reserved(port2).unwrap());
+    }
+
+    #[test]
+    fn test_validate_path_relationship_ancestor() {
+        use std::env;
+
+        let db = create_test_database();
+        let cwd = env::current_dir().unwrap();
+
+        // Ancestor path (parent of cwd) should be allowed
+        if let Some(parent) = cwd.parent() {
+            let result = db.validate_path_relationship(parent, false);
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_validate_path_relationship_descendant() {
+        use std::env;
+
+        let db = create_test_database();
+        let cwd = env::current_dir().unwrap();
+
+        // Descendant path (child of cwd) should be allowed
+        let child = cwd.join("subdir");
+        let result = db.validate_path_relationship(&child, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_relationship_same() {
+        use std::env;
+
+        let db = create_test_database();
+        let cwd = env::current_dir().unwrap();
+
+        // Same path should be allowed
+        let result = db.validate_path_relationship(&cwd, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_relationship_unrelated_denied() {
+        let db = create_test_database();
+
+        // Create a path that's definitely unrelated to the current directory
+        let unrelated = Path::new("/unrelated/path/xyz");
+
+        // Should fail without allow_unrelated
+        let result = db.validate_path_relationship(unrelated, false);
+        assert!(result.is_err());
+
+        // Check that it's the right error type
+        match result {
+            Err(Error::PathRelationshipViolation { .. }) => {} // Expected
+            _ => panic!("Expected PathRelationshipViolation error"),
+        }
+    }
+
+    #[test]
+    fn test_validate_path_relationship_unrelated_allowed() {
+        let db = create_test_database();
+
+        // Create a path that's definitely unrelated to the current directory
+        let unrelated = Path::new("/unrelated/path/xyz");
+
+        // Should succeed with allow_unrelated
+        let result = db.validate_path_relationship(unrelated, true);
+        assert!(result.is_ok());
     }
 }

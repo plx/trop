@@ -3,11 +3,12 @@
 //! This module provides types for managing port reservations, including
 //! reservation keys, metadata, and builder patterns for construction.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::path::PathResolver;
 use crate::Port;
 
 /// A unique identifier for a port reservation.
@@ -85,6 +86,73 @@ impl ReservationKey {
         };
 
         Ok(Self { path, tag })
+    }
+
+    /// Creates a new reservation key with explicit path resolution.
+    ///
+    /// Explicit paths are normalized but NOT canonicalized, preserving symlinks.
+    /// This is appropriate for paths explicitly provided by users via CLI arguments
+    /// or environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Path normalization fails
+    /// - The tag is provided but is empty after trimming whitespace
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use trop::ReservationKey;
+    /// use std::path::Path;
+    ///
+    /// // Create a reservation key with an explicit path
+    /// let key = ReservationKey::with_explicit_path(
+    ///     Path::new("~/project"),
+    ///     None
+    /// ).unwrap();
+    /// ```
+    pub fn with_explicit_path(
+        path: impl AsRef<Path>,
+        tag: Option<String>,
+    ) -> crate::error::Result<Self> {
+        let resolver = PathResolver::new();
+        let resolved_path = resolver.resolve_explicit(path.as_ref())?;
+        Self::new(resolved_path.into_path_buf(), tag).map_err(crate::error::Error::from)
+    }
+
+    /// Creates a new reservation key with implicit path resolution.
+    ///
+    /// Implicit paths are normalized AND canonicalized, following symlinks to their
+    /// real paths. This is appropriate for paths inferred from context like the
+    /// current working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Path normalization fails
+    /// - Path canonicalization fails (for existing paths)
+    /// - The tag is provided but is empty after trimming whitespace
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use trop::ReservationKey;
+    /// use std::path::Path;
+    ///
+    /// // Create a reservation key with an implicit path
+    /// let key = ReservationKey::with_implicit_path(
+    ///     Path::new("."),
+    ///     None
+    /// ).unwrap();
+    /// ```
+    pub fn with_implicit_path(
+        path: impl AsRef<Path>,
+        tag: Option<String>,
+    ) -> crate::error::Result<Self> {
+        let resolver = PathResolver::new();
+        let resolved_path = resolver.resolve_implicit(path.as_ref())?;
+        Self::new(resolved_path.into_path_buf(), tag).map_err(crate::error::Error::from)
     }
 }
 
@@ -580,5 +648,96 @@ mod tests {
         let display = format!("{err}");
         assert!(display.contains("project"));
         assert!(display.contains("must be non-empty"));
+    }
+
+    #[test]
+    fn test_with_explicit_path_normalizes() {
+        use std::env;
+
+        // Test with a relative path
+        let cwd = env::current_dir().unwrap();
+        let key = ReservationKey::with_explicit_path(Path::new("./test"), None).unwrap();
+
+        // Should be normalized to absolute
+        assert!(key.path.is_absolute());
+        assert!(key.path.starts_with(&cwd));
+    }
+
+    #[test]
+    fn test_with_implicit_path_normalizes() {
+        // Test with a relative path
+        let key = ReservationKey::with_implicit_path(Path::new("./test"), None).unwrap();
+
+        // Should be normalized to absolute
+        assert!(key.path.is_absolute());
+        // Note: May or may not start with cwd depending on canonicalization
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_with_explicit_path_preserves_symlink() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        // Explicit path should NOT canonicalize - should preserve "link"
+        let key = ReservationKey::with_explicit_path(&link, None).unwrap();
+        assert!(key.path.ends_with("link"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_with_implicit_path_follows_symlink() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        // Implicit path should canonicalize - should follow to "target"
+        let key = ReservationKey::with_implicit_path(&link, None).unwrap();
+        assert!(key.path.ends_with("target"));
+    }
+
+    #[test]
+    fn test_with_explicit_path_with_tag() {
+        let key =
+            ReservationKey::with_explicit_path(Path::new("/test/path"), Some("web".to_string()))
+                .unwrap();
+        assert_eq!(key.tag, Some("web".to_string()));
+    }
+
+    #[test]
+    fn test_with_implicit_path_with_tag() {
+        let key =
+            ReservationKey::with_implicit_path(Path::new("/test/path"), Some("web".to_string()))
+                .unwrap();
+        assert_eq!(key.tag, Some("web".to_string()));
+    }
+
+    #[test]
+    fn test_with_explicit_path_empty_tag_fails() {
+        let result =
+            ReservationKey::with_explicit_path(Path::new("/test/path"), Some(String::new()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_with_implicit_path_empty_tag_fails() {
+        let result =
+            ReservationKey::with_implicit_path(Path::new("/test/path"), Some(String::new()));
+        assert!(result.is_err());
     }
 }
