@@ -13,10 +13,6 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-/// Maximum symlink depth to prevent infinite loops.
-#[allow(dead_code)]
-const MAX_SYMLINK_DEPTH: usize = 40;
-
 /// Attempt to canonicalize a path by following symlinks.
 ///
 /// This function uses the standard library's `canonicalize` to resolve all
@@ -242,6 +238,9 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    /// Maximum symlink depth used in tests.
+    const MAX_SYMLINK_DEPTH: usize = 40;
 
     #[test]
     fn test_canonicalize_nonexistent() {

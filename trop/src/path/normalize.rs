@@ -118,14 +118,11 @@ pub fn resolve_components(path: &Path) -> Result<PathBuf> {
             Component::ParentDir => {
                 // Try to pop the last component for ".."
                 if !result.pop() {
-                    // If we can't pop (already at root), that's an error
-                    if has_root {
-                        return Err(Error::InvalidPath {
-                            path: path.to_path_buf(),
-                            reason: "Path contains too many '..' components (escapes root)"
-                                .to_string(),
-                        });
-                    }
+                    // Already at root - can't go up further
+                    return Err(Error::InvalidPath {
+                        path: path.to_path_buf(),
+                        reason: "Path contains too many '..' components (escapes root)".to_string(),
+                    });
                 }
             }
         }

@@ -238,16 +238,8 @@ impl PathRelationship {
 /// This function removes trailing slashes and normalizes separators to ensure
 /// consistent comparison results.
 fn normalize_for_comparison(path: &Path) -> PathBuf {
-    let mut p = path.to_path_buf();
-
-    // Remove trailing separator if present (but not for root)
-    if let Some(s) = p.to_str() {
-        if s.len() > 1 && (s.ends_with('/') || s.ends_with('\\')) {
-            p = PathBuf::from(&s[..s.len() - 1]);
-        }
-    }
-
-    p
+    // Components iterator automatically normalizes trailing separators
+    path.components().collect()
 }
 
 #[cfg(test)]

@@ -149,10 +149,7 @@ impl Database {
         // (INSERT OR REPLACE doesn't work with NULL in PRIMARY KEY due to NULL != NULL)
         tx.execute(
             DELETE_RESERVATION,
-            params![
-                reservation.key().path.to_string_lossy().to_string(),
-                reservation.key().tag
-            ],
+            params![reservation.key().path_as_string(), reservation.key().tag],
         )?;
 
         let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
@@ -161,7 +158,7 @@ impl Database {
         tx.execute(
             INSERT_RESERVATION,
             params![
-                reservation.key().path.to_string_lossy().to_string(),
+                reservation.key().path_as_string(),
                 reservation.key().tag,
                 reservation.port().value(),
                 reservation.project(),
@@ -203,30 +200,27 @@ impl Database {
     pub fn get_reservation(&self, key: &ReservationKey) -> Result<Option<Reservation>> {
         let mut stmt = self.conn.prepare(SELECT_RESERVATION)?;
 
-        match stmt.query_row(
-            params![key.path.to_string_lossy().to_string(), key.tag],
-            |row| {
-                let port_value: u16 = row.get(0)?;
-                let port = Port::try_from(port_value)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        match stmt.query_row(params![key.path_as_string(), key.tag], |row| {
+            let port_value: u16 = row.get(0)?;
+            let port = Port::try_from(port_value)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
-                let project: Option<String> = row.get(1)?;
-                let task: Option<String> = row.get(2)?;
-                let created_secs: i64 = row.get(3)?;
-                let last_used_secs: i64 = row.get(4)?;
+            let project: Option<String> = row.get(1)?;
+            let task: Option<String> = row.get(2)?;
+            let created_secs: i64 = row.get(3)?;
+            let last_used_secs: i64 = row.get(4)?;
 
-                let created_at = unix_secs_to_systemtime(created_secs);
-                let last_used_at = unix_secs_to_systemtime(last_used_secs);
+            let created_at = unix_secs_to_systemtime(created_secs);
+            let last_used_at = unix_secs_to_systemtime(last_used_secs);
 
-                Reservation::builder(key.clone(), port)
-                    .project(project)
-                    .task(task)
-                    .created_at(created_at)
-                    .last_used_at(last_used_at)
-                    .build()
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-            },
-        ) {
+            Reservation::builder(key.clone(), port)
+                .project(project)
+                .task(task)
+                .created_at(created_at)
+                .last_used_at(last_used_at)
+                .build()
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        }) {
             Ok(reservation) => Ok(Some(reservation)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
@@ -266,7 +260,7 @@ impl Database {
 
         let rows_affected = tx.execute(
             UPDATE_LAST_USED,
-            params![now, key.path.to_string_lossy().to_string(), key.tag],
+            params![now, key.path_as_string(), key.tag],
         )?;
 
         tx.commit()?;
@@ -302,10 +296,8 @@ impl Database {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let rows_affected = tx.execute(
-            DELETE_RESERVATION,
-            params![key.path.to_string_lossy().to_string(), key.tag],
-        )?;
+        let rows_affected =
+            tx.execute(DELETE_RESERVATION, params![key.path_as_string(), key.tag])?;
 
         tx.commit()?;
         Ok(rows_affected > 0)

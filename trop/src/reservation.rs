@@ -154,6 +154,15 @@ impl ReservationKey {
         let resolved_path = resolver.resolve_implicit(path.as_ref())?;
         Self::new(resolved_path.into_path_buf(), tag).map_err(crate::error::Error::from)
     }
+
+    /// Converts the path to a string for database operations.
+    ///
+    /// This helper provides a consistent way to convert paths to strings
+    /// for storage in the database. It uses `to_string_lossy()` to handle
+    /// paths that may contain invalid UTF-8.
+    pub(crate) fn path_as_string(&self) -> String {
+        self.path.to_string_lossy().to_string()
+    }
 }
 
 impl std::fmt::Display for ReservationKey {
