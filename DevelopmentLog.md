@@ -42,3 +42,27 @@ The implementation required careful consideration of platform differences, parti
 One notable design decision was the three-mode resolver approach (explicit, implicit, canonical), which provides fine-grained control over canonicalization behavior based on path provenance. This aligns perfectly with the specification's requirements for handling user-provided vs system-inferred paths differently.
 
 The path handling module is well-organized with clear separation of concerns: normalization, canonicalization, relationship checking, and resolver abstraction are all independent and composable. Error handling properly distinguishes between different failure modes (not found, permission denied, path relationship violations). The code is ready for Phase 4 (Basic Reservation Operations).
+
+## 2025-10-15 - Phase 4: Basic Reservation Operations
+
+Implemented the core reservation operations using a plan-execute pattern, including idempotent reserve/release operations, sticky field protection, and path relationship validation. This phase brings the core business logic to life, enabling users to actually reserve and release ports.
+
+The implementation went very smoothly, with all 10 tasks completed successfully. Key accomplishments include:
+
+- Plan-execute pattern enabling dry-run mode and robust testing
+- Idempotent reserve operations returning consistent ports for (path, tag) tuples
+- Sticky field protection preventing accidental metadata changes
+- Path relationship validation enforcing ancestor/descendant rules
+- Force flag and granular override flags (allow_project_change, allow_task_change, allow_unrelated_path)
+- Comprehensive test coverage: 348 tests passing (233 lib + 115 integration/doc tests)
+- Property-based tests for mathematical invariants using proptest
+- Dry-run mode verified to not modify database
+- Plan descriptions providing clear operation summaries
+
+The plan-execute pattern proved invaluable for testing and debugging. The separation between planning (validation, decision-making) and execution (database operations) enabled independent testing of each phase and provided clear error messages before any database modifications occur.
+
+One notable design success was the sticky field protection system. The implementation supports both coarse-grained control (force flag overrides everything) and fine-grained control (specific allow flags for project/task changes). This provides flexibility for power users while maintaining safety by default.
+
+The integration tests are particularly comprehensive, covering idempotency (24 tests), planning (31 tests), and path validation (25 tests). Property-based tests verify mathematical properties like plan idempotency, sticky field transitivity, and path relationship correctness across thousands of generated test cases.
+
+Code quality is excellent with only minor stylistic clippy warnings (length comparisons, format string inlining). The operations module is well-organized with clear separation between plan types, reserve logic, release logic, and execution engine. Error handling properly distinguishes between user errors (sticky field changes, path violations) and system errors. The code is ready for Phase 5 (Configuration System).

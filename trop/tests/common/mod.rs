@@ -8,7 +8,10 @@ pub mod database;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use trop::{Port, Reservation, ReservationKey};
+use trop::{
+    PlanExecutor, Port, ReleaseOptions, ReleasePlan, Reservation, ReservationKey, ReserveOptions,
+    ReservePlan,
+};
 
 /// Creates a temporary directory for testing.
 ///
@@ -163,6 +166,113 @@ impl Default for ReservationFixture {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Generates a platform-specific unrelated path for testing.
+///
+/// On Windows, returns a path under C:\Windows\Temp.
+/// On Unix-like systems, returns a path under /tmp.
+///
+/// This helper consolidates the platform-specific logic for creating paths
+/// that are guaranteed to be unrelated to the current working directory.
+///
+/// # Arguments
+///
+/// * `subpath` - A suffix to append to the base unrelated path, making each
+///   test path unique
+///
+/// # Examples
+///
+/// ```no_run
+/// # use common::unrelated_path;
+/// let path = unrelated_path("my_test");
+/// // On Unix: /tmp/my_test
+/// // On Windows: C:\Windows\Temp\my_test
+/// ```
+#[allow(dead_code)]
+pub fn unrelated_path(subpath: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(format!("C:\\Windows\\Temp\\{subpath}"))
+    } else {
+        PathBuf::from(format!("/tmp/{subpath}"))
+    }
+}
+
+/// Creates a reservation by planning and executing the reserve operation.
+///
+/// This helper consolidates the common pattern of:
+/// 1. Creating ReserveOptions
+/// 2. Building a ReservePlan
+/// 3. Creating a PlanExecutor
+/// 4. Executing the plan
+///
+/// Returns the execution result, or an error if planning or execution fails.
+///
+/// # Arguments
+///
+/// * `db` - Mutable reference to the database
+/// * `options` - The ReserveOptions describing the reservation to create
+///
+/// # Examples
+///
+/// ```no_run
+/// # use common::{create_reservation, database::create_test_database};
+/// # use trop::{ReserveOptions, ReservationKey, Port};
+/// # use std::path::PathBuf;
+/// let mut db = create_test_database();
+/// let key = ReservationKey::new(PathBuf::from("/test"), None).unwrap();
+/// let port = Port::try_from(8080).unwrap();
+/// let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
+///
+/// let result = create_reservation(&mut db, options).unwrap();
+/// assert!(result.success);
+/// ```
+#[allow(dead_code)]
+pub fn create_reservation(
+    db: &mut trop::database::Database,
+    options: ReserveOptions,
+) -> Result<trop::ExecutionResult, trop::Error> {
+    let plan = ReservePlan::new(options).build_plan(db)?;
+    let mut executor = PlanExecutor::new(db);
+    executor.execute(&plan)
+}
+
+/// Releases a reservation by planning and executing the release operation.
+///
+/// This helper consolidates the common pattern of:
+/// 1. Creating ReleaseOptions
+/// 2. Building a ReleasePlan
+/// 3. Creating a PlanExecutor
+/// 4. Executing the plan
+///
+/// Returns the execution result, or an error if planning or execution fails.
+///
+/// # Arguments
+///
+/// * `db` - Mutable reference to the database
+/// * `options` - The ReleaseOptions describing the reservation to release
+///
+/// # Examples
+///
+/// ```no_run
+/// # use common::{release_reservation, database::create_test_database};
+/// # use trop::{ReleaseOptions, ReservationKey};
+/// # use std::path::PathBuf;
+/// let mut db = create_test_database();
+/// let key = ReservationKey::new(PathBuf::from("/test"), None).unwrap();
+/// let options = ReleaseOptions::new(key).with_allow_unrelated_path(true);
+///
+/// let result = release_reservation(&mut db, options).unwrap();
+/// assert!(result.success);
+/// ```
+#[allow(dead_code)]
+pub fn release_reservation(
+    db: &mut trop::database::Database,
+    options: ReleaseOptions,
+) -> Result<trop::ExecutionResult, trop::Error> {
+    let plan = ReleasePlan::new(options).build_plan(db)?;
+    let mut executor = PlanExecutor::new(db);
+    executor.execute(&plan)
 }
 
 #[cfg(test)]
