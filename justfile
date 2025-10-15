@@ -40,6 +40,49 @@ build-release:
 # Run all checks (fmt, clippy, tests)
 check: fmt-check clippy test
 
+# Pre-flight checks for PR submission (minimal output)
+preflight-pr:
+    #!/usr/bin/env bash
+    echo "Running pre-flight checks..."
+    echo ""
+
+    # Build check
+    if cargo build --quiet 2>&1 | grep -q .; then
+        echo "✗ Build failed"
+        cargo build 2>&1 | tail -20
+        exit 1
+    fi
+    echo "✓ Build succeeded"
+
+    # Format check
+    if ! cargo fmt -- --check &>/dev/null; then
+        echo "✗ Format check failed"
+        cargo fmt -- --check 2>&1
+        exit 1
+    fi
+    echo "✓ Format check passed"
+
+    # Clippy check
+    output=$(cargo clippy -- -D warnings 2>&1) || true
+    if echo "$output" | grep -q "error:\|warning:"; then
+        echo "✗ Clippy failed"
+        echo "$output" | grep -v "Checking\|Finished"
+        exit 1
+    fi
+    echo "✓ Clippy passed"
+
+    # Test check
+    output=$(cargo test 2>&1) || true
+    if echo "$output" | grep -q "test result: FAILED"; then
+        echo "✗ Tests failed"
+        echo "$output" | grep -A 20 "failures:" | head -40
+        exit 1
+    fi
+    echo "✓ Tests passed"
+
+    echo ""
+    echo "All pre-flight checks passed!"
+
 # Clean build artifacts
 clean:
     cargo clean
