@@ -1,0 +1,339 @@
+//! Configuration merging and precedence handling.
+//!
+//! This module implements hierarchical merging of configuration sources,
+//! with special handling for accumulated fields like `excluded_ports`.
+
+use crate::config::loader::ConfigSource;
+use crate::config::schema::{CleanupConfig, Config, OccupancyConfig, PortConfig, PortExclusion};
+
+/// Merges configuration sources according to precedence rules.
+///
+/// # Examples
+///
+/// ```
+/// use trop::config::{Config, ConfigMerger};
+///
+/// let low = Config { project: Some("low".to_string()), ..Default::default() };
+/// let high = Config { project: Some("high".to_string()), ..Default::default() };
+///
+/// let mut result = low;
+/// ConfigMerger::merge_into(&mut result, &high);
+/// assert_eq!(result.project, Some("high".to_string()));
+/// ```
+pub struct ConfigMerger;
+
+impl ConfigMerger {
+    /// Merge multiple configuration sources into final config.
+    ///
+    /// Sources should be provided in order from lowest to highest precedence.
+    /// The final configuration will have higher-precedence values overriding
+    /// lower-precedence ones, with special handling for accumulated fields.
+    #[must_use]
+    pub fn merge(sources: Vec<ConfigSource>) -> Config {
+        let mut result = Config::default();
+
+        // Process in order (lowest to highest precedence)
+        for source in sources {
+            Self::merge_into(&mut result, &source.config);
+        }
+
+        result
+    }
+
+    /// Merge source config into target (source overwrites target).
+    ///
+    /// # Merging Rules
+    ///
+    /// - Simple fields: source overwrites if Some
+    /// - Excluded ports: accumulated (union)
+    /// - Nested configs: field-by-field merge
+    /// - Occupancy config: atomic replacement
+    /// - Reservation groups: complete replacement
+    pub fn merge_into(target: &mut Config, source: &Config) {
+        // Simple fields - source overwrites if Some
+        if source.project.is_some() {
+            target.project = source.project.clone();
+        }
+
+        if source.disable_autoinit.is_some() {
+            target.disable_autoinit = source.disable_autoinit;
+        }
+
+        if source.disable_autoprune.is_some() {
+            target.disable_autoprune = source.disable_autoprune;
+        }
+
+        if source.disable_autoexpire.is_some() {
+            target.disable_autoexpire = source.disable_autoexpire;
+        }
+
+        if source.allow_unrelated_path.is_some() {
+            target.allow_unrelated_path = source.allow_unrelated_path;
+        }
+
+        if source.allow_change_project.is_some() {
+            target.allow_change_project = source.allow_change_project;
+        }
+
+        if source.allow_change_task.is_some() {
+            target.allow_change_task = source.allow_change_task;
+        }
+
+        if source.allow_change.is_some() {
+            target.allow_change = source.allow_change;
+        }
+
+        if source.maximum_lock_wait_seconds.is_some() {
+            target.maximum_lock_wait_seconds = source.maximum_lock_wait_seconds;
+        }
+
+        if source.output_format.is_some() {
+            target.output_format = source.output_format;
+        }
+
+        // Merge ports config
+        if let Some(ref source_ports) = source.ports {
+            target.ports = Some(match &target.ports {
+                Some(target_ports) => Self::merge_port_config(target_ports, source_ports),
+                None => source_ports.clone(),
+            });
+        }
+
+        // Merge excluded_ports (union of all exclusions)
+        if let Some(ref source_excluded) = source.excluded_ports {
+            match &mut target.excluded_ports {
+                Some(target_excluded) => {
+                    target_excluded.extend(source_excluded.clone());
+                }
+                None => {
+                    target.excluded_ports = source.excluded_ports.clone();
+                }
+            }
+        }
+
+        // Merge cleanup config
+        if let Some(ref source_cleanup) = source.cleanup {
+            target.cleanup = Some(match &target.cleanup {
+                Some(target_cleanup) => Self::merge_cleanup(target_cleanup, source_cleanup),
+                None => source_cleanup.clone(),
+            });
+        }
+
+        // Occupancy config - full replacement (not field-by-field)
+        if source.occupancy_check.is_some() {
+            target.occupancy_check = source.occupancy_check.clone();
+        }
+
+        // Reservation groups - don't merge, only replace
+        if source.reservations.is_some() {
+            target.reservations = source.reservations.clone();
+        }
+    }
+
+    /// Merge port configuration.
+    ///
+    /// Source values take precedence over target values.
+    fn merge_port_config(target: &PortConfig, source: &PortConfig) -> PortConfig {
+        PortConfig {
+            min: source.min, // Always use source
+            max: source.max.or(target.max),
+            max_offset: source.max_offset.or(target.max_offset),
+        }
+    }
+
+    /// Merge cleanup configuration.
+    ///
+    /// Source values take precedence over target values.
+    fn merge_cleanup(target: &CleanupConfig, source: &CleanupConfig) -> CleanupConfig {
+        CleanupConfig {
+            expire_after_days: source.expire_after_days.or(target.expire_after_days),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn make_source(precedence: u8, config: Config) -> ConfigSource {
+        ConfigSource {
+            path: PathBuf::from(format!("test-{}.yaml", precedence)),
+            precedence,
+            config,
+        }
+    }
+
+    #[test]
+    fn test_merge_simple_fields() {
+        let mut target = Config::default();
+        let source = Config {
+            project: Some("test".to_string()),
+            disable_autoinit: Some(true),
+            ..Default::default()
+        };
+
+        ConfigMerger::merge_into(&mut target, &source);
+        assert_eq!(target.project, Some("test".to_string()));
+        assert_eq!(target.disable_autoinit, Some(true));
+    }
+
+    #[test]
+    fn test_merge_overwrites() {
+        let mut target = Config {
+            project: Some("old".to_string()),
+            ..Default::default()
+        };
+        let source = Config {
+            project: Some("new".to_string()),
+            ..Default::default()
+        };
+
+        ConfigMerger::merge_into(&mut target, &source);
+        assert_eq!(target.project, Some("new".to_string()));
+    }
+
+    #[test]
+    fn test_merge_excluded_ports_accumulates() {
+        let mut target = Config {
+            excluded_ports: Some(vec![PortExclusion::Single(5001)]),
+            ..Default::default()
+        };
+        let source = Config {
+            excluded_ports: Some(vec![PortExclusion::Single(5002)]),
+            ..Default::default()
+        };
+
+        ConfigMerger::merge_into(&mut target, &source);
+        assert_eq!(target.excluded_ports.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_merge_port_config() {
+        let mut target = Config {
+            ports: Some(PortConfig {
+                min: 5000,
+                max: Some(6000),
+                max_offset: None,
+            }),
+            ..Default::default()
+        };
+        let source = Config {
+            ports: Some(PortConfig {
+                min: 7000,
+                max: None,
+                max_offset: Some(100),
+            }),
+            ..Default::default()
+        };
+
+        ConfigMerger::merge_into(&mut target, &source);
+        let ports = target.ports.unwrap();
+        assert_eq!(ports.min, 7000); // Always use source
+        assert_eq!(ports.max, Some(6000)); // Source didn't specify, use target
+        assert_eq!(ports.max_offset, Some(100)); // Use source
+    }
+
+    #[test]
+    fn test_merge_cleanup_config() {
+        let mut target = Config {
+            cleanup: Some(CleanupConfig {
+                expire_after_days: Some(30),
+            }),
+            ..Default::default()
+        };
+        let source = Config {
+            cleanup: Some(CleanupConfig {
+                expire_after_days: Some(60),
+            }),
+            ..Default::default()
+        };
+
+        ConfigMerger::merge_into(&mut target, &source);
+        let cleanup = target.cleanup.unwrap();
+        assert_eq!(cleanup.expire_after_days, Some(60));
+    }
+
+    #[test]
+    fn test_merge_occupancy_atomic_replacement() {
+        let mut target = Config {
+            occupancy_check: Some(OccupancyConfig {
+                skip: Some(false),
+                skip_ip4: Some(true),
+                skip_ip6: Some(false),
+                skip_tcp: Some(false),
+                skip_udp: Some(false),
+                check_all_interfaces: Some(false),
+            }),
+            ..Default::default()
+        };
+        let source = Config {
+            occupancy_check: Some(OccupancyConfig {
+                skip: Some(true),
+                skip_ip4: None,
+                skip_ip6: None,
+                skip_tcp: None,
+                skip_udp: None,
+                check_all_interfaces: None,
+            }),
+            ..Default::default()
+        };
+
+        ConfigMerger::merge_into(&mut target, &source);
+        let occ = target.occupancy_check.unwrap();
+        // Complete replacement - target values are lost
+        assert_eq!(occ.skip, Some(true));
+        assert_eq!(occ.skip_ip4, None);
+    }
+
+    #[test]
+    fn test_merge_multiple_sources() {
+        let sources = vec![
+            make_source(
+                1,
+                Config {
+                    project: Some("base".to_string()),
+                    disable_autoinit: Some(false),
+                    ..Default::default()
+                },
+            ),
+            make_source(
+                2,
+                Config {
+                    project: Some("override".to_string()),
+                    disable_autoprune: Some(true),
+                    ..Default::default()
+                },
+            ),
+            make_source(
+                3,
+                Config {
+                    disable_autoinit: Some(true),
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        let result = ConfigMerger::merge(sources);
+        assert_eq!(result.project, Some("override".to_string()));
+        assert_eq!(result.disable_autoinit, Some(true));
+        assert_eq!(result.disable_autoprune, Some(true));
+    }
+
+    #[test]
+    fn test_merge_none_values_dont_overwrite() {
+        let mut target = Config {
+            project: Some("existing".to_string()),
+            ..Default::default()
+        };
+        let source = Config {
+            project: None,
+            disable_autoinit: Some(true),
+            ..Default::default()
+        };
+
+        ConfigMerger::merge_into(&mut target, &source);
+        assert_eq!(target.project, Some("existing".to_string()));
+        assert_eq!(target.disable_autoinit, Some(true));
+    }
+}

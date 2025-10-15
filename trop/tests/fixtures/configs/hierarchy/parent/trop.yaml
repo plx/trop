@@ -1,0 +1,12 @@
+# Parent directory config
+project: parent-project
+
+ports:
+  min: 5000
+  max: 6000
+
+excluded_ports:
+  - 5001
+
+cleanup:
+  expire_after_days: 20
