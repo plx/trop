@@ -630,8 +630,7 @@ fn test_env_var_boolean_parsing() {
         assert_eq!(
             config.disable_autoinit,
             Some(expected),
-            "Failed for value: {}",
-            val
+            "Failed for value: {val}"
         );
     }
 }
@@ -754,7 +753,7 @@ fn test_validation_port_range_max_less_than_min() {
             assert!(field.contains("ports"));
             assert!(message.contains("max") || message.contains("min"));
         }
-        _ => panic!("Expected validation error, got: {:?}", err),
+        _ => panic!("Expected validation error, got: {err:?}"),
     }
 }
 
@@ -1152,7 +1151,8 @@ fn test_yaml_parsing_complete_config() {
 /// Port ranges can be specified as:
 /// - String: "5000..5010"
 /// - Object: {start: 5000, end: 5010}
-/// Both should work.
+///
+///   Both should work.
 #[test]
 fn test_yaml_parsing_port_range_formats() {
     let temp = TempDir::new().unwrap();
@@ -1200,8 +1200,7 @@ fn test_yaml_parsing_unknown_fields_rejected() {
     // It will be a Validation error from our loader
     assert!(
         matches!(err, Error::Validation { .. }),
-        "Expected Validation error, got: {:?}",
-        err
+        "Expected Validation error, got: {err:?}"
     );
 }
 
@@ -1298,7 +1297,8 @@ fn test_reservation_groups_complete_parsing() {
 /// - Just preferred (with explicit offset to avoid default 0)
 /// - Just env (with explicit offset)
 /// - Any combination
-/// All valid combinations should work.
+///
+///   All valid combinations should work.
 #[test]
 fn test_reservation_groups_service_combinations() {
     let temp = TempDir::new().unwrap();
@@ -1555,7 +1555,7 @@ disable_autoinit: true
         .unwrap();
 
     // Service A's config only has excluded_ports (no project field)
-    assert!(config_a.excluded_ports.as_ref().unwrap().len() >= 1);
+    assert!(!config_a.excluded_ports.as_ref().unwrap().is_empty());
 
     // Load from service B
     let config_b = ConfigBuilder::new()

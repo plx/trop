@@ -488,7 +488,7 @@ mod property_tests {
                         prop_assert_eq!(s, start, "Start value preserved");
                         prop_assert_eq!(e, end, "End value preserved");
                     }
-                    _ => prop_assert!(false, "Expected Range variant"),
+                    PortExclusion::Single(_) => prop_assert!(false, "Expected Range variant"),
                 }
             }
         }
@@ -518,7 +518,7 @@ mod property_tests {
     proptest! {
         #[test]
         fn prop_port_exclusion_range_roundtrip(start in 1u16..=65535, offset in 0u16..=100) {
-            let end = start.saturating_add(offset).min(65535);
+            let end = start.saturating_add(offset);
             let exclusion = PortExclusion::Range { start, end };
 
             // Serialize as YAML
@@ -537,7 +537,7 @@ mod property_tests {
     proptest! {
         #[test]
         fn prop_port_exclusion_string_format_parsing(start in 1u16..=65535, offset in 0u16..=100) {
-            let end = start.saturating_add(offset).min(65535);
+            let end = start.saturating_add(offset);
             let yaml = format!("\"{start}..{end}\"");
 
             let exclusion: PortExclusion = serde_yaml::from_str(&yaml).unwrap();
@@ -547,7 +547,7 @@ mod property_tests {
                     prop_assert_eq!(e, end, "End value parsed correctly");
                     prop_assert!(s <= e, "Parsed range is valid");
                 }
-                _ => prop_assert!(false, "String range should parse to Range variant"),
+                PortExclusion::Single(_) => prop_assert!(false, "String range should parse to Range variant"),
             }
         }
     }

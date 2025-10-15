@@ -736,9 +736,6 @@ mod property_tests {
             max_offset in 0u16..=5535, // Ensures min + offset <= 65535
         ) {
             let max = min + max_offset;
-            if max > 65535 {
-                return Ok(());
-            }
 
             let config = PortConfig {
                 min,
@@ -842,10 +839,10 @@ mod property_tests {
     /// Mathematical Property: If min + max_offset > 65535, validation should fail.
     proptest! {
         #[test]
-        #[allow(unused_comparisons)] // u16 can't exceed 65535, but test logic needs check
         fn prop_max_offset_overflow_rejected(min in 60000u16..=65535, max_offset in 1000u16..=10000) {
-            let computed_max = min.saturating_add(max_offset);
-            if computed_max <= 65535 {
+            // Since u16::saturating_add caps at u16::MAX (65535), we need to check if
+            // the non-saturating add would overflow to determine if validation should fail
+            if min.checked_add(max_offset).is_some() {
                 return Ok(()); // Skip if no overflow
             }
 
@@ -887,7 +884,7 @@ mod property_tests {
             start in 1u16..=65535,
             offset in 0u16..=100,
         ) {
-            let end = start.saturating_add(offset).min(65535);
+            let end = start.saturating_add(offset);
             let exclusions = vec![PortExclusion::Range { start, end }];
 
             let result = ConfigValidator::validate_excluded_ports(&exclusions);

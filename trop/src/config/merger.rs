@@ -681,17 +681,18 @@ mod property_tests {
 
             let merged_cleanup = target.cleanup.unwrap();
 
-            match source_days_opt {
-                Some(days) => prop_assert_eq!(
+            if let Some(days) = source_days_opt {
+                prop_assert_eq!(
                     merged_cleanup.expire_after_days,
                     Some(days),
                     "Source value used when present"
-                ),
-                None => prop_assert_eq!(
+                );
+            } else {
+                prop_assert_eq!(
                     merged_cleanup.expire_after_days,
                     Some(target_days),
                     "Target value preserved when source None"
-                ),
+                );
             }
         }
     }

@@ -439,7 +439,7 @@ mod property_tests {
     proptest! {
         #[test]
         fn prop_port_range_parsing_valid(start in 1u16..=65535, offset in 0u16..=100) {
-            let end = start.saturating_add(offset).min(65535);
+            let end = start.saturating_add(offset);
             let input = format!("{start}..{end}");
 
             let result = EnvironmentConfig::parse_excluded_ports(&input);
@@ -454,7 +454,7 @@ mod property_tests {
                     prop_assert_eq!(*e, end, "End value preserved");
                     prop_assert!(*s <= *e, "Range invariant maintained");
                 }
-                _ => prop_assert!(false, "Expected Range variant"),
+                PortExclusion::Single(_) => prop_assert!(false, "Expected Range variant"),
             }
         }
     }
@@ -488,7 +488,7 @@ mod property_tests {
         #[test]
         fn prop_comma_separated_parsing(ports in prop::collection::vec(1u16..=65535, 1..=5)) {
             let input = ports.iter()
-                .map(|p| p.to_string())
+                .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
 
@@ -563,7 +563,7 @@ mod property_tests {
                     prop_assert_eq!(*start, range_start, "Range start correct");
                     prop_assert_eq!(*end, range_end, "Range end correct");
                 }
-                _ => prop_assert!(false, "Second should be Range"),
+                PortExclusion::Single(_) => prop_assert!(false, "Second should be Range"),
             }
             prop_assert_eq!(&exclusions[2], &PortExclusion::Single(port2), "Third port correct");
         }
@@ -588,7 +588,7 @@ mod property_tests {
     /// Mathematical Property: For port numbers outside [1, 65535], parsing should fail
     proptest! {
         #[test]
-        fn prop_invalid_port_numbers_fail(invalid_port in 65536u32..=100000) {
+        fn prop_invalid_port_numbers_fail(invalid_port in 65536u32..=100_000) {
             let input = invalid_port.to_string();
             let result = EnvironmentConfig::parse_excluded_ports(&input);
 
