@@ -14,7 +14,7 @@ FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
 # Only process Edit and Write tools
 if [[ "$TOOL_NAME" != "Edit" && "$TOOL_NAME" != "Write" ]]; then
     # Return success decision (non-blocking)
-    echo '{"decision": "allow"}'
+    echo '{"permissionDecision": "allow"}'
     exit 0
 fi
 
@@ -33,5 +33,5 @@ if [[ "$FILE_PATH" =~ \.rs$ ]]; then
 fi
 
 # Always return success (non-blocking)
-echo '{"decision": "allow"}'
+echo '{"permissionDecision": "allow"}'
 exit 0

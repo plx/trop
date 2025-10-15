@@ -142,6 +142,34 @@ pub enum Error {
         /// Details about the attempted change.
         details: String,
     },
+
+    /// A path does not exist.
+    #[error("path not found: {}", path.display())]
+    PathNotFound {
+        /// The path that was not found.
+        path: PathBuf,
+    },
+
+    /// Permission denied accessing a path.
+    #[error("permission denied: {}", path.display())]
+    PermissionDenied {
+        /// The path that could not be accessed.
+        path: PathBuf,
+    },
+
+    /// A symlink loop was detected.
+    #[error("symlink loop detected: {}", path.display())]
+    SymlinkLoop {
+        /// The path where the loop was detected.
+        path: PathBuf,
+    },
+
+    /// A path relationship violation occurred.
+    #[error("path relationship violation: {details}")]
+    PathRelationshipViolation {
+        /// Details about the violation.
+        details: String,
+    },
 }
 
 // Additional conversions for better ergonomics
@@ -171,6 +199,40 @@ impl From<crate::reservation::ValidationError> for Error {
             field: err.field,
             message: err.message,
         }
+    }
+}
+
+impl Error {
+    /// Check if error indicates a path does not exist.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trop::Error;
+    /// use std::path::PathBuf;
+    ///
+    /// let err = Error::PathNotFound { path: PathBuf::from("/nonexistent") };
+    /// assert!(err.is_not_found());
+    /// ```
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::PathNotFound { .. })
+    }
+
+    /// Check if error is permission-related.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trop::Error;
+    /// use std::path::PathBuf;
+    ///
+    /// let err = Error::PermissionDenied { path: PathBuf::from("/restricted") };
+    /// assert!(err.is_permission_denied());
+    /// ```
+    #[must_use]
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(self, Self::PermissionDenied { .. })
     }
 }
 
