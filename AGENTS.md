@@ -32,6 +32,10 @@ Additionally, this repository is an experiment in "hands off", "high-autonomy" a
 - Format code: `cargo fmt`
 - Build release: `cargo build --release`
 
+## GitHub PR Comments
+
+When posting comments to PRs using `gh pr comment`, the comment will be attributed to whatever GitHub account is authenticated with the `gh` CLI (typically the user's account). To ensure proper attribution, add explicit bot attribution in comment text (e.g., "🤖 Posted by Claude Code" at the end of comments).
+
 ## Current Status
 
 - Working On Initial Implementation (as per `specifications/ImplementationPlan.md`)
