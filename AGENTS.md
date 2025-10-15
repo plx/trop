@@ -36,4 +36,6 @@ Additionally, this repository is an experiment in "hands off", "high-autonomy" a
 
 - Working On Initial Implementation (as per `specifications/ImplementationPlan.md`)
 - Phase 1 (Project Scaffold) is COMPLETED and merged
-- Phase 2 (SQLite Database Layer) is COMPLETED and ready for merge
+- Phase 2 (SQLite Database Layer) is COMPLETED and merged
+- Phase 3 (Path Handling System) is COMPLETED and merged
+- Phase 4 (Basic Reservation Operations) is COMPLETED and ready for merge
