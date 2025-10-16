@@ -12,12 +12,12 @@ Here's an overview of the repository's structure:
 
 The `reference` directory contains two important documents:
 
-- `specifications/ImplementationSpecification.md`: high-level specification for the `trop` tool
-- `specifications/ImplementationPlan.md`: high-level implementation plan for the `trop` tool (broken down into a linear sequence of "phases")
+- `ImplementationSpecification.md`: high-level specification for the `trop` tool
+- `ImplementationPlan.md`: high-level implementation plan for the `trop` tool (broken down into a linear sequence of "phases")
 
-These files should be treated as the source of truth for the `trop` tool; agents should consult them for context and clarification. Agents should **NEVER** modify the `specifications/ImplementationSpecification.md`; in some circumstances, agents *may* be asked to modify the `specifications/ImplementationPlan.md`, and should *only* modify that file if-and-when explcitly directed to do so.
+These files should be treated as the source of truth for the `trop` tool; agents should consult them for context and clarification. Agents should **NEVER** modify the `ImplementationSpecification.md`; in some circumstances, agents *may* be asked to modify the `ImplementationPlan.md`, and should *only* modify that file if-and-when explcitly directed to do so.
 
-Development will generally follow the plan outlined in `specifications/ImplementationPlan.md`, mixed in with occasional ad-hoc directives.
+Development will generally follow the plan outlined in `ImplementationPlan.md`, mixed in with occasional ad-hoc directives.
 
 ## Meta-Goal: Autonomous Development
 
@@ -38,7 +38,7 @@ When posting comments to PRs using `gh pr comment`, the comment will be attribut
 
 ## Current Status
 
-- Working On Initial Implementation (as per `specifications/ImplementationPlan.md`)
+- Working On Initial Implementation (as per `ImplementationPlan.md`)
 - Phase 1 (Project Scaffold) is COMPLETED and merged
 - Phase 2 (SQLite Database Layer) is COMPLETED and merged
 - Phase 3 (Path Handling System) is COMPLETED and merged
