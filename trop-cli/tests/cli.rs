@@ -6,15 +6,15 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
-/// Test that the binary runs without arguments and displays basic information.
+/// Test that the binary runs without arguments and displays help/error.
 #[test]
 fn test_cli_no_arguments() {
     let mut cmd = Command::cargo_bin("trop").expect("Failed to find trop binary");
 
+    // With clap subcommands required, no arguments should fail and show usage
     cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("trop v"))
-        .stdout(predicate::str::contains("Port reservation management tool"));
+        .failure()
+        .stderr(predicate::str::contains("Usage:"));
 }
 
 /// Test that the --version flag displays version information.
@@ -27,7 +27,7 @@ fn test_cli_version_flag() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("trop"))
-        .stdout(predicate::str::contains("0.1.0"));
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }
 
 /// Test that the -V short flag also displays version information.
@@ -40,7 +40,7 @@ fn test_cli_version_short_flag() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("trop"))
-        .stdout(predicate::str::contains("0.1.0"));
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }
 
 /// Test that the --help flag displays help text.

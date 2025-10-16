@@ -1,23 +1,49 @@
+//! Main entry point for the trop CLI.
+//!
+//! This is the command-line interface for the trop port reservation system.
+//! It provides three main commands:
+//! - `reserve`: Reserve a port for a directory
+//! - `release`: Release a port reservation
+//! - `list`: List active reservations
+
+mod cli;
+mod commands;
+mod error;
+mod utils;
+
 use clap::Parser;
-
-#[derive(Parser)]
-#[command(name = "trop")]
-#[command(version, about = "Manage ephemeral port reservations", long_about = None)]
-struct Cli {
-    /// Placeholder for future subcommands
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(clap::Subcommand)]
-enum Commands {
-    // Subcommands will be added in future phases
-}
+use cli::Cli;
+use utils::GlobalOptions;
 
 fn main() {
-    let _cli = Cli::parse();
+    // Parse CLI arguments
+    let cli = Cli::parse();
 
-    // For now, just print the version if no subcommands are provided
-    println!("trop v{}", env!("CARGO_PKG_VERSION"));
-    println!("Port reservation management tool");
+    // Initialize logging based on verbosity
+    let _logger = trop::init_logger(cli.verbose, cli.quiet);
+
+    // Convert CLI args to GlobalOptions
+    let global = GlobalOptions {
+        verbose: cli.verbose,
+        quiet: cli.quiet,
+        data_dir: cli.data_dir,
+        busy_timeout: cli.busy_timeout,
+        disable_autoinit: cli.disable_autoinit,
+    };
+
+    // Execute the command
+    let result = match cli.command {
+        cli::Command::Reserve(cmd) => cmd.execute(&global),
+        cli::Command::Release(cmd) => cmd.execute(&global),
+        cli::Command::List(cmd) => cmd.execute(&global),
+    };
+
+    // Handle errors and set exit code
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(e.exit_code());
+        }
+    }
 }
