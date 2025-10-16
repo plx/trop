@@ -149,7 +149,18 @@ impl ConfigValidator {
                 });
             }
 
-            let computed_max = config.min.saturating_add(offset);
+            let computed_max = match config.min.checked_add(offset) {
+                Some(max) => max,
+                None => {
+                    return Err(Error::Validation {
+                        field: "ports.max_offset".into(),
+                        message: format!(
+                            "Offset {} would overflow when added to min port {}",
+                            offset, config.min
+                        ),
+                    });
+                }
+            };
             Port::try_from(computed_max).map_err(|_| Error::Validation {
                 field: "ports.max_offset".into(),
                 message: format!("Offset would create invalid max port: {computed_max}"),
