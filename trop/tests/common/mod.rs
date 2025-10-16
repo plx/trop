@@ -8,10 +8,28 @@ pub mod database;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use trop::config::{Config, PortConfig};
 use trop::{
     PlanExecutor, Port, ReleaseOptions, ReleasePlan, Reservation, ReservationKey, ReserveOptions,
     ReservePlan,
 };
+
+/// Creates a test configuration with reasonable defaults.
+///
+/// Returns a Config with:
+/// - Port range: 5000-7000
+/// - All other settings at defaults
+#[allow(dead_code)]
+pub fn create_test_config() -> Config {
+    Config {
+        ports: Some(PortConfig {
+            min: 5000,
+            max: Some(7000),
+            max_offset: None,
+        }),
+        ..Default::default()
+    }
+}
 
 /// Creates a temporary directory for testing.
 ///
@@ -200,57 +218,37 @@ pub fn unrelated_path(subpath: &str) -> PathBuf {
 
 /// Creates a reservation by planning and executing the reserve operation.
 ///
-/// This helper consolidates the common pattern of:
-/// 1. Creating ReserveOptions
-/// 2. Building a ReservePlan
-/// 3. Creating a PlanExecutor
-/// 4. Executing the plan
-///
-/// Returns the execution result, or an error if planning or execution fails.
-///
-/// # Arguments
-///
-/// * `db` - Mutable reference to the database
-/// * `options` - The ReserveOptions describing the reservation to create
+/// Consolidates the common pattern: build plan, create executor, execute.
 ///
 /// # Examples
 ///
 /// ```no_run
-/// # use common::{create_reservation, database::create_test_database};
+/// # use common::{create_reservation, create_test_config, database::create_test_database};
 /// # use trop::{ReserveOptions, ReservationKey, Port};
 /// # use std::path::PathBuf;
 /// let mut db = create_test_database();
+/// let config = create_test_config();
 /// let key = ReservationKey::new(PathBuf::from("/test"), None).unwrap();
 /// let port = Port::try_from(8080).unwrap();
 /// let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
 ///
-/// let result = create_reservation(&mut db, options).unwrap();
+/// let result = create_reservation(&mut db, options, &config).unwrap();
 /// assert!(result.success);
 /// ```
 #[allow(dead_code)]
 pub fn create_reservation(
     db: &mut trop::database::Database,
     options: ReserveOptions,
+    config: &Config,
 ) -> Result<trop::ExecutionResult, trop::Error> {
-    let plan = ReservePlan::new(options).build_plan(db)?;
+    let plan = ReservePlan::new(options, config).build_plan(db)?;
     let mut executor = PlanExecutor::new(db);
     executor.execute(&plan)
 }
 
 /// Releases a reservation by planning and executing the release operation.
 ///
-/// This helper consolidates the common pattern of:
-/// 1. Creating ReleaseOptions
-/// 2. Building a ReleasePlan
-/// 3. Creating a PlanExecutor
-/// 4. Executing the plan
-///
-/// Returns the execution result, or an error if planning or execution fails.
-///
-/// # Arguments
-///
-/// * `db` - Mutable reference to the database
-/// * `options` - The ReleaseOptions describing the reservation to release
+/// Consolidates the common pattern: build plan, create executor, execute.
 ///
 /// # Examples
 ///

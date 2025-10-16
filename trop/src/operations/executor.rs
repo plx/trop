@@ -65,15 +65,17 @@ impl ExecutionResult {
 /// ```no_run
 /// use trop::operations::{PlanExecutor, ReservePlan, ReserveOptions};
 /// use trop::{Database, DatabaseConfig, ReservationKey, Port};
+/// use trop::config::ConfigBuilder;
 /// use std::path::PathBuf;
 ///
 /// let mut db = Database::open(DatabaseConfig::new("/tmp/trop.db")).unwrap();
+/// let config = ConfigBuilder::new().build().unwrap();
 /// let key = ReservationKey::new(PathBuf::from("/path"), None).unwrap();
 /// let port = Port::try_from(8080).unwrap();
 ///
 /// let options = ReserveOptions::new(key, Some(port))
 ///     .with_allow_unrelated_path(true);
-/// let plan = ReservePlan::new(options).build_plan(&db).unwrap();
+/// let plan = ReservePlan::new(options, &config).build_plan(&db).unwrap();
 ///
 /// // Normal execution
 /// let mut executor = PlanExecutor::new(&mut db);

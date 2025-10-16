@@ -1,7 +1,18 @@
 //! Port and port range types for network port management.
 //!
 //! This module provides types for working with TCP/UDP ports, including
-//! validation and range operations.
+//! validation, range operations, allocation, and occupancy checking.
+
+pub mod allocator;
+pub mod exclusions;
+pub mod group;
+pub mod occupancy;
+
+// Property-based tests
+#[cfg(test)]
+mod allocator_proptests;
+#[cfg(test)]
+mod group_proptests;
 
 use std::fmt;
 
@@ -67,6 +78,54 @@ impl Port {
     #[must_use]
     pub const fn is_privileged(self) -> bool {
         self.0 < 1024
+    }
+
+    /// Add an offset to a port, returning a new port if the result is valid.
+    ///
+    /// Returns `None` if the result would overflow or be invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trop::Port;
+    ///
+    /// let port = Port::try_from(5000).unwrap();
+    /// assert_eq!(port.checked_add(10).unwrap().value(), 5010);
+    ///
+    /// // Overflow returns None
+    /// let high = Port::try_from(65535).unwrap();
+    /// assert!(high.checked_add(1).is_none());
+    /// ```
+    #[must_use]
+    pub const fn checked_add(self, offset: u16) -> Option<Self> {
+        match self.0.checked_add(offset) {
+            Some(result) if result > 0 => Some(Self(result)),
+            _ => None,
+        }
+    }
+
+    /// Subtract an offset from a port, returning a new port if the result is valid.
+    ///
+    /// Returns `None` if the result would underflow or be invalid (port 0).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trop::Port;
+    ///
+    /// let port = Port::try_from(5010).unwrap();
+    /// assert_eq!(port.checked_sub(10).unwrap().value(), 5000);
+    ///
+    /// // Underflow returns None
+    /// let low = Port::try_from(5).unwrap();
+    /// assert!(low.checked_sub(10).is_none());
+    /// ```
+    #[must_use]
+    pub const fn checked_sub(self, offset: u16) -> Option<Self> {
+        match self.0.checked_sub(offset) {
+            Some(result) if result > 0 => Some(Self(result)),
+            _ => None,
+        }
     }
 }
 
@@ -505,5 +564,31 @@ mod tests {
 
         assert_eq!(range.len(), 65535);
         assert!(range.contains(Port::try_from(32768).unwrap()));
+    }
+
+    #[test]
+    fn test_port_checked_add_overflow() {
+        // Test overflow with high port numbers
+        let high = Port::try_from(65535).unwrap();
+        assert!(high.checked_add(1).is_none());
+        assert!(high.checked_add(100).is_none());
+
+        // Test near-overflow that should work
+        let near_max = Port::try_from(65534).unwrap();
+        assert_eq!(near_max.checked_add(1).unwrap().value(), 65535);
+        assert!(near_max.checked_add(2).is_none());
+    }
+
+    #[test]
+    fn test_port_checked_sub_underflow() {
+        // Test underflow with low port numbers
+        let low = Port::try_from(1).unwrap();
+        assert!(low.checked_sub(1).is_none());
+        assert!(low.checked_sub(100).is_none());
+
+        // Test near-underflow that should work
+        let near_min = Port::try_from(2).unwrap();
+        assert_eq!(near_min.checked_sub(1).unwrap().value(), 1);
+        assert!(near_min.checked_sub(2).is_none());
     }
 }
