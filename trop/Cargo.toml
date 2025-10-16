@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 proptest = "1.0"
 criterion = "0.5"
+serial_test = "3.2"
 
 [[bench]]
 name = "path_bench"

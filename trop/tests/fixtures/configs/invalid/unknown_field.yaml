@@ -1,0 +1,5 @@
+# Invalid: contains unknown field
+project: unknown-field-test
+unknown_field_here: this should fail
+ports:
+  min: 5000
