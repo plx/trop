@@ -1,0 +1,13 @@
+# Configuration focusing on excluded ports
+project: excluded-ports-test
+
+ports:
+  min: 5000
+  max: 9000
+
+excluded_ports:
+  - 5432  # PostgreSQL
+  - 3306  # MySQL
+  - "8080..8089"  # Common web server range
+  - 6379  # Redis
+  - "27017..27019"  # MongoDB

@@ -1,0 +1,8 @@
+# Local overrides for child directory
+# Should have highest precedence
+
+excluded_ports:
+  - 7999
+
+disable_autoinit: true
+maximum_lock_wait_seconds: 15
