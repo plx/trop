@@ -44,11 +44,11 @@ pub mod reservation;
 // Re-export key types at crate root for convenience
 pub use config::{Config, ConfigBuilder};
 pub use database::{Database, DatabaseConfig};
-pub use error::{Error, Result};
+pub use error::{Error, PortUnavailableReason, Result};
 pub use logging::{init_logger, LogLevel, Logger};
 pub use operations::{
-    ExecutionResult, OperationPlan, PlanAction, PlanExecutor, ReleaseOptions, ReleasePlan,
-    ReserveOptions, ReservePlan,
+    AutocleanResult, CleanupOperations, ExecutionResult, ExpireResult, OperationPlan, PlanAction,
+    PlanExecutor, PruneResult, ReleaseOptions, ReleasePlan, ReserveOptions, ReservePlan,
 };
 pub use path::{PathProvenance, PathRelationship, PathResolver};
 pub use port::{Port, PortRange};

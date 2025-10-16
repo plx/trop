@@ -1,6 +1,7 @@
 //! Integration tests for reservation operations.
 
 mod common;
+use common::create_test_config;
 
 use common::database::create_test_database;
 use std::path::PathBuf;
@@ -17,7 +18,9 @@ fn test_reserve_and_release_cycle() {
         .with_project(Some("test-project".to_string()))
         .with_allow_unrelated_path(true);
 
-    let plan = ReservePlan::new(reserve_opts).build_plan(&db).unwrap();
+    let plan = ReservePlan::new(reserve_opts, &create_test_config())
+        .build_plan(&db)
+        .unwrap();
     assert_eq!(plan.actions.len(), 1);
 
     let mut executor = trop::PlanExecutor::new(&mut db);
@@ -60,7 +63,7 @@ fn test_idempotent_reserve() {
         .with_allow_unrelated_path(true);
 
     // First reservation
-    let plan = ReservePlan::new(reserve_opts.clone())
+    let plan = ReservePlan::new(reserve_opts.clone(), &create_test_config())
         .build_plan(&db)
         .unwrap();
     let mut executor = trop::PlanExecutor::new(&mut db);
@@ -68,7 +71,9 @@ fn test_idempotent_reserve() {
     assert!(result.success);
 
     // Second reservation with same parameters
-    let plan2 = ReservePlan::new(reserve_opts).build_plan(&db).unwrap();
+    let plan2 = ReservePlan::new(reserve_opts, &create_test_config())
+        .build_plan(&db)
+        .unwrap();
 
     // Should update timestamp, not create new reservation
     assert_eq!(plan2.actions.len(), 1);
@@ -98,7 +103,9 @@ fn test_sticky_field_protection() {
         .with_project(Some("project1".to_string()))
         .with_allow_unrelated_path(true);
 
-    let plan = ReservePlan::new(reserve_opts).build_plan(&db).unwrap();
+    let plan = ReservePlan::new(reserve_opts, &create_test_config())
+        .build_plan(&db)
+        .unwrap();
     let mut executor = trop::PlanExecutor::new(&mut db);
     executor.execute(&plan).unwrap();
 
@@ -107,7 +114,7 @@ fn test_sticky_field_protection() {
         .with_project(Some("project2".to_string()))
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(reserve_opts2).build_plan(&db);
+    let result = ReservePlan::new(reserve_opts2, &create_test_config()).build_plan(&db);
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
@@ -120,7 +127,9 @@ fn test_sticky_field_protection() {
         .with_force(true)
         .with_allow_unrelated_path(true);
 
-    let plan = ReservePlan::new(reserve_opts3).build_plan(&db).unwrap();
+    let plan = ReservePlan::new(reserve_opts3, &create_test_config())
+        .build_plan(&db)
+        .unwrap();
     let mut executor = trop::PlanExecutor::new(&mut db);
     let result = executor.execute(&plan);
     assert!(result.is_ok());
@@ -136,7 +145,9 @@ fn test_dry_run_mode() {
         .with_project(Some("test-project".to_string()))
         .with_allow_unrelated_path(true);
 
-    let plan = ReservePlan::new(reserve_opts).build_plan(&db).unwrap();
+    let plan = ReservePlan::new(reserve_opts, &create_test_config())
+        .build_plan(&db)
+        .unwrap();
 
     // Execute in dry-run mode
     let mut executor = trop::PlanExecutor::new(&mut db).dry_run();
@@ -190,7 +201,9 @@ fn test_multiple_tagged_reservations() {
     // Reserve all three
     for (key, port) in [(key1, port1), (key2, port2), (key3, port3)] {
         let opts = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
-        let plan = ReservePlan::new(opts).build_plan(&db).unwrap();
+        let plan = ReservePlan::new(opts, &create_test_config())
+            .build_plan(&db)
+            .unwrap();
         let mut executor = trop::PlanExecutor::new(&mut db);
         executor.execute(&plan).unwrap();
     }

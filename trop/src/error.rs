@@ -170,6 +170,64 @@ pub enum Error {
         /// Details about the violation.
         details: String,
     },
+
+    /// No ports are available in the specified range.
+    #[error("port range {range} exhausted{}", if *.tried_cleanup { " after cleanup" } else { "" })]
+    PortExhausted {
+        /// The port range that was exhausted.
+        range: crate::port::PortRange,
+        /// Whether cleanup was attempted.
+        tried_cleanup: bool,
+    },
+
+    /// Port occupancy check failed.
+    #[error("occupancy check failed for port {port}: {source}")]
+    OccupancyCheckFailed {
+        /// The port that failed the check.
+        port: crate::port::Port,
+        /// The underlying error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// A preferred port is unavailable.
+    #[error("preferred port {port} unavailable: {reason}")]
+    PreferredPortUnavailable {
+        /// The preferred port that was unavailable.
+        port: crate::port::Port,
+        /// The reason the port is unavailable.
+        reason: PortUnavailableReason,
+    },
+
+    /// Group allocation failed.
+    #[error("group allocation failed after attempting {attempted} service(s): {reason}")]
+    GroupAllocationFailed {
+        /// Number of services attempted before failure.
+        attempted: usize,
+        /// The reason for failure.
+        reason: String,
+    },
+}
+
+/// Reason why a port is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortUnavailableReason {
+    /// Port is already reserved in the database.
+    Reserved,
+    /// Port is in the exclusion list.
+    Excluded,
+    /// Port is currently occupied on the system.
+    Occupied,
+}
+
+impl std::fmt::Display for PortUnavailableReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reserved => write!(f, "reserved"),
+            Self::Excluded => write!(f, "excluded"),
+            Self::Occupied => write!(f, "occupied"),
+        }
+    }
 }
 
 // Additional conversions for better ergonomics
