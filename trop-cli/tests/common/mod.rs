@@ -45,13 +45,23 @@ impl TestEnv {
         }
     }
 
+    /// Get a bare command builder without pre-configured flags.
+    ///
+    /// This returns a Command with only the trop binary, allowing tests
+    /// to have full control over all flags including --data-dir.
+    /// Use this when you need to override the data directory or test
+    /// global flag behavior.
+    pub fn command_bare(&self) -> Command {
+        Command::cargo_bin("trop").expect("Failed to find trop binary")
+    }
+
     /// Get a command builder with the data directory pre-configured.
     ///
     /// This is a convenience method that returns a Command with:
     /// - The trop binary
     /// - The --data-dir flag set to this environment's data directory
     pub fn command(&self) -> Command {
-        let mut cmd = Command::cargo_bin("trop").expect("Failed to find trop binary");
+        let mut cmd = self.command_bare();
         cmd.arg("--data-dir").arg(&self.data_dir);
         cmd
     }

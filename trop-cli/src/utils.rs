@@ -34,21 +34,18 @@ pub struct GlobalOptions {
 /// # Path Handling Rules
 ///
 /// - Explicit paths (provided by user) are normalized but NOT canonicalized
-/// - Implicit paths (CWD) are both normalized AND canonicalized
+/// - Implicit paths (CWD) are normalized from the current directory
 ///
-/// This prevents surprising behavior when users specify symlinks explicitly.
+/// Normalization makes paths absolute and expands ~, but doesn't follow symlinks.
+/// This allows paths that don't exist yet and avoids issues with temp directories.
 pub fn resolve_path(path: Option<PathBuf>) -> Result<PathBuf, CliError> {
-    match path {
-        Some(p) => {
-            // Explicit path - normalize but don't canonicalize
-            normalize_path(&p)
-        }
-        None => {
-            // Implicit path - use CWD and canonicalize
-            let cwd = env::current_dir()?;
-            canonicalize_path(&cwd)
-        }
-    }
+    let path_to_resolve = match path {
+        Some(p) => p,
+        None => env::current_dir()?,
+    };
+
+    // Normalize to make absolute, but don't canonicalize (allows non-existent paths)
+    normalize_path(&path_to_resolve)
 }
 
 /// Normalize a path (make absolute, expand ~, etc.) without following symlinks.

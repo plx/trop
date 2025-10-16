@@ -259,7 +259,7 @@ fn test_data_dir_flag_override() {
     let test_path = env.create_dir("test-project");
 
     // Reserve with custom data dir
-    env.command()
+    env.command_bare()
         .args(["--data-dir", custom_data_dir.to_str().unwrap()])
         .arg("reserve")
         .arg("--path")
@@ -292,9 +292,10 @@ fn test_data_dir_isolation() {
     let test_path = env.create_dir("test-project");
 
     // Reserve in data-a
-    let mut cmd_a = env.command();
-    cmd_a.arg("--data-dir").arg(&data_dir_a);
-    let port_a = cmd_a
+    let port_a = env
+        .command_bare()
+        .arg("--data-dir")
+        .arg(&data_dir_a)
         .arg("reserve")
         .arg("--path")
         .arg(&test_path)
@@ -305,9 +306,13 @@ fn test_data_dir_isolation() {
     let port_a = common::parse_port(&String::from_utf8(port_a.stdout).unwrap());
 
     // List in data-b should be empty
-    let mut cmd_b = env.command();
-    cmd_b.arg("--data-dir").arg(&data_dir_b);
-    let list_b = cmd_b.arg("list").output().unwrap();
+    let list_b = env
+        .command_bare()
+        .arg("--data-dir")
+        .arg(&data_dir_b)
+        .arg("list")
+        .output()
+        .unwrap();
     let list_output = String::from_utf8(list_b.stdout).unwrap();
 
     // Should not contain the port from data-a
@@ -328,7 +333,7 @@ fn test_data_dir_with_relative_path() {
 
     // Use relative path for data dir
     let output = env
-        .command()
+        .command_bare()
         .arg("--data-dir")
         .arg("./relative-data")
         .arg("reserve")
@@ -702,7 +707,7 @@ fn test_multiple_global_flags() {
     let test_path = env.create_dir("test-project");
 
     // Combine several global flags
-    env.command()
+    env.command_bare()
         .arg("--verbose")
         .arg("--data-dir")
         .arg(&custom_data)
@@ -815,7 +820,7 @@ fn test_data_dir_with_special_characters() {
     let special_data = env.path().join("data with spaces");
     let test_path = env.create_dir("test-project");
 
-    env.command()
+    env.command_bare()
         .arg("--data-dir")
         .arg(&special_data)
         .arg("reserve")

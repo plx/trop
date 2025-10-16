@@ -5,7 +5,7 @@
 
 use crate::error::CliError;
 use crate::utils::{
-    canonicalize_path, format_timestamp, load_configuration, open_database, shorten_path,
+    format_timestamp, load_configuration, normalize_path, open_database, shorten_path,
     GlobalOptions,
 };
 use clap::{Args, ValueEnum};
@@ -28,7 +28,13 @@ const COLUMN_HEADERS: [&str; 7] = [
 #[derive(Args)]
 pub struct ListCommand {
     /// Output format
-    #[arg(long, value_enum, default_value = "table", env = "TROP_OUTPUT_FORMAT")]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "table",
+        env = "TROP_OUTPUT_FORMAT",
+        ignore_case = true
+    )]
     pub format: OutputFormat,
 
     /// Filter by project
@@ -50,6 +56,7 @@ pub struct ListCommand {
 
 /// Output format for list command.
 #[derive(Clone, Copy, ValueEnum)]
+#[value(rename_all = "lowercase")]
 pub enum OutputFormat {
     /// Tab-separated table format (human-readable)
     Table,
@@ -83,8 +90,8 @@ impl ListCommand {
         }
 
         if let Some(ref path) = self.filter_path {
-            let canonical = canonicalize_path(path)?;
-            reservations.retain(|r| r.key().path.starts_with(&canonical));
+            let normalized = normalize_path(path)?;
+            reservations.retain(|r| r.key().path.starts_with(&normalized));
         }
 
         // 5. Format and output to stdout
