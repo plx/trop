@@ -42,7 +42,7 @@ That said, you will have to use your best judgement to decide how to handle its 
 
 ### Open PR
 
-Assuming the completion-verification is successful (e.g. "we think we're done"), your last step is to open a PR for human review. To do this, you must *specifically* invoke the `/trop:open-phase-pr $suggested-title` slash command, providing a brief description of the overall phase (or the path to the plan file, etc.).
+Assuming the completion-verification is successful (e.g. "we think we're done"), your last step is to open a PR for human review. To do this, you should invoke the `/trop:open-phase-pr $suggested-title` slash command, providing a brief description of the overall phase (or the path to the plan file, etc.).
 
 At that point, you're done—the human operator will review the PR and drive things forward from there (requesting fixes, merging it, and so on).
 

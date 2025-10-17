@@ -1,9 +1,0 @@
-# Child directory config - overrides parent
-project: child-project
-
-ports:
-  min: 7000
-  max: 8000
-
-excluded_ports:
-  - 7001

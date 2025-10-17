@@ -1,6 +1,0 @@
-# Invalid: max < min
-project: bad-range
-
-ports:
-  min: 8000
-  max: 5000
