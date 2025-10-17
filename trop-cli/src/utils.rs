@@ -55,13 +55,6 @@ pub fn normalize_path(path: &Path) -> Result<PathBuf, CliError> {
     Ok(resolved.into_path_buf())
 }
 
-/// Canonicalize a path (follow symlinks).
-pub fn canonicalize_path(path: &Path) -> Result<PathBuf, CliError> {
-    let resolver = PathResolver::new();
-    let resolved = resolver.resolve_implicit(path).map_err(CliError::from)?;
-    Ok(resolved.into_path_buf())
-}
-
 /// Load hierarchical configuration.
 ///
 /// Configuration is merged from multiple sources with precedence:

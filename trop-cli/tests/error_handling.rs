@@ -430,16 +430,16 @@ fn test_io_error_exit_code_documentation() {
 // Library Errors (Exit Code 6)
 // ============================================================================
 
-/// Test general library errors return exit code 6.
+/// Test that release is idempotent and succeeds even when no reservation exists.
 ///
-/// Errors from the library that don't fit other categories should
-/// return exit code 6.
+/// Per the specification (line 631): "Idempotent—returns success even if no
+/// matching reservation exists."
 #[test]
-fn test_library_error_exit_code() {
+fn test_release_idempotent_success() {
     let env = TestEnv::new();
     let test_path = env.create_dir("test-project");
 
-    // Try to release something that doesn't exist (without --force)
+    // Release something that doesn't exist - should succeed (idempotent)
     let output = env
         .command()
         .arg("release")
@@ -448,21 +448,18 @@ fn test_library_error_exit_code() {
         .output()
         .unwrap();
 
-    // Should fail
-    assert!(!output.status.success());
-
-    // Exit code depends on how this error is classified
-    // Could be 6 (library error) or 1 (semantic error)
-    let code = output.status.code().unwrap();
-    assert!(
-        code == 1 || code == 6,
-        "Release non-existent should exit with code 1 or 6"
+    // Should succeed with exit code 0 (idempotent operation)
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "Release should succeed even when reservation doesn't exist (idempotent)"
     );
 
+    // stderr should indicate no reservation was found (but not as an error)
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("not found") || stderr.contains("No reservation"),
-        "Should explain what's missing"
+        stderr.contains("No reservation found") || stderr.contains("already released"),
+        "Should indicate no reservation was found: {stderr}"
     );
 }
 
@@ -537,9 +534,12 @@ fn test_error_messages_are_helpful() {
     // but this depends on implementation
 }
 
-/// Test that missing reservation errors are clear.
+/// Test that releasing a non-existent reservation provides clear feedback.
+///
+/// While release is idempotent and succeeds, it should still provide clear
+/// feedback to the user that no reservation was found.
 #[test]
-fn test_missing_reservation_error_message() {
+fn test_release_nonexistent_clear_message() {
     let env = TestEnv::new();
     let test_path = env.create_dir("test-project");
 
@@ -551,12 +551,19 @@ fn test_missing_reservation_error_message() {
         .output()
         .unwrap();
 
-    assert!(!output.status.success());
+    // Should succeed (idempotent)
+    assert!(
+        output.status.success(),
+        "Release should succeed even when reservation doesn't exist"
+    );
 
+    // But should provide clear feedback
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("not found") || stderr.contains("No reservation"),
-        "Should clearly state reservation doesn't exist"
+        stderr.contains("not found")
+            || stderr.contains("No reservation")
+            || stderr.contains("already released"),
+        "Should clearly indicate no reservation was found (as info, not error): {stderr}"
     );
 }
 

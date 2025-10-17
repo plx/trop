@@ -32,14 +32,10 @@ impl ConfigValidator {
     ///
     /// Returns validation errors for invalid configurations.
     pub fn validate(config: &Config, is_tropfile: bool) -> Result<()> {
-        // Validate project field (only in trop.yaml)
+        // Validate project field
+        // Note: We allow project from any source (env vars, CLI flags, trop.yaml)
+        // The tropfile restriction was overly strict and prevented valid CLI usage
         if let Some(ref project) = config.project {
-            if !is_tropfile {
-                return Err(Error::Validation {
-                    field: "project".into(),
-                    message: "project field is only valid in trop.yaml files".into(),
-                });
-            }
             Self::validate_identifier("project", project)?;
         }
 
@@ -348,12 +344,13 @@ mod tests {
 
     #[test]
     fn test_validate_project_in_user_config() {
+        // Project is now allowed from any source (env vars, CLI, config files)
         let config = Config {
             project: Some("test".to_string()),
             ..Default::default()
         };
         let result = ConfigValidator::validate(&config, false);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
