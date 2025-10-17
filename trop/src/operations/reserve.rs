@@ -5,7 +5,7 @@
 
 use crate::config::Config;
 use crate::database::Database;
-use crate::error::{Error, PortUnavailableReason, Result};
+use crate::error::{Error, Result};
 use crate::port::allocator::{allocator_from_config, AllocationOptions, AllocationResult};
 use crate::port::occupancy::OccupancyCheckConfig;
 use crate::{Port, Reservation, ReservationKey};
@@ -249,16 +249,17 @@ impl<'a> ReservePlan<'a> {
             return Ok(plan);
         }
 
-        // Step 3: Determine port (manual or automatic allocation)
-        let port = if let Some(port) = self.options.port {
-            // Manual port specified - use it directly (backward compatibility)
-            port
-        } else {
-            // Automatic allocation
+        // Step 3: Determine port (unified allocation with fallback)
+        // All ports (whether from --port or automatic) go through the allocator.
+        // If a preferred port is specified but unavailable, we fall back to
+        // automatic scanning. This implements the "try preferred first, then scan"
+        // algorithm described in the specification.
+        let port = {
             let allocator = allocator_from_config(self.config)?;
 
             let allocation_options = AllocationOptions {
-                preferred: self.options.preferred_port,
+                // Merge explicit --port and --preferred-port options
+                preferred: self.options.port.or(self.options.preferred_port),
                 ignore_occupied: self.options.ignore_occupied,
                 ignore_exclusions: self.options.ignore_exclusions,
             };
@@ -267,25 +268,31 @@ impl<'a> ReservePlan<'a> {
 
             match allocator.allocate_single(db, &allocation_options, &occupancy_config)? {
                 AllocationResult::Allocated(port) => port,
-                AllocationResult::PreferredUnavailable { port, reason } => {
-                    // Check if we should error based on the reason and ignore flags
-                    match reason {
-                        PortUnavailableReason::Reserved => {
-                            // Reserved port is always an error - can't be ignored
-                            return Err(Error::PreferredPortUnavailable { port, reason });
+
+                AllocationResult::PreferredUnavailable { .. } => {
+                    // Preferred port unavailable - fall back to automatic scanning
+                    // This implements the specification's "preferentially reserved if available"
+                    // behavior: try the preferred port first, but scan if unavailable.
+
+                    let fallback_options = AllocationOptions {
+                        preferred: None, // No preference for fallback scan
+                        ignore_occupied: self.options.ignore_occupied,
+                        ignore_exclusions: self.options.ignore_exclusions,
+                    };
+
+                    match allocator.allocate_single(db, &fallback_options, &occupancy_config)? {
+                        AllocationResult::Allocated(fallback_port) => fallback_port,
+                        AllocationResult::Exhausted { tried_cleanup } => {
+                            return Err(Error::PortExhausted {
+                                range: *allocator.range(),
+                                tried_cleanup,
+                            });
                         }
-                        PortUnavailableReason::Occupied if !self.options.ignore_occupied => {
-                            return Err(Error::PreferredPortUnavailable { port, reason });
-                        }
-                        PortUnavailableReason::Excluded if !self.options.ignore_exclusions => {
-                            return Err(Error::PreferredPortUnavailable { port, reason });
-                        }
-                        _ => {
-                            // Ignored or no issue - use the preferred port anyway
-                            port
-                        }
+                        // Should not get PreferredUnavailable without a preferred port
+                        AllocationResult::PreferredUnavailable { .. } => unreachable!(),
                     }
                 }
+
                 AllocationResult::Exhausted { tried_cleanup } => {
                     return Err(Error::PortExhausted {
                         range: *allocator.range(),

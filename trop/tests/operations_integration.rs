@@ -26,12 +26,15 @@ fn test_reserve_and_release_cycle() {
     let mut executor = trop::PlanExecutor::new(&mut db);
     let result = executor.execute(&plan).unwrap();
     assert!(result.success);
-    assert_eq!(result.port, Some(port));
+    assert!(result.port.is_some(), "Should allocate a port");
+
+    // Save the actually allocated port (might not be the preferred one if occupied)
+    let allocated_port = result.port.unwrap();
 
     // Verify reservation exists
     let reservation = db.get_reservation(&key).unwrap();
     assert!(reservation.is_some());
-    assert_eq!(reservation.as_ref().unwrap().port(), port);
+    assert_eq!(reservation.as_ref().unwrap().port(), allocated_port);
     assert_eq!(
         reservation.as_ref().unwrap().project(),
         Some("test-project")
@@ -69,6 +72,13 @@ fn test_idempotent_reserve() {
     let mut executor = trop::PlanExecutor::new(&mut db);
     let result = executor.execute(&plan).unwrap();
     assert!(result.success);
+    assert!(
+        result.port.is_some(),
+        "First reservation should allocate a port"
+    );
+
+    // Save the actually allocated port (might not be the preferred one if occupied)
+    let allocated_port = result.port.unwrap();
 
     // Second reservation with same parameters
     let plan2 = ReservePlan::new(reserve_opts, &create_test_config())
@@ -85,7 +95,11 @@ fn test_idempotent_reserve() {
     let mut executor = trop::PlanExecutor::new(&mut db);
     let result = executor.execute(&plan2).unwrap();
     assert!(result.success);
-    assert_eq!(result.port, Some(port));
+    assert_eq!(
+        result.port,
+        Some(allocated_port),
+        "Second reservation should return same port"
+    );
 
     // Verify only one reservation exists
     let all = db.list_all_reservations().unwrap();
@@ -155,7 +169,10 @@ fn test_dry_run_mode() {
 
     assert!(result.success);
     assert!(result.dry_run);
-    assert_eq!(result.port, Some(port));
+    assert!(
+        result.port.is_some(),
+        "Should have planned to allocate a port"
+    );
 
     // Verify no reservation was created
     let reservation = db.get_reservation(&key).unwrap();

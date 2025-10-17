@@ -55,7 +55,14 @@ fn test_idempotent_reserve_returns_same_port() {
     let mut executor = PlanExecutor::new(&mut db);
     let result1 = executor.execute(&plan1).unwrap();
     assert!(result1.success);
-    assert_eq!(result1.port, Some(port));
+    assert!(
+        result1.port.is_some(),
+        "First reservation should allocate a port"
+    );
+
+    // Save the port that was actually allocated (might not be the preferred one
+    // if it was occupied on the system)
+    let allocated_port = result1.port.unwrap();
 
     // Second reservation with identical parameters
     let plan2 = ReservePlan::new(options.clone(), &create_test_config())
@@ -64,7 +71,11 @@ fn test_idempotent_reserve_returns_same_port() {
     let mut executor = PlanExecutor::new(&mut db);
     let result2 = executor.execute(&plan2).unwrap();
     assert!(result2.success);
-    assert_eq!(result2.port, Some(port));
+    assert_eq!(
+        result2.port,
+        Some(allocated_port),
+        "Second reservation should return same port"
+    );
 
     // Third reservation - testing multiple repetitions
     let plan3 = ReservePlan::new(options, &create_test_config())
@@ -73,9 +84,13 @@ fn test_idempotent_reserve_returns_same_port() {
     let mut executor = PlanExecutor::new(&mut db);
     let result3 = executor.execute(&plan3).unwrap();
     assert!(result3.success);
-    assert_eq!(result3.port, Some(port));
+    assert_eq!(
+        result3.port,
+        Some(allocated_port),
+        "Third reservation should return same port"
+    );
 
-    // All three should return the same port
+    // All three should return the same port (idempotency)
     assert_eq!(result1.port, result2.port);
     assert_eq!(result2.port, result3.port);
 
