@@ -233,10 +233,8 @@ fn test_reserve_with_preferred_port() {
 
     // Should get a valid port (preferred if available, fallback if occupied)
     assert!(
-        port >= 5000 && port <= 7000,
-        "Should allocate a port in valid range (got {}, preferred was {})",
-        port,
-        preferred
+        (5000..=7000).contains(&port),
+        "Should allocate a port in valid range (got {port}, preferred was {preferred})"
     );
 }
 
@@ -936,7 +934,7 @@ fn test_reserve_with_multiple_flags() {
     let port = parse_port(&String::from_utf8(output.stdout).unwrap());
     // Port might be fallback if preferred was occupied
     assert!(
-        port >= 5000 && port <= 7000,
+        (5000..=7000).contains(&port),
         "Should allocate a port in valid range"
     );
 

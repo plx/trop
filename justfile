@@ -19,7 +19,7 @@ test-all:
 
 # Run clippy linter
 clippy:
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets --all-features --workspace -- -D warnings
 
 # Format code with rustfmt
 fmt:
