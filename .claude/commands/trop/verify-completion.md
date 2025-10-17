@@ -1,7 +1,7 @@
 ---
 description: Verify that a phase is complete
 argument-hint: [description of the phase (or where to find a description)]
-disable-model-invocation: true
+disable-model-invocation: false
 ---
 
 At this point we *think* we're done with a major phase of work, and want to verify that it's actually complete. This task *must* be delegated to the `phase-completion-verifier` agent: that agent is *extremely* specified to perform this exact task, and needs only minimal guidance beyond a description of what it's supposed to verify.

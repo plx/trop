@@ -75,7 +75,7 @@ Build the hierarchical configuration system with YAML support.
 - Create configuration merge logic for hierarchical inheritance
 
 This enables users to configure the tool's behavior at multiple levels, essential for real-world usage.
-dte
+
 ## Phase 6: Port Allocation & Occupancy
 
 Implement the port allocation algorithm with occupancy checking.
