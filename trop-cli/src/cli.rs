@@ -5,9 +5,10 @@
 
 use crate::commands::{
     AssertDataDirCommand, AssertPortCommand, AssertReservationCommand, AutocleanCommand,
-    AutoreserveCommand, CompactExclusionsCommand, ExcludeCommand, ExpireCommand, ListCommand,
-    PortInfoCommand, PruneCommand, ReleaseCommand, ReserveCommand, ReserveGroupCommand,
-    ScanCommand, ShowDataDirCommand, ShowPathCommand, ValidateCommand,
+    AutoreserveCommand, CompactExclusionsCommand, ExcludeCommand, ExpireCommand, InitCommand,
+    ListCommand, ListProjectsCommand, MigrateCommand, PortInfoCommand, PruneCommand,
+    ReleaseCommand, ReserveCommand, ReserveGroupCommand, ScanCommand, ShowDataDirCommand,
+    ShowPathCommand, ValidateCommand,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -98,4 +99,13 @@ pub enum Command {
 
     /// Compact exclusion list to minimal representation
     CompactExclusions(CompactExclusionsCommand),
+
+    /// Initialize trop data directory and database
+    Init(InitCommand),
+
+    /// List all unique project identifiers
+    ListProjects(ListProjectsCommand),
+
+    /// Migrate reservations between paths
+    Migrate(MigrateCommand),
 }

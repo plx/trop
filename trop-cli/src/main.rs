@@ -53,6 +53,9 @@ fn main() {
         cli::Command::Validate(cmd) => cmd.execute(&global),
         cli::Command::Exclude(cmd) => cmd.execute(&global),
         cli::Command::CompactExclusions(cmd) => cmd.execute(&global),
+        cli::Command::Init(cmd) => cmd.execute(&global),
+        cli::Command::ListProjects(cmd) => cmd.execute(&global),
+        cli::Command::Migrate(cmd) => cmd.execute(&global),
     };
 
     // Handle errors and set exit code

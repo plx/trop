@@ -531,6 +531,42 @@ impl Database {
         self.get_reserved_ports(range)
     }
 
+    /// Gets all unique project identifiers from reservations.
+    ///
+    /// Returns a sorted list of distinct non-null project values.
+    /// Projects with NULL values are excluded from the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use trop::database::{Database, DatabaseConfig};
+    ///
+    /// let config = DatabaseConfig::new("/tmp/trop.db");
+    /// let db = Database::open(config).unwrap();
+    ///
+    /// let projects = db.list_projects().unwrap();
+    /// for project in projects {
+    ///     println!("{}", project);
+    /// }
+    /// ```
+    pub fn list_projects(&self) -> Result<Vec<String>> {
+        let query = "SELECT DISTINCT project FROM reservations
+                     WHERE project IS NOT NULL
+                     ORDER BY project";
+
+        let mut stmt = self.conn.prepare(query)?;
+
+        let projects = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+
+        Ok(projects)
+    }
+
     /// Verifies database integrity using PRAGMA `integrity_check`.
     ///
     /// This is compatible with existing transaction patterns as it's a read-only operation.
@@ -943,5 +979,131 @@ mod tests {
         // Should succeed with allow_unrelated
         let result = db.validate_path_relationship(unrelated, true);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_list_projects_empty() {
+        let db = create_test_database();
+        let projects = db.list_projects().unwrap();
+        assert_eq!(projects.len(), 0);
+    }
+
+    #[test]
+    fn test_list_projects_single() {
+        let mut db = create_test_database();
+
+        let key = ReservationKey::new(PathBuf::from("/path1"), None).unwrap();
+        let port = Port::try_from(5000).unwrap();
+        let reservation = Reservation::builder(key, port)
+            .project(Some("project-a".to_string()))
+            .build()
+            .unwrap();
+
+        db.create_reservation(&reservation).unwrap();
+
+        let projects = db.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0], "project-a");
+    }
+
+    #[test]
+    fn test_list_projects_multiple() {
+        let mut db = create_test_database();
+
+        // Create reservations with different projects
+        let r1 = Reservation::builder(
+            ReservationKey::new(PathBuf::from("/path1"), None).unwrap(),
+            Port::try_from(5000).unwrap(),
+        )
+        .project(Some("zebra".to_string()))
+        .build()
+        .unwrap();
+
+        let r2 = Reservation::builder(
+            ReservationKey::new(PathBuf::from("/path2"), None).unwrap(),
+            Port::try_from(5001).unwrap(),
+        )
+        .project(Some("alpha".to_string()))
+        .build()
+        .unwrap();
+
+        let r3 = Reservation::builder(
+            ReservationKey::new(PathBuf::from("/path3"), None).unwrap(),
+            Port::try_from(5002).unwrap(),
+        )
+        .project(Some("beta".to_string()))
+        .build()
+        .unwrap();
+
+        db.create_reservation(&r1).unwrap();
+        db.create_reservation(&r2).unwrap();
+        db.create_reservation(&r3).unwrap();
+
+        let projects = db.list_projects().unwrap();
+        assert_eq!(projects.len(), 3);
+        // Should be sorted alphabetically
+        assert_eq!(projects[0], "alpha");
+        assert_eq!(projects[1], "beta");
+        assert_eq!(projects[2], "zebra");
+    }
+
+    #[test]
+    fn test_list_projects_duplicates() {
+        let mut db = create_test_database();
+
+        // Create multiple reservations with same project
+        let r1 = Reservation::builder(
+            ReservationKey::new(PathBuf::from("/path1"), None).unwrap(),
+            Port::try_from(5000).unwrap(),
+        )
+        .project(Some("same-project".to_string()))
+        .build()
+        .unwrap();
+
+        let r2 = Reservation::builder(
+            ReservationKey::new(PathBuf::from("/path2"), None).unwrap(),
+            Port::try_from(5001).unwrap(),
+        )
+        .project(Some("same-project".to_string()))
+        .build()
+        .unwrap();
+
+        db.create_reservation(&r1).unwrap();
+        db.create_reservation(&r2).unwrap();
+
+        let projects = db.list_projects().unwrap();
+        // Should only return distinct values
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0], "same-project");
+    }
+
+    #[test]
+    fn test_list_projects_excludes_null() {
+        let mut db = create_test_database();
+
+        // Create reservation with project
+        let r1 = Reservation::builder(
+            ReservationKey::new(PathBuf::from("/path1"), None).unwrap(),
+            Port::try_from(5000).unwrap(),
+        )
+        .project(Some("has-project".to_string()))
+        .build()
+        .unwrap();
+
+        // Create reservation without project (NULL)
+        let r2 = Reservation::builder(
+            ReservationKey::new(PathBuf::from("/path2"), None).unwrap(),
+            Port::try_from(5001).unwrap(),
+        )
+        .build()
+        .unwrap();
+
+        db.create_reservation(&r1).unwrap();
+        db.create_reservation(&r2).unwrap();
+
+        let projects = db.list_projects().unwrap();
+        // Should only return non-NULL projects
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0], "has-project");
     }
 }

@@ -182,6 +182,46 @@ impl ReserveOptions {
         self.disable_autoexpire = disable;
         self
     }
+
+    /// Infers project and task from git context if not explicitly provided.
+    ///
+    /// This method uses git repository information to automatically set
+    /// project and task fields when they haven't been explicitly specified.
+    ///
+    /// - Project: extracted from repository name
+    /// - Task: extracted from worktree name (in worktree) or branch name (in regular repo)
+    ///
+    /// Only sets fields that are currently `None` - explicit values are preserved.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to search upward from for git repository
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use trop::operations::ReserveOptions;
+    /// use trop::ReservationKey;
+    /// use std::path::{Path, PathBuf};
+    ///
+    /// let key = ReservationKey::new(PathBuf::from("/path"), None).unwrap();
+    /// let options = ReserveOptions::new(key, None)
+    ///     .with_git_inference(Path::new("/path"));
+    /// // project and task will be inferred from git if available
+    /// ```
+    #[must_use]
+    pub fn with_git_inference(mut self, path: &std::path::Path) -> Self {
+        use super::inference::{infer_project, infer_task};
+
+        // Only infer if not explicitly provided
+        if self.project.is_none() {
+            self.project = infer_project(path);
+        }
+        if self.task.is_none() {
+            self.task = infer_task(path);
+        }
+        self
+    }
 }
 
 /// A reservation plan generator.
