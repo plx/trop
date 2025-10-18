@@ -209,3 +209,64 @@ The implementation adds 6,462 lines across 21 files, with major contributions:
 - `trop/src/operations/autoreserve.rs` (359 lines): Config discovery and autoreserve logic
 
 All 164 tests pass reliably, with no clippy warnings. The implementation is production-ready and provides excellent user experience with clear error messages, helpful defaults, and flexible configuration options.
+
+## 2025-10-18 - Phase 9: Cleanup Operations
+
+Implemented maintenance commands for cleaning up stale reservations, including `prune`, `expire`, and `autoclean` commands, with automatic cleanup-on-exhaustion support during port allocation. This phase completes the core maintenance capabilities by providing tools to prevent database bloat in long-running systems.
+
+The implementation went very smoothly, with all components completed successfully. Key accomplishments include:
+
+- Three cleanup commands (prune, expire, autoclean) with dry-run support
+- Prune command removes reservations for non-existent directories
+- Expire command removes reservations older than configurable threshold
+- Autoclean combines both prune and expire operations
+- Auto-cleanup during allocation when ports are exhausted (opt-in via configuration)
+- Enhanced AllocationResult enum with cleanup hints (cleanup_suggested, tried_cleanup)
+- Two-phase allocation strategy: attempt allocation, then cleanup-and-retry on exhaustion
+- Configuration options for disabling auto-prune and auto-expire
+- CLI flags (--disable-autoprune, --disable-autoexpire, --disable-autoclean) for fine-grained control
+- Comprehensive test coverage: 28 CLI cleanup command tests plus integration tests
+- Proper output formatting with quiet/normal/verbose modes and dry-run prefixes
+
+The implementation maintains backward compatibility by using a hint-based approach rather than changing the allocator's database reference from immutable to mutable. When allocation exhaustion occurs, the allocator returns `AllocationResult::Exhausted { cleanup_suggested: true }`, signaling that cleanup might help. The reserve operation then performs cleanup with its mutable database reference and retries allocation.
+
+Auto-cleanup integration was carefully designed to be conservative:
+- Only triggers on actual port exhaustion (not on every allocation)
+- Respects configuration settings (disable_autoprune, disable_autoexpire)
+- Logs cleanup actions for visibility
+- Reports whether cleanup was attempted in error messages
+- Fails gracefully if cleanup doesn't free enough ports
+
+Output formatting is consistent across all cleanup commands:
+- **Quiet mode**: Just the count to stdout (or nothing if 0)
+- **Normal mode**: Summary message to stderr
+- **Verbose mode**: Detailed list of removed reservations with metadata
+- **Dry-run mode**: All output prefixed with `[DRY RUN]` and no database modifications
+
+Implementation architecture follows established patterns:
+- CLI commands are thin wrappers around library `CleanupOperations` functions
+- Database operations are already implemented from Phase 2 (cleanup module exists)
+- Configuration precedence: CLI flags > environment variables > config files
+- Error handling with proper context and user-friendly messages
+
+Testing covered multiple dimensions:
+- CLI integration tests (28 tests) covering all commands, formats, and flag combinations
+- Dry-run mode verification ensuring no database modifications
+- Auto-cleanup scenarios (exhaustion triggering cleanup, cleanup disabled, partial success)
+- Configuration precedence testing
+- Error handling for missing thresholds and database failures
+
+Notable design decisions:
+- AllocationResult enhancement preserves API compatibility while enabling cleanup hints
+- Reserve operation signature changed from `&Database` to `&mut Database` (minor breaking change but necessary)
+- Auto-cleanup is opt-in via configuration (default behavior unchanged)
+- Cleanup operations are fail-open for path checking (uncertain = preserve reservation)
+- Expire command requires explicit threshold (either via CLI --days or config expire_after_days)
+
+The implementation adds 1,887 lines with major contributions:
+- `trop-cli/tests/cleanup_commands.rs` (1265 lines): Comprehensive CLI integration tests
+- `trop/src/operations/reserve.rs` (+147 lines): Auto-cleanup integration
+- `trop-cli/src/commands/{prune,expire,autoclean}.rs` (296 lines total): Command implementations
+- Enhanced `AllocationResult` with cleanup hints
+
+All tests pass (568 lib + 260 CLI + 164 doc tests = 992 total), with no clippy warnings. The cleanup system is production-ready and provides essential maintenance capabilities for long-running trop deployments.

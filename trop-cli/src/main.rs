@@ -40,6 +40,9 @@ fn main() {
         cli::Command::List(cmd) => cmd.execute(&global),
         cli::Command::ReserveGroup(cmd) => cmd.execute(&global),
         cli::Command::Autoreserve(cmd) => cmd.execute(&global),
+        cli::Command::Prune(cmd) => cmd.execute(&global),
+        cli::Command::Expire(cmd) => cmd.execute(&global),
+        cli::Command::Autoclean(cmd) => cmd.execute(&global),
     };
 
     // Handle errors and set exit code

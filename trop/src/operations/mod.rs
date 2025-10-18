@@ -23,22 +23,12 @@
 //! let key = ReservationKey::new(PathBuf::from("/path"), None).unwrap();
 //! let port = Port::try_from(8080).unwrap();
 //!
-//! let options = ReserveOptions {
-//!     key,
-//!     project: Some("my-project".to_string()),
-//!     task: None,
-//!     port: Some(port),
-//!     preferred_port: None,
-//!     ignore_occupied: false,
-//!     ignore_exclusions: false,
-//!     force: false,
-//!     allow_unrelated_path: true,
-//!     allow_project_change: false,
-//!     allow_task_change: false,
-//! };
+//! let options = ReserveOptions::new(key, Some(port))
+//!     .with_project(Some("my-project".to_string()))
+//!     .with_allow_unrelated_path(true);
 //!
 //! // Generate plan
-//! let plan = ReservePlan::new(options, &config).build_plan(&db).unwrap();
+//! let plan = ReservePlan::new(options, &config).build_plan(&mut db).unwrap();
 //!
 //! // Execute plan
 //! let mut executor = PlanExecutor::new(&mut db);

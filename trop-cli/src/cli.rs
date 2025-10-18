@@ -4,7 +4,8 @@
 //! including global options and subcommands.
 
 use crate::commands::{
-    AutoreserveCommand, ListCommand, ReleaseCommand, ReserveCommand, ReserveGroupCommand,
+    AutocleanCommand, AutoreserveCommand, ExpireCommand, ListCommand, PruneCommand, ReleaseCommand,
+    ReserveCommand, ReserveGroupCommand,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -55,4 +56,13 @@ pub enum Command {
 
     /// Automatically discover and reserve ports from project config
     Autoreserve(AutoreserveCommand),
+
+    /// Remove reservations for non-existent directories
+    Prune(PruneCommand),
+
+    /// Remove reservations based on age
+    Expire(ExpireCommand),
+
+    /// Combined cleanup (prune + expire)
+    Autoclean(AutocleanCommand),
 }

@@ -1353,6 +1353,7 @@ dependencies = [
  "csv",
  "home",
  "predicates",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "trop",

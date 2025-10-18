@@ -41,7 +41,7 @@ fn test_reserve_current_directory_allowed() {
     // The current directory is considered a valid target because you're explicitly
     // running the command from there, showing clear intent.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let cwd = env::current_dir().unwrap();
     let key = ReservationKey::new(cwd, None).unwrap();
     let port = Port::try_from(PORT_BASE_RESERVE_ALLOWED).unwrap();
@@ -49,7 +49,7 @@ fn test_reserve_current_directory_allowed() {
     // Should succeed without any special flags
     let options = ReserveOptions::new(key, Some(port));
 
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
 
     assert!(
         result.is_ok(),
@@ -65,7 +65,7 @@ fn test_reserve_subdirectory_allowed() {
     // This is a descendant relationship: if you're in /home/user/project,
     // you should be able to reserve for /home/user/project/backend.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let cwd = env::current_dir().unwrap();
     let subdir = cwd.join("subdirectory");
     let key = ReservationKey::new(subdir, None).unwrap();
@@ -73,7 +73,7 @@ fn test_reserve_subdirectory_allowed() {
 
     let options = ReserveOptions::new(key, Some(port));
 
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
 
     assert!(
         result.is_ok(),
@@ -89,7 +89,7 @@ fn test_reserve_parent_directory_allowed() {
     // This is an ancestor relationship: if you're in /home/user/project/backend,
     // you should be able to reserve for /home/user/project.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let cwd = env::current_dir().unwrap();
 
     // Get parent directory (if it exists)
@@ -99,7 +99,7 @@ fn test_reserve_parent_directory_allowed() {
 
         let options = ReserveOptions::new(key, Some(port));
 
-        let result = ReservePlan::new(options, &create_test_config()).build_plan(&db);
+        let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
 
         assert!(
             result.is_ok(),
@@ -115,7 +115,7 @@ fn test_reserve_nested_subdirectory_allowed() {
     //
     // The hierarchical relationship extends to any depth.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let cwd = env::current_dir().unwrap();
     let nested = cwd.join("a").join("b").join("c").join("d");
     let key = ReservationKey::new(nested, None).unwrap();
@@ -123,7 +123,7 @@ fn test_reserve_nested_subdirectory_allowed() {
 
     let options = ReserveOptions::new(key, Some(port));
 
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
 
     assert!(
         result.is_ok(),
@@ -136,7 +136,7 @@ fn test_reserve_nested_subdirectory_allowed() {
 fn test_reserve_ancestor_directory_allowed() {
     // Tests that any ancestor in the path hierarchy is allowed.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let cwd = env::current_dir().unwrap();
 
     // Walk up the directory tree testing ancestors
@@ -148,7 +148,7 @@ fn test_reserve_ancestor_directory_allowed() {
         let port = Port::try_from(PORT_BASE_RESERVE_ALLOWED + 10 + tested_count).unwrap();
 
         let options = ReserveOptions::new(key, Some(port));
-        let result = ReservePlan::new(options, &create_test_config()).build_plan(&db);
+        let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
 
         assert!(result.is_ok(), "Ancestor {parent:?} should be allowed");
 
@@ -175,7 +175,7 @@ fn test_reserve_unrelated_absolute_path_blocked() {
     // This is the core protection: prevents accidentally operating on
     // unrelated projects.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let cwd = env::current_dir().unwrap();
 
     // Create a path that's definitely unrelated by using a different root structure
@@ -193,7 +193,7 @@ fn test_reserve_unrelated_absolute_path_blocked() {
     // Should fail without allow flag
     let options = ReserveOptions::new(key, Some(port));
 
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
 
     assert!(result.is_err(), "Unrelated path should be blocked");
     let err = result.unwrap_err();
@@ -217,7 +217,7 @@ fn test_reserve_sibling_directory_blocked() {
     // If you're in /home/user/project-a, you shouldn't be able to
     // modify /home/user/project-b without explicit permission.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let cwd = env::current_dir().unwrap();
 
     // Get a sibling by going to parent and adding a different child
@@ -232,7 +232,7 @@ fn test_reserve_sibling_directory_blocked() {
 
         let options = ReserveOptions::new(key, Some(port));
 
-        let result = ReservePlan::new(options, &create_test_config()).build_plan(&db);
+        let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
 
         assert!(result.is_err(), "Sibling directory should be blocked");
         assert!(matches!(
@@ -248,7 +248,7 @@ fn test_reserve_cousin_path_blocked() {
     //
     // Example: from /a/b/c, cannot access /a/d/e without permission.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let cwd = env::current_dir().unwrap();
 
     // Create a cousin: go up two levels, then down a different path
@@ -265,7 +265,7 @@ fn test_reserve_cousin_path_blocked() {
 
         let options = ReserveOptions::new(key, Some(port));
 
-        let result = ReservePlan::new(options, &create_test_config()).build_plan(&db);
+        let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
 
         assert!(result.is_err(), "Cousin path should be blocked");
         assert!(matches!(
@@ -294,7 +294,7 @@ fn test_reserve_unrelated_path_with_allow_flag() {
 
     let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(options.clone(), &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(options.clone(), &create_test_config()).build_plan(&mut db);
 
     assert!(
         result.is_ok(),
@@ -328,7 +328,7 @@ fn test_reserve_unrelated_path_with_force_flag() {
 
     let options = ReserveOptions::new(key, Some(port)).with_force(true);
 
-    let result = ReservePlan::new(options.clone(), &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(options.clone(), &create_test_config()).build_plan(&mut db);
 
     assert!(
         result.is_ok(),
@@ -350,7 +350,7 @@ fn test_reserve_force_overrides_all_path_checks() {
     //
     // This verifies force is truly a master override.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
 
     // Use root directory or C:\ - definitely unrelated
     let unrelated = if cfg!(windows) {
@@ -364,7 +364,7 @@ fn test_reserve_force_overrides_all_path_checks() {
 
     let options = ReserveOptions::new(key, Some(port)).with_force(true);
 
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
 
     assert!(
         result.is_ok(),
@@ -550,7 +550,7 @@ fn test_mixed_related_and_unrelated_paths() {
     // Tests that related paths work while unrelated paths are still blocked,
     // demonstrating that validation is applied per-operation, not globally.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let cwd = env::current_dir().unwrap();
     let subdir = cwd.join("allowed");
 
@@ -561,7 +561,7 @@ fn test_mixed_related_and_unrelated_paths() {
     let port1 = Port::try_from(PORT_BASE_MULTIPLE + 10).unwrap();
 
     let opts1 = ReserveOptions::new(key1, Some(port1));
-    let result1 = ReservePlan::new(opts1, &create_test_config()).build_plan(&db);
+    let result1 = ReservePlan::new(opts1, &create_test_config()).build_plan(&mut db);
 
     assert!(result1.is_ok(), "Related path should work");
 
@@ -570,7 +570,7 @@ fn test_mixed_related_and_unrelated_paths() {
     let port2 = Port::try_from(PORT_BASE_MULTIPLE + 11).unwrap();
 
     let opts2 = ReserveOptions::new(key2, Some(port2));
-    let result2 = ReservePlan::new(opts2, &create_test_config()).build_plan(&db);
+    let result2 = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
 
     assert!(result2.is_err(), "Unrelated path should still be blocked");
 }
@@ -585,7 +585,7 @@ fn test_path_validation_with_tagged_reservations() {
     //
     // The tag doesn't affect path relationship checking - only the path matters.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let cwd = env::current_dir().unwrap();
     let subdir = cwd.join("tagged");
 
@@ -594,7 +594,7 @@ fn test_path_validation_with_tagged_reservations() {
     let port = Port::try_from(PORT_BASE_EDGE).unwrap();
 
     let options = ReserveOptions::new(key, Some(port));
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
 
     assert!(
         result.is_ok(),
@@ -627,7 +627,7 @@ fn test_path_validation_applies_before_sticky_field_check() {
     // Should fail on path validation, not sticky field check
     let opts2 = ReserveOptions::new(key, Some(port)).with_project(Some("project2".to_string()));
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
 
     assert!(result.is_err(), "Should fail validation");
 
@@ -664,7 +664,7 @@ fn test_allow_unrelated_path_does_not_affect_sticky_fields() {
         .with_project(Some("project2".to_string()))
         .with_allow_unrelated_path(true); // Path flag set, but not project flag
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
 
     // Should fail on sticky field check, not path check
     assert!(result.is_err(), "Should fail on sticky field check");
@@ -697,7 +697,7 @@ fn test_force_flag_overrides_both_path_and_sticky_checks() {
         .with_project(Some("project2".to_string()))
         .with_force(true);
 
-    let result = ReservePlan::new(opts2.clone(), &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(opts2.clone(), &create_test_config()).build_plan(&mut db);
 
     assert!(
         result.is_ok(),
