@@ -171,6 +171,64 @@ pub fn format_allocations(
     formatter.format(allocations).map_err(CliError::from)
 }
 
+/// Resolve the data directory path.
+///
+/// Returns the default data directory location: `~/.trop`
+pub fn resolve_data_dir() -> PathBuf {
+    home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".trop")
+}
+
+/// Find project configuration file (trop.yaml) starting from current directory.
+///
+/// Searches up the directory tree for `trop.local.yaml` or `trop.yaml`.
+/// Returns the first match found, with `trop.local.yaml` taking precedence.
+///
+/// # Returns
+///
+/// - `Ok(Some(path))` if a configuration file is found
+/// - `Ok(None)` if no configuration file is found
+/// - `Err(_)` if there's an error accessing the file system
+pub fn find_project_config() -> Result<Option<PathBuf>, CliError> {
+    let mut current = env::current_dir()?;
+
+    loop {
+        // Check for trop.local.yaml first (higher precedence)
+        let local_config = current.join("trop.local.yaml");
+        if local_config.exists() {
+            return Ok(Some(local_config));
+        }
+
+        // Check for trop.yaml
+        let config = current.join("trop.yaml");
+        if config.exists() {
+            return Ok(Some(config));
+        }
+
+        // Move up one directory
+        if let Some(parent) = current.parent() {
+            current = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+
+    Ok(None)
+}
+
+/// Resolve the configuration file to use (project or global).
+///
+/// Returns the path to the project configuration file (trop.yaml or trop.local.yaml)
+/// if one exists, otherwise returns the path to the global configuration file.
+///
+/// # Returns
+///
+/// Path to the configuration file to use (may not exist yet).
+pub fn resolve_config_file() -> Result<PathBuf, CliError> {
+    Ok(find_project_config()?.unwrap_or_else(|| resolve_data_dir().join("config.yaml")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -26,6 +26,9 @@ pub enum CliError {
 
     /// Configuration error.
     Config(String),
+
+    /// Semantic failure (e.g., assertion failed) - exit code 1.
+    SemanticFailure(String),
 }
 
 impl CliError {
@@ -42,6 +45,7 @@ impl CliError {
     /// - 7: Configuration error
     pub fn exit_code(&self) -> i32 {
         match self {
+            CliError::SemanticFailure(_) => 1,
             CliError::Library(lib_err) => match lib_err {
                 LibError::StickyFieldChange { .. } => 1,
                 LibError::PathRelationshipViolation { .. } => 1,
@@ -70,6 +74,7 @@ impl fmt::Display for CliError {
                 )
             }
             CliError::Config(msg) => write!(f, "Configuration error: {msg}"),
+            CliError::SemanticFailure(msg) => write!(f, "{msg}"),
         }
     }
 }

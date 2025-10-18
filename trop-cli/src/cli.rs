@@ -4,8 +4,10 @@
 //! including global options and subcommands.
 
 use crate::commands::{
-    AutocleanCommand, AutoreserveCommand, ExpireCommand, ListCommand, PruneCommand, ReleaseCommand,
-    ReserveCommand, ReserveGroupCommand,
+    AssertDataDirCommand, AssertPortCommand, AssertReservationCommand, AutocleanCommand,
+    AutoreserveCommand, CompactExclusionsCommand, ExcludeCommand, ExpireCommand, ListCommand,
+    PortInfoCommand, PruneCommand, ReleaseCommand, ReserveCommand, ReserveGroupCommand,
+    ScanCommand, ShowDataDirCommand, ShowPathCommand, ValidateCommand,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -65,4 +67,35 @@ pub enum Command {
 
     /// Combined cleanup (prune + expire)
     Autoclean(AutocleanCommand),
+
+    /// Assert that a reservation exists for a path/tag
+    AssertReservation(AssertReservationCommand),
+
+    /// Assert that a specific port is reserved
+    AssertPort(AssertPortCommand),
+
+    /// Assert that the data directory exists and is valid
+    AssertDataDir(AssertDataDirCommand),
+
+    /// Display information about a specific port
+    #[command(name = "port-info")]
+    PortInfo(PortInfoCommand),
+
+    /// Show the resolved data directory path
+    ShowDataDir(ShowDataDirCommand),
+
+    /// Show the resolved path for a reservation
+    ShowPath(ShowPathCommand),
+
+    /// Scan port range for occupied ports
+    Scan(ScanCommand),
+
+    /// Validate a configuration file
+    Validate(ValidateCommand),
+
+    /// Add port or range to exclusion list
+    Exclude(ExcludeCommand),
+
+    /// Compact exclusion list to minimal representation
+    CompactExclusions(CompactExclusionsCommand),
 }

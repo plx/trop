@@ -7,6 +7,7 @@ use crate::error::CliError;
 use crate::utils::{load_configuration, open_database, resolve_path, GlobalOptions};
 use clap::Args;
 use std::path::PathBuf;
+use trop::config::DEFAULT_MIN_PORT;
 use trop::{PlanExecutor, Port, ReservationKey, ReserveOptions, ReservePlan};
 
 /// Reserve a port for a directory.
@@ -156,8 +157,8 @@ impl ReserveCommand {
             use trop::config::PortConfig;
             // Override config port range with CLI arguments
             let port_config = PortConfig {
-                min: min.unwrap_or(5000), // Use min from CLI or default
-                max,                      // max from CLI (already Option<u16>)
+                min: min.unwrap_or(DEFAULT_MIN_PORT), // Use min from CLI or default
+                max,                                  // max from CLI (already Option<u16>)
                 max_offset: None,
             };
             config.ports = Some(port_config);

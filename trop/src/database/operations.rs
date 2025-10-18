@@ -111,6 +111,12 @@ const CHECK_PORT_RESERVED: &str = r"
     SELECT COUNT(*) FROM reservations WHERE port = ?
 ";
 
+const SELECT_BY_PORT: &str = r"
+    SELECT path, tag, port, project, task, created_at, last_used_at
+    FROM reservations
+    WHERE port = ?
+";
+
 impl Database {
     /// Creates or updates a reservation in the database.
     ///
@@ -459,6 +465,102 @@ impl Database {
             self.conn
                 .query_row(CHECK_PORT_RESERVED, params![port.value()], |row| row.get(0))?;
         Ok(count > 0)
+    }
+
+    /// Gets a reservation by port number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails (other than "not found").
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(reservation))` if a reservation exists for this port
+    /// - `Ok(None)` if no reservation exists for this port
+    /// - `Err(_)` if a database error occurs
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use trop::database::{Database, DatabaseConfig};
+    /// use trop::Port;
+    ///
+    /// let config = DatabaseConfig::new("/tmp/trop.db");
+    /// let db = Database::open(config).unwrap();
+    ///
+    /// let port = Port::try_from(8080).unwrap();
+    /// let reservation = db.get_reservation_by_port(port).unwrap();
+    /// ```
+    pub fn get_reservation_by_port(&self, port: Port) -> Result<Option<Reservation>> {
+        let mut stmt = self.conn.prepare_cached(SELECT_BY_PORT)?;
+        let mut rows = stmt.query_map(params![port.value()], row_to_reservation)?;
+
+        match rows.next() {
+            Some(Ok(reservation)) => Ok(Some(reservation)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// Gets all reserved ports in a range.
+    ///
+    /// This is an alias for `get_reserved_ports` with the same behavior,
+    /// provided for consistency with the CLI command naming.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use trop::database::{Database, DatabaseConfig};
+    /// use trop::{Port, PortRange};
+    ///
+    /// let config = DatabaseConfig::new("/tmp/trop.db");
+    /// let db = Database::open(config).unwrap();
+    ///
+    /// let min = Port::try_from(5000).unwrap();
+    /// let max = Port::try_from(5100).unwrap();
+    /// let range = PortRange::new(min, max).unwrap();
+    ///
+    /// let reserved = db.get_reserved_ports_in_range(&range).unwrap();
+    /// ```
+    pub fn get_reserved_ports_in_range(&self, range: &PortRange) -> Result<Vec<Port>> {
+        // This is the same as get_reserved_ports - we just provide both names
+        self.get_reserved_ports(range)
+    }
+
+    /// Verifies database integrity using PRAGMA `integrity_check`.
+    ///
+    /// This is compatible with existing transaction patterns as it's a read-only operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the integrity check fails or detects corruption.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use trop::database::{Database, DatabaseConfig};
+    ///
+    /// let config = DatabaseConfig::new("/tmp/trop.db");
+    /// let mut db = Database::open(config).unwrap();
+    ///
+    /// db.verify_integrity().unwrap();
+    /// ```
+    pub fn verify_integrity(&mut self) -> Result<()> {
+        let result: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+
+        if result == "ok" {
+            Ok(())
+        } else {
+            Err(Error::DatabaseCorruption {
+                details: format!("Integrity check failed: {result}"),
+            })
+        }
     }
 
     /// Validates path relationship for database operations.
