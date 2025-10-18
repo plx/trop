@@ -91,7 +91,7 @@ impl ExecutionResult {
 ///
 /// let options = ReserveOptions::new(key, Some(port))
 ///     .with_allow_unrelated_path(true);
-/// let plan = ReservePlan::new(options, &config).build_plan(&db).unwrap();
+/// let plan = ReservePlan::new(options, &config).build_plan(&mut db).unwrap();
 ///
 /// // Normal execution
 /// let mut executor = PlanExecutor::new(&mut db);

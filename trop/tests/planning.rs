@@ -46,14 +46,14 @@ fn test_reserve_plan_for_new_reservation_has_create_action() {
     // This is the most basic case: nothing exists, so we need to create.
     // The plan should have exactly one action of the correct type.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/new"), None).unwrap();
     let port = Port::try_from(PORT_BASE_NEW_RESERVATION).unwrap();
 
     let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     // Should have exactly one action
@@ -77,7 +77,7 @@ fn test_reserve_plan_create_action_contains_correct_reservation() {
     // The plan action should contain a fully-formed Reservation with all the
     // requested metadata.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/details"), None).unwrap();
     let port = Port::try_from(PORT_BASE_NEW_RESERVATION + 1).unwrap();
 
@@ -87,7 +87,7 @@ fn test_reserve_plan_create_action_contains_correct_reservation() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     // Extract the reservation from the plan
@@ -115,14 +115,14 @@ fn test_reserve_plan_with_tagged_reservation() {
     //
     // Tags are part of the ReservationKey and should be preserved in the plan.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/tagged"), Some("web".to_string())).unwrap();
     let port = Port::try_from(PORT_BASE_NEW_RESERVATION + 2).unwrap();
 
     let options = ReserveOptions::new(key.clone(), Some(port)).with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     if let PlanAction::CreateReservation(ref reservation) = plan.actions[0] {
@@ -142,14 +142,14 @@ fn test_reserve_plan_description_is_informative() {
     //
     // Good descriptions make --dry-run output useful.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/descriptive"), None).unwrap();
     let port = Port::try_from(PORT_BASE_NEW_RESERVATION + 3).unwrap();
 
     let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     // Description should mention what we're doing
@@ -189,7 +189,7 @@ fn test_reserve_plan_for_existing_reservation_has_update_last_used_action() {
     let options = ReserveOptions::new(key.clone(), Some(port)).with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     // Should have exactly one action
@@ -232,7 +232,7 @@ fn test_reserve_plan_idempotent_with_matching_metadata() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     // Should be idempotent (UpdateLastUsed)
@@ -263,7 +263,7 @@ fn test_reserve_plan_fails_with_metadata_mismatch() {
         .with_project(Some("project2".to_string()))
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
 
     // Should fail during planning
     assert!(result.is_err(), "Plan generation should fail");
@@ -384,7 +384,7 @@ fn test_dry_run_reserve_does_not_create_reservation() {
     let options = ReserveOptions::new(key.clone(), Some(port)).with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     // Execute in dry-run mode
@@ -420,7 +420,7 @@ fn test_dry_run_reserve_returns_port_in_result() {
     let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     let mut executor = PlanExecutor::new(&mut db).dry_run();
@@ -454,7 +454,7 @@ fn test_dry_run_idempotent_reserve_does_not_update_timestamp() {
     // Plan idempotent reserve
     let options = ReserveOptions::new(key.clone(), Some(port)).with_allow_unrelated_path(true);
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     // Execute in dry-run
@@ -485,7 +485,7 @@ fn test_dry_run_with_metadata_works() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     let mut executor = PlanExecutor::new(&mut db).dry_run();
@@ -570,7 +570,7 @@ fn test_normal_execution_creates_reservation() {
 
     let options = ReserveOptions::new(key.clone(), Some(port)).with_allow_unrelated_path(true);
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     // Execute normally (not dry-run)
@@ -625,14 +625,14 @@ fn test_plan_generation_uses_automatic_allocation_when_no_port() {
     //
     // With Phase 6, automatic allocation is used when no port is specified.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/no-port"), None).unwrap();
 
     // No port specified - should use automatic allocation
     let options = ReserveOptions::new(key.clone(), None).with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     // Should successfully create a plan with an allocated port
@@ -651,7 +651,7 @@ fn test_plan_generation_uses_automatic_allocation_when_no_port() {
 fn test_plan_generation_fails_for_path_violation() {
     // Tests that path validation errors occur during planning.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
 
     let unrelated = unrelated_path("plan_test");
 
@@ -661,7 +661,7 @@ fn test_plan_generation_fails_for_path_violation() {
     // Don't allow unrelated path
     let options = ReserveOptions::new(key, Some(port));
 
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
 
     assert!(result.is_err(), "Should fail on path violation");
     assert!(matches!(
@@ -693,13 +693,13 @@ fn test_plan_is_empty_method() {
 fn test_plan_is_not_empty_for_create() {
     // Tests that plans with actions are not empty.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/not-empty"), None).unwrap();
     let port = Port::try_from(PORT_BASE_CONTENT).unwrap();
 
     let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     assert!(!plan.is_empty(), "Create plan should not be empty");
@@ -712,13 +712,13 @@ fn test_plan_action_descriptions_are_helpful() {
     //
     // These descriptions are used in logging and dry-run output.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/action-desc"), None).unwrap();
     let port = Port::try_from(PORT_BASE_CONTENT + 1).unwrap();
 
     let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     // Get action description
@@ -741,7 +741,7 @@ fn test_multiple_plans_can_be_generated_without_execution() {
     //
     // This demonstrates the separation of planning and execution phases.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
 
     let plans: Vec<_> = (0..10)
         .map(|i| {
@@ -751,7 +751,7 @@ fn test_multiple_plans_can_be_generated_without_execution() {
             let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
 
             ReservePlan::new(options, &create_test_config())
-                .build_plan(&db)
+                .build_plan(&mut db)
                 .unwrap()
         })
         .collect();
@@ -780,7 +780,7 @@ fn test_plan_execution_result_contains_useful_information() {
 
     let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     let mut executor = PlanExecutor::new(&mut db);
@@ -811,7 +811,7 @@ fn test_dry_run_result_indicates_dry_run_mode() {
 
     let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     let mut executor = PlanExecutor::new(&mut db).dry_run();
@@ -830,7 +830,7 @@ fn test_dry_run_result_indicates_dry_run_mode() {
 fn test_planning_with_all_metadata_fields() {
     // Tests that plans correctly capture all metadata fields.
 
-    let db = create_test_database();
+    let mut db = create_test_database();
     let key =
         ReservationKey::new(PathBuf::from("/test/all-metadata"), Some("web".to_string())).unwrap();
     let port = Port::try_from(PORT_BASE_COMPLEX).unwrap();
@@ -841,7 +841,7 @@ fn test_planning_with_all_metadata_fields() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(options, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     // Extract and verify the reservation
@@ -873,7 +873,7 @@ fn test_planning_sequence_reserve_then_release() {
     // Plan 1: Reserve
     let reserve_opts = ReserveOptions::new(key.clone(), Some(port)).with_allow_unrelated_path(true);
     let reserve_plan = ReservePlan::new(reserve_opts, &create_test_config())
-        .build_plan(&db)
+        .build_plan(&mut db)
         .unwrap();
 
     assert_eq!(reserve_plan.len(), 1);

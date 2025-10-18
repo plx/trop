@@ -67,7 +67,9 @@ pub enum AllocationResult {
     },
     /// No ports available in the range.
     Exhausted {
-        /// Whether cleanup was attempted.
+        /// Suggests whether cleanup might help free up ports.
+        cleanup_suggested: bool,
+        /// Whether cleanup was already attempted.
         tried_cleanup: bool,
     },
 }
@@ -250,10 +252,9 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         if let Some(port) = self.find_next_available(self.range.min(), db, occupancy_config)? {
             Ok(AllocationResult::Allocated(port))
         } else {
-            // Note: Cleanup integration would be triggered here if needed in the future.
-            // For now, we simply report exhaustion. Cleanup operations are available
-            // via the CleanupOperations module for external use.
+            // No ports available - suggest cleanup might help
             Ok(AllocationResult::Exhausted {
+                cleanup_suggested: true,
                 tried_cleanup: false,
             })
         }
@@ -581,6 +582,7 @@ mod tests {
         assert_eq!(
             result,
             AllocationResult::Exhausted {
+                cleanup_suggested: true,
                 tried_cleanup: false
             }
         );

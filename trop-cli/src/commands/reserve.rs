@@ -172,7 +172,9 @@ impl ReserveCommand {
             .with_force(self.force)
             .with_allow_unrelated_path(self.allow_unrelated_path)
             .with_allow_project_change(self.allow_project_change || self.allow_change)
-            .with_allow_task_change(self.allow_task_change || self.allow_change);
+            .with_allow_task_change(self.allow_task_change || self.allow_change)
+            .with_disable_autoprune(self.disable_autoprune || self.disable_autoclean)
+            .with_disable_autoexpire(self.disable_autoexpire || self.disable_autoclean);
 
         // 8. Handle dry-run mode
         if self.dry_run {
@@ -189,7 +191,7 @@ impl ReserveCommand {
 
         // 9. Build plan
         let plan = ReservePlan::new(options, &config)
-            .build_plan(&db)
+            .build_plan(&mut db)
             .map_err(CliError::from)?;
 
         // 10. Execute plan
