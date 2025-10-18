@@ -43,7 +43,7 @@ pub struct ConfigSource {
 /// use trop::config::ConfigLoader;
 /// use std::path::Path;
 ///
-/// let sources = ConfigLoader::load_all(Path::new(".")).unwrap();
+/// let sources = ConfigLoader::load_all(Path::new("."), None).unwrap();
 /// println!("Found {} configuration sources", sources.len());
 /// ```
 pub struct ConfigLoader;
@@ -56,15 +56,17 @@ impl ConfigLoader {
     /// 2. Project `trop.yaml` files walking up from `working_dir` (precedence 2)
     /// 3. Project `trop.local.yaml` files (precedence 3)
     ///
+    /// The `data_dir` parameter allows overriding where the user config is loaded from.
+    ///
     /// # Errors
     ///
     /// Returns an error if any configuration file exists but cannot be read
     /// or parsed.
-    pub fn load_all(working_dir: &Path) -> Result<Vec<ConfigSource>> {
+    pub fn load_all(working_dir: &Path, data_dir: Option<&Path>) -> Result<Vec<ConfigSource>> {
         let mut sources = Vec::new();
 
-        // Load user config (~/.trop/config.yaml)
-        if let Some(user_config) = Self::load_user_config()? {
+        // Load user config (~/.trop/config.yaml or custom data dir)
+        if let Some(user_config) = Self::load_user_config(data_dir)? {
             sources.push(user_config);
         }
 
@@ -80,11 +82,18 @@ impl ConfigLoader {
 
     /// Load user configuration file.
     ///
+    /// If `data_dir` is provided, loads from `{data_dir}/config.yaml`.
+    /// Otherwise uses the default data directory.
+    ///
     /// # Errors
     ///
     /// Returns an error if the file exists but cannot be read or parsed.
-    fn load_user_config() -> Result<Option<ConfigSource>> {
-        let config_path = Self::user_config_path()?;
+    fn load_user_config(data_dir: Option<&Path>) -> Result<Option<ConfigSource>> {
+        let config_path = if let Some(dir) = data_dir {
+            dir.join("config.yaml")
+        } else {
+            Self::user_config_path()?
+        };
 
         if !config_path.exists() {
             return Ok(None);
@@ -261,7 +270,7 @@ mod tests {
         fs::write(temp_dir.path().join("trop.yaml"), "project: main\n").unwrap();
         fs::write(temp_dir.path().join("trop.local.yaml"), "project: local\n").unwrap();
 
-        let sources = ConfigLoader::load_all(temp_dir.path()).unwrap();
+        let sources = ConfigLoader::load_all(temp_dir.path(), None).unwrap();
 
         // Should be sorted by precedence (lowest to highest)
         for i in 1..sources.len() {

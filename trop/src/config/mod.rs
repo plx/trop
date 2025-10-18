@@ -85,6 +85,6 @@ pub use loader::{ConfigLoader, ConfigSource};
 pub use merger::ConfigMerger;
 pub use schema::{
     CleanupConfig, Config, OccupancyConfig, OutputFormat, PortConfig, PortExclusion,
-    ReservationGroup, ServiceDefinition,
+    ReservationGroup, ServiceDefinition, DEFAULT_MAX_PORT, DEFAULT_MIN_PORT,
 };
 pub use validator::ConfigValidator;

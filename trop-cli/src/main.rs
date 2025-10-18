@@ -43,6 +43,16 @@ fn main() {
         cli::Command::Prune(cmd) => cmd.execute(&global),
         cli::Command::Expire(cmd) => cmd.execute(&global),
         cli::Command::Autoclean(cmd) => cmd.execute(&global),
+        cli::Command::AssertReservation(cmd) => cmd.execute(&global),
+        cli::Command::AssertPort(cmd) => cmd.execute(&global),
+        cli::Command::AssertDataDir(cmd) => cmd.execute(&global),
+        cli::Command::PortInfo(cmd) => cmd.execute(&global),
+        cli::Command::ShowDataDir(cmd) => cmd.execute(&global),
+        cli::Command::ShowPath(cmd) => cmd.execute(&global),
+        cli::Command::Scan(cmd) => cmd.execute(&global),
+        cli::Command::Validate(cmd) => cmd.execute(&global),
+        cli::Command::Exclude(cmd) => cmd.execute(&global),
+        cli::Command::CompactExclusions(cmd) => cmd.execute(&global),
     };
 
     // Handle errors and set exit code
