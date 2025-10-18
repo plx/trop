@@ -37,6 +37,7 @@ pub mod database;
 pub mod error;
 pub mod logging;
 pub mod operations;
+pub mod output;
 pub mod path;
 pub mod port;
 pub mod reservation;
@@ -47,8 +48,9 @@ pub use database::{Database, DatabaseConfig};
 pub use error::{Error, PortUnavailableReason, Result};
 pub use logging::{init_logger, LogLevel, Logger};
 pub use operations::{
-    AutocleanResult, CleanupOperations, ExecutionResult, ExpireResult, OperationPlan, PlanAction,
-    PlanExecutor, PruneResult, ReleaseOptions, ReleasePlan, ReserveOptions, ReservePlan,
+    AutocleanResult, AutoreserveOptions, AutoreservePlan, CleanupOperations, ExecutionResult,
+    ExpireResult, OperationPlan, PlanAction, PlanExecutor, PruneResult, ReleaseOptions,
+    ReleasePlan, ReserveGroupOptions, ReserveGroupPlan, ReserveOptions, ReservePlan,
 };
 pub use path::{PathProvenance, PathRelationship, PathResolver};
 pub use port::{Port, PortRange};

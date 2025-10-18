@@ -3,7 +3,9 @@
 //! This module defines the main CLI structure using clap's derive macros,
 //! including global options and subcommands.
 
-use crate::commands::{ListCommand, ReleaseCommand, ReserveCommand};
+use crate::commands::{
+    AutoreserveCommand, ListCommand, ReleaseCommand, ReserveCommand, ReserveGroupCommand,
+};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -47,4 +49,10 @@ pub enum Command {
 
     /// List active reservations
     List(ListCommand),
+
+    /// Reserve ports for a group of services defined in a config file
+    ReserveGroup(ReserveGroupCommand),
+
+    /// Automatically discover and reserve ports from project config
+    Autoreserve(AutoreserveCommand),
 }

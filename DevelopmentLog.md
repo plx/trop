@@ -154,3 +154,58 @@ Notable design decisions:
 - All logging and warnings go to stderr; only primary output (port numbers, lists) goes to stdout
 - Format enum supports case-insensitive parsing for better UX
 - Release operations are idempotent (success even when nothing to release)
+
+## 2025-10-17 - Phase 8: Group Reservations
+
+Implemented batch reservation functionality with `reserve-group` and `autoreserve` commands, enabling atomic reservation of multiple related services with sophisticated output formatting. This phase completes the core feature set by providing convenient workflow tools for reserving entire service groups from configuration files.
+
+The implementation went very smoothly, with all components completed successfully. Key accomplishments include:
+
+- Complete output formatting module with four formats (export, json, dotenv, human)
+- Shell detection and format generation for bash, zsh, fish, and PowerShell
+- Reserve-group command for explicit config file reservation
+- Autoreserve command with automatic config discovery walking up from current directory
+- Environment variable mapping support for services (e.g., web → WEB_PORT)
+- Integration with Phase 6 group allocation for atomic port reservation
+- Comprehensive test coverage: 164 tests passing (1645 CLI group command tests, 1250 library group integration tests)
+- Proper stdout/stderr separation enabling shell sourcing (`eval $(trop autoreserve)`)
+
+The output formatting system is the major new capability in this phase. Four distinct formatters handle different use cases:
+
+1. **Export Format**: Shell-specific environment variable exports (e.g., `export WEB_PORT=5000` for bash/zsh, `set -x WEB_PORT 5000` for fish, `$env:WEB_PORT="5000"` for PowerShell)
+2. **JSON Format**: Machine-readable JSON output (e.g., `{"web": 5000, "api": 5001}`)
+3. **Dotenv Format**: `.env` file format (e.g., `WEB_PORT=5000`)
+4. **Human Format**: User-friendly output (e.g., `Reserved ports:\n  web: 5000\n  api: 5001`)
+
+Shell detection leverages environment variables (`$SHELL`, `$ZSH_VERSION`, `$FISH_VERSION`, `$PSModulePath`) with explicit `--shell` override support. This enables the powerful workflow: `eval $(trop autoreserve)` sources environment variables directly into the current shell.
+
+The autoreserve command implements intelligent config discovery, walking up from the current directory until finding `trop.yaml` or `trop.local.yaml`. The discovered config's parent directory becomes the base path for all reservations, ensuring consistent behavior regardless of invocation location. This matches user expectations and aligns with the existing `ConfigLoader::discover_project_configs` behavior.
+
+Implementation architecture follows established patterns:
+- Plan-execute pattern extended with `ReserveGroupPlan` and `AutoreservePlan`
+- Execution via `PlanAction::AllocateGroup` leveraging Phase 6's `PortAllocator::allocate_group`
+- Configuration validation ensuring services have either offset or preferred port
+- Builder pattern for options with fluent API (`ReserveGroupOptions::new().with_task().with_force()`)
+
+Testing was comprehensive across multiple dimensions:
+- Output formatters tested with various port allocations, edge cases (empty, single service), and format-specific validation
+- Shell detection tested with mocked environment variables for all shell types
+- CLI integration tests covering all format options, config discovery scenarios, dry-run mode, and error conditions
+- Library integration tests validating group allocation, transactional semantics, and database state
+
+Notable design decisions:
+- Base path for reservations is config file's parent directory (not CWD), ensuring predictable behavior
+- Environment variable names default to uppercased service tags but support explicit mapping via `env` field
+- Shell detection defaults to bash when unable to determine, ensuring safe fallback
+- Stdout contains machine-readable output only; all human messages go to stderr
+- Config discovery stops at first directory containing trop configs (no recursive search)
+
+The implementation adds 6,462 lines across 21 files, with major contributions:
+- `trop/src/output/formatters.rs` (1135 lines): Complete formatter implementations
+- `trop/src/output/shell.rs` (604 lines): Shell detection and format generation
+- `trop-cli/tests/group_commands.rs` (1645 lines): Comprehensive CLI integration tests
+- `trop/tests/group_reservation_integration.rs` (1250 lines): Library-level group tests
+- `trop/src/operations/reserve_group.rs` (530 lines): Plan builders for group operations
+- `trop/src/operations/autoreserve.rs` (359 lines): Config discovery and autoreserve logic
+
+All 164 tests pass reliably, with no clippy warnings. The implementation is production-ready and provides excellent user experience with clear error messages, helpful defaults, and flexible configuration options.

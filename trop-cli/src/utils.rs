@@ -5,9 +5,11 @@
 //! and output formatting.
 
 use crate::error::CliError;
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
-use trop::{Config, ConfigBuilder, Database, DatabaseConfig, PathResolver};
+use trop::output::OutputFormat;
+use trop::{Config, ConfigBuilder, Database, DatabaseConfig, PathResolver, Port};
 
 /// Global CLI options shared across all commands.
 #[derive(Debug, Clone)]
@@ -130,6 +132,43 @@ pub fn shorten_path(path: &Path) -> String {
         }
     }
     path.display().to_string()
+}
+
+/// Format port allocations using the specified output format.
+///
+/// This function extracts environment variable mappings from the config
+/// and uses the output formatter to generate the appropriate output format.
+///
+/// # Arguments
+///
+/// * `output_format` - The desired output format (export, json, dotenv, human)
+/// * `allocations` - Map of service tags to allocated ports
+/// * `config` - Configuration containing service definitions with env mappings
+///
+/// # Returns
+///
+/// Formatted string representation of the allocations
+pub fn format_allocations(
+    output_format: &OutputFormat,
+    allocations: &HashMap<String, Port>,
+    config: &Config,
+) -> Result<String, CliError> {
+    // Extract environment variable mappings from config if present
+    let env_mappings = config.reservations.as_ref().map(|group| {
+        group
+            .services
+            .iter()
+            .filter_map(|(tag, service)| {
+                service
+                    .env
+                    .as_ref()
+                    .map(|env_name| (tag.clone(), env_name.clone()))
+            })
+            .collect::<HashMap<String, String>>()
+    });
+
+    let formatter = output_format.create_formatter(env_mappings);
+    formatter.format(allocations).map_err(CliError::from)
 }
 
 #[cfg(test)]

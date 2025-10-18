@@ -14,7 +14,7 @@ use crate::{Port, PortRange, Result};
 /// This is derived from `OccupancyConfig` but represents the actual
 /// parameters for a specific check operation.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct OccupancyCheckConfig {
     /// Skip TCP checks.
     pub skip_tcp: bool,
