@@ -1,10 +1,12 @@
 //! Main entry point for the trop CLI.
 //!
 //! This is the command-line interface for the trop port reservation system.
-//! It provides three main commands:
+//! It provides commands for managing port reservations:
 //! - `reserve`: Reserve a port for a directory
 //! - `release`: Release a port reservation
 //! - `list`: List active reservations
+//! - `reserve-group`: Reserve ports for a group of services
+//! - `autoreserve`: Automatically discover and reserve ports
 
 mod cli;
 mod commands;
@@ -36,6 +38,8 @@ fn main() {
         cli::Command::Reserve(cmd) => cmd.execute(&global),
         cli::Command::Release(cmd) => cmd.execute(&global),
         cli::Command::List(cmd) => cmd.execute(&global),
+        cli::Command::ReserveGroup(cmd) => cmd.execute(&global),
+        cli::Command::Autoreserve(cmd) => cmd.execute(&global),
     };
 
     // Handle errors and set exit code

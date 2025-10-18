@@ -105,7 +105,7 @@ impl ConfigLoader {
     /// # Errors
     ///
     /// Returns an error if any discovered file cannot be read or parsed.
-    fn discover_project_configs(start_dir: &Path) -> Result<Vec<ConfigSource>> {
+    pub fn discover_project_configs(start_dir: &Path) -> Result<Vec<ConfigSource>> {
         let mut configs = Vec::new();
         let mut current = start_dir.to_path_buf();
 
@@ -150,7 +150,7 @@ impl ConfigLoader {
     /// # Errors
     ///
     /// Returns an error if the file cannot be read or the YAML is invalid.
-    fn load_file(path: &Path) -> Result<Config> {
+    pub fn load_file(path: &Path) -> Result<Config> {
         let contents = fs::read_to_string(path).map_err(|e| Error::InvalidPath {
             path: path.to_path_buf(),
             reason: format!("Failed to read configuration file: {e}"),

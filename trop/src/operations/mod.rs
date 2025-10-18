@@ -45,14 +45,18 @@
 //! let result = executor.execute(&plan).unwrap();
 //! ```
 
+pub mod autoreserve;
 pub mod cleanup;
 pub mod executor;
 pub mod plan;
 pub mod release;
 pub mod reserve;
+pub mod reserve_group;
 
+pub use autoreserve::{AutoreserveOptions, AutoreservePlan};
 pub use cleanup::{AutocleanResult, CleanupOperations, ExpireResult, PruneResult};
 pub use executor::{ExecutionResult, PlanExecutor};
 pub use plan::{OperationPlan, PlanAction};
 pub use release::{ReleaseOptions, ReleasePlan};
 pub use reserve::{ReserveOptions, ReservePlan};
+pub use reserve_group::{ReserveGroupOptions, ReserveGroupPlan};

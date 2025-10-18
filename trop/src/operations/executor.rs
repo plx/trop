@@ -3,8 +3,11 @@
 //! This module implements the executor that takes operation plans
 //! and applies them to the database.
 
+use std::collections::HashMap;
+
 use crate::database::Database;
 use crate::error::Result;
+use crate::port::allocator::allocator_from_config;
 use crate::Port;
 
 use super::plan::{OperationPlan, PlanAction};
@@ -29,28 +32,41 @@ pub struct ExecutionResult {
 
     /// The port that was reserved (if applicable).
     pub port: Option<Port>,
+
+    /// Allocated ports for group operations (tag -> port mapping).
+    pub allocated_ports: Option<HashMap<String, Port>>,
 }
 
 impl ExecutionResult {
     /// Creates a successful execution result.
-    fn success(plan: &OperationPlan, port: Option<Port>) -> Self {
+    fn success(
+        plan: &OperationPlan,
+        port: Option<Port>,
+        allocated_ports: Option<HashMap<String, Port>>,
+    ) -> Self {
         Self {
             success: true,
             dry_run: false,
             actions_taken: plan.actions.iter().map(PlanAction::description).collect(),
             warnings: plan.warnings.clone(),
             port,
+            allocated_ports,
         }
     }
 
     /// Creates a dry-run execution result.
-    fn dry_run(plan: &OperationPlan, port: Option<Port>) -> Self {
+    fn dry_run(
+        plan: &OperationPlan,
+        port: Option<Port>,
+        allocated_ports: Option<HashMap<String, Port>>,
+    ) -> Self {
         Self {
             success: true,
             dry_run: true,
             actions_taken: plan.actions.iter().map(PlanAction::description).collect(),
             warnings: plan.warnings.clone(),
             port,
+            allocated_ports,
         }
     }
 }
@@ -154,30 +170,55 @@ impl<'a> PlanExecutor<'a> {
         if self.dry_run {
             // In dry-run mode, extract port without database queries
             let port = Self::extract_port_from_plan_dry_run(plan);
-            return Ok(ExecutionResult::dry_run(plan, port));
+            let allocated_ports = Self::extract_allocated_ports_dry_run(plan);
+            return Ok(ExecutionResult::dry_run(plan, port, allocated_ports));
         }
 
-        // Execute each action
+        // Execute each action and collect any allocated ports
+        let mut allocated_ports = None;
         for action in &plan.actions {
-            self.execute_action(action)?;
+            if let Some(ports) = self.execute_action(action)? {
+                allocated_ports = Some(ports);
+            }
         }
 
         // Extract the port from the plan after execution
         let port = self.extract_port_from_plan(plan);
 
-        Ok(ExecutionResult::success(plan, port))
+        Ok(ExecutionResult::success(plan, port, allocated_ports))
     }
 
     /// Executes a single action.
-    fn execute_action(&mut self, action: &PlanAction) -> Result<()> {
+    ///
+    /// Returns `Ok(Some(ports))` for group allocations, `Ok(None)` for other actions.
+    fn execute_action(&mut self, action: &PlanAction) -> Result<Option<HashMap<String, Port>>> {
         match action {
-            PlanAction::CreateReservation(reservation) => self.db.create_reservation(reservation),
+            PlanAction::CreateReservation(reservation) => {
+                self.db.create_reservation(reservation)?;
+                Ok(None)
+            }
             PlanAction::UpdateReservation(reservation) => {
                 // update_reservation is the same as create_reservation (upsert)
-                self.db.create_reservation(reservation)
+                self.db.create_reservation(reservation)?;
+                Ok(None)
             }
-            PlanAction::UpdateLastUsed(key) => self.db.update_last_used(key).map(|_| ()),
-            PlanAction::DeleteReservation(key) => self.db.delete_reservation(key).map(|_| ()),
+            PlanAction::UpdateLastUsed(key) => {
+                self.db.update_last_used(key).map(|_| ())?;
+                Ok(None)
+            }
+            PlanAction::DeleteReservation(key) => {
+                self.db.delete_reservation(key).map(|_| ())?;
+                Ok(None)
+            }
+            PlanAction::AllocateGroup {
+                request,
+                full_config,
+                occupancy_config,
+            } => {
+                let allocator = allocator_from_config(full_config)?;
+                let result = allocator.allocate_group(self.db, request, occupancy_config)?;
+                Ok(Some(result.allocations))
+            }
         }
     }
 
@@ -197,8 +238,8 @@ impl<'a> PlanExecutor<'a> {
                         return Some(reservation.port());
                     }
                 }
-                PlanAction::DeleteReservation(_) => {
-                    // Release operations don't return a port
+                PlanAction::DeleteReservation(_) | PlanAction::AllocateGroup { .. } => {
+                    // Release operations and group allocations don't return a single port
                 }
             }
         }
@@ -216,13 +257,21 @@ impl<'a> PlanExecutor<'a> {
                 PlanAction::CreateReservation(r) | PlanAction::UpdateReservation(r) => {
                     return Some(r.port());
                 }
-                PlanAction::UpdateLastUsed(_) | PlanAction::DeleteReservation(_) => {
+                PlanAction::UpdateLastUsed(_)
+                | PlanAction::DeleteReservation(_)
+                | PlanAction::AllocateGroup { .. } => {
                     // In dry-run mode, we don't query the database.
-                    // For UpdateLastUsed, return None.
+                    // For UpdateLastUsed and AllocateGroup, return None.
                     // Release operations also don't return a port.
                 }
             }
         }
+        None
+    }
+
+    /// Extracts allocated ports from a plan's group allocation actions (dry-run).
+    fn extract_allocated_ports_dry_run(_plan: &OperationPlan) -> Option<HashMap<String, Port>> {
+        // In dry-run mode, we don't actually allocate ports
         None
     }
 }
