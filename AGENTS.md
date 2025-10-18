@@ -45,4 +45,6 @@ When posting comments to PRs using `gh pr comment`, the comment will be attribut
 - Phase 4 (Basic Reservation Operations) is COMPLETED and merged
 - Phase 5 (Configuration System) is COMPLETED and merged
 - Phase 6 (Port Allocation & Occupancy) is COMPLETED and merged
-- Phase 7 (Essential CLI Commands) is COMPLETED and ready for merge
+- Phase 7 (Essential CLI Commands) is COMPLETED and merged
+- Phase 8 (Group Reservations) is COMPLETED and merged
+- Phase 9 (Cleanup Operations) is COMPLETED and ready for merge
