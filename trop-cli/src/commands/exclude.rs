@@ -41,10 +41,14 @@ impl ExcludeCommand {
 
         // 4. Determine target config file
         let config_path = if self.global {
-            resolve_data_dir().join("config.yaml")
+            global
+                .data_dir
+                .as_ref()
+                .map(|d| d.join("config.yaml"))
+                .unwrap_or_else(|| resolve_data_dir().join("config.yaml"))
         } else {
             // Use resolve_config_file which returns project config if exists, otherwise global
-            resolve_config_file()?
+            resolve_config_file(global)?
         };
 
         // 5. Load, modify, and save configuration

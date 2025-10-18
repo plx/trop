@@ -64,8 +64,13 @@ pub fn normalize_path(path: &Path) -> Result<PathBuf, CliError> {
 /// 2. Environment variables
 /// 3. Configuration files
 /// 4. Built-in defaults (lowest priority)
-pub fn load_configuration(_global: &GlobalOptions) -> Result<Config, CliError> {
-    let builder = ConfigBuilder::new();
+pub fn load_configuration(global: &GlobalOptions) -> Result<Config, CliError> {
+    let mut builder = ConfigBuilder::new();
+
+    // Set data directory if provided via --data-dir
+    if let Some(ref data_dir) = global.data_dir {
+        builder = builder.with_data_dir(data_dir);
+    }
 
     // Build configuration from environment and files
     let config = builder
@@ -173,11 +178,15 @@ pub fn format_allocations(
 
 /// Resolve the data directory path.
 ///
-/// Returns the default data directory location: `~/.trop`
+/// Respects `TROP_DATA_DIR` environment variable, otherwise defaults to `~/.trop`.
+///
+/// # Panics
+///
+/// Panics if the home directory cannot be determined and `TROP_DATA_DIR` is not set.
 pub fn resolve_data_dir() -> PathBuf {
-    home::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".trop")
+    trop::database::default_data_dir().expect(
+        "Failed to determine data directory (home directory not found and TROP_DATA_DIR not set)",
+    )
 }
 
 /// Find project configuration file (trop.yaml) starting from current directory.
@@ -222,11 +231,19 @@ pub fn find_project_config() -> Result<Option<PathBuf>, CliError> {
 /// Returns the path to the project configuration file (trop.yaml or trop.local.yaml)
 /// if one exists, otherwise returns the path to the global configuration file.
 ///
+/// The global config path respects `--data-dir` if provided via `GlobalOptions`.
+///
 /// # Returns
 ///
 /// Path to the configuration file to use (may not exist yet).
-pub fn resolve_config_file() -> Result<PathBuf, CliError> {
-    Ok(find_project_config()?.unwrap_or_else(|| resolve_data_dir().join("config.yaml")))
+pub fn resolve_config_file(global: &GlobalOptions) -> Result<PathBuf, CliError> {
+    let global_config = global
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("config.yaml"))
+        .unwrap_or_else(|| resolve_data_dir().join("config.yaml"));
+
+    Ok(find_project_config()?.unwrap_or(global_config))
 }
 
 #[cfg(test)]

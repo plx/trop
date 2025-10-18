@@ -132,7 +132,7 @@ impl ScanCommand {
         global: &GlobalOptions,
     ) -> Result<(), CliError> {
         // Determine target config file (project or global)
-        let config_path = resolve_config_file()?;
+        let config_path = resolve_config_file(global)?;
 
         // Ensure excluded_ports exists
         if config.excluded_ports.is_none() {
@@ -179,7 +179,7 @@ impl ScanCommand {
                 *exclusions = compacted;
 
                 // Save compacted config
-                let config_path = resolve_config_file()?;
+                let config_path = resolve_config_file(global)?;
 
                 let yaml = serde_yaml::to_string(config)
                     .map_err(|e| CliError::Config(format!("Failed to serialize config: {e}")))?;
