@@ -46,9 +46,7 @@ impl ExpireCommand {
         };
 
         if self.dry_run && !global.quiet {
-            eprintln!(
-                "[DRY RUN] Scanning for reservations unused for {days} days..."
-            );
+            eprintln!("[DRY RUN] Scanning for reservations unused for {days} days...");
         }
 
         // Open database
