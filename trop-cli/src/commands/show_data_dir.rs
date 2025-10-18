@@ -11,10 +11,7 @@ pub struct ShowDataDirCommand {}
 impl ShowDataDirCommand {
     pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
         // Resolve data directory using same logic as other commands
-        let data_dir = global
-            .data_dir
-            .clone()
-            .unwrap_or_else(resolve_data_dir);
+        let data_dir = global.data_dir.clone().unwrap_or_else(resolve_data_dir);
 
         println!("{}", data_dir.display());
         Ok(())
