@@ -48,9 +48,11 @@ pub use database::{Database, DatabaseConfig};
 pub use error::{Error, PortUnavailableReason, Result};
 pub use logging::{init_logger, LogLevel, Logger};
 pub use operations::{
-    AutocleanResult, AutoreserveOptions, AutoreservePlan, CleanupOperations, ExecutionResult,
-    ExpireResult, OperationPlan, PlanAction, PlanExecutor, PruneResult, ReleaseOptions,
-    ReleasePlan, ReserveGroupOptions, ReserveGroupPlan, ReserveOptions, ReservePlan,
+    execute_migrate, init_database, AutocleanResult, AutoreserveOptions, AutoreservePlan,
+    CleanupOperations, ExecutionResult, ExpireResult, InitOptions, InitResult, MigrateOptions,
+    MigratePlan, MigrateResult, MigrationItem, OperationPlan, PlanAction, PlanExecutor,
+    PruneResult, ReleaseOptions, ReleasePlan, ReserveGroupOptions, ReserveGroupPlan,
+    ReserveOptions, ReservePlan,
 };
 pub use path::{PathProvenance, PathRelationship, PathResolver};
 pub use port::{Port, PortRange};

@@ -38,6 +38,9 @@
 pub mod autoreserve;
 pub mod cleanup;
 pub mod executor;
+pub mod inference;
+pub mod init;
+pub mod migrate;
 pub mod plan;
 pub mod release;
 pub mod reserve;
@@ -46,6 +49,8 @@ pub mod reserve_group;
 pub use autoreserve::{AutoreserveOptions, AutoreservePlan};
 pub use cleanup::{AutocleanResult, CleanupOperations, ExpireResult, PruneResult};
 pub use executor::{ExecutionResult, PlanExecutor};
+pub use init::{init_database, InitOptions, InitResult};
+pub use migrate::{execute_migrate, MigrateOptions, MigratePlan, MigrateResult, MigrationItem};
 pub use plan::{OperationPlan, PlanAction};
 pub use release::{ReleaseOptions, ReleasePlan};
 pub use reserve::{ReserveOptions, ReservePlan};

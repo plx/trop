@@ -155,7 +155,7 @@ impl ScanCommand {
         std::fs::write(&config_path, yaml)?;
 
         if !global.quiet {
-            println!(
+            eprintln!(
                 "Added {} exclusions to {}",
                 ports.len(),
                 config_path.display()
@@ -186,7 +186,7 @@ impl ScanCommand {
                 std::fs::write(&config_path, yaml)?;
 
                 if !global.quiet {
-                    println!("Compacted {original_count} exclusions to {new_count}");
+                    eprintln!("Compacted {original_count} exclusions to {new_count}");
                 }
             }
         }
@@ -254,8 +254,8 @@ impl ScanCommand {
         }
 
         if !unreserved.is_empty() {
-            println!();
-            println!("Found {} unreserved occupied port(s)", unreserved.len());
+            eprintln!();
+            eprintln!("Found {} unreserved occupied port(s)", unreserved.len());
         }
 
         Ok(())
