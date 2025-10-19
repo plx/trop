@@ -13,6 +13,8 @@ pub mod occupancy;
 mod allocator_proptests;
 #[cfg(test)]
 mod group_proptests;
+#[cfg(test)]
+mod proptests;
 
 use std::fmt;
 

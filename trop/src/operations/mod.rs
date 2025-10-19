@@ -46,6 +46,9 @@ pub mod release;
 pub mod reserve;
 pub mod reserve_group;
 
+#[cfg(test)]
+mod proptests;
+
 pub use autoreserve::{AutoreserveOptions, AutoreservePlan};
 pub use cleanup::{AutocleanResult, CleanupOperations, ExpireResult, PruneResult};
 pub use executor::{ExecutionResult, PlanExecutor};

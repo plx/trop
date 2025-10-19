@@ -78,6 +78,9 @@ pub mod merger;
 pub mod schema;
 pub mod validator;
 
+#[cfg(test)]
+mod proptests;
+
 // Re-export key types at module root
 pub use builder::ConfigBuilder;
 pub use environment::EnvironmentConfig;
