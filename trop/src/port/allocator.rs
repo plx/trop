@@ -291,6 +291,54 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         Ok(None)
     }
 
+    /// Find the next available port that can be atomically allocated.
+    ///
+    /// This method performs allocation without checking occupancy or reservations
+    /// in advance. Instead, it relies on the atomic insertion with UNIQUE constraint
+    /// to detect conflicts. This is suitable for use within a reservation transaction.
+    ///
+    /// The method scans forward from `start` checking only exclusions and occupancy,
+    /// then returns the first candidate port. The caller should attempt to insert
+    /// this port atomically and retry if it fails due to UNIQUE constraint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if occupancy checks fail.
+    pub fn find_next_allocatable(
+        &self,
+        start: Port,
+        occupancy_config: &OccupancyCheckConfig,
+    ) -> Result<Option<Port>> {
+        // Scan from start to range max
+        let scan_range = PortRange::new(start, self.range.max())?;
+
+        for port in scan_range {
+            // Check if in range (already guaranteed by scan_range, but explicit)
+            if !self.range.contains(port) {
+                continue;
+            }
+
+            // Check if excluded
+            if self.exclusions.is_excluded(port) {
+                continue;
+            }
+
+            // Check if occupied on system
+            // Fail-closed policy: if the occupancy check itself fails (e.g., permission errors),
+            // we conservatively treat the port as occupied.
+            let occupied = self
+                .checker
+                .is_occupied(port, occupancy_config)
+                .unwrap_or(true);
+
+            if !occupied {
+                return Ok(Some(port));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Check if a specific port is available for allocation.
     ///
     /// A port is available if it is:

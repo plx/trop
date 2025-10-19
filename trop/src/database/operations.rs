@@ -467,6 +467,90 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Creates a reservation within a transaction, checking port availability atomically.
+    ///
+    /// This method combines the port availability check and reservation creation
+    /// into a single atomic transaction, preventing TOCTOU race conditions in
+    /// concurrent port allocation scenarios.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The transaction cannot be started
+    /// - The port is already reserved
+    /// - The insert fails (e.g., due to UNIQUE constraint violation)
+    /// - The transaction cannot be committed
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` if the reservation was created successfully
+    /// - `Ok(false)` if the port was already reserved
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use trop::database::{Database, DatabaseConfig};
+    /// use trop::{Reservation, ReservationKey, Port};
+    /// use std::path::PathBuf;
+    ///
+    /// let config = DatabaseConfig::new("/tmp/trop.db");
+    /// let mut db = Database::open(config).unwrap();
+    ///
+    /// let key = ReservationKey::new(PathBuf::from("/path"), None).unwrap();
+    /// let port = Port::try_from(8080).unwrap();
+    /// let reservation = Reservation::builder(key, port).build().unwrap();
+    ///
+    /// match db.try_create_reservation_atomic(&reservation) {
+    ///     Ok(true) => println!("Reservation created"),
+    ///     Ok(false) => println!("Port already reserved"),
+    ///     Err(e) => eprintln!("Error: {}", e),
+    /// }
+    /// ```
+    pub fn try_create_reservation_atomic(&mut self, reservation: &Reservation) -> Result<bool> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Check if port is already reserved (within transaction)
+        let count: i32 = tx.query_row(
+            CHECK_PORT_RESERVED,
+            params![reservation.port().value()],
+            |row| row.get(0),
+        )?;
+
+        if count > 0 {
+            // Port already reserved - rollback and return false
+            tx.rollback()?;
+            return Ok(false);
+        }
+
+        // For NULL tags, explicitly delete first to ensure replacement works
+        // (INSERT OR REPLACE doesn't work with NULL in PRIMARY KEY due to NULL != NULL)
+        tx.execute(
+            DELETE_RESERVATION,
+            params![reservation.key().path_as_string(), reservation.key().tag],
+        )?;
+
+        let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
+        let last_used_secs = systemtime_to_unix_secs(reservation.last_used_at())?;
+
+        tx.execute(
+            INSERT_RESERVATION,
+            params![
+                reservation.key().path_as_string(),
+                reservation.key().tag,
+                reservation.port().value(),
+                reservation.project(),
+                reservation.task(),
+                created_secs,
+                last_used_secs,
+            ],
+        )?;
+
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Gets a reservation by port number.
     ///
     /// # Errors

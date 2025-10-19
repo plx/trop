@@ -194,11 +194,26 @@ impl<'a> PlanExecutor<'a> {
     fn execute_action(&mut self, action: &PlanAction) -> Result<Option<HashMap<String, Port>>> {
         match action {
             PlanAction::CreateReservation(reservation) => {
-                self.db.create_reservation(reservation)?;
+                // Use atomic create to prevent TOCTOU races in concurrent scenarios
+                // The UNIQUE constraint on the port column ensures atomicity
+                let created = self.db.try_create_reservation_atomic(reservation)?;
+                if !created {
+                    // Port was allocated by another process between planning and execution
+                    // This should be rare but can happen in high-concurrency scenarios
+                    return Err(crate::error::Error::Validation {
+                        field: "port".into(),
+                        message: format!(
+                            "Port {} was allocated by another process during execution. Please retry the operation.",
+                            reservation.port().value()
+                        ),
+                    });
+                }
                 Ok(None)
             }
             PlanAction::UpdateReservation(reservation) => {
-                // update_reservation is the same as create_reservation (upsert)
+                // For updates, use the regular create_reservation (upsert)
+                // Updates are for existing reservations where we're changing metadata,
+                // not allocating new ports, so atomicity isn't critical
                 self.db.create_reservation(reservation)?;
                 Ok(None)
             }

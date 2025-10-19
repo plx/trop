@@ -23,12 +23,13 @@ pub const CREATE_METADATA_TABLE: &str = r"
 ///
 /// The reservations table stores all port reservations with their associated
 /// metadata. The primary key is the combination of (path, tag) to ensure
-/// uniqueness of reservations.
+/// uniqueness of reservations. The port column has a UNIQUE constraint to
+/// prevent duplicate port allocations under concurrent load.
 pub const CREATE_RESERVATIONS_TABLE: &str = r"
     CREATE TABLE IF NOT EXISTS reservations (
         path TEXT NOT NULL,
         tag TEXT,
-        port INTEGER NOT NULL,
+        port INTEGER NOT NULL UNIQUE,
         project TEXT,
         task TEXT,
         created_at INTEGER NOT NULL,

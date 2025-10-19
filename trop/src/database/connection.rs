@@ -77,14 +77,16 @@ impl Database {
         // Open the connection
         let conn = Connection::open_with_flags(&config.path, flags)?;
 
-        // Set pragmas for optimal operation
-        // Note: PRAGMA journal_mode returns a result, so we use query_row
-        let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-        conn.execute_batch("PRAGMA synchronous = NORMAL")?;
-        conn.execute_batch(&format!(
-            "PRAGMA busy_timeout = {}",
-            config.busy_timeout.as_millis()
-        ))?;
+        // Set pragmas for optimal operation (skip for read-only databases)
+        if !config.read_only {
+            // Note: PRAGMA journal_mode returns a result, so we use query_row
+            let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+            conn.execute_batch("PRAGMA synchronous = NORMAL")?;
+            conn.execute_batch(&format!(
+                "PRAGMA busy_timeout = {}",
+                config.busy_timeout.as_millis()
+            ))?;
+        }
 
         // Check and initialize schema (will be implemented in migrations module)
         super::migrations::check_schema_compatibility(&conn)?;
