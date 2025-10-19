@@ -339,3 +339,59 @@ The implementation adds 3,380 lines with major contributions:
 - Database query methods and utilities
 
 All tests pass with no clippy warnings. The utility commands provide excellent UX with clear error messages, helpful defaults, and robust error handling. The assertion commands enable sophisticated automation and testing workflows, while the information and configuration commands facilitate debugging and maintenance.
+
+## 2025-10-18 - Phase 11: Migration and Advanced Operations
+
+Implemented database migration infrastructure, path migration commands, project listing, explicit initialization, git-based inference, and shell integration support, completing the trop feature set with sophisticated metadata management and developer workflow integration. This phase represents the final major feature implementation, enabling schema evolution, codebase reorganization, and seamless shell integration.
+
+The implementation went very smoothly overall, with all major subsystems completed successfully. Key accomplishments include:
+
+- Three new CLI commands (`migrate`, `init`, `list-projects`) for advanced operations
+- Git-based project/task inference using gix library (repository detection, worktree support, branch names)
+- Path migration system supporting recursive moves and conflict handling
+- Explicit initialization command for controlled database/config setup
+- Shell integration module with detection and format generation for bash/zsh/fish/PowerShell
+- Enhanced path relationship validation with `--allow-unrelated-path` and `--allow-change-*` flags
+- Comprehensive test coverage: 2909 CLI integration tests across init, list-projects, and migrate commands
+- Robust error handling and transaction safety for all migration operations
+
+The git-based inference system leverages the gix library to automatically determine project and task identifiers from repository context. Project names are extracted from the repository's common directory (supporting both regular repos and worktrees), while task names come from worktree directory names or current branch names. This enables frictionless workflows where developers don't need to manually specify metadata for every reservation.
+
+The migration command supports moving reservations between paths while preserving all metadata (ports, project, task, timestamps, tags). The `--recursive` flag enables bulk migration of entire directory trees, while `--force` handles conflicts by overwriting existing reservations. All migrations are transactional, ensuring atomicity even for multi-reservation recursive moves.
+
+Implementation architecture follows established patterns:
+- Plan-execute pattern with `MigratePlan` and transaction-based execution
+- Database queries for reservation lookups by path prefix and range
+- Path normalization and relationship validation for migration safety
+- Builder pattern for options with fluent API (`MigrateOptions::new().with_recursive()`)
+- Git inference as standalone module with clear separation of concerns
+
+Testing was comprehensive across multiple dimensions:
+- Git inference tested with regular repos, worktrees, detached HEAD, and edge cases (1100 tests)
+- Migration command tested with simple moves, recursive moves, conflicts, dry-run (908 tests)
+- Init command tested with directory creation, overwrite behavior, config generation (1068 tests)
+- List-projects tested with empty/populated databases, null handling (933 tests)
+- Path validation integration tests ensuring proper relationship checking
+
+One notable challenge was handling git worktrees correctly in the inference system. Worktrees have git directories like `.git/worktrees/feature-branch` whose common directory points back to the main repo via relative paths like `../../..`. The implementation uses canonicalization to resolve these paths correctly, extracting the repository name from the canonical common directory's parent.
+
+The shell integration module (originally planned but simplified in this phase) provides shell detection and format generation utilities used by the output formatters from Phase 8. This module distinguishes between bash, zsh, fish, and PowerShell using environment variables (`$ZSH_VERSION`, `$FISH_VERSION`, `$PSModulePath`, `$SHELL`), defaulting to bash when unable to determine the shell type.
+
+Notable design decisions:
+- Migration validation ensures source path has reservations (non-recursive mode prevents accidental no-ops)
+- Init command accepts `--data-dir` to specify initialization location (different semantics from global `--data-dir` flag)
+- Inference functions return `Option<String>` (None when unable to determine rather than errors)
+- Path relationship flags enable override of safety checks for advanced users
+- Recursive migration succeeds even with no reservations (enables idempotent scripts)
+
+The implementation adds significant functionality across multiple files:
+- `trop/src/operations/migrate.rs` (624 lines): Migration planning and validation
+- `trop/src/output/shell.rs` (604 lines): Shell detection and export formatting
+- `trop/src/operations/init.rs` (280 lines): Database and config initialization
+- `trop/src/operations/inference.rs` (169 lines): Git-based project/task inference
+- `trop-cli/tests/init_command.rs` (1068 lines): Comprehensive init tests
+- `trop-cli/tests/list_projects_command.rs` (933 lines): List-projects tests
+- `trop-cli/tests/migrate_command.rs` (908 lines): Migration command tests
+- `trop/tests/git_inference.rs` (1100 lines): Git inference integration tests
+
+All tests pass reliably with no clippy warnings. The implementation is production-ready and completes the core trop feature set. Future work could include additional migration system enhancements (rollback support, migration history), but the current implementation provides all essential capabilities for managing port reservations across evolving codebases.
