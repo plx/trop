@@ -1,0 +1,172 @@
+name: Multi-Platform Tests
+
+on:
+  push:
+    branches: [ main, develop, 'phase-*' ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }} with Rust ${{ matrix.rust }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, beta]
+        include:
+          # Test MSRV (Minimum Supported Rust Version)
+          - os: ubuntu-latest
+            rust: 1.75.0
+          # Additional macOS variant for Apple Silicon (M1/M2/M3)
+          - os: macos-14  # M1 runner
+            rust: stable
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      # Use Swatinem/rust-cache for more efficient caching than manual cache actions
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.rust }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+        if: matrix.rust == 'stable'
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features --workspace -- -D warnings
+
+      - name: Build all targets
+        run: cargo build --verbose --all-features --workspace
+
+      - name: Run unit and integration tests
+        run: cargo test --verbose --all-features --workspace
+
+      - name: Run doc tests
+        run: cargo test --doc --workspace
+
+      - name: Build release binary
+        run: cargo build --release
+        if: matrix.rust == 'stable'
+
+      # End-to-end CLI testing on Unix-like systems (Linux & macOS)
+      - name: Test CLI end-to-end (Unix)
+        if: runner.os != 'Windows' && matrix.rust == 'stable'
+        run: |
+          echo "Testing CLI binary..."
+          ./target/release/trop --version
+
+          # Create temporary test directory
+          TEST_DIR=$(mktemp -d)
+          echo "Using test directory: $TEST_DIR"
+
+          # Initialize trop with config
+          ./target/release/trop --data-dir "$TEST_DIR" init --with-config
+
+          # List reservations (should be empty)
+          ./target/release/trop --data-dir "$TEST_DIR" list
+
+          # Test basic reservation operations
+          ./target/release/trop --data-dir "$TEST_DIR" reserve --id test-port --port 8080
+          ./target/release/trop --data-dir "$TEST_DIR" list | grep test-port
+          ./target/release/trop --data-dir "$TEST_DIR" release --id test-port
+
+          echo "CLI tests passed!"
+
+      # End-to-end CLI testing on Windows
+      - name: Test CLI end-to-end (Windows)
+        if: runner.os == 'Windows' && matrix.rust == 'stable'
+        shell: pwsh
+        run: |
+          Write-Host "Testing CLI binary..."
+          .\target\release\trop.exe --version
+
+          # Create temporary test directory
+          $TestDir = Join-Path $env:TEMP "trop-test-$(Get-Random)"
+          New-Item -ItemType Directory -Force -Path $TestDir | Out-Null
+          Write-Host "Using test directory: $TestDir"
+
+          # Initialize trop with config
+          .\target\release\trop.exe --data-dir $TestDir init --with-config
+
+          # List reservations (should be empty)
+          .\target\release\trop.exe --data-dir $TestDir list
+
+          # Test basic reservation operations
+          .\target\release\trop.exe --data-dir $TestDir reserve --id test-port --port 8080
+          .\target\release\trop.exe --data-dir $TestDir list | Select-String test-port
+          .\target\release\trop.exe --data-dir $TestDir release --id test-port
+
+          Write-Host "CLI tests passed!"
+
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run integration tests
+        run: cargo test --test '*' --release --workspace
+
+      - name: Run property-based tests
+        run: cargo test --release proptest -- --nocapture
+        continue-on-error: false
+
+      - name: Run concurrency tests
+        run: cargo test --release concurrent -- --test-threads=1 --nocapture
+        continue-on-error: false
+
+      # Run stress/ignored tests - these may take longer or be flaky
+      - name: Run stress tests
+        run: cargo test --release --ignored -- --test-threads=1 --nocapture
+        continue-on-error: true
+        timeout-minutes: 15
+
+  build-summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: [test, integration-tests]
+    if: always()
+
+    steps:
+      - name: Check test results
+        run: |
+          if [ "${{ needs.test.result }}" == "success" ] && [ "${{ needs.integration-tests.result }}" == "success" ]; then
+            echo "All tests passed successfully!"
+            echo "### Build Status: PASSED" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "All multi-platform tests and integration tests completed successfully." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Some tests failed."
+            echo "### Build Status: FAILED" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- Test job: ${{ needs.test.result }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Integration tests: ${{ needs.integration-tests.result }}" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi

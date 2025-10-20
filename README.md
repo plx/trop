@@ -1,5 +1,9 @@
 # trop
 
+[![CI](https://github.com/prb/trop/actions/workflows/ci.yml/badge.svg)](https://github.com/prb/trop/actions/workflows/ci.yml)
+[![Multi-Platform Tests](https://github.com/prb/trop/actions/workflows/multi-platform.yml/badge.svg)](https://github.com/prb/trop/actions/workflows/multi-platform.yml)
+[![Code Coverage](https://github.com/prb/trop/actions/workflows/coverage.yml/badge.svg)](https://github.com/prb/trop/actions/workflows/coverage.yml)
+
 `trop` is a lightweight, directory-aware port reservation tool designed for managing ephemeral port allocations in concurrent development workflows. It helps prevent port collisions when multiple processes, agents, or worktrees need to run services on predictable ports.
 
 ## Current Status
