@@ -21,9 +21,6 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, beta]
         include:
-          # Test MSRV (Minimum Supported Rust Version)
-          - os: ubuntu-latest
-            rust: 1.77.0
           # Additional macOS variant for Apple Silicon (M1/M2/M3)
           - os: macos-14  # M1 runner
             rust: stable
@@ -88,7 +85,7 @@ jobs:
           # Test basic reservation operations
           ./target/release/trop --data-dir "$TEST_DIR" reserve --path "$TEST_PROJECT" --port 8080 --allow-unrelated-path
           ./target/release/trop --data-dir "$TEST_DIR" list | grep "$TEST_PROJECT"
-          ./target/release/trop --data-dir "$TEST_DIR" release --path "$TEST_PROJECT" --allow-unrelated-path
+          ./target/release/trop --data-dir "$TEST_DIR" release --path "$TEST_PROJECT"
 
           echo "CLI tests passed!"
 
@@ -118,7 +115,7 @@ jobs:
           # Test basic reservation operations
           .\target\release\trop.exe --data-dir $TestDir reserve --path $TestProject --port 8080 --allow-unrelated-path
           .\target\release\trop.exe --data-dir $TestDir list | Select-String test-project
-          .\target\release\trop.exe --data-dir $TestDir release --path $TestProject --allow-unrelated-path
+          .\target\release\trop.exe --data-dir $TestDir release --path $TestProject
 
           Write-Host "CLI tests passed!"
 

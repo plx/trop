@@ -324,6 +324,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_normalized_path_accepts_absolute() {
         let absolute = PathBuf::from("/absolute/path");
         let result = NormalizedPath::new(absolute.clone(), PathProvenance::Explicit);

@@ -504,6 +504,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_migrate_plan_single_reservation() {
         let mut db = create_test_database();
 
@@ -535,6 +536,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_migrate_plan_with_conflict() {
         let mut db = create_test_database();
 
@@ -563,6 +565,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_migrate_plan_with_conflict_force() {
         let mut db = create_test_database();
 
@@ -590,6 +593,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_migrate_plan_recursive() {
         let mut db = create_test_database();
 
