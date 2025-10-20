@@ -149,7 +149,7 @@ jobs:
 
       # Run stress/ignored tests - these may take longer or be flaky
       - name: Run stress tests
-        run: cargo test --release --ignored -- --test-threads=1 --nocapture
+        run: cargo test --release -- --ignored --test-threads=1 --nocapture
         continue-on-error: true
         timeout-minutes: 15
 
