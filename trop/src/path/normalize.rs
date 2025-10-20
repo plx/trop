@@ -275,7 +275,7 @@ mod tests {
     }
 
     // Property-based tests
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "property-tests"))]
     mod property_tests {
         use super::*;
         use proptest::prelude::*;

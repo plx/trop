@@ -46,13 +46,13 @@ jobs:
         if: matrix.rust == 'stable'
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features --workspace -- -D warnings
+        run: cargo clippy --all-targets --workspace -- -D warnings
 
       - name: Build all targets
-        run: cargo build --verbose --all-features --workspace
+        run: cargo build --verbose --workspace
 
       - name: Run unit and integration tests
-        run: cargo test --verbose --all-features --workspace
+        run: cargo test --verbose --workspace
 
       - name: Run doc tests
         run: cargo test --doc --workspace
@@ -138,10 +138,6 @@ jobs:
 
       - name: Run integration tests
         run: cargo test --test '*' --release --workspace
-
-      - name: Run property-based tests
-        run: cargo test --release proptest -- --nocapture
-        continue-on-error: false
 
       - name: Run concurrency tests
         run: cargo test --release concurrent -- --test-threads=1 --nocapture

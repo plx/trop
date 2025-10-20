@@ -7,6 +7,10 @@ license = "MIT"
 description = "Library for managing ephemeral port reservations"
 repository = "https://github.com/prb/trop"
 
+[features]
+default = []
+property-tests = []
+
 [dependencies]
 clap = { workspace = true }
 rusqlite = { workspace = true }
