@@ -401,9 +401,15 @@ pub fn execute_migrate(plan: &MigratePlan, db: &mut Database) -> Result<MigrateR
     // Convert to operation plan
     let op_plan = to_operation_plan(plan);
 
-    // Execute the plan
-    let mut executor = PlanExecutor::new(db);
+    // Begin transaction for atomic migration
+    let tx = db.begin_transaction()?;
+
+    // Execute the plan inside transaction
+    let mut executor = PlanExecutor::new(&tx);
     executor.execute(&op_plan)?;
+
+    // Commit transaction
+    tx.commit()?;
 
     // Build result
     Ok(MigrateResult {

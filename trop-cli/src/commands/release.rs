@@ -7,7 +7,7 @@ use crate::error::CliError;
 use crate::utils::{load_configuration, open_database, resolve_path, GlobalOptions};
 use clap::Args;
 use std::path::PathBuf;
-use trop::{PlanExecutor, ReleaseOptions, ReleasePlan, ReservationKey};
+use trop::{Database, PlanExecutor, ReleaseOptions, ReleasePlan, ReservationKey};
 
 /// Release a port reservation.
 #[derive(Args)]
@@ -60,7 +60,8 @@ impl ReleaseCommand {
         if self.recursive {
             // For recursive release, we need to find all reservations under this path
             // and release them one by one
-            let all_reservations = db.list_all_reservations().map_err(CliError::from)?;
+            let all_reservations =
+                Database::list_all_reservations(db.connection()).map_err(CliError::from)?;
 
             let mut released_count = 0;
             let mut plans = Vec::new();
@@ -87,8 +88,9 @@ impl ReleaseCommand {
                     .with_force(self.force)
                     .with_allow_unrelated_path(true); // Already validated
 
+                // Build plan using database connection for reading
                 let plan = ReleasePlan::new(options)
-                    .build_plan(&db)
+                    .build_plan(db.connection())
                     .map_err(CliError::from)?;
 
                 plans.push((reservation.key().clone(), plan));
@@ -107,8 +109,11 @@ impl ReleaseCommand {
                 }
             } else {
                 for (_, plan) in plans {
-                    let mut executor = PlanExecutor::new(&mut db);
+                    // Each release in its own transaction
+                    let tx = db.begin_transaction().map_err(CliError::from)?;
+                    let mut executor = PlanExecutor::new(&tx);
                     executor.execute(&plan).map_err(CliError::from)?;
+                    tx.commit().map_err(trop::Error::from).map_err(CliError::from)?;
                     released_count += 1;
                 }
 
@@ -127,8 +132,11 @@ impl ReleaseCommand {
                 .with_force(self.force)
                 .with_allow_unrelated_path(true); // Path was resolved from CWD
 
+            // Begin transaction for single release
+            let tx = db.begin_transaction().map_err(CliError::from)?;
+
             let plan = ReleasePlan::new(options)
-                .build_plan(&db)
+                .build_plan(&tx)
                 .map_err(CliError::from)?;
 
             if self.dry_run {
@@ -145,8 +153,11 @@ impl ReleaseCommand {
                     }
                 }
             } else {
-                let mut executor = PlanExecutor::new(&mut db);
+                let mut executor = PlanExecutor::new(&tx);
                 let result = executor.execute(&plan).map_err(CliError::from)?;
+
+                // Commit transaction
+                tx.commit().map_err(trop::Error::from).map_err(CliError::from)?;
 
                 if !global.quiet {
                     if plan.actions.is_empty() {

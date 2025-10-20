@@ -363,6 +363,29 @@ impl Database {
         Ok(rows_affected > 0)
     }
 
+    /// Updates the last used timestamp for a reservation (without creating a transaction).
+    ///
+    /// This method is intended for use within an existing transaction.
+    /// For standalone use, use `update_last_used` instead.
+    pub fn update_last_used_simple(conn: &Connection, key: &ReservationKey) -> Result<bool> {
+        let now = systemtime_to_unix_secs(SystemTime::now())?;
+        let rows_affected = conn.execute(
+            UPDATE_LAST_USED,
+            params![now, key.path_as_string(), key.tag],
+        )?;
+        Ok(rows_affected > 0)
+    }
+
+    /// Deletes a reservation from the database (without creating a transaction).
+    ///
+    /// This method is intended for use within an existing transaction.
+    /// For standalone use, use `delete_reservation` instead.
+    pub fn delete_reservation_simple(conn: &Connection, key: &ReservationKey) -> Result<bool> {
+        let rows_affected =
+            conn.execute(DELETE_RESERVATION, params![key.path_as_string(), key.tag])?;
+        Ok(rows_affected > 0)
+    }
+
     /// Lists all reservations in the database.
     ///
     /// # Errors

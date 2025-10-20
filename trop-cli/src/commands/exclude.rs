@@ -104,7 +104,7 @@ impl ExcludeCommand {
 
         for port_value in ports_to_check {
             if let Ok(port) = Port::try_from(port_value) {
-                if db.is_port_reserved(port).unwrap_or(false) {
+                if Database::is_port_reserved(db.connection(), port).unwrap_or(false) {
                     return Err(CliError::InvalidArguments(format!(
                         "Port {port_value} is reserved. Use --force to override."
                     )));

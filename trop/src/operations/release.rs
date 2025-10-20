@@ -6,6 +6,7 @@
 use crate::database::Database;
 use crate::error::Result;
 use crate::ReservationKey;
+use rusqlite::Connection;
 
 use super::plan::{OperationPlan, PlanAction};
 
@@ -117,7 +118,7 @@ impl ReleasePlan {
     ///
     /// let plan = ReleasePlan::new(options).build_plan(&db).unwrap();
     /// ```
-    pub fn build_plan(&self, db: &Database) -> Result<OperationPlan> {
+    pub fn build_plan(&self, conn: &Connection) -> Result<OperationPlan> {
         let mut plan = OperationPlan::new(format!("Release reservation for {}", self.options.key));
 
         // Step 1: Validate path relationship
@@ -126,7 +127,7 @@ impl ReleasePlan {
         }
 
         // Step 2: Check if reservation exists
-        if Database::get_reservation(db.connection(), &self.options.key)?.is_some() {
+        if Database::get_reservation(conn, &self.options.key)?.is_some() {
             // Reservation exists - plan to delete it
             plan = plan.add_action(PlanAction::DeleteReservation(self.options.key.clone()));
         } else {

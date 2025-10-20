@@ -6,11 +6,11 @@
 use std::path::PathBuf;
 
 use crate::config::{Config, ConfigLoader};
-use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::port::group::{GroupAllocationRequest, ServiceAllocationRequest};
 use crate::port::occupancy::OccupancyCheckConfig;
 use crate::Port;
+use rusqlite::Connection;
 
 use super::plan::{OperationPlan, PlanAction};
 
@@ -194,7 +194,7 @@ impl ReserveGroupPlan {
     /// let planner = ReserveGroupPlan::new(options).unwrap();
     /// let plan = planner.build_plan(&db).unwrap();
     /// ```
-    pub fn build_plan(&self, _db: &Database) -> Result<OperationPlan> {
+    pub fn build_plan(&self, _conn: &Connection) -> Result<OperationPlan> {
         // Extract the reservation group from config
         let reservation_group =
             self.config

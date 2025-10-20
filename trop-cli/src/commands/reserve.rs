@@ -190,14 +190,20 @@ impl ReserveCommand {
         // 8. Open database
         let mut db = open_database(global, &config)?;
 
-        // 9. Build plan
+        // 9. Begin transaction - wraps entire operation (planning + execution)
+        let tx = db.begin_transaction().map_err(CliError::from)?;
+
+        // 10. Build plan (inside transaction - sees consistent view)
         let plan = ReservePlan::new(options, &config)
-            .build_plan(&mut db)
+            .build_plan(&tx)
             .map_err(CliError::from)?;
 
-        // 10. Execute plan
-        let mut executor = PlanExecutor::new(&mut db);
+        // 11. Execute plan (inside same transaction)
+        let mut executor = PlanExecutor::new(&tx);
         let result = executor.execute(&plan).map_err(CliError::from)?;
+
+        // 12. Commit transaction - all or nothing
+        tx.commit().map_err(trop::Error::from).map_err(CliError::from)?;
 
         // 11. Output just the port number (shell-friendly) to stdout
         if let Some(port) = result.port {

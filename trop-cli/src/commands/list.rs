@@ -11,7 +11,7 @@ use crate::utils::{
 use clap::{Args, ValueEnum};
 use std::io::Write;
 use std::path::PathBuf;
-use trop::Reservation;
+use trop::{Database, Reservation};
 
 /// Column headers for CSV/TSV output.
 const COLUMN_HEADERS: [&str; 7] = [
@@ -78,7 +78,8 @@ impl ListCommand {
         let db = open_database(global, &config)?;
 
         // 3. Query reservations
-        let mut reservations = db.list_all_reservations().map_err(CliError::from)?;
+        let mut reservations =
+            Database::list_all_reservations(db.connection()).map_err(CliError::from)?;
 
         // 4. Apply filters
         if let Some(ref project) = self.filter_project {
