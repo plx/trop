@@ -255,7 +255,7 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let key = ReservationKey::new(PathBuf::from("/path"), None).unwrap();
-    /// let reservation = Database::get_reservation(&db.conn, &key).unwrap();
+    /// let reservation = Database::get_reservation(db.connection(), &key).unwrap();
     /// ```
     pub fn get_reservation(conn: &Connection, key: &ReservationKey) -> Result<Option<Reservation>> {
         let mut stmt = conn.prepare(SELECT_RESERVATION)?;
@@ -367,6 +367,10 @@ impl Database {
     ///
     /// This method is intended for use within an existing transaction.
     /// For standalone use, use `update_last_used` instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the timestamp conversion fails or the database update fails.
     pub fn update_last_used_simple(conn: &Connection, key: &ReservationKey) -> Result<bool> {
         let now = systemtime_to_unix_secs(SystemTime::now())?;
         let rows_affected = conn.execute(
@@ -380,6 +384,10 @@ impl Database {
     ///
     /// This method is intended for use within an existing transaction.
     /// For standalone use, use `delete_reservation` instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database deletion fails.
     pub fn delete_reservation_simple(conn: &Connection, key: &ReservationKey) -> Result<bool> {
         let rows_affected =
             conn.execute(DELETE_RESERVATION, params![key.path_as_string(), key.tag])?;
@@ -401,7 +409,7 @@ impl Database {
     /// let config = DatabaseConfig::new("/tmp/trop.db");
     /// let db = Database::open(config).unwrap();
     ///
-    /// let reservations = Database::list_all_reservations(&db.conn).unwrap();
+    /// let reservations = Database::list_all_reservations(db.connection()).unwrap();
     /// for reservation in reservations {
     ///     println!("{:?}", reservation);
     /// }
@@ -438,7 +446,7 @@ impl Database {
     /// let max = Port::try_from(5100).unwrap();
     /// let range = PortRange::new(min, max).unwrap();
     ///
-    /// let reserved = Database::get_reserved_ports(&db.conn, &range).unwrap();
+    /// let reserved = Database::get_reserved_ports(db.connection(), &range).unwrap();
     /// ```
     pub fn get_reserved_ports(conn: &Connection, range: &PortRange) -> Result<Vec<Port>> {
         let mut stmt = conn.prepare(SELECT_RESERVED_PORTS)?;
@@ -472,7 +480,7 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let prefix = Path::new("/home/user/projects");
-    /// let reservations = Database::get_reservations_by_path_prefix(&db.conn, prefix).unwrap();
+    /// let reservations = Database::get_reservations_by_path_prefix(db.connection(), prefix).unwrap();
     /// ```
     pub fn get_reservations_by_path_prefix(
         conn: &Connection,
@@ -505,7 +513,7 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let max_age = Duration::from_secs(86400 * 7); // 7 days
-    /// let expired = Database::find_expired_reservations(&db.conn, max_age).unwrap();
+    /// let expired = Database::find_expired_reservations(db.connection(), max_age).unwrap();
     /// ```
     pub fn find_expired_reservations(
         conn: &Connection,
@@ -541,7 +549,7 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let port = Port::try_from(8080).unwrap();
-    /// let is_reserved = Database::is_port_reserved(&db.conn, port).unwrap();
+    /// let is_reserved = Database::is_port_reserved(db.connection(), port).unwrap();
     /// ```
     pub fn is_port_reserved(conn: &Connection, port: Port) -> Result<bool> {
         let count: i32 =
@@ -571,7 +579,7 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let port = Port::try_from(8080).unwrap();
-    /// let reservation = Database::get_reservation_by_port(&db.conn, port).unwrap();
+    /// let reservation = Database::get_reservation_by_port(db.connection(), port).unwrap();
     /// ```
     pub fn get_reservation_by_port(conn: &Connection, port: Port) -> Result<Option<Reservation>> {
         let mut stmt = conn.prepare_cached(SELECT_BY_PORT)?;
@@ -606,7 +614,7 @@ impl Database {
     /// let max = Port::try_from(5100).unwrap();
     /// let range = PortRange::new(min, max).unwrap();
     ///
-    /// let reserved = Database::get_reserved_ports_in_range(&db.conn, &range).unwrap();
+    /// let reserved = Database::get_reserved_ports_in_range(db.connection(), &range).unwrap();
     /// ```
     pub fn get_reserved_ports_in_range(conn: &Connection, range: &PortRange) -> Result<Vec<Port>> {
         // This is the same as get_reserved_ports - we just provide both names
@@ -630,7 +638,7 @@ impl Database {
     /// let config = DatabaseConfig::new("/tmp/trop.db");
     /// let db = Database::open(config).unwrap();
     ///
-    /// let projects = Database::list_projects(&db.conn).unwrap();
+    /// let projects = Database::list_projects(db.connection()).unwrap();
     /// for project in projects {
     ///     println!("{}", project);
     /// }

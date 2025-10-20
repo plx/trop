@@ -16,10 +16,8 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 use trop::{
-    Database,
-
-    PlanAction, PlanExecutor, Port, ReleaseOptions, ReleasePlan, ReservationKey, ReserveOptions,
-    ReservePlan,
+    Database, PlanAction, PlanExecutor, Port, ReleaseOptions, ReleasePlan, ReservationKey,
+    ReserveOptions, ReservePlan,
 };
 
 // Port base constants for test organization
@@ -127,7 +125,9 @@ fn test_idempotent_reserve_updates_timestamp() {
     executor.execute(&plan1).unwrap();
 
     // Get initial timestamp
-    let reservation1 = Database::get_reservation(db.connection(), &key).unwrap().unwrap();
+    let reservation1 = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
     let timestamp1 = reservation1.last_used_at();
 
     // Sleep to ensure timestamp difference (Unix timestamps have second precision)
@@ -141,7 +141,9 @@ fn test_idempotent_reserve_updates_timestamp() {
     executor.execute(&plan2).unwrap();
 
     // Get updated timestamp
-    let reservation2 = Database::get_reservation(db.connection(), &key).unwrap().unwrap();
+    let reservation2 = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
     let timestamp2 = reservation2.last_used_at();
 
     // Timestamp should have been updated
@@ -819,7 +821,9 @@ fn test_release_is_idempotent() {
     create_reservation(&mut db, reserve_opts, &create_test_config()).unwrap();
 
     // Verify it exists
-    assert!(Database::get_reservation(db.connection(), &key).unwrap().is_some());
+    assert!(Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .is_some());
 
     // First release
     let release_opts = ReleaseOptions::new(key.clone()).with_allow_unrelated_path(true);
@@ -831,10 +835,14 @@ fn test_release_is_idempotent() {
     assert!(result1.success);
 
     // Verify it's gone
-    assert!(Database::get_reservation(db.connection(), &key).unwrap().is_none());
+    assert!(Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .is_none());
 
     // Second release - should succeed idempotently
-    let plan2 = ReleasePlan::new(release_opts).build_plan(db.connection()).unwrap();
+    let plan2 = ReleasePlan::new(release_opts)
+        .build_plan(db.connection())
+        .unwrap();
 
     // Plan should have no actions, just a warning
     assert_eq!(
@@ -891,6 +899,8 @@ fn test_reserve_after_release_creates_new_reservation() {
     executor.execute(&plan2).unwrap();
 
     // Verify new reservation exists with new project
-    let reservation = Database::get_reservation(db.connection(), &key).unwrap().unwrap();
+    let reservation = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
     assert_eq!(reservation.project(), Some("project2"));
 }

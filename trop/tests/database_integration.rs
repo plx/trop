@@ -13,7 +13,6 @@ use trop::database::{Database, DatabaseConfig};
 
 use trop::{Port, PortRange, Reservation, ReservationKey};
 
-
 #[test]
 fn test_database_auto_creation() {
     let dir = tempdir().unwrap();
@@ -234,7 +233,9 @@ fn test_full_lifecycle() {
     assert!(updated);
 
     // Verify timestamp changed
-    let reloaded = Database::get_reservation(db.connection(), &key).unwrap().unwrap();
+    let reloaded = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
     assert!(reloaded.last_used_at() > loaded.last_used_at());
 
     // Check port is reserved
@@ -284,12 +285,13 @@ fn test_query_operations() {
     assert_eq!(reserved.len(), 10);
 
     // Test path prefix query
-    let prefix_results = Database::get_reservations_by_path_prefix(db.connection(), &PathBuf::from("/home/user"))
-        .unwrap();
+    let prefix_results =
+        Database::get_reservations_by_path_prefix(db.connection(), &PathBuf::from("/home/user"))
+            .unwrap();
     assert_eq!(prefix_results.len(), 10);
 
-    let prefix_results = Database::get_reservations_by_path_prefix(db.connection(), &PathBuf::from("/opt"))
-        .unwrap();
+    let prefix_results =
+        Database::get_reservations_by_path_prefix(db.connection(), &PathBuf::from("/opt")).unwrap();
     assert_eq!(prefix_results.len(), 5);
 
     // Test list all
@@ -321,14 +323,14 @@ fn test_expired_reservations() {
     db.create_reservation(&fresh_reservation).unwrap();
 
     // Find expired (older than 100 seconds)
-    let expired = Database::find_expired_reservations(db.connection(), Duration::from_secs(100))
-        .unwrap();
+    let expired =
+        Database::find_expired_reservations(db.connection(), Duration::from_secs(100)).unwrap();
     assert_eq!(expired.len(), 1);
     assert_eq!(expired[0].key().path, PathBuf::from("/old/path"));
 
     // Find with shorter max age (should find both - fresh ones are also "expired" with 0 max age)
-    let expired = Database::find_expired_reservations(db.connection(), Duration::from_secs(0))
-        .unwrap();
+    let expired =
+        Database::find_expired_reservations(db.connection(), Duration::from_secs(0)).unwrap();
     // Note: This might be 1 or 2 depending on timing. Let's just check we have at least one
     assert!(!expired.is_empty());
 }

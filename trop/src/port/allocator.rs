@@ -479,7 +479,9 @@ mod tests {
         let options = AllocationOptions::default();
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::Allocated(Port::try_from(5000).unwrap())
@@ -498,7 +500,9 @@ mod tests {
         };
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::Allocated(Port::try_from(5005).unwrap())
@@ -519,7 +523,9 @@ mod tests {
         };
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::PreferredUnavailable {
@@ -543,7 +549,9 @@ mod tests {
         };
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::PreferredUnavailable {
@@ -565,7 +573,9 @@ mod tests {
         let options = AllocationOptions::default();
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::Allocated(Port::try_from(5002).unwrap())
@@ -588,7 +598,9 @@ mod tests {
         let options = AllocationOptions::default();
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::Allocated(Port::try_from(5001).unwrap())
@@ -607,7 +619,9 @@ mod tests {
         let options = AllocationOptions::default();
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::Allocated(Port::try_from(5002).unwrap())
@@ -628,7 +642,9 @@ mod tests {
         let options = AllocationOptions::default();
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::Exhausted {
@@ -686,7 +702,9 @@ mod tests {
         };
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::Allocated(Port::try_from(5005).unwrap())
@@ -708,7 +726,9 @@ mod tests {
         };
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::Allocated(Port::try_from(5005).unwrap())
@@ -729,7 +749,9 @@ mod tests {
         };
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::PreferredUnavailable {
@@ -755,7 +777,9 @@ mod tests {
         let options = AllocationOptions::default();
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::Allocated(Port::try_from(5010).unwrap())
@@ -789,7 +813,9 @@ mod tests {
         let config = OccupancyCheckConfig::default();
 
         // Should skip 5000 (reserved), 5001 (excluded), 5002 (occupied) and allocate 5003
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::Allocated(Port::try_from(5003).unwrap())
@@ -816,7 +842,9 @@ mod tests {
         };
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::PreferredUnavailable {
@@ -935,9 +963,15 @@ mod tests {
         let config = OccupancyCheckConfig::default();
 
         // Allocate multiple times
-        let result1 = allocator.allocate_single(db.connection(), &options, &config).unwrap();
-        let result2 = allocator.allocate_single(db.connection(), &options, &config).unwrap();
-        let result3 = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result1 = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
+        let result2 = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
+        let result3 = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
 
         // All should return the same port (5001, the first available)
         assert_eq!(result1, result2);
@@ -982,7 +1016,9 @@ mod tests {
         };
         let config = OccupancyCheckConfig::default();
 
-        let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
         assert_eq!(
             result,
             AllocationResult::Allocated(Port::try_from(5005).unwrap())

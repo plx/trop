@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use crate::database::Database;
 use crate::error::Result;
+use crate::port::allocator::allocator_from_config;
 use crate::Port;
 use rusqlite::Connection;
 
@@ -217,13 +218,13 @@ impl<'conn> PlanExecutor<'conn> {
                 Ok(None)
             }
             PlanAction::AllocateGroup {
-                request: _,
-                full_config: _,
-                occupancy_config: _,
+                request,
+                full_config,
+                occupancy_config,
             } => {
-                // TODO: Update group allocation to work with transactions
-                // For now, this is not critical for the main reserve flow
-                unimplemented!("Group allocation needs to be updated for transaction support")
+                let allocator = allocator_from_config(full_config)?;
+                let result = allocator.allocate_group(self.conn, request, occupancy_config)?;
+                Ok(Some(result.allocations))
             }
         }
     }
@@ -333,7 +334,9 @@ mod tests {
         assert!(result.success);
 
         // Verify timestamp was updated
-        let loaded = Database::get_reservation(db.connection(), &key).unwrap().unwrap();
+        let loaded = Database::get_reservation(db.connection(), &key)
+            .unwrap()
+            .unwrap();
         assert!(loaded.last_used_at() > reservation.last_used_at());
     }
 
@@ -402,8 +405,12 @@ mod tests {
         assert_eq!(result.actions_taken.len(), 2);
 
         // Verify both reservations were created
-        assert!(Database::get_reservation(db.connection(), &key1).unwrap().is_some());
-        assert!(Database::get_reservation(db.connection(), &key2).unwrap().is_some());
+        assert!(Database::get_reservation(db.connection(), &key1)
+            .unwrap()
+            .is_some());
+        assert!(Database::get_reservation(db.connection(), &key2)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

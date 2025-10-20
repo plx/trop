@@ -5,9 +5,8 @@ use common::create_test_config;
 
 use common::database::create_test_database;
 use std::path::PathBuf;
-use trop::{Port, ReleaseOptions, ReleasePlan, ReservationKey, ReserveOptions, ReservePlan};
 use trop::Database;
-
+use trop::{Port, ReleaseOptions, ReleasePlan, ReservationKey, ReserveOptions, ReservePlan};
 
 #[test]
 fn test_reserve_and_release_cycle() {
@@ -45,7 +44,9 @@ fn test_reserve_and_release_cycle() {
     // Release the port
     let release_opts = ReleaseOptions::new(key.clone()).with_allow_unrelated_path(true);
 
-    let plan = ReleasePlan::new(release_opts).build_plan(db.connection()).unwrap();
+    let plan = ReleasePlan::new(release_opts)
+        .build_plan(db.connection())
+        .unwrap();
     assert_eq!(plan.actions.len(), 1);
 
     let mut executor = trop::PlanExecutor::new(db.connection());

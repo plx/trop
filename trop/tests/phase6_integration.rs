@@ -26,7 +26,6 @@ use trop::port::occupancy::{MockOccupancyChecker, OccupancyCheckConfig};
 
 use trop::{Port, PortRange, Reservation, ReservationKey};
 
-
 // Helper to create a test allocator with mock occupancy checker
 fn create_test_allocator_with_config(
     occupied: HashSet<Port>,
@@ -315,7 +314,7 @@ fn test_group_allocation_end_to_end() {
 
     let occupancy_config = OccupancyCheckConfig::default();
     let result = allocator
-        .allocate_group(&mut db, &request, &occupancy_config)
+        .allocate_group(db.connection(), &request, &occupancy_config)
         .unwrap();
 
     // Verify allocations
@@ -388,7 +387,7 @@ fn test_group_allocation_with_conflicts() {
 
     let occupancy_config = OccupancyCheckConfig::default();
     let result = allocator
-        .allocate_group(&mut db, &request, &occupancy_config)
+        .allocate_group(db.connection(), &request, &occupancy_config)
         .unwrap();
 
     // Should skip base port 5000 (because 5000+1=5001 is reserved)

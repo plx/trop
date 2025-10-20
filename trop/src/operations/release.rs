@@ -286,7 +286,8 @@ mod tests {
                 .with_allow_unrelated_path(false);
 
             // Without force, should fail path validation
-            let result_without = ReleasePlan::new(options_without_force).build_plan(db.connection());
+            let result_without =
+                ReleasePlan::new(options_without_force).build_plan(db.connection());
             assert!(
                 result_without.is_err(),
                 "unrelated path must fail without force"
@@ -331,12 +332,16 @@ mod tests {
             let options = ReleaseOptions::new(key).with_allow_unrelated_path(true);
 
             // First release - should have no actions (nothing to delete)
-            let plan1 = ReleasePlan::new(options.clone()).build_plan(db.connection()).unwrap();
+            let plan1 = ReleasePlan::new(options.clone())
+                .build_plan(db.connection())
+                .unwrap();
             assert_eq!(plan1.len(), 0);
             assert!(!plan1.warnings.is_empty());
 
             // Second release - should produce identical result
-            let plan2 = ReleasePlan::new(options).build_plan(db.connection()).unwrap();
+            let plan2 = ReleasePlan::new(options)
+                .build_plan(db.connection())
+                .unwrap();
             assert_eq!(plan2.len(), 0);
             assert!(!plan2.warnings.is_empty());
         }
@@ -376,7 +381,9 @@ mod tests {
 
         // Plan to release it
         let options = ReleaseOptions::new(key).with_allow_unrelated_path(true);
-        let plan = ReleasePlan::new(options).build_plan(db.connection()).unwrap();
+        let plan = ReleasePlan::new(options)
+            .build_plan(db.connection())
+            .unwrap();
 
         assert_eq!(plan.len(), 1);
         assert!(matches!(plan.actions[0], PlanAction::DeleteReservation(_)));
@@ -389,7 +396,9 @@ mod tests {
 
         // Plan to release a reservation that doesn't exist
         let options = ReleaseOptions::new(key).with_allow_unrelated_path(true);
-        let plan = ReleasePlan::new(options).build_plan(db.connection()).unwrap();
+        let plan = ReleasePlan::new(options)
+            .build_plan(db.connection())
+            .unwrap();
 
         // Should be empty with a warning (idempotent)
         assert_eq!(plan.len(), 0);

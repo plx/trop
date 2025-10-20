@@ -193,12 +193,12 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     /// };
     ///
     /// let occupancy_config = OccupancyCheckConfig::default();
-    /// let result = allocator.allocate_group(&mut db, &request, &occupancy_config).unwrap();
+    /// let result = allocator.allocate_group(db.connection(), &request, &occupancy_config).unwrap();
     /// println!("Allocated {} ports", result.allocations.len());
     /// ```
     pub fn allocate_group(
         &self,
-        db: &mut Database,
+        conn: &rusqlite::Connection,
         request: &GroupAllocationRequest,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<GroupAllocationResult> {
@@ -245,7 +245,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
 
             // Find a base port where all offsets are available
             let base = self
-                .find_pattern_match(&pattern, db, occupancy_config)?
+                .find_pattern_match(&pattern, conn, occupancy_config)?
                 .ok_or_else(|| Error::GroupAllocationFailed {
                     attempted: 0,
                     reason: "No base port found for offset pattern".into(),
@@ -270,7 +270,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
                 ignore_exclusions: false,
             };
 
-            match self.allocate_single(db.connection(), &options, occupancy_config)? {
+            match self.allocate_single(conn, &options, occupancy_config)? {
                 crate::port::allocator::AllocationResult::Allocated(_) => {
                     // Good, port is available
                 }
@@ -322,10 +322,10 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
             }
         }
 
-        // Atomically create all reservations
-        // If any creation fails, the transaction will roll back
+        // Create all reservations using simple create (within transaction managed by caller)
+        // If any creation fails, the transaction managed by the caller will roll back
         for reservation in &reservations_to_create {
-            db.create_reservation(reservation)?;
+            Database::create_reservation_simple(conn, reservation)?;
         }
 
         Ok(GroupAllocationResult {
@@ -345,7 +345,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     pub fn find_pattern_match(
         &self,
         pattern: &[u16],
-        db: &Database,
+        conn: &rusqlite::Connection,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<Option<Port>> {
         if pattern.is_empty() {
@@ -369,7 +369,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
             let mut all_available = true;
             for &offset in pattern {
                 if let Some(port) = base.checked_add(offset) {
-                    if self.is_port_available(port, db.connection(), occupancy_config)?
+                    if self.is_port_available(port, conn, occupancy_config)?
                         == super::allocator::PortAvailability::Available
                     {
                         // Good, continue checking
@@ -439,7 +439,7 @@ mod tests {
 
         let config = OccupancyCheckConfig::default();
         let result = allocator
-            .allocate_group(&mut db, &request, &config)
+            .allocate_group(db.connection(), &request, &config)
             .unwrap();
 
         assert_eq!(result.allocations.len(), 2);
@@ -482,7 +482,7 @@ mod tests {
 
         let config = OccupancyCheckConfig::default();
         let result = allocator
-            .allocate_group(&mut db, &request, &config)
+            .allocate_group(db.connection(), &request, &config)
             .unwrap();
 
         assert_eq!(result.allocations.len(), 3);
@@ -526,7 +526,7 @@ mod tests {
 
         let config = OccupancyCheckConfig::default();
         let result = allocator
-            .allocate_group(&mut db, &request, &config)
+            .allocate_group(db.connection(), &request, &config)
             .unwrap();
 
         let web_port = result.allocations.get("web").unwrap();
@@ -560,7 +560,7 @@ mod tests {
         let config = OccupancyCheckConfig::default();
 
         // This should fail because 8080 is outside the range
-        let result = allocator.allocate_group(&mut db, &request, &config);
+        let result = allocator.allocate_group(db.connection(), &request, &config);
         assert!(result.is_err());
     }
 
@@ -577,7 +577,7 @@ mod tests {
         };
 
         let config = OccupancyCheckConfig::default();
-        let result = allocator.allocate_group(&mut db, &request, &config);
+        let result = allocator.allocate_group(db.connection(), &request, &config);
 
         assert!(result.is_err());
         match result {
@@ -612,7 +612,7 @@ mod tests {
         };
 
         let config = OccupancyCheckConfig::default();
-        let result = allocator.allocate_group(&mut db, &request, &config);
+        let result = allocator.allocate_group(db.connection(), &request, &config);
 
         assert!(result.is_err());
         match result {
@@ -632,7 +632,7 @@ mod tests {
         let config = OccupancyCheckConfig::default();
 
         let result = allocator
-            .find_pattern_match(&pattern, &db, &config)
+            .find_pattern_match(&pattern, db.connection(), &config)
             .unwrap();
         assert_eq!(result, Some(Port::try_from(5000).unwrap()));
     }
@@ -652,7 +652,7 @@ mod tests {
         let config = OccupancyCheckConfig::default();
 
         let result = allocator
-            .find_pattern_match(&pattern, &db, &config)
+            .find_pattern_match(&pattern, db.connection(), &config)
             .unwrap();
         // Should find first available base where both 0 and 1 offsets are free
         assert_eq!(result, Some(Port::try_from(5002).unwrap()));
@@ -673,7 +673,7 @@ mod tests {
         let config = OccupancyCheckConfig::default();
 
         let result = allocator
-            .find_pattern_match(&pattern, &db, &config)
+            .find_pattern_match(&pattern, db.connection(), &config)
             .unwrap();
         // Can't use 5000 (because 5000+1=5001 is occupied), should use 5002
         assert_eq!(result, Some(Port::try_from(5002).unwrap()));
@@ -695,7 +695,7 @@ mod tests {
         let config = OccupancyCheckConfig::default();
 
         let result = allocator
-            .find_pattern_match(&pattern, &db, &config)
+            .find_pattern_match(&pattern, db.connection(), &config)
             .unwrap();
         assert_eq!(result, None);
     }
@@ -725,7 +725,7 @@ mod tests {
 
         let config = OccupancyCheckConfig::default();
         let result = allocator
-            .allocate_group(&mut db, &request, &config)
+            .allocate_group(db.connection(), &request, &config)
             .unwrap();
 
         // Verify reservations were created in database
@@ -772,7 +772,7 @@ mod tests {
 
         let config = OccupancyCheckConfig::default();
         let result = allocator
-            .allocate_group(&mut db, &request, &config)
+            .allocate_group(db.connection(), &request, &config)
             .unwrap();
 
         assert_eq!(result.allocations.len(), 2);
@@ -809,7 +809,7 @@ mod tests {
 
         let config = OccupancyCheckConfig::default();
         let result = allocator
-            .allocate_group(&mut db, &request, &config)
+            .allocate_group(db.connection(), &request, &config)
             .unwrap();
 
         assert_eq!(result.allocations.len(), 2);
@@ -828,7 +828,7 @@ mod tests {
         let config = OccupancyCheckConfig::default();
 
         let result = allocator
-            .find_pattern_match(&pattern, &db, &config)
+            .find_pattern_match(&pattern, db.connection(), &config)
             .unwrap();
         assert_eq!(result, Some(Port::try_from(5000).unwrap()));
     }
@@ -845,7 +845,7 @@ mod tests {
         let config = OccupancyCheckConfig::default();
 
         let result = allocator
-            .find_pattern_match(&pattern, &db, &config)
+            .find_pattern_match(&pattern, db.connection(), &config)
             .unwrap();
         // Should not find a match because pattern would overflow
         assert!(result.is_none());
@@ -870,7 +870,7 @@ mod tests {
         };
 
         let config = OccupancyCheckConfig::default();
-        let result = allocator.allocate_group(&mut db, &request, &config);
+        let result = allocator.allocate_group(db.connection(), &request, &config);
 
         assert!(result.is_err());
     }
@@ -886,7 +886,7 @@ mod tests {
         let config = OccupancyCheckConfig::default();
 
         let result = allocator
-            .find_pattern_match(&pattern, &db, &config)
+            .find_pattern_match(&pattern, db.connection(), &config)
             .unwrap();
         assert_eq!(result, None);
     }
@@ -908,7 +908,7 @@ mod tests {
         let config = OccupancyCheckConfig::default();
 
         let result = allocator
-            .find_pattern_match(&pattern, &db, &config)
+            .find_pattern_match(&pattern, db.connection(), &config)
             .unwrap();
         // Should skip 5000 (5000+1=5001 occupied) and 5002 (5002+1=5003 occupied)
         // First valid base is 5004
@@ -942,7 +942,7 @@ mod tests {
 
         let config = OccupancyCheckConfig::default();
         let result = allocator
-            .allocate_group(&mut db, &request, &config)
+            .allocate_group(db.connection(), &request, &config)
             .unwrap();
 
         let web_port = result.allocations.get("web").unwrap();
@@ -977,7 +977,7 @@ mod tests {
 
         let config = OccupancyCheckConfig::default();
         let result = allocator
-            .allocate_group(&mut db, &request, &config)
+            .allocate_group(db.connection(), &request, &config)
             .unwrap();
 
         assert!(result.base_port.is_some());

@@ -105,7 +105,7 @@ mod tests {
             };
 
             let config = OccupancyCheckConfig::default();
-            let result = allocator.allocate_group(&mut db, &request, &config);
+            let result = allocator.allocate_group(db.connection(), &request, &config);
 
             // Count how many reservations exist in the database for this path
             let reservations = Database::list_all_reservations(db.connection()).unwrap();
@@ -206,7 +206,7 @@ mod tests {
 
             let config = OccupancyCheckConfig::default();
 
-            if let Ok(result) = allocator.allocate_group(&mut db, &request, &config) {
+            if let Ok(result) = allocator.allocate_group(db.connection(), &request, &config) {
                 // Verify base port exists
                 let base = result.base_port.expect("Base port should exist for offset-based allocation");
 
@@ -300,7 +300,7 @@ mod tests {
             };
 
             let config = OccupancyCheckConfig::default();
-            let result = allocator.allocate_group(&mut db, &request, &config);
+            let result = allocator.allocate_group(db.connection(), &request, &config);
 
             // Should succeed and skip the blocked pattern
             prop_assert!(result.is_ok(), "Allocation should succeed by skipping occupied pattern");
@@ -381,7 +381,7 @@ mod tests {
             };
 
             let config = OccupancyCheckConfig::default();
-            let result = allocator.allocate_group(&mut db, &request, &config);
+            let result = allocator.allocate_group(db.connection(), &request, &config);
 
             // Must fail with validation error
             prop_assert!(result.is_err(), "Duplicate tags should cause error");
@@ -449,7 +449,7 @@ mod tests {
 
             let config = OccupancyCheckConfig::default();
 
-            if let Ok(result) = allocator.allocate_group(&mut db, &request, &config) {
+            if let Ok(result) = allocator.allocate_group(db.connection(), &request, &config) {
                 // Result must have exactly the same number of allocations
                 prop_assert_eq!(
                     result.allocations.len(),
@@ -528,7 +528,7 @@ mod tests {
 
             let config = OccupancyCheckConfig::default();
 
-            if let Ok(result) = allocator.allocate_group(&mut db, &request, &config) {
+            if let Ok(result) = allocator.allocate_group(db.connection(), &request, &config) {
                 // Collect all allocated ports
                 let ports: Vec<Port> = result.allocations.values().copied().collect();
 
@@ -583,7 +583,7 @@ mod tests {
             };
 
             let config = OccupancyCheckConfig::default();
-            let result = allocator.allocate_group(&mut db, &request, &config);
+            let result = allocator.allocate_group(db.connection(), &request, &config);
 
             prop_assert!(result.is_err(), "Empty services should cause error");
 
@@ -655,7 +655,7 @@ mod tests {
             };
 
             let config = OccupancyCheckConfig::default();
-            let result = allocator.allocate_group(&mut db, &request, &config);
+            let result = allocator.allocate_group(db.connection(), &request, &config);
 
             // Either succeeds (found valid base) or fails (no valid base)
             // Should never panic
@@ -739,7 +739,7 @@ mod tests {
 
             let config = OccupancyCheckConfig::default();
 
-            if let Ok(result) = allocator.allocate_group(&mut db, &request, &config) {
+            if let Ok(result) = allocator.allocate_group(db.connection(), &request, &config) {
                 // Verify preferred service got its preferred port
                 let preferred_allocated = result.allocations.get("preferred").unwrap();
                 prop_assert_eq!(
@@ -823,7 +823,7 @@ mod tests {
 
             let config = OccupancyCheckConfig::default();
 
-            if let Ok(result) = allocator.allocate_group(&mut db, &request, &config) {
+            if let Ok(result) = allocator.allocate_group(db.connection(), &request, &config) {
                 if has_zero_offset {
                     // Should have a base port
                     let base = result.base_port.expect("Should have base port");

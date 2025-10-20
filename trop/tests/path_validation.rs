@@ -19,9 +19,8 @@ use common::{create_reservation, unrelated_path};
 use std::env;
 use std::path::PathBuf;
 use trop::{
-    Database,
-
-    PlanExecutor, Port, ReleaseOptions, ReleasePlan, ReservationKey, ReserveOptions, ReservePlan,
+    Database, PlanExecutor, Port, ReleaseOptions, ReleasePlan, ReservationKey, ReserveOptions,
+    ReservePlan,
 };
 
 // Port base constants for test organization
@@ -296,7 +295,8 @@ fn test_reserve_unrelated_path_with_allow_flag() {
 
     let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(options.clone(), &create_test_config()).build_plan(db.connection());
+    let result =
+        ReservePlan::new(options.clone(), &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -330,7 +330,8 @@ fn test_reserve_unrelated_path_with_force_flag() {
 
     let options = ReserveOptions::new(key, Some(port)).with_force(true);
 
-    let result = ReservePlan::new(options.clone(), &create_test_config()).build_plan(db.connection());
+    let result =
+        ReservePlan::new(options.clone(), &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),

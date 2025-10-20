@@ -178,8 +178,8 @@ fn test_successful_group_reservation_with_offsets() {
     );
 
     // Verify database state - all reservations should exist
-    let all_reservations = Database::list_all_reservations(db.connection())
-        .expect("Failed to list reservations");
+    let all_reservations =
+        Database::list_all_reservations(db.connection()).expect("Failed to list reservations");
     assert_eq!(
         all_reservations.len(),
         3,
@@ -281,8 +281,8 @@ fn test_mixed_offset_and_preferred_ports() {
     );
 
     // Verify all reservations are in database
-    let all_reservations = Database::list_all_reservations(db.connection())
-        .expect("Failed to list reservations");
+    let all_reservations =
+        Database::list_all_reservations(db.connection()).expect("Failed to list reservations");
     assert_eq!(all_reservations.len(), 3);
 }
 
@@ -363,8 +363,8 @@ fn test_group_reservation_with_project_and_task() {
     assert!(result.success);
 
     // Verify all reservations have correct sticky fields
-    let all_reservations = Database::list_all_reservations(db.connection())
-        .expect("Failed to list reservations");
+    let all_reservations =
+        Database::list_all_reservations(db.connection()).expect("Failed to list reservations");
     for reservation in &all_reservations {
         assert_eq!(
             reservation.project(),
