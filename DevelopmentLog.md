@@ -537,3 +537,56 @@ The tests as implemented are valuable and will remain - they correctly identifie
 - **Remediation plan**: Comprehensive 9-step implementation plan created
 
 This phase demonstrates the value of thorough testing - not just verifying that code works, but verifying it implements the intended design. The concurrent tests served their purpose perfectly by revealing an architectural misalignment that requires correction.
+
+## 2025-10-20 - Phase 12.3: Documentation Generation
+
+Implemented comprehensive user-facing documentation including man pages, shell completions, practical examples, and configuration guides. This phase makes trop discoverable and usable for developers who encounter the tool for the first time, with clear onboarding and integration patterns.
+
+The implementation went smoothly with all planned components completed successfully:
+
+**Man Page Generation**:
+- Added `clap_mangen` build dependency for compile-time man page generation
+- Created `trop-cli/build.rs` (151 lines) to generate man pages during builds
+- Man pages include full command documentation, examples, and options
+- Generated files placed in `OUT_DIR` for installation
+- Build script reruns when CLI structure changes
+
+**Shell Completions**:
+- Added `clap_complete` dependency for runtime completion generation
+- Implemented `completions` subcommand supporting bash, zsh, fish, and PowerShell
+- Each completion includes installation instructions printed to stderr
+- Users can eval directly or save to completion directories
+- Completions stay synchronized with current version automatically
+
+**Practical Examples** (6 guides totaling 1,149 lines):
+- `examples/basic_usage.md` (308 lines): Getting started guide with common workflows
+- `examples/docker_example/` (264 lines): Docker Compose integration with multi-service setup
+- `examples/README.md` (35 lines): Index of all examples
+- Example configurations: `simple.toml`, `team.toml` for different use cases
+- All examples tested to ensure they work with actual trop commands
+
+**README Updates**:
+- Expanded with documentation sections, installation instructions, quick start
+- Links to examples, man pages, shell completions
+- Clear distinction between user docs (examples, man pages) and developer docs (specs, plans)
+
+The documentation infrastructure is now production-ready. Man pages build automatically, completions work across all major shells, and examples provide clear guidance for common scenarios (basic usage, team workflows, Docker integration).
+
+One minor challenge was ensuring the build.rs had access to the CLI structure. This required exposing `build_cli()` as a public function in `trop-cli/src/lib.rs`, which required creating the lib.rs file (previously only had main.rs). This is a standard pattern for CLI tools that need build-time codegen.
+
+Testing verified:
+- Man pages build successfully and render correctly
+- Completions generate for all four shells
+- Example code snippets run without errors
+- Docker example works with actual containers
+
+The documentation aligns with trop's philosophy of being a developer tool - the examples focus on practical integration patterns (justfiles, Docker Compose, shell scripts) rather than abstract feature lists. The shell completion integration makes trop feel like a first-class system tool rather than a cargo-installed binary.
+
+**Implementation Statistics**:
+- Man page infrastructure: 151 lines (build.rs)
+- Completions command: 71 lines
+- Examples and guides: 1,149 lines
+- Updated README: +144 lines of user-facing documentation
+- Total documentation additions: ~1,500 lines
+
+This phase completes Phase 12's documentation milestone. Combined with Phase 12.1 (property tests) and Phase 12.2 (concurrency tests + fixes), trop now has comprehensive testing and complete user documentation.
