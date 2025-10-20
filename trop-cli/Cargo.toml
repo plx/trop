@@ -10,6 +10,7 @@ repository = "https://github.com/prb/trop"
 [[bin]]
 name = "trop"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 trop = { path = "../trop" }
