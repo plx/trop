@@ -2295,6 +2295,7 @@ dependencies = [
  "clap_mangen",
  "csv",
  "home",
+ "libc",
  "predicates",
  "rusqlite",
  "serde",
