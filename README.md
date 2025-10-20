@@ -199,6 +199,33 @@ Run only unit tests:
 cargo test --lib
 ```
 
+### Benchmarks
+
+`trop` ships Criterion benchmarks covering both the core library and the CLI to guard against performance regressions. Run the smoke suite locally with:
+
+```bash
+cargo bench -p trop --bench operations_bench -- --sample-size 10 --measurement-time 2
+cargo bench -p trop-cli --bench cli_bench -- --sample-size 10 --measurement-time 2
+```
+
+Recent baseline numbers (median of 10 samples on a shared CI runner):
+
+| Library benchmark | Scenario | Median time |
+| ----------------- | -------- | ----------- |
+| `reserve_single` | Allocate one reservation | 476 µs 【c65538†L1-L3】 |
+| `reserve_bulk/250` | Allocate 250 sequential reservations | 213 ms 【b60669†L1-L2】 |
+| `lookup_by_path/1000` | Fetch reservation from a 1000-row dataset | 1.05 ms 【966eac†L1-L3】 |
+| `list_reservations/1000` | List 1000 reservations | 1.82 ms 【47e436†L1-L3】 |
+| `release_reservation` | Delete an existing reservation | 383 µs 【04e778†L1-L2】 |
+
+| CLI benchmark | Scenario | Median time |
+| ------------- | -------- | ----------- |
+| `cli_startup_version` | Process startup + `--version` | 8.39 ms 【4dae56†L1-L3】 |
+| `cli_reserve` | `trop reserve` against a fresh data dir | 19.9 ms 【c8c021†L1-L3】 |
+| `cli_list` | `trop list --format json` with 50 reservations | 17.8 ms 【54929a†L1-L3】 |
+
+These figures meet the phase targets (<10 ms for library reserve, <50 ms for CLI startup, <20 ms for list operations) and establish a baseline for future changes.【c65538†L1-L3】【47e436†L1-L3】【4dae56†L1-L3】
+
 Run only integration tests:
 
 ```bash
