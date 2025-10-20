@@ -96,12 +96,20 @@ impl AutoreserveCommand {
         let config = load_configuration(global)?;
         let mut db = open_database(global, &config)?;
 
-        // 6. Build plan
-        let plan = planner.build_plan(&db).map_err(CliError::from)?;
+        // 6. Begin transaction
+        let tx = db.begin_transaction().map_err(CliError::from)?;
 
-        // 7. Execute plan
-        let mut executor = PlanExecutor::new(&mut db);
+        // 7. Build plan (inside transaction)
+        let plan = planner.build_plan(&tx).map_err(CliError::from)?;
+
+        // 8. Execute plan (inside transaction)
+        let mut executor = PlanExecutor::new(&tx);
         let result = executor.execute(&plan).map_err(CliError::from)?;
+
+        // 9. Commit transaction
+        tx.commit()
+            .map_err(trop::Error::from)
+            .map_err(CliError::from)?;
 
         // 8. Extract allocated ports
         let allocated_ports = result.allocated_ports.ok_or_else(|| {

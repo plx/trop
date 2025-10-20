@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 use crate::port::allocator::{allocator_from_config, AllocationOptions, AllocationResult};
 use crate::port::occupancy::OccupancyCheckConfig;
 use crate::{Port, Reservation, ReservationKey};
+use rusqlite::Connection;
 
 use super::plan::{OperationPlan, PlanAction};
 
@@ -293,18 +294,18 @@ impl<'a> ReservePlan<'a> {
     /// let options = ReserveOptions::new(key, Some(port))
     ///     .with_allow_unrelated_path(true);
     ///
-    /// let plan = ReservePlan::new(options, &config).build_plan(&mut db).unwrap();
+    /// let plan = ReservePlan::new(options, &config).build_plan(db.connection()).unwrap();
     /// ```
-    pub fn build_plan(&self, db: &mut Database) -> Result<OperationPlan> {
+    pub fn build_plan(&self, conn: &Connection) -> Result<OperationPlan> {
         let mut plan = OperationPlan::new(format!("Reserve port for {}", self.options.key));
 
         // Step 1: Validate path relationship
         if !self.options.force && !self.options.allow_unrelated_path {
-            db.validate_path_relationship(&self.options.key.path, false)?;
+            Database::validate_path_relationship(&self.options.key.path, false)?;
         }
 
         // Step 2: Check for existing reservation
-        if let Some(existing) = db.get_reservation(&self.options.key)? {
+        if let Some(existing) = Database::get_reservation(conn, &self.options.key)? {
             // Reservation exists - validate sticky fields and return idempotent result
             self.validate_sticky_fields(&existing)?;
 
@@ -314,7 +315,7 @@ impl<'a> ReservePlan<'a> {
             return Ok(plan);
         }
 
-        // Step 3: Determine port (unified allocation with fallback and auto-cleanup)
+        // Step 3: Determine port (unified allocation with fallback)
         let port = {
             let allocator = allocator_from_config(self.config)?;
             let allocation_options = AllocationOptions {
@@ -324,7 +325,7 @@ impl<'a> ReservePlan<'a> {
             };
             let occupancy_config = self.occupancy_config();
 
-            match allocator.allocate_single(db, &allocation_options, &occupancy_config)? {
+            match allocator.allocate_single(conn, &allocation_options, &occupancy_config)? {
                 AllocationResult::Allocated(port) => port,
 
                 AllocationResult::PreferredUnavailable { .. } => {
@@ -335,61 +336,23 @@ impl<'a> ReservePlan<'a> {
                         ignore_exclusions: self.options.ignore_exclusions,
                     };
 
-                    match allocator.allocate_single(db, &fallback_options, &occupancy_config)? {
+                    match allocator.allocate_single(conn, &fallback_options, &occupancy_config)? {
                         AllocationResult::Allocated(port) => port,
-                        AllocationResult::Exhausted {
-                            cleanup_suggested, ..
-                        } => {
-                            // Attempt cleanup if suggested and enabled
-                            if cleanup_suggested && self.should_attempt_cleanup() {
-                                if let Some(port) = self.attempt_cleanup_and_retry(
-                                    db,
-                                    &allocator,
-                                    &fallback_options,
-                                    &occupancy_config,
-                                )? {
-                                    port
-                                } else {
-                                    return Err(Error::PortExhausted {
-                                        range: *allocator.range(),
-                                        tried_cleanup: true,
-                                    });
-                                }
-                            } else {
-                                return Err(Error::PortExhausted {
-                                    range: *allocator.range(),
-                                    tried_cleanup: false,
-                                });
-                            }
+                        AllocationResult::Exhausted { .. } => {
+                            return Err(Error::PortExhausted {
+                                range: *allocator.range(),
+                                tried_cleanup: false,
+                            });
                         }
                         AllocationResult::PreferredUnavailable { .. } => unreachable!(),
                     }
                 }
 
-                AllocationResult::Exhausted {
-                    cleanup_suggested, ..
-                } => {
-                    // Attempt cleanup if suggested and enabled
-                    if cleanup_suggested && self.should_attempt_cleanup() {
-                        if let Some(port) = self.attempt_cleanup_and_retry(
-                            db,
-                            &allocator,
-                            &allocation_options,
-                            &occupancy_config,
-                        )? {
-                            port
-                        } else {
-                            return Err(Error::PortExhausted {
-                                range: *allocator.range(),
-                                tried_cleanup: true,
-                            });
-                        }
-                    } else {
-                        return Err(Error::PortExhausted {
-                            range: *allocator.range(),
-                            tried_cleanup: false,
-                        });
-                    }
+                AllocationResult::Exhausted { .. } => {
+                    return Err(Error::PortExhausted {
+                        range: *allocator.range(),
+                        tried_cleanup: false,
+                    });
                 }
             }
         };
@@ -452,71 +415,6 @@ impl<'a> ReservePlan<'a> {
             self.options.force,
             self.options.allow_task_change,
         )
-    }
-
-    /// Determines if auto-cleanup should be attempted.
-    fn should_attempt_cleanup(&self) -> bool {
-        // Check if cleanup is disabled via config or CLI flags
-        let autoprune_disabled =
-            self.config.disable_autoprune.unwrap_or(false) || self.options.disable_autoprune;
-        let autoexpire_disabled =
-            self.config.disable_autoexpire.unwrap_or(false) || self.options.disable_autoexpire;
-
-        // Cleanup is worthwhile if at least one operation is enabled
-        !autoprune_disabled || !autoexpire_disabled
-    }
-
-    /// Attempts cleanup and retries allocation.
-    fn attempt_cleanup_and_retry(
-        &self,
-        db: &mut Database,
-        allocator: &crate::port::allocator::PortAllocator,
-        options: &AllocationOptions,
-        occupancy_config: &OccupancyCheckConfig,
-    ) -> Result<Option<Port>> {
-        use crate::operations::CleanupOperations;
-
-        let mut freed_any = false;
-
-        // Try pruning if enabled
-        if !self.config.disable_autoprune.unwrap_or(false) && !self.options.disable_autoprune {
-            let prune_result = CleanupOperations::prune(db, false)?;
-            freed_any |= prune_result.removed_count > 0;
-
-            if prune_result.removed_count > 0 {
-                log::info!(
-                    "Auto-pruned {} reservation(s) for non-existent paths",
-                    prune_result.removed_count
-                );
-            }
-        }
-
-        // Try expiring if enabled and configured
-        if !self.config.disable_autoexpire.unwrap_or(false) && !self.options.disable_autoexpire {
-            if let Some(ref cleanup_config) = self.config.cleanup {
-                if cleanup_config.expire_after_days.is_some() {
-                    let expire_result = CleanupOperations::expire(db, cleanup_config, false)?;
-                    freed_any |= expire_result.removed_count > 0;
-
-                    if expire_result.removed_count > 0 {
-                        log::info!(
-                            "Auto-expired {} old reservation(s)",
-                            expire_result.removed_count
-                        );
-                    }
-                }
-            }
-        }
-
-        // Retry allocation if we freed anything
-        if freed_any {
-            match allocator.allocate_single(db, options, occupancy_config)? {
-                AllocationResult::Allocated(port) => Ok(Some(port)),
-                _ => Ok(None),
-            }
-        } else {
-            Ok(None)
-        }
     }
 }
 
@@ -822,7 +720,7 @@ mod tests {
                 let options = ReserveOptions::new(key, Some(port))
                     .with_allow_unrelated_path(true);
 
-                let plan = ReservePlan::new(options, &config).build_plan(&mut db).unwrap();
+                let plan = ReservePlan::new(options, &config).build_plan(db.connection()).unwrap();
 
                 // Must generate UpdateLastUsed, not CreateReservation
                 prop_assert_eq!(plan.len(), 1);
@@ -853,11 +751,11 @@ mod tests {
                     .with_allow_unrelated_path(false);
 
                 // Without force, should fail path validation
-                let result_without = ReservePlan::new(options_without_force, &config).build_plan(&mut db);
+                let result_without = ReservePlan::new(options_without_force, &config).build_plan(db.connection());
                 prop_assert!(result_without.is_err(), "unrelated path must fail without force");
 
                 // With force, should succeed
-                let result_with = ReservePlan::new(options_with_force, &config).build_plan(&mut db);
+                let result_with = ReservePlan::new(options_with_force, &config).build_plan(db.connection());
                 prop_assert!(result_with.is_ok(), "force must override path validation");
             }
         }
@@ -879,7 +777,7 @@ mod tests {
                     .with_force(false)
                     .with_allow_unrelated_path(true);
 
-                let result = ReservePlan::new(options, &config).build_plan(&mut db);
+                let result = ReservePlan::new(options, &config).build_plan(db.connection());
                 prop_assert!(result.is_ok(), "allow_unrelated_path must enable unrelated path operations");
             }
         }
@@ -925,7 +823,7 @@ mod tests {
         let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
 
         let plan = ReservePlan::new(options, &config)
-            .build_plan(&mut db)
+            .build_plan(db.connection())
             .unwrap();
 
         assert_eq!(plan.len(), 1);
@@ -947,7 +845,7 @@ mod tests {
         let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
 
         let plan = ReservePlan::new(options, &config)
-            .build_plan(&mut db)
+            .build_plan(db.connection())
             .unwrap();
 
         // Should just update timestamp
@@ -974,7 +872,7 @@ mod tests {
             .with_project(Some("project2".to_string()))
             .with_allow_unrelated_path(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         assert!(result.is_err());
         assert!(matches!(
@@ -1003,7 +901,7 @@ mod tests {
             .with_force(true)
             .with_allow_unrelated_path(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         // Should succeed with force
         assert!(result.is_ok());
@@ -1029,7 +927,7 @@ mod tests {
             .with_allow_project_change(true)
             .with_allow_unrelated_path(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         // Should succeed with allow flag
         assert!(result.is_ok());
@@ -1054,7 +952,7 @@ mod tests {
             .with_task(Some("task2".to_string()))
             .with_allow_unrelated_path(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         assert!(result.is_err());
         assert!(matches!(
@@ -1073,7 +971,7 @@ mod tests {
         let options = ReserveOptions::new(key.clone(), None).with_allow_unrelated_path(true);
 
         let plan = ReservePlan::new(options, &config)
-            .build_plan(&mut db)
+            .build_plan(db.connection())
             .unwrap();
 
         assert_eq!(plan.len(), 1);
@@ -1120,7 +1018,7 @@ mod tests {
             .with_disable_autoprune(true)  // Disable autoclean to test exhaustion
             .with_disable_autoexpire(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::PortExhausted { .. }));
@@ -1136,7 +1034,7 @@ mod tests {
         // Don't allow unrelated path
         let options = ReserveOptions::new(key, Some(port));
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         assert!(result.is_err());
         assert!(matches!(
@@ -1155,7 +1053,7 @@ mod tests {
         // Force allows unrelated path
         let options = ReserveOptions::new(key, Some(port)).with_force(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         assert!(result.is_ok());
     }

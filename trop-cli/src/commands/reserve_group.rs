@@ -130,13 +130,21 @@ impl ReserveGroupCommand {
         let config = load_configuration(global)?;
         let mut db = open_database(global, &config)?;
 
-        // 5. Build plan
-        let planner = ReserveGroupPlan::new(options).map_err(CliError::from)?;
-        let plan = planner.build_plan(&db).map_err(CliError::from)?;
+        // 5. Begin transaction
+        let tx = db.begin_transaction().map_err(CliError::from)?;
 
-        // 6. Execute plan
-        let mut executor = PlanExecutor::new(&mut db);
+        // 6. Build plan (inside transaction)
+        let planner = ReserveGroupPlan::new(options).map_err(CliError::from)?;
+        let plan = planner.build_plan(&tx).map_err(CliError::from)?;
+
+        // 7. Execute plan (inside transaction)
+        let mut executor = PlanExecutor::new(&tx);
         let result = executor.execute(&plan).map_err(CliError::from)?;
+
+        // 8. Commit transaction
+        tx.commit()
+            .map_err(trop::Error::from)
+            .map_err(CliError::from)?;
 
         // 7. Extract allocated ports
         let allocated_ports = result.allocated_ports.ok_or_else(|| {

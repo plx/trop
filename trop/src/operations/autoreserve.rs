@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use crate::config::ConfigLoader;
-use crate::database::Database;
 use crate::error::{Error, Result};
+use rusqlite::Connection;
 
 use super::plan::OperationPlan;
 use super::reserve_group::{ReserveGroupOptions, ReserveGroupPlan};
@@ -183,9 +183,9 @@ impl AutoreservePlan {
     /// let db = Database::open(DatabaseConfig::new("/tmp/trop.db")).unwrap();
     /// let options = AutoreserveOptions::new(PathBuf::from("."));
     /// let planner = AutoreservePlan::new(options).unwrap();
-    /// let plan = planner.build_plan(&db).unwrap();
+    /// let plan = planner.build_plan(db.connection()).unwrap();
     /// ```
-    pub fn build_plan(&self, db: &Database) -> Result<OperationPlan> {
+    pub fn build_plan(&self, conn: &Connection) -> Result<OperationPlan> {
         // Build options for ReserveGroupPlan
         let reserve_group_options = ReserveGroupOptions {
             config_path: self.discovered_config_path.clone(),
@@ -198,7 +198,7 @@ impl AutoreservePlan {
 
         // Delegate to ReserveGroupPlan
         let reserve_group_plan = ReserveGroupPlan::new(reserve_group_options)?;
-        reserve_group_plan.build_plan(db)
+        reserve_group_plan.build_plan(conn)
     }
 
     /// Returns the discovered configuration file path.
@@ -340,7 +340,7 @@ reservations:
         let db = create_test_database();
         let options = AutoreserveOptions::new(temp_dir.path().to_path_buf());
         let planner = AutoreservePlan::new(options).unwrap();
-        let plan = planner.build_plan(&db).unwrap();
+        let plan = planner.build_plan(db.connection()).unwrap();
 
         assert_eq!(plan.actions.len(), 1);
     }

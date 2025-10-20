@@ -6,11 +6,11 @@
 use std::path::PathBuf;
 
 use crate::config::{Config, ConfigLoader};
-use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::port::group::{GroupAllocationRequest, ServiceAllocationRequest};
 use crate::port::occupancy::OccupancyCheckConfig;
 use crate::Port;
+use rusqlite::Connection;
 
 use super::plan::{OperationPlan, PlanAction};
 
@@ -192,9 +192,9 @@ impl ReserveGroupPlan {
     /// let db = Database::open(DatabaseConfig::new("/tmp/trop.db")).unwrap();
     /// let options = ReserveGroupOptions::new(PathBuf::from("trop.yaml"));
     /// let planner = ReserveGroupPlan::new(options).unwrap();
-    /// let plan = planner.build_plan(&db).unwrap();
+    /// let plan = planner.build_plan(db.connection()).unwrap();
     /// ```
-    pub fn build_plan(&self, _db: &Database) -> Result<OperationPlan> {
+    pub fn build_plan(&self, _conn: &Connection) -> Result<OperationPlan> {
         // Extract the reservation group from config
         let reservation_group =
             self.config
@@ -340,7 +340,7 @@ ports:
 
         let options = ReserveGroupOptions::new(config_path);
         let plan = ReserveGroupPlan::new(options).unwrap();
-        let result = plan.build_plan(&db);
+        let result = plan.build_plan(db.connection());
 
         assert!(result.is_err());
         match result {
@@ -371,7 +371,7 @@ reservations:
 
         let options = ReserveGroupOptions::new(config_path);
         let planner = ReserveGroupPlan::new(options).unwrap();
-        let plan = planner.build_plan(&db).unwrap();
+        let plan = planner.build_plan(db.connection()).unwrap();
 
         assert_eq!(plan.actions.len(), 1);
         match &plan.actions[0] {
@@ -399,7 +399,7 @@ reservations:
 
         let options = ReserveGroupOptions::new(config_path);
         let planner = ReserveGroupPlan::new(options).unwrap();
-        let result = planner.build_plan(&db);
+        let result = planner.build_plan(db.connection());
 
         assert!(result.is_err());
         match result {

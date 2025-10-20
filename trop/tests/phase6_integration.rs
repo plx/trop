@@ -7,15 +7,23 @@
 mod common;
 
 use common::database::create_test_database;
+use trop::Database;
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use trop::config::{CleanupConfig, Config, PortConfig, PortExclusion};
+
 use trop::operations::CleanupOperations;
+
 use trop::port::allocator::{AllocationOptions, AllocationResult, PortAllocator};
+
 use trop::port::exclusions::ExclusionManager;
+
 use trop::port::group::{GroupAllocationRequest, ServiceAllocationRequest};
+
 use trop::port::occupancy::{MockOccupancyChecker, OccupancyCheckConfig};
+
 use trop::{Port, PortRange, Reservation, ReservationKey};
 
 // Helper to create a test allocator with mock occupancy checker
@@ -77,7 +85,7 @@ fn test_automatic_allocation_with_no_constraints() {
     let occupancy_config = OccupancyCheckConfig::default();
 
     let result = allocator
-        .allocate_single(&db, &options, &occupancy_config)
+        .allocate_single(db.connection(), &options, &occupancy_config)
         .unwrap();
 
     // Should allocate the first port in range
@@ -95,7 +103,7 @@ fn test_automatic_allocation_with_no_constraints() {
 
     // Second allocation should get next port
     let result2 = allocator
-        .allocate_single(&db, &options, &occupancy_config)
+        .allocate_single(db.connection(), &options, &occupancy_config)
         .unwrap();
     assert_eq!(
         result2,
@@ -132,7 +140,7 @@ fn test_allocation_with_exclusions_from_config() {
     let occupancy_config = OccupancyCheckConfig::default();
 
     let result = allocator
-        .allocate_single(&db, &options, &occupancy_config)
+        .allocate_single(db.connection(), &options, &occupancy_config)
         .unwrap();
 
     // Should skip 5000, 5001, and allocate 5002 (first non-excluded)
@@ -168,7 +176,7 @@ fn test_allocation_with_occupied_ports() {
     let occupancy_config = OccupancyCheckConfig::default();
 
     let result = allocator
-        .allocate_single(&db, &options, &occupancy_config)
+        .allocate_single(db.connection(), &options, &occupancy_config)
         .unwrap();
 
     // Should skip occupied ports 5000-5002 and allocate 5003
@@ -210,7 +218,7 @@ fn test_allocation_exhaustion_and_cleanup() {
 
     // Should be exhausted
     let result = allocator
-        .allocate_single(&db, &options, &occupancy_config)
+        .allocate_single(db.connection(), &options, &occupancy_config)
         .unwrap();
     assert!(matches!(result, AllocationResult::Exhausted { .. }));
 
@@ -220,7 +228,7 @@ fn test_allocation_exhaustion_and_cleanup() {
 
     // Now allocation should succeed
     let result = allocator
-        .allocate_single(&db, &options, &occupancy_config)
+        .allocate_single(db.connection(), &options, &occupancy_config)
         .unwrap();
     assert_eq!(
         result,
@@ -259,7 +267,7 @@ fn test_cleanup_with_expiration() {
     assert_eq!(result.removed_count, 1);
 
     // Verify only fresh reservation remains
-    let all = db.list_all_reservations().unwrap();
+    let all = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].key().path, PathBuf::from("/test/fresh"));
 }
@@ -306,7 +314,7 @@ fn test_group_allocation_end_to_end() {
 
     let occupancy_config = OccupancyCheckConfig::default();
     let result = allocator
-        .allocate_group(&mut db, &request, &occupancy_config)
+        .allocate_group(db.connection(), &request, &occupancy_config)
         .unwrap();
 
     // Verify allocations
@@ -325,7 +333,7 @@ fn test_group_allocation_end_to_end() {
     );
 
     // Verify reservations in database
-    let all_reservations = db.list_all_reservations().unwrap();
+    let all_reservations = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(all_reservations.len(), 3);
 
     for reservation in &all_reservations {
@@ -379,7 +387,7 @@ fn test_group_allocation_with_conflicts() {
 
     let occupancy_config = OccupancyCheckConfig::default();
     let result = allocator
-        .allocate_group(&mut db, &request, &occupancy_config)
+        .allocate_group(db.connection(), &request, &occupancy_config)
         .unwrap();
 
     // Should skip base port 5000 (because 5000+1=5001 is reserved)
@@ -436,7 +444,7 @@ fn test_combined_constraints_integration() {
     let occupancy_config = OccupancyCheckConfig::default();
 
     let result = allocator
-        .allocate_single(&db, &options, &occupancy_config)
+        .allocate_single(db.connection(), &options, &occupancy_config)
         .unwrap();
 
     // Should skip:
@@ -492,7 +500,7 @@ fn test_autoclean_integration() {
     assert_eq!(result.total_removed, 2);
 
     // Verify only fresh reservation remains
-    let remaining = db.list_all_reservations().unwrap();
+    let remaining = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].key().tag, Some("fresh".to_string()));
 }
@@ -526,7 +534,7 @@ fn test_preferred_port_with_occupancy_check() {
     let occupancy_config = OccupancyCheckConfig::default();
 
     let result = allocator
-        .allocate_single(&db, &options, &occupancy_config)
+        .allocate_single(db.connection(), &options, &occupancy_config)
         .unwrap();
 
     assert_eq!(
@@ -545,7 +553,7 @@ fn test_preferred_port_with_occupancy_check() {
     };
 
     let result2 = allocator
-        .allocate_single(&db, &options_ignore, &occupancy_config)
+        .allocate_single(db.connection(), &options_ignore, &occupancy_config)
         .unwrap();
 
     assert_eq!(
@@ -582,7 +590,7 @@ fn test_occupancy_config_integration() {
     let options = AllocationOptions::default();
 
     let result = allocator
-        .allocate_single(&db, &options, &occ_config)
+        .allocate_single(db.connection(), &options, &occ_config)
         .unwrap();
 
     // Should skip occupied port 5000 and allocate 5001

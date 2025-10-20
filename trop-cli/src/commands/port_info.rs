@@ -4,7 +4,7 @@ use crate::error::CliError;
 use crate::utils::{format_timestamp, load_configuration, open_database, GlobalOptions};
 use clap::Args;
 use trop::port::occupancy::{OccupancyCheckConfig, PortOccupancyChecker, SystemOccupancyChecker};
-use trop::Port;
+use trop::{Database, Port};
 
 /// Display information about a specific port.
 #[derive(Args)]
@@ -29,7 +29,8 @@ impl PortInfoCommand {
         let db = open_database(global, &config)?;
 
         // 3. Find reservation for this port
-        let reservation = db.get_reservation_by_port(port).map_err(CliError::from)?;
+        let reservation =
+            Database::get_reservation_by_port(db.connection(), port).map_err(CliError::from)?;
 
         // 4. Display reservation info
         if let Some(res) = reservation {

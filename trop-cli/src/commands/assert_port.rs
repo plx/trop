@@ -3,7 +3,7 @@
 use crate::error::CliError;
 use crate::utils::{load_configuration, open_database, GlobalOptions};
 use clap::Args;
-use trop::Port;
+use trop::{Database, Port};
 
 /// Assert that a specific port is reserved.
 #[derive(Args)]
@@ -28,7 +28,7 @@ impl AssertPortCommand {
         let db = open_database(global, &config)?;
 
         // 3. Check if port is reserved (method already exists)
-        let reserved = db.is_port_reserved(port).map_err(CliError::from)?;
+        let reserved = Database::is_port_reserved(db.connection(), port).map_err(CliError::from)?;
 
         // 4. Check assertion
         let success = if self.not { !reserved } else { reserved };

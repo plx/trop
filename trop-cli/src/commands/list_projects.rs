@@ -7,6 +7,7 @@ use crate::error::CliError;
 use crate::utils::{load_configuration, open_database, GlobalOptions};
 use clap::Parser;
 use std::io::Write;
+use trop::Database;
 
 /// List all unique project identifiers.
 #[derive(Parser)]
@@ -25,7 +26,7 @@ impl ListProjectsCommand {
         let db = open_database(global, &config)?;
 
         // 3. Query projects
-        let projects = db.list_projects().map_err(CliError::from)?;
+        let projects = Database::list_projects(db.connection()).map_err(CliError::from)?;
 
         // 4. Output one per line to stdout
         let stdout = std::io::stdout();

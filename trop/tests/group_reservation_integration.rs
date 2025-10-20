@@ -18,6 +18,7 @@ use tempfile::TempDir;
 use trop::operations::{
     AutoreserveOptions, AutoreservePlan, ReserveGroupOptions, ReserveGroupPlan,
 };
+use trop::Database;
 use trop::{PlanExecutor, ReservationKey};
 
 // ============================================================================
@@ -138,9 +139,11 @@ fn test_successful_group_reservation_with_offsets() {
     // Build and execute the reservation plan
     let options = ReserveGroupOptions::new(config_path.clone());
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
-    let plan = planner.build_plan(&db).expect("Failed to build plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Failed to build plan");
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).expect("Failed to execute plan");
 
     // Verify execution succeeded
@@ -175,9 +178,8 @@ fn test_successful_group_reservation_with_offsets() {
     );
 
     // Verify database state - all reservations should exist
-    let all_reservations = db
-        .list_all_reservations()
-        .expect("Failed to list reservations");
+    let all_reservations =
+        Database::list_all_reservations(db.connection()).expect("Failed to list reservations");
     assert_eq!(
         all_reservations.len(),
         3,
@@ -235,9 +237,11 @@ fn test_mixed_offset_and_preferred_ports() {
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
-    let plan = planner.build_plan(&db).expect("Failed to build plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Failed to build plan");
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).expect("Failed to execute plan");
 
     assert!(result.success);
@@ -277,9 +281,8 @@ fn test_mixed_offset_and_preferred_ports() {
     );
 
     // Verify all reservations are in database
-    let all_reservations = db
-        .list_all_reservations()
-        .expect("Failed to list reservations");
+    let all_reservations =
+        Database::list_all_reservations(db.connection()).expect("Failed to list reservations");
     assert_eq!(all_reservations.len(), 3);
 }
 
@@ -303,9 +306,11 @@ fn test_group_reservation_preferred_ports_only() {
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
-    let plan = planner.build_plan(&db).expect("Failed to build plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Failed to build plan");
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).expect("Failed to execute plan");
 
     assert!(result.success);
@@ -348,17 +353,18 @@ fn test_group_reservation_with_project_and_task() {
 
     let options = ReserveGroupOptions::new(config_path).with_task(Some("development".to_string()));
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
-    let plan = planner.build_plan(&db).expect("Failed to build plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Failed to build plan");
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).expect("Failed to execute plan");
 
     assert!(result.success);
 
     // Verify all reservations have correct sticky fields
-    let all_reservations = db
-        .list_all_reservations()
-        .expect("Failed to list reservations");
+    let all_reservations =
+        Database::list_all_reservations(db.connection()).expect("Failed to list reservations");
     for reservation in &all_reservations {
         assert_eq!(
             reservation.project(),
@@ -397,9 +403,11 @@ fn test_database_state_after_group_reservation() {
 
     let options = ReserveGroupOptions::new(config_path).with_task(Some("test-task".to_string()));
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
-    let plan = planner.build_plan(&db).expect("Failed to build plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Failed to build plan");
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).expect("Failed to execute plan");
 
     assert!(result.success);
@@ -411,8 +419,7 @@ fn test_database_state_after_group_reservation() {
         let key = ReservationKey::new(temp_dir.path().to_path_buf(), Some(tag.clone()))
             .expect("Should create valid key");
 
-        let reservation = db
-            .get_reservation(&key)
+        let reservation = Database::get_reservation(db.connection(), &key)
             .expect("Database query should succeed")
             .expect("Reservation should exist");
 
@@ -425,7 +432,7 @@ fn test_database_state_after_group_reservation() {
     // Verify port occupancy - allocated ports should be marked as reserved
     for port in allocated_ports.values() {
         assert!(
-            db.is_port_reserved(*port)
+            Database::is_port_reserved(db.connection(), *port)
                 .expect("Port occupancy check should succeed"),
             "Allocated port {port} should be reserved in database"
         );
@@ -454,16 +461,20 @@ fn test_allocated_ports_not_reused() {
     // Allocate first group
     let options1 = ReserveGroupOptions::new(config1_path);
     let planner1 = ReserveGroupPlan::new(options1).expect("Failed to create plan");
-    let plan1 = planner1.build_plan(&db).expect("Failed to build plan");
-    let mut executor1 = PlanExecutor::new(&mut db);
+    let plan1 = planner1
+        .build_plan(db.connection())
+        .expect("Failed to build plan");
+    let mut executor1 = PlanExecutor::new(db.connection());
     let result1 = executor1.execute(&plan1).expect("Failed to execute plan");
     let ports1 = result1.allocated_ports.expect("Should have ports");
 
     // Allocate second group
     let options2 = ReserveGroupOptions::new(config2_path);
     let planner2 = ReserveGroupPlan::new(options2).expect("Failed to create plan");
-    let plan2 = planner2.build_plan(&db).expect("Failed to build plan");
-    let mut executor2 = PlanExecutor::new(&mut db);
+    let plan2 = planner2
+        .build_plan(db.connection())
+        .expect("Failed to build plan");
+    let mut executor2 = PlanExecutor::new(db.connection());
     let result2 = executor2.execute(&plan2).expect("Failed to execute plan");
     let ports2 = result2.allocated_ports.expect("Should have ports");
 
@@ -475,7 +486,7 @@ fn test_allocated_ports_not_reused() {
     }
 
     // Verify both groups are in database
-    let all_reservations = db.list_all_reservations().expect("Should list");
+    let all_reservations = Database::list_all_reservations(db.connection()).expect("Should list");
     assert_eq!(
         all_reservations.len(),
         4,
@@ -505,9 +516,11 @@ fn test_autoreserve_discovers_config_in_current_dir() {
 
     let options = AutoreserveOptions::new(temp_dir.path().to_path_buf());
     let planner = AutoreservePlan::new(options).expect("Should discover config");
-    let plan = planner.build_plan(&db).expect("Should build plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).expect("Should execute");
 
     assert!(result.success);
@@ -546,14 +559,16 @@ fn test_autoreserve_discovers_config_from_parent() {
         "Discovered config should be in parent directory"
     );
 
-    let plan = planner.build_plan(&db).expect("Should build plan");
-    let mut executor = PlanExecutor::new(&mut db);
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).expect("Should execute");
 
     assert!(result.success);
 
     // Verify reservations use config's parent directory as base path
-    let all_reservations = db.list_all_reservations().expect("Should list");
+    let all_reservations = Database::list_all_reservations(db.connection()).expect("Should list");
     for reservation in &all_reservations {
         assert_eq!(
             reservation.key().path,
@@ -614,14 +629,16 @@ reservations:
         "Should prefer trop.local.yaml over trop.yaml"
     );
 
-    let plan = planner.build_plan(&db).expect("Should build plan");
-    let mut executor = PlanExecutor::new(&mut db);
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).expect("Should execute");
 
     assert!(result.success);
 
     // Verify reservation uses local config's project
-    let all_reservations = db.list_all_reservations().expect("Should list");
+    let all_reservations = Database::list_all_reservations(db.connection()).expect("Should list");
     assert_eq!(all_reservations.len(), 1);
     assert_eq!(
         all_reservations[0].project(),
@@ -686,9 +703,11 @@ fn test_allow_unrelated_path_flag() {
     // Test with flag enabled
     let options = ReserveGroupOptions::new(config_path).with_allow_unrelated_path(true);
     let planner = ReserveGroupPlan::new(options).expect("Should create plan");
-    let plan = planner.build_plan(&db).expect("Should build plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).expect("Should execute");
 
     assert!(result.success, "Should succeed with flag enabled");
@@ -713,9 +732,11 @@ fn test_allow_project_change_flag() {
 
     let options = ReserveGroupOptions::new(config_path).with_allow_project_change(true);
     let planner = ReserveGroupPlan::new(options).expect("Should create plan");
-    let plan = planner.build_plan(&db).expect("Should build plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).expect("Should execute");
 
     assert!(result.success);
@@ -739,9 +760,11 @@ fn test_allow_task_change_flag() {
         .with_task(Some("task1".to_string()))
         .with_allow_task_change(true);
     let planner = ReserveGroupPlan::new(options).expect("Should create plan");
-    let plan = planner.build_plan(&db).expect("Should build plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).expect("Should execute");
 
     assert!(result.success);
@@ -764,9 +787,11 @@ fn test_force_flag_behavior() {
 
     let options = ReserveGroupOptions::new(config_path).with_force(true);
     let planner = ReserveGroupPlan::new(options).expect("Should create plan");
-    let plan = planner.build_plan(&db).expect("Should build plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).expect("Should execute");
 
     assert!(result.success, "Should succeed with force flag");
@@ -799,7 +824,7 @@ ports:
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
-    let result = planner.build_plan(&db);
+    let result = planner.build_plan(db.connection());
 
     assert!(result.is_err(), "Should fail without reservations");
     let err = result.unwrap_err();
@@ -835,7 +860,7 @@ reservations:
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
-    let result = planner.build_plan(&db);
+    let result = planner.build_plan(db.connection());
 
     assert!(result.is_err(), "Should fail with empty services");
     let err = result.unwrap_err();
@@ -872,7 +897,7 @@ reservations:
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
-    let result = planner.build_plan(&db);
+    let result = planner.build_plan(db.connection());
 
     assert!(
         result.is_err(),
@@ -914,9 +939,11 @@ reservations:
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
-    let plan = planner.build_plan(&db).expect("Should build plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan);
 
     assert!(
@@ -925,7 +952,8 @@ reservations:
     );
 
     // Verify no reservations were created (atomicity)
-    let all_reservations = db.list_all_reservations().expect("Should be able to list");
+    let all_reservations =
+        Database::list_all_reservations(db.connection()).expect("Should be able to list");
     assert_eq!(
         all_reservations.len(),
         0,
@@ -962,8 +990,10 @@ reservations:
     let first_path = create_config_file(temp_dir.path(), "first.yaml", first_config);
     let first_options = ReserveGroupOptions::new(first_path);
     let first_planner = ReserveGroupPlan::new(first_options).expect("Should create planner");
-    let first_plan = first_planner.build_plan(&db).expect("Should build plan");
-    let mut first_executor = PlanExecutor::new(&mut db);
+    let first_plan = first_planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
+    let mut first_executor = PlanExecutor::new(db.connection());
     let first_result = first_executor
         .execute(&first_plan)
         .expect("First allocation should succeed");
@@ -987,8 +1017,10 @@ reservations:
     let second_path = create_config_file(temp_dir.path(), "second.yaml", &second_config);
     let second_options = ReserveGroupOptions::new(second_path);
     let second_planner = ReserveGroupPlan::new(second_options).expect("Should create planner");
-    let second_plan = second_planner.build_plan(&db).expect("Should build plan");
-    let mut second_executor = PlanExecutor::new(&mut db);
+    let second_plan = second_planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
+    let mut second_executor = PlanExecutor::new(db.connection());
     let result = second_executor.execute(&second_plan);
 
     assert!(
@@ -997,7 +1029,8 @@ reservations:
     );
 
     // Verify only first group's reservations exist
-    let all_reservations = db.list_all_reservations().expect("Should be able to list");
+    let all_reservations =
+        Database::list_all_reservations(db.connection()).expect("Should be able to list");
     assert_eq!(
         all_reservations.len(),
         1,
@@ -1054,8 +1087,10 @@ reservations:
     let blocking_path = create_config_file(blocking_dir.path(), "trop.yaml", blocking_config);
     let blocking_options = ReserveGroupOptions::new(blocking_path);
     let blocking_planner = ReserveGroupPlan::new(blocking_options).expect("Should create planner");
-    let blocking_plan = blocking_planner.build_plan(&db).expect("Should build plan");
-    let mut blocking_executor = PlanExecutor::new(&mut db);
+    let blocking_plan = blocking_planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
+    let mut blocking_executor = PlanExecutor::new(db.connection());
     blocking_executor
         .execute(&blocking_plan)
         .expect("Blocking allocation should succeed");
@@ -1063,8 +1098,10 @@ reservations:
     // Now try to allocate the pattern - should fail
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
-    let plan = planner.build_plan(&db).expect("Should build plan");
-    let mut executor = PlanExecutor::new(&mut db);
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan);
 
     assert!(
@@ -1102,17 +1139,20 @@ fn test_dry_run_no_database_changes() {
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
-    let plan = planner.build_plan(&db).expect("Should build plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
 
     // Execute in dry-run mode
-    let mut executor = PlanExecutor::new(&mut db).dry_run();
+    let mut executor = PlanExecutor::new(db.connection()).dry_run();
     let result = executor.execute(&plan).expect("Dry-run should succeed");
 
     assert!(result.success, "Dry-run should succeed");
     assert!(result.dry_run, "Result should indicate dry-run mode");
 
     // Verify no reservations were created
-    let all_reservations = db.list_all_reservations().expect("Should be able to list");
+    let all_reservations =
+        Database::list_all_reservations(db.connection()).expect("Should be able to list");
     assert_eq!(
         all_reservations.len(),
         0,
@@ -1157,9 +1197,11 @@ reservations:
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
-    let plan = planner.build_plan(&db).expect("Should build plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).expect("Should execute");
 
     assert!(result.success);
@@ -1219,9 +1261,11 @@ reservations:
 
         let options = ReserveGroupOptions::new(config_path);
         let planner = ReserveGroupPlan::new(options).expect("Should create planner");
-        let plan = planner.build_plan(&db).expect("Should build plan");
+        let plan = planner
+            .build_plan(db.connection())
+            .expect("Should build plan");
 
-        let mut executor = PlanExecutor::new(&mut db);
+        let mut executor = PlanExecutor::new(db.connection());
         let result = executor.execute(&plan).expect("Should execute");
 
         assert!(result.success, "Group {i} should succeed");
@@ -1231,7 +1275,7 @@ reservations:
     }
 
     // Verify all reservations exist
-    let all_reservations = db.list_all_reservations().expect("Should list");
+    let all_reservations = Database::list_all_reservations(db.connection()).expect("Should list");
     assert_eq!(
         all_reservations.len(),
         6,
