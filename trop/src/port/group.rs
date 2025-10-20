@@ -729,7 +729,7 @@ mod tests {
             .unwrap();
 
         // Verify reservations were created in database
-        let all_reservations = db.list_all_reservations().unwrap();
+        let all_reservations = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all_reservations.len(), 2);
 
         for reservation in &all_reservations {

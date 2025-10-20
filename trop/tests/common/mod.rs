@@ -241,8 +241,8 @@ pub fn create_reservation(
     options: ReserveOptions,
     config: &Config,
 ) -> Result<trop::ExecutionResult, trop::Error> {
-    let plan = ReservePlan::new(options, config).build_plan(db)?;
-    let mut executor = PlanExecutor::new(db);
+    let plan = ReservePlan::new(options, config).build_plan(db.connection())?;
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan)
 }
 
@@ -268,8 +268,8 @@ pub fn release_reservation(
     db: &mut trop::database::Database,
     options: ReleaseOptions,
 ) -> Result<trop::ExecutionResult, trop::Error> {
-    let plan = ReleasePlan::new(options).build_plan(db)?;
-    let mut executor = PlanExecutor::new(db);
+    let plan = ReleasePlan::new(options).build_plan(db.connection())?;
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan)
 }
 

@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 use trop::{
+    Database,
+
     PlanAction, PlanExecutor, Port, ReleaseOptions, ReleasePlan, ReservationKey, ReserveOptions,
     ReservePlan,
 };
@@ -50,9 +52,9 @@ fn test_idempotent_reserve_returns_same_port() {
 
     // First reservation
     let plan1 = ReservePlan::new(options.clone(), &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result1 = executor.execute(&plan1).unwrap();
     assert!(result1.success);
     assert!(
@@ -66,9 +68,9 @@ fn test_idempotent_reserve_returns_same_port() {
 
     // Second reservation with identical parameters
     let plan2 = ReservePlan::new(options.clone(), &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result2 = executor.execute(&plan2).unwrap();
     assert!(result2.success);
     assert_eq!(
@@ -79,9 +81,9 @@ fn test_idempotent_reserve_returns_same_port() {
 
     // Third reservation - testing multiple repetitions
     let plan3 = ReservePlan::new(options, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result3 = executor.execute(&plan3).unwrap();
     assert!(result3.success);
     assert_eq!(
@@ -95,7 +97,7 @@ fn test_idempotent_reserve_returns_same_port() {
     assert_eq!(result2.port, result3.port);
 
     // Verify only one reservation exists in the database
-    let all = db.list_all_reservations().unwrap();
+    let all = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(
         all.len(),
         1,
@@ -119,13 +121,13 @@ fn test_idempotent_reserve_updates_timestamp() {
 
     // First reservation
     let plan1 = ReservePlan::new(options.clone(), &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan1).unwrap();
 
     // Get initial timestamp
-    let reservation1 = db.get_reservation(&key).unwrap().unwrap();
+    let reservation1 = Database::get_reservation(db.connection(), &key).unwrap().unwrap();
     let timestamp1 = reservation1.last_used_at();
 
     // Sleep to ensure timestamp difference (Unix timestamps have second precision)
@@ -133,13 +135,13 @@ fn test_idempotent_reserve_updates_timestamp() {
 
     // Second reservation
     let plan2 = ReservePlan::new(options, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan2).unwrap();
 
     // Get updated timestamp
-    let reservation2 = db.get_reservation(&key).unwrap().unwrap();
+    let reservation2 = Database::get_reservation(db.connection(), &key).unwrap().unwrap();
     let timestamp2 = reservation2.last_used_at();
 
     // Timestamp should have been updated
@@ -165,7 +167,7 @@ fn test_idempotent_reserve_action_is_update_last_used() {
 
     // First reservation - should create
     let plan1 = ReservePlan::new(options.clone(), &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
     assert_eq!(plan1.actions.len(), 1);
     assert!(
@@ -174,12 +176,12 @@ fn test_idempotent_reserve_action_is_update_last_used() {
     );
 
     // Execute the creation
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan1).unwrap();
 
     // Second reservation - should only update timestamp
     let plan2 = ReservePlan::new(options, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
     assert_eq!(plan2.actions.len(), 1);
     assert!(
@@ -215,9 +217,9 @@ fn test_idempotent_reserve_with_different_tags() {
     ] {
         let opts = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
         let plan = ReservePlan::new(opts, &create_test_config())
-            .build_plan(&mut db)
+            .build_plan(db.connection())
             .unwrap();
-        let mut executor = PlanExecutor::new(&mut db);
+        let mut executor = PlanExecutor::new(db.connection());
         executor.execute(&plan).unwrap();
     }
 
@@ -229,20 +231,20 @@ fn test_idempotent_reserve_with_different_tags() {
     ] {
         let opts = ReserveOptions::new(key, Some(expected_port)).with_allow_unrelated_path(true);
         let plan = ReservePlan::new(opts, &create_test_config())
-            .build_plan(&mut db)
+            .build_plan(db.connection())
             .unwrap();
 
         // Should be UpdateLastUsed, not CreateReservation
         assert_eq!(plan.actions.len(), 1);
         assert!(matches!(plan.actions[0], PlanAction::UpdateLastUsed(_)));
 
-        let mut executor = PlanExecutor::new(&mut db);
+        let mut executor = PlanExecutor::new(db.connection());
         let result = executor.execute(&plan).unwrap();
         assert_eq!(result.port, Some(expected_port));
     }
 
     // All three should still exist
-    let all = db.list_all_reservations().unwrap();
+    let all = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(all.len(), 3);
 }
 
@@ -268,9 +270,9 @@ fn test_cannot_change_project_without_permission() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Try to change project to "project2" without permission
@@ -278,7 +280,7 @@ fn test_cannot_change_project_without_permission() {
         .with_project(Some("project2".to_string()))
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(result.is_err(), "Should fail to change project field");
     let err = result.unwrap_err();
@@ -312,9 +314,9 @@ fn test_can_change_project_with_force_flag() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Change project with force flag
@@ -323,7 +325,7 @@ fn test_can_change_project_with_force_flag() {
         .with_force(true)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -352,9 +354,9 @@ fn test_can_change_project_with_allow_project_change_flag() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Change project with specific allow flag
@@ -363,7 +365,7 @@ fn test_can_change_project_with_allow_project_change_flag() {
         .with_allow_project_change(true)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -390,9 +392,9 @@ fn test_can_keep_same_project_value() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Reserve again with same project - should succeed
@@ -400,7 +402,7 @@ fn test_can_keep_same_project_value() {
         .with_project(Some("project1".to_string()))
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -425,9 +427,9 @@ fn test_cannot_change_project_from_some_to_none() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Try to remove project (change to None)
@@ -435,7 +437,7 @@ fn test_cannot_change_project_from_some_to_none() {
         .with_project(None)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(result.is_err(), "Should block change from Some to None");
     assert!(matches!(
@@ -460,9 +462,9 @@ fn test_cannot_change_project_from_none_to_some() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Try to add project
@@ -470,7 +472,7 @@ fn test_cannot_change_project_from_none_to_some() {
         .with_project(Some("project1".to_string()))
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(result.is_err(), "Should block change from None to Some");
     assert!(matches!(
@@ -495,9 +497,9 @@ fn test_can_keep_project_as_none() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Reserve again with no project - should succeed
@@ -505,7 +507,7 @@ fn test_can_keep_project_as_none() {
         .with_project(None)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(result.is_ok(), "Should allow keeping project as None");
 }
@@ -530,9 +532,9 @@ fn test_cannot_change_task_without_permission() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Try to change task
@@ -540,7 +542,7 @@ fn test_cannot_change_task_without_permission() {
         .with_task(Some("task2".to_string()))
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(result.is_err(), "Should fail to change task field");
     let err = result.unwrap_err();
@@ -564,9 +566,9 @@ fn test_can_change_task_with_force_flag() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Change task with force
@@ -575,7 +577,7 @@ fn test_can_change_task_with_force_flag() {
         .with_force(true)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -597,9 +599,9 @@ fn test_can_change_task_with_allow_task_change_flag() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Change task with specific allow flag
@@ -608,7 +610,7 @@ fn test_can_change_task_with_allow_task_change_flag() {
         .with_allow_task_change(true)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -630,9 +632,9 @@ fn test_can_keep_same_task_value() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Reserve again with same task
@@ -640,7 +642,7 @@ fn test_can_keep_same_task_value() {
         .with_task(Some("task1".to_string()))
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(result.is_ok(), "Should allow keeping the same task value");
 }
@@ -667,9 +669,9 @@ fn test_cannot_change_both_project_and_task() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Try to change both
@@ -678,7 +680,7 @@ fn test_cannot_change_both_project_and_task() {
         .with_task(Some("task2".to_string()))
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(result.is_err(), "Should fail when changing both fields");
     assert!(matches!(
@@ -702,9 +704,9 @@ fn test_can_change_both_with_force() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Change both with force
@@ -714,7 +716,7 @@ fn test_can_change_both_with_force() {
         .with_force(true)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -737,9 +739,9 @@ fn test_can_change_both_with_individual_flags() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Change both with individual allow flags
@@ -750,7 +752,7 @@ fn test_can_change_both_with_individual_flags() {
         .with_allow_task_change(true)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -774,9 +776,9 @@ fn test_can_change_project_but_not_task_with_selective_flags() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(opts, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Try to change both but only allow project change
@@ -786,7 +788,7 @@ fn test_can_change_project_but_not_task_with_selective_flags() {
         .with_allow_project_change(true) // Only project allowed
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     // Should fail because task change is not allowed
     assert!(result.is_err(), "Should fail on task change");
@@ -817,22 +819,22 @@ fn test_release_is_idempotent() {
     create_reservation(&mut db, reserve_opts, &create_test_config()).unwrap();
 
     // Verify it exists
-    assert!(db.get_reservation(&key).unwrap().is_some());
+    assert!(Database::get_reservation(db.connection(), &key).unwrap().is_some());
 
     // First release
     let release_opts = ReleaseOptions::new(key.clone()).with_allow_unrelated_path(true);
     let plan1 = ReleasePlan::new(release_opts.clone())
-        .build_plan(&db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result1 = executor.execute(&plan1).unwrap();
     assert!(result1.success);
 
     // Verify it's gone
-    assert!(db.get_reservation(&key).unwrap().is_none());
+    assert!(Database::get_reservation(db.connection(), &key).unwrap().is_none());
 
     // Second release - should succeed idempotently
-    let plan2 = ReleasePlan::new(release_opts).build_plan(&db).unwrap();
+    let plan2 = ReleasePlan::new(release_opts).build_plan(db.connection()).unwrap();
 
     // Plan should have no actions, just a warning
     assert_eq!(
@@ -843,7 +845,7 @@ fn test_release_is_idempotent() {
     assert_eq!(plan2.warnings.len(), 1, "Should have a warning");
     assert!(plan2.warnings[0].contains("No reservation found"));
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let result2 = executor.execute(&plan2).unwrap();
     assert!(result2.success, "Second release should succeed");
 }
@@ -875,7 +877,7 @@ fn test_reserve_after_release_creates_new_reservation() {
         .with_allow_unrelated_path(true);
 
     let plan2 = ReservePlan::new(reserve_opts2, &create_test_config())
-        .build_plan(&mut db)
+        .build_plan(db.connection())
         .unwrap();
 
     // Should be CreateReservation, not UpdateLastUsed
@@ -885,10 +887,10 @@ fn test_reserve_after_release_creates_new_reservation() {
         "After release, should create new reservation"
     );
 
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan2).unwrap();
 
     // Verify new reservation exists with new project
-    let reservation = db.get_reservation(&key).unwrap().unwrap();
+    let reservation = Database::get_reservation(db.connection(), &key).unwrap().unwrap();
     assert_eq!(reservation.project(), Some("project2"));
 }

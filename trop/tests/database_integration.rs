@@ -10,7 +10,9 @@ use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
 
 use trop::database::{Database, DatabaseConfig};
+
 use trop::{Port, PortRange, Reservation, ReservationKey};
+
 
 #[test]
 fn test_database_auto_creation() {
@@ -102,7 +104,7 @@ fn test_concurrent_write_operations() {
     // Verify all reservations were created
     let config = DatabaseConfig::new(&db_path);
     let db = Database::open(config).unwrap();
-    let all = db.list_all_reservations().unwrap();
+    let all = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(all.len(), 10);
 }
 
@@ -134,7 +136,7 @@ fn test_concurrent_read_write_operations() {
             let config = DatabaseConfig::new(path);
             let db = Database::open(config)?;
             for _ in 0..10 {
-                let _ = db.list_all_reservations()?;
+                let _ = Database::list_all_reservations(db.connection())?;
                 thread::sleep(Duration::from_millis(1));
             }
             Ok(())
@@ -164,7 +166,7 @@ fn test_concurrent_read_write_operations() {
     // Verify final state
     let config = DatabaseConfig::new(&db_path);
     let db = Database::open(config).unwrap();
-    let all = db.list_all_reservations().unwrap();
+    let all = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(all.len(), 10);
 }
 
@@ -196,7 +198,7 @@ fn test_transaction_atomicity_batch_create() {
     db.batch_create_reservations(&reservations).unwrap();
 
     // Verify both were created
-    let all = db.list_all_reservations().unwrap();
+    let all = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(all.len(), 2);
 }
 
@@ -219,7 +221,7 @@ fn test_full_lifecycle() {
     db.create_reservation(&reservation).unwrap();
 
     // Read it back
-    let loaded = db.get_reservation(&key).unwrap();
+    let loaded = Database::get_reservation(db.connection(), &key).unwrap();
     assert!(loaded.is_some());
     let loaded = loaded.unwrap();
     assert_eq!(loaded.port(), port);
@@ -232,22 +234,22 @@ fn test_full_lifecycle() {
     assert!(updated);
 
     // Verify timestamp changed
-    let reloaded = db.get_reservation(&key).unwrap().unwrap();
+    let reloaded = Database::get_reservation(db.connection(), &key).unwrap().unwrap();
     assert!(reloaded.last_used_at() > loaded.last_used_at());
 
     // Check port is reserved
-    assert!(db.is_port_reserved(port).unwrap());
+    assert!(Database::is_port_reserved(db.connection(), port).unwrap());
 
     // Delete it
     let deleted = db.delete_reservation(&key).unwrap();
     assert!(deleted);
 
     // Verify it's gone
-    let gone = db.get_reservation(&key).unwrap();
+    let gone = Database::get_reservation(db.connection(), &key).unwrap();
     assert!(gone.is_none());
 
     // Port should no longer be reserved
-    assert!(!db.is_port_reserved(port).unwrap());
+    assert!(!Database::is_port_reserved(db.connection(), port).unwrap());
 }
 
 #[test]
@@ -278,22 +280,20 @@ fn test_query_operations() {
     let min = Port::try_from(5000).unwrap();
     let max = Port::try_from(5009).unwrap();
     let range = PortRange::new(min, max).unwrap();
-    let reserved = db.get_reserved_ports(&range).unwrap();
+    let reserved = Database::get_reserved_ports(db.connection(), &range).unwrap();
     assert_eq!(reserved.len(), 10);
 
     // Test path prefix query
-    let prefix_results = db
-        .get_reservations_by_path_prefix(&PathBuf::from("/home/user"))
+    let prefix_results = Database::get_reservations_by_path_prefix(db.connection(), &PathBuf::from("/home/user"))
         .unwrap();
     assert_eq!(prefix_results.len(), 10);
 
-    let prefix_results = db
-        .get_reservations_by_path_prefix(&PathBuf::from("/opt"))
+    let prefix_results = Database::get_reservations_by_path_prefix(db.connection(), &PathBuf::from("/opt"))
         .unwrap();
     assert_eq!(prefix_results.len(), 5);
 
     // Test list all
-    let all = db.list_all_reservations().unwrap();
+    let all = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(all.len(), 15);
 }
 
@@ -321,15 +321,13 @@ fn test_expired_reservations() {
     db.create_reservation(&fresh_reservation).unwrap();
 
     // Find expired (older than 100 seconds)
-    let expired = db
-        .find_expired_reservations(Duration::from_secs(100))
+    let expired = Database::find_expired_reservations(db.connection(), Duration::from_secs(100))
         .unwrap();
     assert_eq!(expired.len(), 1);
     assert_eq!(expired[0].key().path, PathBuf::from("/old/path"));
 
     // Find with shorter max age (should find both - fresh ones are also "expired" with 0 max age)
-    let expired = db
-        .find_expired_reservations(Duration::from_secs(0))
+    let expired = Database::find_expired_reservations(db.connection(), Duration::from_secs(0))
         .unwrap();
     // Note: This might be 1 or 2 depending on timing. Let's just check we have at least one
     assert!(!expired.is_empty());
@@ -353,7 +351,7 @@ fn test_batch_operations() {
 
     db.batch_create_reservations(&reservations).unwrap();
 
-    let all = db.list_all_reservations().unwrap();
+    let all = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(all.len(), 20);
 
     // Batch delete half of them
@@ -364,7 +362,7 @@ fn test_batch_operations() {
     let deleted = db.batch_delete_reservations(&keys_to_delete).unwrap();
     assert_eq!(deleted, 10);
 
-    let remaining = db.list_all_reservations().unwrap();
+    let remaining = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(remaining.len(), 10);
 }
 
@@ -389,7 +387,7 @@ fn test_database_reopening() {
         let config = DatabaseConfig::new(&db_path);
         let db = Database::open(config).unwrap();
 
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].port().value(), 8080);
     }

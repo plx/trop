@@ -145,7 +145,7 @@ mod tests {
         db.batch_create_reservations(&reservations).unwrap();
 
         // Verify all were created
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 3);
     }
 
@@ -156,7 +156,7 @@ mod tests {
         let reservations: Vec<Reservation> = vec![];
         db.batch_create_reservations(&reservations).unwrap();
 
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 0);
     }
 
@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(deleted, 2);
 
         // Verify only one remains
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].key().path, PathBuf::from("/path3"));
     }
@@ -215,7 +215,7 @@ mod tests {
         let deleted = db.batch_delete_reservations(&keys).unwrap();
         assert_eq!(deleted, 1);
 
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 0);
     }
 }

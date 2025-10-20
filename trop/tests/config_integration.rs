@@ -29,6 +29,7 @@ use trop::config::{
     ReservationGroup, ServiceDefinition,
 };
 use trop::error::Error;
+use trop::Database;
 
 // ============================================================================
 // Test Utilities

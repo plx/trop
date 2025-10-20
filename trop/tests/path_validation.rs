@@ -19,6 +19,8 @@ use common::{create_reservation, unrelated_path};
 use std::env;
 use std::path::PathBuf;
 use trop::{
+    Database,
+
     PlanExecutor, Port, ReleaseOptions, ReleasePlan, ReservationKey, ReserveOptions, ReservePlan,
 };
 
@@ -49,7 +51,7 @@ fn test_reserve_current_directory_allowed() {
     // Should succeed without any special flags
     let options = ReserveOptions::new(key, Some(port));
 
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -73,7 +75,7 @@ fn test_reserve_subdirectory_allowed() {
 
     let options = ReserveOptions::new(key, Some(port));
 
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -99,7 +101,7 @@ fn test_reserve_parent_directory_allowed() {
 
         let options = ReserveOptions::new(key, Some(port));
 
-        let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
+        let result = ReservePlan::new(options, &create_test_config()).build_plan(db.connection());
 
         assert!(
             result.is_ok(),
@@ -123,7 +125,7 @@ fn test_reserve_nested_subdirectory_allowed() {
 
     let options = ReserveOptions::new(key, Some(port));
 
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -148,7 +150,7 @@ fn test_reserve_ancestor_directory_allowed() {
         let port = Port::try_from(PORT_BASE_RESERVE_ALLOWED + 10 + tested_count).unwrap();
 
         let options = ReserveOptions::new(key, Some(port));
-        let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
+        let result = ReservePlan::new(options, &create_test_config()).build_plan(db.connection());
 
         assert!(result.is_ok(), "Ancestor {parent:?} should be allowed");
 
@@ -193,7 +195,7 @@ fn test_reserve_unrelated_absolute_path_blocked() {
     // Should fail without allow flag
     let options = ReserveOptions::new(key, Some(port));
 
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(db.connection());
 
     assert!(result.is_err(), "Unrelated path should be blocked");
     let err = result.unwrap_err();
@@ -232,7 +234,7 @@ fn test_reserve_sibling_directory_blocked() {
 
         let options = ReserveOptions::new(key, Some(port));
 
-        let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
+        let result = ReservePlan::new(options, &create_test_config()).build_plan(db.connection());
 
         assert!(result.is_err(), "Sibling directory should be blocked");
         assert!(matches!(
@@ -265,7 +267,7 @@ fn test_reserve_cousin_path_blocked() {
 
         let options = ReserveOptions::new(key, Some(port));
 
-        let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
+        let result = ReservePlan::new(options, &create_test_config()).build_plan(db.connection());
 
         assert!(result.is_err(), "Cousin path should be blocked");
         assert!(matches!(
@@ -294,7 +296,7 @@ fn test_reserve_unrelated_path_with_allow_flag() {
 
     let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(options.clone(), &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(options.clone(), &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -304,7 +306,7 @@ fn test_reserve_unrelated_path_with_allow_flag() {
 
     // Also verify we can execute the plan
     let plan = result.unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let exec_result = executor.execute(&plan);
 
     assert!(
@@ -328,7 +330,7 @@ fn test_reserve_unrelated_path_with_force_flag() {
 
     let options = ReserveOptions::new(key, Some(port)).with_force(true);
 
-    let result = ReservePlan::new(options.clone(), &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(options.clone(), &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -338,7 +340,7 @@ fn test_reserve_unrelated_path_with_force_flag() {
 
     // Verify execution
     let plan = result.unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let exec_result = executor.execute(&plan);
 
     assert!(exec_result.is_ok(), "Execution should succeed with force");
@@ -364,7 +366,7 @@ fn test_reserve_force_overrides_all_path_checks() {
 
     let options = ReserveOptions::new(key, Some(port)).with_force(true);
 
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -393,7 +395,7 @@ fn test_release_current_directory_allowed() {
 
     // Release should work without special flags
     let release_opts = ReleaseOptions::new(key);
-    let result = ReleasePlan::new(release_opts).build_plan(&db);
+    let result = ReleasePlan::new(release_opts).build_plan(db.connection());
 
     assert!(result.is_ok(), "Current directory release should succeed");
 }
@@ -414,7 +416,7 @@ fn test_release_subdirectory_allowed() {
 
     // Release subdirectory
     let release_opts = ReleaseOptions::new(key);
-    let result = ReleasePlan::new(release_opts).build_plan(&db);
+    let result = ReleasePlan::new(release_opts).build_plan(db.connection());
 
     assert!(result.is_ok(), "Subdirectory release should succeed");
 }
@@ -430,7 +432,7 @@ fn test_release_unrelated_path_blocked() {
     let key = ReservationKey::new(unrelated, None).unwrap();
 
     let release_opts = ReleaseOptions::new(key);
-    let result = ReleasePlan::new(release_opts).build_plan(&db);
+    let result = ReleasePlan::new(release_opts).build_plan(db.connection());
 
     assert!(result.is_err(), "Unrelated path release should be blocked");
     assert!(matches!(
@@ -456,7 +458,7 @@ fn test_release_unrelated_path_with_allow_flag() {
 
     // Release with allow flag
     let release_opts = ReleaseOptions::new(key).with_allow_unrelated_path(true);
-    let result = ReleasePlan::new(release_opts.clone()).build_plan(&db);
+    let result = ReleasePlan::new(release_opts.clone()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -466,7 +468,7 @@ fn test_release_unrelated_path_with_allow_flag() {
 
     // Execute the release
     let plan = result.unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let exec_result = executor.execute(&plan);
 
     assert!(exec_result.is_ok(), "Release execution should succeed");
@@ -489,7 +491,7 @@ fn test_release_unrelated_path_with_force_flag() {
 
     // Release with force
     let release_opts = ReleaseOptions::new(key).with_force(true);
-    let result = ReleasePlan::new(release_opts).build_plan(&db);
+    let result = ReleasePlan::new(release_opts).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -499,7 +501,7 @@ fn test_release_unrelated_path_with_force_flag() {
 
     // Execute the release
     let plan = result.unwrap();
-    let mut executor = PlanExecutor::new(&mut db);
+    let mut executor = PlanExecutor::new(db.connection());
     let exec_result = executor.execute(&plan);
 
     assert!(exec_result.is_ok(), "Release execution should succeed");
@@ -541,7 +543,7 @@ fn test_multiple_related_paths_all_allowed() {
     }
 
     // Verify all were created
-    let all = db.list_all_reservations().unwrap();
+    let all = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(all.len(), paths.len());
 }
 
@@ -561,7 +563,7 @@ fn test_mixed_related_and_unrelated_paths() {
     let port1 = Port::try_from(PORT_BASE_MULTIPLE + 10).unwrap();
 
     let opts1 = ReserveOptions::new(key1, Some(port1));
-    let result1 = ReservePlan::new(opts1, &create_test_config()).build_plan(&mut db);
+    let result1 = ReservePlan::new(opts1, &create_test_config()).build_plan(db.connection());
 
     assert!(result1.is_ok(), "Related path should work");
 
@@ -570,7 +572,7 @@ fn test_mixed_related_and_unrelated_paths() {
     let port2 = Port::try_from(PORT_BASE_MULTIPLE + 11).unwrap();
 
     let opts2 = ReserveOptions::new(key2, Some(port2));
-    let result2 = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result2 = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(result2.is_err(), "Unrelated path should still be blocked");
 }
@@ -594,7 +596,7 @@ fn test_path_validation_with_tagged_reservations() {
     let port = Port::try_from(PORT_BASE_EDGE).unwrap();
 
     let options = ReserveOptions::new(key, Some(port));
-    let result = ReservePlan::new(options, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(options, &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),
@@ -627,7 +629,7 @@ fn test_path_validation_applies_before_sticky_field_check() {
     // Should fail on path validation, not sticky field check
     let opts2 = ReserveOptions::new(key, Some(port)).with_project(Some("project2".to_string()));
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     assert!(result.is_err(), "Should fail validation");
 
@@ -664,7 +666,7 @@ fn test_allow_unrelated_path_does_not_affect_sticky_fields() {
         .with_project(Some("project2".to_string()))
         .with_allow_unrelated_path(true); // Path flag set, but not project flag
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
 
     // Should fail on sticky field check, not path check
     assert!(result.is_err(), "Should fail on sticky field check");
@@ -697,7 +699,7 @@ fn test_force_flag_overrides_both_path_and_sticky_checks() {
         .with_project(Some("project2".to_string()))
         .with_force(true);
 
-    let result = ReservePlan::new(opts2.clone(), &create_test_config()).build_plan(&mut db);
+    let result = ReservePlan::new(opts2.clone(), &create_test_config()).build_plan(db.connection());
 
     assert!(
         result.is_ok(),

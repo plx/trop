@@ -107,7 +107,9 @@ impl AutoreserveCommand {
         let result = executor.execute(&plan).map_err(CliError::from)?;
 
         // 9. Commit transaction
-        tx.commit().map_err(trop::Error::from).map_err(CliError::from)?;
+        tx.commit()
+            .map_err(trop::Error::from)
+            .map_err(CliError::from)?;
 
         // 8. Extract allocated ports
         let allocated_ports = result.allocated_ports.ok_or_else(|| {

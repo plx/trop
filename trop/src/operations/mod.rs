@@ -28,10 +28,10 @@
 //!     .with_allow_unrelated_path(true);
 //!
 //! // Generate plan
-//! let plan = ReservePlan::new(options, &config).build_plan(&mut db).unwrap();
+//! let plan = ReservePlan::new(options, &config).build_plan(db.connection()).unwrap();
 //!
 //! // Execute plan
-//! let mut executor = PlanExecutor::new(&mut db);
+//! let mut executor = PlanExecutor::new(db.connection());
 //! let result = executor.execute(&plan).unwrap();
 //! ```
 

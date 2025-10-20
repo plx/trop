@@ -113,7 +113,9 @@ impl ReleaseCommand {
                     let tx = db.begin_transaction().map_err(CliError::from)?;
                     let mut executor = PlanExecutor::new(&tx);
                     executor.execute(&plan).map_err(CliError::from)?;
-                    tx.commit().map_err(trop::Error::from).map_err(CliError::from)?;
+                    tx.commit()
+                        .map_err(trop::Error::from)
+                        .map_err(CliError::from)?;
                     released_count += 1;
                 }
 
@@ -157,7 +159,9 @@ impl ReleaseCommand {
                 let result = executor.execute(&plan).map_err(CliError::from)?;
 
                 // Commit transaction
-                tx.commit().map_err(trop::Error::from).map_err(CliError::from)?;
+                tx.commit()
+                    .map_err(trop::Error::from)
+                    .map_err(CliError::from)?;
 
                 if !global.quiet {
                     if plan.actions.is_empty() {

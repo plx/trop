@@ -183,7 +183,7 @@ impl AutoreservePlan {
     /// let db = Database::open(DatabaseConfig::new("/tmp/trop.db")).unwrap();
     /// let options = AutoreserveOptions::new(PathBuf::from("."));
     /// let planner = AutoreservePlan::new(options).unwrap();
-    /// let plan = planner.build_plan(&db).unwrap();
+    /// let plan = planner.build_plan(db.connection()).unwrap();
     /// ```
     pub fn build_plan(&self, conn: &Connection) -> Result<OperationPlan> {
         // Build options for ReserveGroupPlan
@@ -340,7 +340,7 @@ reservations:
         let db = create_test_database();
         let options = AutoreserveOptions::new(temp_dir.path().to_path_buf());
         let planner = AutoreservePlan::new(options).unwrap();
-        let plan = planner.build_plan(&db).unwrap();
+        let plan = planner.build_plan(db.connection()).unwrap();
 
         assert_eq!(plan.actions.len(), 1);
     }

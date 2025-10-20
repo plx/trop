@@ -203,7 +203,9 @@ impl ReserveCommand {
         let result = executor.execute(&plan).map_err(CliError::from)?;
 
         // 12. Commit transaction - all or nothing
-        tx.commit().map_err(trop::Error::from).map_err(CliError::from)?;
+        tx.commit()
+            .map_err(trop::Error::from)
+            .map_err(CliError::from)?;
 
         // 11. Output just the port number (shell-friendly) to stdout
         if let Some(port) = result.port {

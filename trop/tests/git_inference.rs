@@ -15,8 +15,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 use trop::operations::inference::{infer_project, infer_task};
+use trop::Database;
+
 use trop::operations::ReserveOptions;
+
 use trop::{Port, ReservationKey};
+
 
 // ============================================================================
 // Test Helper Functions

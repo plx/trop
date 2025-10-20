@@ -8,6 +8,7 @@
 #[cfg(test)]
 mod tests {
     use crate::database::test_util::create_test_database;
+    use crate::database::Database;
     use crate::port::allocator::PortAllocator;
     use crate::port::exclusions::ExclusionManager;
     use crate::port::group::{GroupAllocationRequest, ServiceAllocationRequest};
@@ -107,7 +108,7 @@ mod tests {
             let result = allocator.allocate_group(&mut db, &request, &config);
 
             // Count how many reservations exist in the database for this path
-            let reservations = db.list_all_reservations().unwrap();
+            let reservations = Database::list_all_reservations(db.connection()).unwrap();
             let group_reservations: Vec<_> = reservations
                 .iter()
                 .filter(|r| r.key().path == PathBuf::from("/test/group"))

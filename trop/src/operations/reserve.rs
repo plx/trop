@@ -294,7 +294,7 @@ impl<'a> ReservePlan<'a> {
     /// let options = ReserveOptions::new(key, Some(port))
     ///     .with_allow_unrelated_path(true);
     ///
-    /// let plan = ReservePlan::new(options, &config).build_plan(&mut db).unwrap();
+    /// let plan = ReservePlan::new(options, &config).build_plan(db.connection()).unwrap();
     /// ```
     pub fn build_plan(&self, conn: &Connection) -> Result<OperationPlan> {
         let mut plan = OperationPlan::new(format!("Reserve port for {}", self.options.key));
@@ -720,7 +720,7 @@ mod tests {
                 let options = ReserveOptions::new(key, Some(port))
                     .with_allow_unrelated_path(true);
 
-                let plan = ReservePlan::new(options, &config).build_plan(&mut db).unwrap();
+                let plan = ReservePlan::new(options, &config).build_plan(db.connection()).unwrap();
 
                 // Must generate UpdateLastUsed, not CreateReservation
                 prop_assert_eq!(plan.len(), 1);
@@ -751,11 +751,11 @@ mod tests {
                     .with_allow_unrelated_path(false);
 
                 // Without force, should fail path validation
-                let result_without = ReservePlan::new(options_without_force, &config).build_plan(&mut db);
+                let result_without = ReservePlan::new(options_without_force, &config).build_plan(db.connection());
                 prop_assert!(result_without.is_err(), "unrelated path must fail without force");
 
                 // With force, should succeed
-                let result_with = ReservePlan::new(options_with_force, &config).build_plan(&mut db);
+                let result_with = ReservePlan::new(options_with_force, &config).build_plan(db.connection());
                 prop_assert!(result_with.is_ok(), "force must override path validation");
             }
         }
@@ -777,7 +777,7 @@ mod tests {
                     .with_force(false)
                     .with_allow_unrelated_path(true);
 
-                let result = ReservePlan::new(options, &config).build_plan(&mut db);
+                let result = ReservePlan::new(options, &config).build_plan(db.connection());
                 prop_assert!(result.is_ok(), "allow_unrelated_path must enable unrelated path operations");
             }
         }
@@ -823,7 +823,7 @@ mod tests {
         let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
 
         let plan = ReservePlan::new(options, &config)
-            .build_plan(&mut db)
+            .build_plan(db.connection())
             .unwrap();
 
         assert_eq!(plan.len(), 1);
@@ -845,7 +845,7 @@ mod tests {
         let options = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
 
         let plan = ReservePlan::new(options, &config)
-            .build_plan(&mut db)
+            .build_plan(db.connection())
             .unwrap();
 
         // Should just update timestamp
@@ -872,7 +872,7 @@ mod tests {
             .with_project(Some("project2".to_string()))
             .with_allow_unrelated_path(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         assert!(result.is_err());
         assert!(matches!(
@@ -901,7 +901,7 @@ mod tests {
             .with_force(true)
             .with_allow_unrelated_path(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         // Should succeed with force
         assert!(result.is_ok());
@@ -927,7 +927,7 @@ mod tests {
             .with_allow_project_change(true)
             .with_allow_unrelated_path(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         // Should succeed with allow flag
         assert!(result.is_ok());
@@ -952,7 +952,7 @@ mod tests {
             .with_task(Some("task2".to_string()))
             .with_allow_unrelated_path(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         assert!(result.is_err());
         assert!(matches!(
@@ -971,7 +971,7 @@ mod tests {
         let options = ReserveOptions::new(key.clone(), None).with_allow_unrelated_path(true);
 
         let plan = ReservePlan::new(options, &config)
-            .build_plan(&mut db)
+            .build_plan(db.connection())
             .unwrap();
 
         assert_eq!(plan.len(), 1);
@@ -1018,7 +1018,7 @@ mod tests {
             .with_disable_autoprune(true)  // Disable autoclean to test exhaustion
             .with_disable_autoexpire(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::PortExhausted { .. }));
@@ -1034,7 +1034,7 @@ mod tests {
         // Don't allow unrelated path
         let options = ReserveOptions::new(key, Some(port));
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         assert!(result.is_err());
         assert!(matches!(
@@ -1053,7 +1053,7 @@ mod tests {
         // Force allows unrelated path
         let options = ReserveOptions::new(key, Some(port)).with_force(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(&mut db);
+        let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         assert!(result.is_ok());
     }
