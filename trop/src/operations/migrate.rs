@@ -428,6 +428,7 @@ pub fn execute_migrate(plan: &MigratePlan, db: &mut Database) -> Result<MigrateR
 mod tests {
     use super::*;
     use crate::database::test_util::create_test_database;
+    #[cfg(unix)]
     use crate::{Port, Reservation};
 
     #[test]
