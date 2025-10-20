@@ -7,7 +7,7 @@ use std::env;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use rusqlite::{params, TransactionBehavior};
+use rusqlite::{params, Connection, TransactionBehavior};
 
 use crate::error::{Error, Result};
 use crate::path::PathRelationship;
@@ -178,6 +178,60 @@ impl Database {
         Ok(())
     }
 
+    /// Creates or updates a reservation using an existing connection or transaction.
+    ///
+    /// This method is intended for use within an existing transaction context.
+    /// Unlike `create_reservation`, it does not create its own transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the insert fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use trop::database::{Database, DatabaseConfig};
+    /// use trop::{Reservation, ReservationKey, Port};
+    /// use std::path::PathBuf;
+    ///
+    /// let config = DatabaseConfig::new("/tmp/trop.db");
+    /// let mut db = Database::open(config).unwrap();
+    ///
+    /// let key = ReservationKey::new(PathBuf::from("/path"), None).unwrap();
+    /// let port = Port::try_from(8080).unwrap();
+    /// let reservation = Reservation::builder(key, port).build().unwrap();
+    ///
+    /// let tx = db.begin_transaction().unwrap();
+    /// Database::create_reservation_simple(&tx, &reservation).unwrap();
+    /// tx.commit().unwrap();
+    /// ```
+    pub fn create_reservation_simple(conn: &Connection, reservation: &Reservation) -> Result<()> {
+        // For NULL tags, explicitly delete first to ensure replacement works
+        // (INSERT OR REPLACE doesn't work with NULL in PRIMARY KEY due to NULL != NULL)
+        conn.execute(
+            DELETE_RESERVATION,
+            params![reservation.key().path_as_string(), reservation.key().tag],
+        )?;
+
+        let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
+        let last_used_secs = systemtime_to_unix_secs(reservation.last_used_at())?;
+
+        conn.execute(
+            INSERT_RESERVATION,
+            params![
+                reservation.key().path_as_string(),
+                reservation.key().tag,
+                reservation.port().value(),
+                reservation.project(),
+                reservation.task(),
+                created_secs,
+                last_used_secs,
+            ],
+        )?;
+
+        Ok(())
+    }
+
     /// Retrieves a reservation from the database.
     ///
     /// # Errors
@@ -201,10 +255,10 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let key = ReservationKey::new(PathBuf::from("/path"), None).unwrap();
-    /// let reservation = db.get_reservation(&key).unwrap();
+    /// let reservation = Database::get_reservation(&db.conn, &key).unwrap();
     /// ```
-    pub fn get_reservation(&self, key: &ReservationKey) -> Result<Option<Reservation>> {
-        let mut stmt = self.conn.prepare(SELECT_RESERVATION)?;
+    pub fn get_reservation(conn: &Connection, key: &ReservationKey) -> Result<Option<Reservation>> {
+        let mut stmt = conn.prepare(SELECT_RESERVATION)?;
 
         match stmt.query_row(params![key.path_as_string(), key.tag], |row| {
             let port_value: u16 = row.get(0)?;
@@ -324,13 +378,13 @@ impl Database {
     /// let config = DatabaseConfig::new("/tmp/trop.db");
     /// let db = Database::open(config).unwrap();
     ///
-    /// let reservations = db.list_all_reservations().unwrap();
+    /// let reservations = Database::list_all_reservations(&db.conn).unwrap();
     /// for reservation in reservations {
     ///     println!("{:?}", reservation);
     /// }
     /// ```
-    pub fn list_all_reservations(&self) -> Result<Vec<Reservation>> {
-        let mut stmt = self.conn.prepare(LIST_RESERVATIONS)?;
+    pub fn list_all_reservations(conn: &Connection) -> Result<Vec<Reservation>> {
+        let mut stmt = conn.prepare(LIST_RESERVATIONS)?;
 
         let reservations = stmt
             .query_map([], row_to_reservation)?
@@ -361,10 +415,10 @@ impl Database {
     /// let max = Port::try_from(5100).unwrap();
     /// let range = PortRange::new(min, max).unwrap();
     ///
-    /// let reserved = db.get_reserved_ports(&range).unwrap();
+    /// let reserved = Database::get_reserved_ports(&db.conn, &range).unwrap();
     /// ```
-    pub fn get_reserved_ports(&self, range: &PortRange) -> Result<Vec<Port>> {
-        let mut stmt = self.conn.prepare(SELECT_RESERVED_PORTS)?;
+    pub fn get_reserved_ports(conn: &Connection, range: &PortRange) -> Result<Vec<Port>> {
+        let mut stmt = conn.prepare(SELECT_RESERVED_PORTS)?;
 
         let ports = stmt
             .query_map(params![range.min().value(), range.max().value()], |row| {
@@ -395,10 +449,13 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let prefix = Path::new("/home/user/projects");
-    /// let reservations = db.get_reservations_by_path_prefix(prefix).unwrap();
+    /// let reservations = Database::get_reservations_by_path_prefix(&db.conn, prefix).unwrap();
     /// ```
-    pub fn get_reservations_by_path_prefix(&self, prefix: &Path) -> Result<Vec<Reservation>> {
-        let mut stmt = self.conn.prepare(SELECT_BY_PATH_PREFIX)?;
+    pub fn get_reservations_by_path_prefix(
+        conn: &Connection,
+        prefix: &Path,
+    ) -> Result<Vec<Reservation>> {
+        let mut stmt = conn.prepare(SELECT_BY_PATH_PREFIX)?;
 
         let reservations = stmt
             .query_map([prefix.to_string_lossy().to_string()], row_to_reservation)?
@@ -425,15 +482,18 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let max_age = Duration::from_secs(86400 * 7); // 7 days
-    /// let expired = db.find_expired_reservations(max_age).unwrap();
+    /// let expired = Database::find_expired_reservations(&db.conn, max_age).unwrap();
     /// ```
-    pub fn find_expired_reservations(&self, max_age: Duration) -> Result<Vec<Reservation>> {
+    pub fn find_expired_reservations(
+        conn: &Connection,
+        max_age: Duration,
+    ) -> Result<Vec<Reservation>> {
         let now_secs = systemtime_to_unix_secs(SystemTime::now())?;
         #[allow(clippy::cast_possible_wrap)]
         let max_age_secs = max_age.as_secs() as i64;
         let cutoff = now_secs.saturating_sub(max_age_secs);
 
-        let mut stmt = self.conn.prepare(SELECT_EXPIRED)?;
+        let mut stmt = conn.prepare(SELECT_EXPIRED)?;
 
         let reservations = stmt
             .query_map([cutoff], row_to_reservation)?
@@ -458,12 +518,11 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let port = Port::try_from(8080).unwrap();
-    /// let is_reserved = db.is_port_reserved(port).unwrap();
+    /// let is_reserved = Database::is_port_reserved(&db.conn, port).unwrap();
     /// ```
-    pub fn is_port_reserved(&self, port: Port) -> Result<bool> {
+    pub fn is_port_reserved(conn: &Connection, port: Port) -> Result<bool> {
         let count: i32 =
-            self.conn
-                .query_row(CHECK_PORT_RESERVED, params![port.value()], |row| row.get(0))?;
+            conn.query_row(CHECK_PORT_RESERVED, params![port.value()], |row| row.get(0))?;
         Ok(count > 0)
     }
 
@@ -573,10 +632,10 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let port = Port::try_from(8080).unwrap();
-    /// let reservation = db.get_reservation_by_port(port).unwrap();
+    /// let reservation = Database::get_reservation_by_port(&db.conn, port).unwrap();
     /// ```
-    pub fn get_reservation_by_port(&self, port: Port) -> Result<Option<Reservation>> {
-        let mut stmt = self.conn.prepare_cached(SELECT_BY_PORT)?;
+    pub fn get_reservation_by_port(conn: &Connection, port: Port) -> Result<Option<Reservation>> {
+        let mut stmt = conn.prepare_cached(SELECT_BY_PORT)?;
         let mut rows = stmt.query_map(params![port.value()], row_to_reservation)?;
 
         match rows.next() {
@@ -608,11 +667,11 @@ impl Database {
     /// let max = Port::try_from(5100).unwrap();
     /// let range = PortRange::new(min, max).unwrap();
     ///
-    /// let reserved = db.get_reserved_ports_in_range(&range).unwrap();
+    /// let reserved = Database::get_reserved_ports_in_range(&db.conn, &range).unwrap();
     /// ```
-    pub fn get_reserved_ports_in_range(&self, range: &PortRange) -> Result<Vec<Port>> {
+    pub fn get_reserved_ports_in_range(conn: &Connection, range: &PortRange) -> Result<Vec<Port>> {
         // This is the same as get_reserved_ports - we just provide both names
-        self.get_reserved_ports(range)
+        Self::get_reserved_ports(conn, range)
     }
 
     /// Gets all unique project identifiers from reservations.
@@ -632,17 +691,17 @@ impl Database {
     /// let config = DatabaseConfig::new("/tmp/trop.db");
     /// let db = Database::open(config).unwrap();
     ///
-    /// let projects = db.list_projects().unwrap();
+    /// let projects = Database::list_projects(&db.conn).unwrap();
     /// for project in projects {
     ///     println!("{}", project);
     /// }
     /// ```
-    pub fn list_projects(&self) -> Result<Vec<String>> {
+    pub fn list_projects(conn: &Connection) -> Result<Vec<String>> {
         let query = "SELECT DISTINCT project FROM reservations
                      WHERE project IS NOT NULL
                      ORDER BY project";
 
-        let mut stmt = self.conn.prepare(query)?;
+        let mut stmt = conn.prepare(query)?;
 
         let projects = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -707,13 +766,9 @@ impl Database {
     ///
     /// // Check if we can operate on a path
     /// let target = Path::new("/home/user/project");
-    /// let result = db.validate_path_relationship(target, false);
+    /// let result = Database::validate_path_relationship(target, false);
     /// ```
-    pub fn validate_path_relationship(
-        &self,
-        target_path: &Path,
-        allow_unrelated: bool,
-    ) -> Result<()> {
+    pub fn validate_path_relationship(target_path: &Path, allow_unrelated: bool) -> Result<()> {
         let current_dir = env::current_dir()?;
         let relationship = PathRelationship::between(target_path, &current_dir);
 

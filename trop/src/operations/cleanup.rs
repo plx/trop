@@ -103,7 +103,7 @@ impl CleanupOperations {
     /// ```
     pub fn prune(db: &mut Database, dry_run: bool) -> Result<PruneResult> {
         // Get all reservations
-        let all_reservations = db.list_all_reservations()?;
+        let all_reservations = Database::list_all_reservations(db.connection())?;
 
         // Filter to those with non-existent paths
         let mut to_remove = Vec::new();
@@ -188,7 +188,7 @@ impl CleanupOperations {
         let max_age = Duration::from_secs(expire_after_days as u64 * SECONDS_PER_DAY);
 
         // Find expired reservations
-        let to_remove = db.find_expired_reservations(max_age)?;
+        let to_remove = Database::find_expired_reservations(db.connection(), max_age)?;
         let removed_count = to_remove.len();
 
         // If not dry-run, actually delete the reservations

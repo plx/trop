@@ -3,7 +3,7 @@
 //! This module provides the main database connection type with proper
 //! initialization and PRAGMA settings for optimal `SQLite` configuration.
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
 use crate::error::Result;
 
@@ -128,6 +128,33 @@ impl Database {
     /// ```
     pub fn connection_mut(&mut self) -> &mut Connection {
         &mut self.conn
+    }
+
+    /// Begins an IMMEDIATE transaction for atomic operations.
+    ///
+    /// IMMEDIATE transactions acquire a write lock immediately, preventing
+    /// other writers from starting. This ensures serialized execution and
+    /// prevents race conditions in port allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be started.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use trop::database::{Database, DatabaseConfig};
+    ///
+    /// let config = DatabaseConfig::new("/tmp/trop.db");
+    /// let mut db = Database::open(config).unwrap();
+    /// let tx = db.begin_transaction().unwrap();
+    /// // Perform operations...
+    /// tx.commit().unwrap();
+    /// ```
+    pub fn begin_transaction(&mut self) -> Result<Transaction<'_>> {
+        Ok(self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?)
     }
 }
 

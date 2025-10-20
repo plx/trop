@@ -300,11 +300,11 @@ impl<'a> ReservePlan<'a> {
 
         // Step 1: Validate path relationship
         if !self.options.force && !self.options.allow_unrelated_path {
-            db.validate_path_relationship(&self.options.key.path, false)?;
+            Database::validate_path_relationship(&self.options.key.path, false)?;
         }
 
         // Step 2: Check for existing reservation
-        if let Some(existing) = db.get_reservation(&self.options.key)? {
+        if let Some(existing) = Database::get_reservation(db.connection(), &self.options.key)? {
             // Reservation exists - validate sticky fields and return idempotent result
             self.validate_sticky_fields(&existing)?;
 
@@ -324,7 +324,11 @@ impl<'a> ReservePlan<'a> {
             };
             let occupancy_config = self.occupancy_config();
 
-            match allocator.allocate_single(db, &allocation_options, &occupancy_config)? {
+            match allocator.allocate_single(
+                db.connection(),
+                &allocation_options,
+                &occupancy_config,
+            )? {
                 AllocationResult::Allocated(port) => port,
 
                 AllocationResult::PreferredUnavailable { .. } => {
@@ -335,7 +339,11 @@ impl<'a> ReservePlan<'a> {
                         ignore_exclusions: self.options.ignore_exclusions,
                     };
 
-                    match allocator.allocate_single(db, &fallback_options, &occupancy_config)? {
+                    match allocator.allocate_single(
+                        db.connection(),
+                        &fallback_options,
+                        &occupancy_config,
+                    )? {
                         AllocationResult::Allocated(port) => port,
                         AllocationResult::Exhausted {
                             cleanup_suggested, ..
@@ -510,7 +518,7 @@ impl<'a> ReservePlan<'a> {
 
         // Retry allocation if we freed anything
         if freed_any {
-            match allocator.allocate_single(db, options, occupancy_config)? {
+            match allocator.allocate_single(db.connection(), options, occupancy_config)? {
                 AllocationResult::Allocated(port) => Ok(Some(port)),
                 _ => Ok(None),
             }

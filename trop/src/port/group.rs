@@ -270,7 +270,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
                 ignore_exclusions: false,
             };
 
-            match self.allocate_single(db, &options, occupancy_config)? {
+            match self.allocate_single(db.connection(), &options, occupancy_config)? {
                 crate::port::allocator::AllocationResult::Allocated(_) => {
                     // Good, port is available
                 }
@@ -369,7 +369,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
             let mut all_available = true;
             for &offset in pattern {
                 if let Some(port) = base.checked_add(offset) {
-                    if self.is_port_available(port, db, occupancy_config)?
+                    if self.is_port_available(port, db.connection(), occupancy_config)?
                         == super::allocator::PortAvailability::Available
                     {
                         // Good, continue checking

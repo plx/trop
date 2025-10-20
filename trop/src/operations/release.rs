@@ -122,11 +122,11 @@ impl ReleasePlan {
 
         // Step 1: Validate path relationship
         if !self.options.force && !self.options.allow_unrelated_path {
-            db.validate_path_relationship(&self.options.key.path, false)?;
+            Database::validate_path_relationship(&self.options.key.path, false)?;
         }
 
         // Step 2: Check if reservation exists
-        if db.get_reservation(&self.options.key)?.is_some() {
+        if Database::get_reservation(db.connection(), &self.options.key)?.is_some() {
             // Reservation exists - plan to delete it
             plan = plan.add_action(PlanAction::DeleteReservation(self.options.key.clone()));
         } else {

@@ -249,7 +249,9 @@ impl<'a> PlanExecutor<'a> {
                 }
                 PlanAction::UpdateLastUsed(key) => {
                     // For idempotent case, get the existing reservation's port
-                    if let Ok(Some(reservation)) = self.db.get_reservation(key) {
+                    if let Ok(Some(reservation)) =
+                        Database::get_reservation(self.db.connection(), key)
+                    {
                         return Some(reservation.port());
                     }
                 }

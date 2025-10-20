@@ -4,6 +4,8 @@
 //! available ports while respecting database reservations, exclusions, and
 //! system occupancy.
 
+use rusqlite::Connection;
+
 use crate::database::Database;
 use crate::error::{Error, PortUnavailableReason};
 use crate::{Port, PortRange, Result};
@@ -205,7 +207,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     /// ```
     pub fn allocate_single(
         &self,
-        db: &Database,
+        conn: &Connection,
         options: &AllocationOptions,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<AllocationResult> {
@@ -220,7 +222,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
             }
 
             // Check availability
-            let availability = self.is_port_available(preferred, db, occupancy_config)?;
+            let availability = self.is_port_available(preferred, conn, occupancy_config)?;
 
             // Check if we should reject the preferred port
             match availability {
@@ -249,7 +251,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         }
 
         // Forward scan from minimum
-        if let Some(port) = self.find_next_available(self.range.min(), db, occupancy_config)? {
+        if let Some(port) = self.find_next_available(self.range.min(), conn, occupancy_config)? {
             Ok(AllocationResult::Allocated(port))
         } else {
             // No ports available - suggest cleanup might help
@@ -274,7 +276,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     pub fn find_next_available(
         &self,
         start: Port,
-        db: &Database,
+        conn: &Connection,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<Option<Port>> {
         // Scan from start to range max
@@ -282,7 +284,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
 
         for port in scan_range {
             if let PortAvailability::Available =
-                self.is_port_available(port, db, occupancy_config)?
+                self.is_port_available(port, conn, occupancy_config)?
             {
                 return Ok(Some(port));
             }
@@ -353,7 +355,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     pub(super) fn is_port_available(
         &self,
         port: Port,
-        db: &Database,
+        conn: &Connection,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<PortAvailability> {
         // Check if in range
@@ -362,7 +364,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         }
 
         // Check if reserved in database
-        if db.is_port_reserved(port)? {
+        if Database::is_port_reserved(conn, port)? {
             return Ok(PortAvailability::Reserved);
         }
 
