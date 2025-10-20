@@ -738,7 +738,7 @@ mod tests {
             ) {
                 // PROPERTY: With force=true, path relationship validation is skipped
                 // This allows operations on unrelated paths without explicit permission
-                let mut db = create_test_database();
+                let db = create_test_database();
                 let config = super::create_test_config();
                 let key = ReservationKey::new(PathBuf::from("/unrelated/path"), None).unwrap();
 
@@ -769,7 +769,7 @@ mod tests {
             ) {
                 // PROPERTY: The allow_unrelated_path flag specifically enables operations
                 // on paths unrelated to the current working directory
-                let mut db = create_test_database();
+                let db = create_test_database();
                 let config = super::create_test_config();
                 let key = ReservationKey::new(PathBuf::from("/unrelated/path"), None).unwrap();
 
@@ -815,7 +815,7 @@ mod tests {
 
     #[test]
     fn test_plan_new_reservation() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let config = create_test_config();
         let key = ReservationKey::new(PathBuf::from("/test/path"), None).unwrap();
         let port = Port::try_from(8080).unwrap();
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn test_plan_automatic_allocation() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let config = create_test_config();
         let key = ReservationKey::new(PathBuf::from("/test/path"), None).unwrap();
 
@@ -1026,7 +1026,7 @@ mod tests {
 
     #[test]
     fn test_plan_path_relationship_denied() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let config = create_test_config();
         let key = ReservationKey::new(PathBuf::from("/unrelated/path"), None).unwrap();
         let port = Port::try_from(8080).unwrap();
@@ -1045,7 +1045,7 @@ mod tests {
 
     #[test]
     fn test_plan_path_relationship_with_force() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let config = create_test_config();
         let key = ReservationKey::new(PathBuf::from("/unrelated/path"), None).unwrap();
         let port = Port::try_from(8080).unwrap();

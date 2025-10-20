@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_group_allocation_simple() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
 
         let request = GroupAllocationRequest {
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn test_group_allocation_with_gaps() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
 
         let request = GroupAllocationRequest {
@@ -497,7 +497,7 @@ mod tests {
 
     #[test]
     fn test_group_allocation_skips_occupied() {
-        let mut db = create_test_database();
+        let db = create_test_database();
 
         // Mark port 5000 and 5001 as occupied
         let mut occupied = HashSet::new();
@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_group_allocation_with_preferred() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
 
         let request = GroupAllocationRequest {
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_group_allocation_empty_services() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
 
         let request = GroupAllocationRequest {
@@ -590,7 +590,7 @@ mod tests {
 
     #[test]
     fn test_group_allocation_duplicate_tags() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
 
         let request = GroupAllocationRequest {
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_group_allocation_creates_reservations() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
 
         let request = GroupAllocationRequest {
@@ -749,7 +749,7 @@ mod tests {
     fn test_group_allocation_mixed_offset_and_preferred() {
         // Test group allocation with both offset-based and preferred ports
         // Verifies correct handling of mixed allocation strategies
-        let mut db = create_test_database();
+        let db = create_test_database();
         let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
 
         let request = GroupAllocationRequest {
@@ -786,7 +786,7 @@ mod tests {
     fn test_group_allocation_no_base_port_only_preferred() {
         // Test group allocation when all services use preferred ports (no base port)
         // Ensures base_port is None when not needed
-        let mut db = create_test_database();
+        let db = create_test_database();
         let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
 
         let request = GroupAllocationRequest {
@@ -855,7 +855,7 @@ mod tests {
     fn test_group_allocation_service_without_offset_or_preferred() {
         // Test validation error when service has neither offset nor preferred port
         // Ensures proper error handling for misconfigured services
-        let mut db = create_test_database();
+        let db = create_test_database();
         let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
 
         let request = GroupAllocationRequest {
@@ -919,7 +919,7 @@ mod tests {
     fn test_group_allocation_large_offset_gap() {
         // Test group allocation with large gaps between offsets
         // Ensures correct handling of sparse port patterns
-        let mut db = create_test_database();
+        let db = create_test_database();
         let allocator = create_test_allocator(HashSet::new(), 5000, 10000);
 
         let request = GroupAllocationRequest {
@@ -954,7 +954,7 @@ mod tests {
     fn test_group_allocation_result_base_port() {
         // Test that result correctly includes base_port for offset-based allocations
         // Verifies base_port tracking is accurate
-        let mut db = create_test_database();
+        let db = create_test_database();
         let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
 
         let request = GroupAllocationRequest {

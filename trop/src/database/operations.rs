@@ -1010,7 +1010,7 @@ mod tests {
     fn test_validate_path_relationship_ancestor() {
         use std::env;
 
-        let db = create_test_database();
+        let _db = create_test_database();
         let cwd = env::current_dir().unwrap();
 
         // Ancestor path (parent of cwd) should be allowed
@@ -1024,7 +1024,7 @@ mod tests {
     fn test_validate_path_relationship_descendant() {
         use std::env;
 
-        let db = create_test_database();
+        let _db = create_test_database();
         let cwd = env::current_dir().unwrap();
 
         // Descendant path (child of cwd) should be allowed
@@ -1037,7 +1037,7 @@ mod tests {
     fn test_validate_path_relationship_same() {
         use std::env;
 
-        let db = create_test_database();
+        let _db = create_test_database();
         let cwd = env::current_dir().unwrap();
 
         // Same path should be allowed
@@ -1047,7 +1047,7 @@ mod tests {
 
     #[test]
     fn test_validate_path_relationship_unrelated_denied() {
-        let db = create_test_database();
+        let _db = create_test_database();
 
         // Create a path that's definitely unrelated to the current directory
         let unrelated = Path::new("/unrelated/path/xyz");
@@ -1065,7 +1065,7 @@ mod tests {
 
     #[test]
     fn test_validate_path_relationship_unrelated_allowed() {
-        let db = create_test_database();
+        let _db = create_test_database();
 
         // Create a path that's definitely unrelated to the current directory
         let unrelated = Path::new("/unrelated/path/xyz");

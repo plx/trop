@@ -40,7 +40,7 @@ fn test_idempotent_reserve_returns_same_port() {
     // multiple times (e.g., in a build script) will always get the same port back,
     // making the system predictable and safe for automation.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/idempotent"), None).unwrap();
     let port = Port::try_from(PORT_BASE_IDEMPOTENCY).unwrap();
 
@@ -111,7 +111,7 @@ fn test_idempotent_reserve_updates_timestamp() {
     // This is important for automatic cleanup: frequently-used reservations
     // should have recent timestamps and won't be considered expired.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/timestamp"), None).unwrap();
     let port = Port::try_from(PORT_BASE_IDEMPOTENCY + 1).unwrap();
 
@@ -161,7 +161,7 @@ fn test_idempotent_reserve_action_is_update_last_used() {
     // This verifies that the planning logic correctly identifies existing
     // reservations and generates the appropriate minimal plan.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/plan-action"), None).unwrap();
     let port = Port::try_from(PORT_BASE_IDEMPOTENCY + 2).unwrap();
 
@@ -200,7 +200,7 @@ fn test_idempotent_reserve_with_different_tags() {
     // This verifies that the ReservationKey (path + tag) properly distinguishes
     // between different reservations.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let path = PathBuf::from("/test/multi-tag");
 
     let key_web = ReservationKey::new(path.clone(), Some("web".to_string())).unwrap();
@@ -262,7 +262,7 @@ fn test_cannot_change_project_without_permission() {
     // This protects against accidental configuration changes that might indicate
     // a mistake in the reservation request (e.g., wrong directory, copy-paste error).
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/sticky-project"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_PROJECT).unwrap();
 
@@ -306,7 +306,7 @@ fn test_can_change_project_with_force_flag() {
     // Force is the master override - it bypasses all sticky field protection.
     // This is useful when you know what you're doing and need to update metadata.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/force-project"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_PROJECT + 1).unwrap();
 
@@ -346,7 +346,7 @@ fn test_can_change_project_with_allow_project_change_flag() {
     // This is more granular than --force, allowing project changes while still
     // protecting task and other fields.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/allow-project"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_PROJECT + 2).unwrap();
 
@@ -384,7 +384,7 @@ fn test_can_keep_same_project_value() {
     // and the reservation already has project=X, it should succeed without
     // requiring any special flags.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/same-project"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_PROJECT + 3).unwrap();
 
@@ -419,7 +419,7 @@ fn test_cannot_change_project_from_some_to_none() {
     // This transition (Some → None) is considered a change and requires permission,
     // preventing accidental removal of metadata.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/project-to-none"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_PROJECT + 4).unwrap();
 
@@ -454,7 +454,7 @@ fn test_cannot_change_project_from_none_to_some() {
     //
     // This transition (None → Some) is also considered a change requiring permission.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/none-to-project"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_PROJECT + 5).unwrap();
 
@@ -489,7 +489,7 @@ fn test_can_keep_project_as_none() {
     //
     // If both old and new values are None, there's no change to block.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/keep-none-project"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_PROJECT + 6).unwrap();
 
@@ -524,7 +524,7 @@ fn test_cannot_change_task_without_permission() {
     //
     // Task field protection works identically to project field protection.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/sticky-task"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_TASK).unwrap();
 
@@ -558,7 +558,7 @@ fn test_cannot_change_task_without_permission() {
 fn test_can_change_task_with_force_flag() {
     // Tests that --force allows changing the task field.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/force-task"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_TASK + 1).unwrap();
 
@@ -591,7 +591,7 @@ fn test_can_change_task_with_force_flag() {
 fn test_can_change_task_with_allow_task_change_flag() {
     // Tests that --allow-task-change allows changing just the task field.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/allow-task"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_TASK + 2).unwrap();
 
@@ -624,7 +624,7 @@ fn test_can_change_task_with_allow_task_change_flag() {
 fn test_can_keep_same_task_value() {
     // Tests that keeping the same task value is allowed without special flags.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/same-task"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_TASK + 3).unwrap();
 
@@ -660,7 +660,7 @@ fn test_cannot_change_both_project_and_task() {
     // The validation should fail on the first field checked, preventing
     // any partial updates.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/both-sticky"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_COMBINED).unwrap();
 
@@ -695,7 +695,7 @@ fn test_cannot_change_both_project_and_task() {
 fn test_can_change_both_with_force() {
     // Tests that --force allows changing both sticky fields.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/both-force"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_COMBINED + 1).unwrap();
 
@@ -730,7 +730,7 @@ fn test_can_change_both_with_force() {
 fn test_can_change_both_with_individual_flags() {
     // Tests that setting both allow flags enables changing both fields.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/both-allow"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_COMBINED + 2).unwrap();
 
@@ -767,7 +767,7 @@ fn test_can_change_project_but_not_task_with_selective_flags() {
     // Tests that allow_project_change only allows changing project,
     // not task, demonstrating flag independence.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/selective"), None).unwrap();
     let port = Port::try_from(PORT_BASE_STICKY_COMBINED + 3).unwrap();
 

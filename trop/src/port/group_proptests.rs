@@ -80,7 +80,7 @@ mod tests {
                 Port::try_from(min + 100).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -183,7 +183,7 @@ mod tests {
                 Port::try_from(min + 1000).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -270,7 +270,7 @@ mod tests {
             occupied.insert(Port::try_from(blocked_base + 1).unwrap());
             occupied.insert(Port::try_from(blocked_base + 2).unwrap());
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(occupied);
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -355,7 +355,7 @@ mod tests {
                 Port::try_from(min + 100).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -424,7 +424,7 @@ mod tests {
                 Port::try_from(min + 1000).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -505,7 +505,7 @@ mod tests {
                 Port::try_from(min + 1000).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -571,7 +571,7 @@ mod tests {
                 Port::try_from(min + 100).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -630,7 +630,7 @@ mod tests {
                 Port::try_from(Port::MAX).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -708,7 +708,7 @@ mod tests {
 
             let preferred_port = Port::try_from(min + preferred_port_offset).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -789,7 +789,7 @@ mod tests {
                 Port::try_from(min + 1000).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 

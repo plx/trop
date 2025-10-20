@@ -276,7 +276,7 @@ fn test_cleanup_with_expiration() {
 fn test_group_allocation_end_to_end() {
     // Test complete group allocation workflow
     // This verifies group allocation with database persistence
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let config = Config {
         ports: Some(PortConfig {

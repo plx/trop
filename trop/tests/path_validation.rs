@@ -42,7 +42,7 @@ fn test_reserve_current_directory_allowed() {
     // The current directory is considered a valid target because you're explicitly
     // running the command from there, showing clear intent.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let cwd = env::current_dir().unwrap();
     let key = ReservationKey::new(cwd, None).unwrap();
     let port = Port::try_from(PORT_BASE_RESERVE_ALLOWED).unwrap();
@@ -66,7 +66,7 @@ fn test_reserve_subdirectory_allowed() {
     // This is a descendant relationship: if you're in /home/user/project,
     // you should be able to reserve for /home/user/project/backend.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let cwd = env::current_dir().unwrap();
     let subdir = cwd.join("subdirectory");
     let key = ReservationKey::new(subdir, None).unwrap();
@@ -90,7 +90,7 @@ fn test_reserve_parent_directory_allowed() {
     // This is an ancestor relationship: if you're in /home/user/project/backend,
     // you should be able to reserve for /home/user/project.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let cwd = env::current_dir().unwrap();
 
     // Get parent directory (if it exists)
@@ -116,7 +116,7 @@ fn test_reserve_nested_subdirectory_allowed() {
     //
     // The hierarchical relationship extends to any depth.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let cwd = env::current_dir().unwrap();
     let nested = cwd.join("a").join("b").join("c").join("d");
     let key = ReservationKey::new(nested, None).unwrap();
@@ -137,7 +137,7 @@ fn test_reserve_nested_subdirectory_allowed() {
 fn test_reserve_ancestor_directory_allowed() {
     // Tests that any ancestor in the path hierarchy is allowed.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let cwd = env::current_dir().unwrap();
 
     // Walk up the directory tree testing ancestors
@@ -176,7 +176,7 @@ fn test_reserve_unrelated_absolute_path_blocked() {
     // This is the core protection: prevents accidentally operating on
     // unrelated projects.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let cwd = env::current_dir().unwrap();
 
     // Create a path that's definitely unrelated by using a different root structure
@@ -218,7 +218,7 @@ fn test_reserve_sibling_directory_blocked() {
     // If you're in /home/user/project-a, you shouldn't be able to
     // modify /home/user/project-b without explicit permission.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let cwd = env::current_dir().unwrap();
 
     // Get a sibling by going to parent and adding a different child
@@ -249,7 +249,7 @@ fn test_reserve_cousin_path_blocked() {
     //
     // Example: from /a/b/c, cannot access /a/d/e without permission.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let cwd = env::current_dir().unwrap();
 
     // Create a cousin: go up two levels, then down a different path
@@ -286,7 +286,7 @@ fn test_reserve_unrelated_path_with_allow_flag() {
     //
     // This flag provides explicit opt-in for cross-project operations.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let unrelated = unrelated_path("unrelated/path");
 
@@ -321,7 +321,7 @@ fn test_reserve_unrelated_path_with_force_flag() {
     //
     // Force is a master override that bypasses all safety checks.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let unrelated = unrelated_path("forced/path");
 
@@ -353,7 +353,7 @@ fn test_reserve_force_overrides_all_path_checks() {
     //
     // This verifies force is truly a master override.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     // Use root directory or C:\ - definitely unrelated
     let unrelated = if cfg!(windows) {
@@ -553,7 +553,7 @@ fn test_mixed_related_and_unrelated_paths() {
     // Tests that related paths work while unrelated paths are still blocked,
     // demonstrating that validation is applied per-operation, not globally.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let cwd = env::current_dir().unwrap();
     let subdir = cwd.join("allowed");
 
@@ -588,7 +588,7 @@ fn test_path_validation_with_tagged_reservations() {
     //
     // The tag doesn't affect path relationship checking - only the path matters.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let cwd = env::current_dir().unwrap();
     let subdir = cwd.join("tagged");
 

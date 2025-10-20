@@ -10,7 +10,7 @@ use trop::{Port, ReleaseOptions, ReleasePlan, ReservationKey, ReserveOptions, Re
 
 #[test]
 fn test_reserve_and_release_cycle() {
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/project"), None).unwrap();
     let port = Port::try_from(8080).unwrap();
 
@@ -60,7 +60,7 @@ fn test_reserve_and_release_cycle() {
 
 #[test]
 fn test_idempotent_reserve() {
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/project"), None).unwrap();
     let port = Port::try_from(8080).unwrap();
 
@@ -111,7 +111,7 @@ fn test_idempotent_reserve() {
 
 #[test]
 fn test_sticky_field_protection() {
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/project"), None).unwrap();
     let port = Port::try_from(8080).unwrap();
 
@@ -154,7 +154,7 @@ fn test_sticky_field_protection() {
 
 #[test]
 fn test_dry_run_mode() {
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/project"), None).unwrap();
     let port = Port::try_from(8080).unwrap();
 
@@ -184,7 +184,7 @@ fn test_dry_run_mode() {
 
 #[test]
 fn test_release_idempotent() {
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/project"), None).unwrap();
 
     // Release non-existent reservation
@@ -206,7 +206,7 @@ fn test_release_idempotent() {
 
 #[test]
 fn test_multiple_tagged_reservations() {
-    let mut db = create_test_database();
+    let db = create_test_database();
     let path = PathBuf::from("/test/project");
 
     // Create multiple reservations for same path with different tags

@@ -46,7 +46,7 @@ fn test_reserve_plan_for_new_reservation_has_create_action() {
     // This is the most basic case: nothing exists, so we need to create.
     // The plan should have exactly one action of the correct type.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/new"), None).unwrap();
     let port = Port::try_from(PORT_BASE_NEW_RESERVATION).unwrap();
 
@@ -77,7 +77,7 @@ fn test_reserve_plan_create_action_contains_correct_reservation() {
     // The plan action should contain a fully-formed Reservation with all the
     // requested metadata.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/details"), None).unwrap();
     let port = Port::try_from(PORT_BASE_NEW_RESERVATION + 1).unwrap();
 
@@ -115,7 +115,7 @@ fn test_reserve_plan_with_tagged_reservation() {
     //
     // Tags are part of the ReservationKey and should be preserved in the plan.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/tagged"), Some("web".to_string())).unwrap();
     let port = Port::try_from(PORT_BASE_NEW_RESERVATION + 2).unwrap();
 
@@ -142,7 +142,7 @@ fn test_reserve_plan_description_is_informative() {
     //
     // Good descriptions make --dry-run output useful.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/descriptive"), None).unwrap();
     let port = Port::try_from(PORT_BASE_NEW_RESERVATION + 3).unwrap();
 
@@ -383,7 +383,7 @@ fn test_dry_run_reserve_does_not_create_reservation() {
     // This is the core promise of dry-run: you can see what would happen
     // without any side effects.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/dry-run-reserve"), None).unwrap();
     let port = Port::try_from(PORT_BASE_DRY_RUN_RESERVE).unwrap();
 
@@ -419,7 +419,7 @@ fn test_dry_run_reserve_returns_port_in_result() {
     //
     // Even though nothing is created, the result should show what would happen.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/dry-run-port"), None).unwrap();
     let port = Port::try_from(PORT_BASE_DRY_RUN_RESERVE + 1).unwrap();
 
@@ -485,7 +485,7 @@ fn test_dry_run_idempotent_reserve_does_not_update_timestamp() {
 fn test_dry_run_with_metadata_works() {
     // Tests that dry-run handles reservations with metadata correctly.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/dry-run-metadata"), None).unwrap();
     let port = Port::try_from(PORT_BASE_DRY_RUN_RESERVE + 3).unwrap();
 
@@ -549,7 +549,7 @@ fn test_dry_run_release_does_not_delete_reservation() {
 fn test_dry_run_release_of_nonexistent_reservation() {
     // Tests that dry-run release of nonexistent reservation completes successfully.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/dry-run-release-none"), None).unwrap();
 
     let options = ReleaseOptions::new(key).with_allow_unrelated_path(true);
@@ -578,7 +578,7 @@ fn test_normal_execution_creates_reservation() {
     //
     // This is the contrast to dry-run: normal execution should have side effects.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/normal-exec"), None).unwrap();
     let port = Port::try_from(PORT_BASE_NORMAL_EXEC).unwrap();
 
@@ -641,7 +641,7 @@ fn test_plan_generation_uses_automatic_allocation_when_no_port() {
     //
     // With Phase 6, automatic allocation is used when no port is specified.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/no-port"), None).unwrap();
 
     // No port specified - should use automatic allocation
@@ -667,7 +667,7 @@ fn test_plan_generation_uses_automatic_allocation_when_no_port() {
 fn test_plan_generation_fails_for_path_violation() {
     // Tests that path validation errors occur during planning.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let unrelated = unrelated_path("plan_test");
 
@@ -711,7 +711,7 @@ fn test_plan_is_empty_method() {
 fn test_plan_is_not_empty_for_create() {
     // Tests that plans with actions are not empty.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/not-empty"), None).unwrap();
     let port = Port::try_from(PORT_BASE_CONTENT).unwrap();
 
@@ -730,7 +730,7 @@ fn test_plan_action_descriptions_are_helpful() {
     //
     // These descriptions are used in logging and dry-run output.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/action-desc"), None).unwrap();
     let port = Port::try_from(PORT_BASE_CONTENT + 1).unwrap();
 
@@ -759,7 +759,7 @@ fn test_multiple_plans_can_be_generated_without_execution() {
     //
     // This demonstrates the separation of planning and execution phases.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let plans: Vec<_> = (0..10)
         .map(|i| {
@@ -792,7 +792,7 @@ fn test_multiple_plans_can_be_generated_without_execution() {
 fn test_plan_execution_result_contains_useful_information() {
     // Tests that execution results contain information about what happened.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/result-info"), None).unwrap();
     let port = Port::try_from(PORT_BASE_CONTENT + 20).unwrap();
 
@@ -823,7 +823,7 @@ fn test_plan_execution_result_contains_useful_information() {
 fn test_dry_run_result_indicates_dry_run_mode() {
     // Tests that dry-run results are clearly marked.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/dry-run-marked"), None).unwrap();
     let port = Port::try_from(PORT_BASE_CONTENT + 21).unwrap();
 
@@ -848,7 +848,7 @@ fn test_dry_run_result_indicates_dry_run_mode() {
 fn test_planning_with_all_metadata_fields() {
     // Tests that plans correctly capture all metadata fields.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key =
         ReservationKey::new(PathBuf::from("/test/all-metadata"), Some("web".to_string())).unwrap();
     let port = Port::try_from(PORT_BASE_COMPLEX).unwrap();
@@ -884,7 +884,7 @@ fn test_planning_sequence_reserve_then_release() {
     // This demonstrates how plans can be generated, inspected, and then
     // executed in sequence.
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/sequence"), None).unwrap();
     let port = Port::try_from(PORT_BASE_COMPLEX + 10).unwrap();
 

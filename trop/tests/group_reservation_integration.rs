@@ -134,7 +134,7 @@ reservations:
 fn test_successful_group_reservation_with_offsets() {
     let temp_dir = create_temp_dir();
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(3));
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     // Build and execute the reservation plan
     let options = ReserveGroupOptions::new(config_path.clone());
@@ -233,7 +233,7 @@ fn test_successful_group_reservation_with_offsets() {
 fn test_mixed_offset_and_preferred_ports() {
     let temp_dir = create_temp_dir();
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &mixed_allocation_config());
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
@@ -302,7 +302,7 @@ fn test_mixed_offset_and_preferred_ports() {
 fn test_group_reservation_preferred_ports_only() {
     let temp_dir = create_temp_dir();
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &preferred_only_config());
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
@@ -349,7 +349,7 @@ fn test_group_reservation_preferred_ports_only() {
 fn test_group_reservation_with_project_and_task() {
     let temp_dir = create_temp_dir();
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(2));
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let options = ReserveGroupOptions::new(config_path).with_task(Some("development".to_string()));
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
@@ -399,7 +399,7 @@ fn test_group_reservation_with_project_and_task() {
 fn test_database_state_after_group_reservation() {
     let temp_dir = create_temp_dir();
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(2));
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let options = ReserveGroupOptions::new(config_path).with_task(Some("test-task".to_string()));
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
@@ -456,7 +456,7 @@ fn test_allocated_ports_not_reused() {
     let temp_dir2 = create_temp_dir();
     let config1_path = create_config_file(temp_dir1.path(), "trop.yaml", &simple_offset_config(2));
     let config2_path = create_config_file(temp_dir2.path(), "trop.yaml", &simple_offset_config(2));
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     // Allocate first group
     let options1 = ReserveGroupOptions::new(config1_path);
@@ -512,7 +512,7 @@ fn test_allocated_ports_not_reused() {
 fn test_autoreserve_discovers_config_in_current_dir() {
     let temp_dir = create_temp_dir();
     create_config_file(temp_dir.path(), "trop.yaml", &minimal_config());
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let options = AutoreserveOptions::new(temp_dir.path().to_path_buf());
     let planner = AutoreservePlan::new(options).expect("Should discover config");
@@ -546,7 +546,7 @@ fn test_autoreserve_discovers_config_from_parent() {
 
     // Put config in parent, start discovery from child
     create_config_file(temp_dir.path(), "trop.yaml", &minimal_config());
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let options = AutoreserveOptions::new(child_dir.clone());
     let planner = AutoreservePlan::new(options).expect("Should discover config");
@@ -617,7 +617,7 @@ reservations:
     create_config_file(temp_dir.path(), "trop.yaml", global_config);
     create_config_file(temp_dir.path(), "trop.local.yaml", local_config);
 
-    let mut db = create_test_database();
+    let db = create_test_database();
     let options = AutoreserveOptions::new(temp_dir.path().to_path_buf());
     let planner = AutoreservePlan::new(options).expect("Should discover config");
 
@@ -698,7 +698,7 @@ fn test_autoreserve_no_config_found() {
 fn test_allow_unrelated_path_flag() {
     let temp_dir = create_temp_dir();
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(1));
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     // Test with flag enabled
     let options = ReserveGroupOptions::new(config_path).with_allow_unrelated_path(true);
@@ -728,7 +728,7 @@ fn test_allow_unrelated_path_flag() {
 fn test_allow_project_change_flag() {
     let temp_dir = create_temp_dir();
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(1));
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let options = ReserveGroupOptions::new(config_path).with_allow_project_change(true);
     let planner = ReserveGroupPlan::new(options).expect("Should create plan");
@@ -754,7 +754,7 @@ fn test_allow_project_change_flag() {
 fn test_allow_task_change_flag() {
     let temp_dir = create_temp_dir();
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(1));
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let options = ReserveGroupOptions::new(config_path)
         .with_task(Some("task1".to_string()))
@@ -783,7 +783,7 @@ fn test_allow_task_change_flag() {
 fn test_force_flag_behavior() {
     let temp_dir = create_temp_dir();
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(1));
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let options = ReserveGroupOptions::new(config_path).with_force(true);
     let planner = ReserveGroupPlan::new(options).expect("Should create plan");
@@ -935,7 +935,7 @@ reservations:
       preferred: 9000
 "#;
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", config_content);
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
@@ -974,7 +974,7 @@ reservations:
 #[test]
 fn test_error_preferred_port_occupied() {
     let temp_dir = create_temp_dir();
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     // First, reserve a port that we'll try to use as preferred
     let first_config = r#"
@@ -1051,7 +1051,7 @@ reservations:
 #[test]
 fn test_error_no_base_port_for_pattern() {
     let temp_dir = create_temp_dir();
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     // Create a very small range
     let config_content = r#"
@@ -1135,7 +1135,7 @@ reservations:
 fn test_dry_run_no_database_changes() {
     let temp_dir = create_temp_dir();
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(2));
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
@@ -1193,7 +1193,7 @@ reservations:
       offset: 1000
 "#;
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", config_content);
-    let mut db = create_test_database();
+    let db = create_test_database();
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
@@ -1237,7 +1237,7 @@ reservations:
 /// - Database handles multiple groups
 #[test]
 fn test_multiple_sequential_group_allocations() {
-    let mut db = create_test_database();
+    let db = create_test_database();
     let mut temp_dirs = Vec::new();
 
     // Allocate three different groups sequentially, each in its own directory

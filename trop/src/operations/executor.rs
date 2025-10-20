@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn test_execute_create_reservation() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let key = ReservationKey::new(PathBuf::from("/test/path"), None).unwrap();
         let port = Port::try_from(8080).unwrap();
         let reservation = Reservation::builder(key.clone(), port).build().unwrap();
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_dry_run_does_not_modify_database() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let key = ReservationKey::new(PathBuf::from("/test/path"), None).unwrap();
         let port = Port::try_from(8080).unwrap();
         let reservation = Reservation::builder(key.clone(), port).build().unwrap();
@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn test_execute_multiple_actions() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let key1 = ReservationKey::new(PathBuf::from("/test/path1"), None).unwrap();
         let key2 = ReservationKey::new(PathBuf::from("/test/path2"), None).unwrap();
         let port1 = Port::try_from(8080).unwrap();
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_execution_result_includes_warnings() {
-        let mut db = create_test_database();
+        let db = create_test_database();
 
         let plan = OperationPlan::new("Test")
             .add_warning("Warning 1")
@@ -431,7 +431,7 @@ mod tests {
 
     #[test]
     fn test_extract_port_from_create_action() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let key = ReservationKey::new(PathBuf::from("/test/path"), None).unwrap();
         let port = Port::try_from(8080).unwrap();
         let reservation = Reservation::builder(key, port).build().unwrap();
