@@ -6,7 +6,7 @@ use crate::utils::{
 };
 use clap::Args;
 use std::path::PathBuf;
-use trop::ReservationKey;
+use trop::{Database, ReservationKey};
 
 /// Assert that a reservation exists for a specific path/tag combination.
 #[derive(Args)]
@@ -38,7 +38,8 @@ impl AssertReservationCommand {
         let key =
             ReservationKey::new(normalized, self.tag).map_err(|e| CliError::Library(e.into()))?;
 
-        let reservation = db.get_reservation(&key).map_err(CliError::from)?;
+        let reservation =
+            Database::get_reservation(db.connection(), &key).map_err(CliError::from)?;
 
         // 4. Check assertion
         let exists = reservation.is_some();

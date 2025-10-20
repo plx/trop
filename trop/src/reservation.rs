@@ -438,6 +438,9 @@ impl std::fmt::Display for ValidationError {
 impl std::error::Error for ValidationError {}
 
 #[cfg(test)]
+mod proptests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

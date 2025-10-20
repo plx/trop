@@ -5,10 +5,10 @@
 
 use crate::commands::{
     AssertDataDirCommand, AssertPortCommand, AssertReservationCommand, AutocleanCommand,
-    AutoreserveCommand, CompactExclusionsCommand, ExcludeCommand, ExpireCommand, InitCommand,
-    ListCommand, ListProjectsCommand, MigrateCommand, PortInfoCommand, PruneCommand,
-    ReleaseCommand, ReserveCommand, ReserveGroupCommand, ScanCommand, ShowDataDirCommand,
-    ShowPathCommand, ValidateCommand,
+    AutoreserveCommand, CompactExclusionsCommand, CompletionsCommand, ExcludeCommand,
+    ExpireCommand, InitCommand, ListCommand, ListProjectsCommand, MigrateCommand, PortInfoCommand,
+    PruneCommand, ReleaseCommand, ReserveCommand, ReserveGroupCommand, ScanCommand,
+    ShowDataDirCommand, ShowPathCommand, ValidateCommand,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -108,4 +108,7 @@ pub enum Command {
 
     /// Migrate reservations between paths
     Migrate(MigrateCommand),
+
+    /// Generate shell completion scripts
+    Completions(CompletionsCommand),
 }

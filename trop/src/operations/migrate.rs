@@ -186,10 +186,10 @@ impl MigratePlan {
         // Step 2: Find all reservations at from_path
         let reservations = if self.options.recursive {
             // Get all descendants (including exact match)
-            db.get_reservations_by_path_prefix(&from_normalized)?
+            Database::get_reservations_by_path_prefix(db.connection(), &from_normalized)?
         } else {
             // Get exact matches only
-            db.list_all_reservations()?
+            Database::list_all_reservations(db.connection())?
                 .into_iter()
                 .filter(|r| normalize(&r.key().path).ok() == Some(from_normalized.clone()))
                 .collect()
@@ -224,7 +224,7 @@ impl MigratePlan {
             let to_key = ReservationKey::new(new_path, from_key.tag.clone())?;
 
             // Check if reservation already exists at destination
-            let has_conflict = db.get_reservation(&to_key)?.is_some();
+            let has_conflict = Database::get_reservation(db.connection(), &to_key)?.is_some();
             if has_conflict {
                 // Conflict detected - track it
                 self.conflicts.push(to_key.clone());
@@ -401,9 +401,15 @@ pub fn execute_migrate(plan: &MigratePlan, db: &mut Database) -> Result<MigrateR
     // Convert to operation plan
     let op_plan = to_operation_plan(plan);
 
-    // Execute the plan
-    let mut executor = PlanExecutor::new(db);
+    // Begin transaction for atomic migration
+    let tx = db.begin_transaction()?;
+
+    // Execute the plan inside transaction
+    let mut executor = PlanExecutor::new(&tx);
     executor.execute(&op_plan)?;
+
+    // Commit transaction
+    tx.commit()?;
 
     // Build result
     Ok(MigrateResult {

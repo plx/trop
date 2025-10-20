@@ -9,6 +9,7 @@ use crate::database::Database;
 use crate::error::Result;
 use crate::port::allocator::allocator_from_config;
 use crate::Port;
+use rusqlite::Connection;
 
 use super::plan::{OperationPlan, PlanAction};
 
@@ -91,24 +92,24 @@ impl ExecutionResult {
 ///
 /// let options = ReserveOptions::new(key, Some(port))
 ///     .with_allow_unrelated_path(true);
-/// let plan = ReservePlan::new(options, &config).build_plan(&mut db).unwrap();
+/// let plan = ReservePlan::new(options, &config).build_plan(db.connection()).unwrap();
 ///
 /// // Normal execution
-/// let mut executor = PlanExecutor::new(&mut db);
+/// let mut executor = PlanExecutor::new(db.connection());
 /// let result = executor.execute(&plan).unwrap();
 /// assert!(result.success);
 ///
 /// // Dry-run execution
-/// let mut executor = PlanExecutor::new(&mut db).dry_run();
+/// let mut executor = PlanExecutor::new(db.connection()).dry_run();
 /// let result = executor.execute(&plan).unwrap();
 /// assert!(result.dry_run);
 /// ```
-pub struct PlanExecutor<'a> {
-    db: &'a mut Database,
+pub struct PlanExecutor<'conn> {
+    conn: &'conn Connection,
     dry_run: bool,
 }
 
-impl<'a> PlanExecutor<'a> {
+impl<'conn> PlanExecutor<'conn> {
     /// Creates a new plan executor.
     ///
     /// # Examples
@@ -118,11 +119,14 @@ impl<'a> PlanExecutor<'a> {
     /// use trop::{Database, DatabaseConfig};
     ///
     /// let mut db = Database::open(DatabaseConfig::new("/tmp/trop.db")).unwrap();
-    /// let executor = PlanExecutor::new(&mut db);
+    /// let executor = PlanExecutor::new(db.connection());
     /// ```
     #[must_use]
-    pub const fn new(db: &'a mut Database) -> Self {
-        Self { db, dry_run: false }
+    pub const fn new(conn: &'conn Connection) -> Self {
+        Self {
+            conn,
+            dry_run: false,
+        }
     }
 
     /// Sets the executor to dry-run mode.
@@ -137,7 +141,7 @@ impl<'a> PlanExecutor<'a> {
     /// use trop::{Database, DatabaseConfig};
     ///
     /// let mut db = Database::open(DatabaseConfig::new("/tmp/trop.db")).unwrap();
-    /// let executor = PlanExecutor::new(&mut db).dry_run();
+    /// let executor = PlanExecutor::new(db.connection()).dry_run();
     /// ```
     #[must_use]
     pub const fn dry_run(mut self) -> Self {
@@ -163,7 +167,7 @@ impl<'a> PlanExecutor<'a> {
     /// let mut db = Database::open(DatabaseConfig::new("/tmp/trop.db")).unwrap();
     /// let plan = OperationPlan::new("Test operation");
     ///
-    /// let mut executor = PlanExecutor::new(&mut db);
+    /// let mut executor = PlanExecutor::new(db.connection());
     /// let result = executor.execute(&plan).unwrap();
     /// ```
     pub fn execute(&mut self, plan: &OperationPlan) -> Result<ExecutionResult> {
@@ -194,20 +198,23 @@ impl<'a> PlanExecutor<'a> {
     fn execute_action(&mut self, action: &PlanAction) -> Result<Option<HashMap<String, Port>>> {
         match action {
             PlanAction::CreateReservation(reservation) => {
-                self.db.create_reservation(reservation)?;
+                // Use simple create - transaction is managed by caller (CLI layer)
+                // The UNIQUE constraint on the port column ensures we can't double-allocate
+                Database::create_reservation_simple(self.conn, reservation)?;
                 Ok(None)
             }
             PlanAction::UpdateReservation(reservation) => {
-                // update_reservation is the same as create_reservation (upsert)
-                self.db.create_reservation(reservation)?;
+                // For updates, use the simple create (upsert) - no transaction needed here
+                // Updates are for existing reservations where we're changing metadata
+                Database::create_reservation_simple(self.conn, reservation)?;
                 Ok(None)
             }
             PlanAction::UpdateLastUsed(key) => {
-                self.db.update_last_used(key).map(|_| ())?;
+                Database::update_last_used_simple(self.conn, key)?;
                 Ok(None)
             }
             PlanAction::DeleteReservation(key) => {
-                self.db.delete_reservation(key).map(|_| ())?;
+                Database::delete_reservation_simple(self.conn, key)?;
                 Ok(None)
             }
             PlanAction::AllocateGroup {
@@ -216,7 +223,7 @@ impl<'a> PlanExecutor<'a> {
                 occupancy_config,
             } => {
                 let allocator = allocator_from_config(full_config)?;
-                let result = allocator.allocate_group(self.db, request, occupancy_config)?;
+                let result = allocator.allocate_group(self.conn, request, occupancy_config)?;
                 Ok(Some(result.allocations))
             }
         }
@@ -234,7 +241,7 @@ impl<'a> PlanExecutor<'a> {
                 }
                 PlanAction::UpdateLastUsed(key) => {
                     // For idempotent case, get the existing reservation's port
-                    if let Ok(Some(reservation)) = self.db.get_reservation(key) {
+                    if let Ok(Some(reservation)) = Database::get_reservation(self.conn, key) {
                         return Some(reservation.port());
                     }
                 }
@@ -285,7 +292,7 @@ mod tests {
 
     #[test]
     fn test_execute_create_reservation() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let key = ReservationKey::new(PathBuf::from("/test/path"), None).unwrap();
         let port = Port::try_from(8080).unwrap();
         let reservation = Reservation::builder(key.clone(), port).build().unwrap();
@@ -293,7 +300,7 @@ mod tests {
         let plan = OperationPlan::new("Test")
             .add_action(PlanAction::CreateReservation(reservation.clone()));
 
-        let mut executor = PlanExecutor::new(&mut db);
+        let mut executor = PlanExecutor::new(db.connection());
         let result = executor.execute(&plan).unwrap();
 
         assert!(result.success);
@@ -301,7 +308,7 @@ mod tests {
         assert_eq!(result.actions_taken.len(), 1);
 
         // Verify reservation was created
-        let loaded = db.get_reservation(&key).unwrap();
+        let loaded = Database::get_reservation(db.connection(), &key).unwrap();
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().port(), port);
     }
@@ -321,13 +328,15 @@ mod tests {
 
         let plan = OperationPlan::new("Test").add_action(PlanAction::UpdateLastUsed(key.clone()));
 
-        let mut executor = PlanExecutor::new(&mut db);
+        let mut executor = PlanExecutor::new(db.connection());
         let result = executor.execute(&plan).unwrap();
 
         assert!(result.success);
 
         // Verify timestamp was updated
-        let loaded = db.get_reservation(&key).unwrap().unwrap();
+        let loaded = Database::get_reservation(db.connection(), &key)
+            .unwrap()
+            .unwrap();
         assert!(loaded.last_used_at() > reservation.last_used_at());
     }
 
@@ -344,19 +353,19 @@ mod tests {
         let plan =
             OperationPlan::new("Test").add_action(PlanAction::DeleteReservation(key.clone()));
 
-        let mut executor = PlanExecutor::new(&mut db);
+        let mut executor = PlanExecutor::new(db.connection());
         let result = executor.execute(&plan).unwrap();
 
         assert!(result.success);
 
         // Verify reservation was deleted
-        let loaded = db.get_reservation(&key).unwrap();
+        let loaded = Database::get_reservation(db.connection(), &key).unwrap();
         assert!(loaded.is_none());
     }
 
     #[test]
     fn test_dry_run_does_not_modify_database() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let key = ReservationKey::new(PathBuf::from("/test/path"), None).unwrap();
         let port = Port::try_from(8080).unwrap();
         let reservation = Reservation::builder(key.clone(), port).build().unwrap();
@@ -364,20 +373,20 @@ mod tests {
         let plan =
             OperationPlan::new("Test").add_action(PlanAction::CreateReservation(reservation));
 
-        let mut executor = PlanExecutor::new(&mut db).dry_run();
+        let mut executor = PlanExecutor::new(db.connection()).dry_run();
         let result = executor.execute(&plan).unwrap();
 
         assert!(result.success);
         assert!(result.dry_run);
 
         // Verify reservation was NOT created
-        let loaded = db.get_reservation(&key).unwrap();
+        let loaded = Database::get_reservation(db.connection(), &key).unwrap();
         assert!(loaded.is_none());
     }
 
     #[test]
     fn test_execute_multiple_actions() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let key1 = ReservationKey::new(PathBuf::from("/test/path1"), None).unwrap();
         let key2 = ReservationKey::new(PathBuf::from("/test/path2"), None).unwrap();
         let port1 = Port::try_from(8080).unwrap();
@@ -389,26 +398,30 @@ mod tests {
             .add_action(PlanAction::CreateReservation(r1))
             .add_action(PlanAction::CreateReservation(r2));
 
-        let mut executor = PlanExecutor::new(&mut db);
+        let mut executor = PlanExecutor::new(db.connection());
         let result = executor.execute(&plan).unwrap();
 
         assert!(result.success);
         assert_eq!(result.actions_taken.len(), 2);
 
         // Verify both reservations were created
-        assert!(db.get_reservation(&key1).unwrap().is_some());
-        assert!(db.get_reservation(&key2).unwrap().is_some());
+        assert!(Database::get_reservation(db.connection(), &key1)
+            .unwrap()
+            .is_some());
+        assert!(Database::get_reservation(db.connection(), &key2)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
     fn test_execution_result_includes_warnings() {
-        let mut db = create_test_database();
+        let db = create_test_database();
 
         let plan = OperationPlan::new("Test")
             .add_warning("Warning 1")
             .add_warning("Warning 2");
 
-        let mut executor = PlanExecutor::new(&mut db);
+        let mut executor = PlanExecutor::new(db.connection());
         let result = executor.execute(&plan).unwrap();
 
         assert_eq!(result.warnings.len(), 2);
@@ -418,7 +431,7 @@ mod tests {
 
     #[test]
     fn test_extract_port_from_create_action() {
-        let mut db = create_test_database();
+        let db = create_test_database();
         let key = ReservationKey::new(PathBuf::from("/test/path"), None).unwrap();
         let port = Port::try_from(8080).unwrap();
         let reservation = Reservation::builder(key, port).build().unwrap();
@@ -426,7 +439,7 @@ mod tests {
         let plan =
             OperationPlan::new("Test").add_action(PlanAction::CreateReservation(reservation));
 
-        let mut executor = PlanExecutor::new(&mut db);
+        let mut executor = PlanExecutor::new(db.connection());
         let result = executor.execute(&plan).unwrap();
 
         assert_eq!(result.port, Some(port));
@@ -444,7 +457,7 @@ mod tests {
 
         let plan = OperationPlan::new("Test").add_action(PlanAction::UpdateLastUsed(key));
 
-        let mut executor = PlanExecutor::new(&mut db);
+        let mut executor = PlanExecutor::new(db.connection());
         let result = executor.execute(&plan).unwrap();
 
         assert_eq!(result.port, Some(port));

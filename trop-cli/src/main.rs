@@ -56,6 +56,7 @@ fn main() {
         cli::Command::Init(cmd) => cmd.execute(&global),
         cli::Command::ListProjects(cmd) => cmd.execute(&global),
         cli::Command::Migrate(cmd) => cmd.execute(&global),
+        cli::Command::Completions(cmd) => cmd.execute(&global),
     };
 
     // Handle errors and set exit code

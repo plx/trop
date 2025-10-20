@@ -4,30 +4,39 @@
 
 ## Current Status
 
-**Phase 1 Complete** - Core types and project scaffold implemented
+**Phase 12 (Testing and Polish)** - Core functionality complete, documentation added
 
-This is early-stage development software. The project has completed Phase 1, which includes:
+This project has completed Phases 1-11, implementing all core functionality:
 
-- Core types: `Port`, `PortRange`, `Reservation`, `ReservationKey`
-- Error handling infrastructure
-- Logging system
-- Project structure (library + CLI crates)
-- Unit tests for core functionality
-- Integration test scaffolding
+- ✅ Core types and project scaffold
+- ✅ SQLite database layer with ACID properties
+- ✅ Path handling and canonicalization
+- ✅ Reservation operations (create, query, release)
+- ✅ Configuration system with TOML support
+- ✅ Port allocation and occupancy checking
+- ✅ Essential CLI commands (reserve, release, list, get)
+- ✅ Group reservations for multi-service projects
+- ✅ Cleanup operations
+- ✅ Assertion and utility commands
+- ✅ Migration and advanced operations
+- ✅ Property-based tests and concurrency tests
+- ✅ Man pages and shell completions
 
-The CLI currently only displays version information. Full functionality is under active development.
+The tool is now feature-complete and undergoing final polish before 1.0 release.
 
 ## What is trop?
 
-`trop` provides a CLI tool for idempotent, directory-based port reservation management. Key features (planned):
+`trop` provides a CLI tool for idempotent, directory-based port reservation management. Key features:
 
-- **Idempotent reservations**: Repeated requests for the same directory/tag return the same port
+- **Idempotent reservations**: Repeated requests for the same directory return the same port
 - **Directory-based lifecycle**: Automatic cleanup when directories are removed
 - **Cross-process safety**: Uses SQLite for ACID properties
 - **Hierarchical configuration**: Supports user-level and project-level config files
-- **Multiple ports per directory**: Use tags to reserve multiple ports (e.g., "web", "api", "db")
+- **Group reservations**: Reserve multiple contiguous ports for multi-service projects
+- **Port occupancy detection**: Automatically avoid ports already in use
+- **Shell completions**: First-class support for bash, zsh, fish, and PowerShell
 
-Typical usage (once implemented):
+Typical usage:
 
 ```justfile
 # Reserve a port for the current directory
@@ -37,12 +46,86 @@ preview:
   npm run preview -- --port {{port}}
 ```
 
+## Quick Start
+
+Once built, initialize trop and reserve your first port:
+
+```bash
+# Initialize trop (creates database and default config)
+trop init --with-config
+
+# Reserve a port for the current directory
+cd ~/projects/my-app
+trop reserve
+
+# Use the port in your application
+PORT=$(trop reserve)
+npm start -- --port $PORT
+
+# List all reservations
+trop list
+
+# Release when done
+trop release
+```
+
+See the [examples/](examples/) directory for more detailed usage guides.
+
 ## Documentation
 
-For detailed information about the tool's design and planned features:
+### User Documentation
+
+- [Basic Usage Guide](examples/basic_usage.md) - Get started in 5 minutes
+- [Examples](examples/) - Practical examples for common scenarios
+- Man page: `man trop` (after installation)
+- Shell completions: `trop completions <shell>`
+
+### Developer Documentation
 
 - [Implementation Specification](reference/ImplementationSpecification.md) - Complete specification
-- [Phase 1 Implementation Plan](plans/phases/phase-01-project-scaffold.md) - Current phase details
+- [Implementation Plan](reference/ImplementationPlan.md) - Phased development plan
+- API documentation: `cargo doc --open`
+
+## Installation
+
+### Install from source
+
+```bash
+git clone https://github.com/your-org/trop
+cd trop
+cargo install --path trop-cli
+```
+
+### Install man pages (optional)
+
+```bash
+# After building
+sudo cp target/release/build/trop-cli-*/out/man/trop.1 /usr/local/share/man/man1/
+sudo mandb
+```
+
+### Install shell completions (optional)
+
+For bash:
+```bash
+trop completions bash > ~/.local/share/bash-completion/completions/trop
+```
+
+For zsh:
+```bash
+trop completions zsh > ~/.zsh/completions/_trop
+# Add ~/.zsh/completions to your $fpath in .zshrc
+```
+
+For fish:
+```bash
+trop completions fish > ~/.config/fish/completions/trop.fish
+```
+
+For PowerShell:
+```powershell
+trop completions powershell > $PROFILE
+```
 
 ## Development
 
@@ -197,15 +280,6 @@ agentic-navigation-guide init --output AGENTIC_NAVIGATION_GUIDE.md --exclude '.g
 
 The CI pipeline automatically checks that the navigation guide is valid on every pull request.
 
-## Installation
-
-Not yet published to crates.io. Once development is further along, installation will be:
-
-```bash
-cargo install trop-cli
-```
-
-For now, build from source using the instructions above.
 
 ## Scope and Limitations
 
@@ -225,13 +299,15 @@ MIT
 
 This is an experimental project exploring high-autonomy agentic development patterns. Contributions are welcome once the project reaches a more stable state.
 
-## Warning
+## Project Status
 
-**This is alpha-stage development software. It is not ready for production use.**
+**Pre-1.0 Release**
 
-- The CLI currently has minimal functionality
-- Database schema and API are subject to change
-- No backward compatibility guarantees yet
-- Full documentation pending implementation
+The core functionality is feature-complete and stable, but trop is still in pre-release status:
 
-Check back as development progresses!
+- ✅ All planned features implemented and tested
+- ⚠️ Minor API refinements may occur before 1.0
+- ✅ Backward compatibility maintained after 1.0 release
+- 📝 Please report any issues or unexpected behavior
+
+Consider this software "beta" quality - ready for real use with the understanding that the 1.0 API is not yet final.

@@ -7,7 +7,7 @@ use clap::{Args, ValueEnum};
 use serde::Serialize;
 use trop::config::{Config, PortExclusion, DEFAULT_MAX_PORT, DEFAULT_MIN_PORT};
 use trop::port::occupancy::{OccupancyCheckConfig, PortOccupancyChecker, SystemOccupancyChecker};
-use trop::{Port, PortRange};
+use trop::{Database, Port, PortRange};
 
 /// Scan port range for occupied ports.
 #[derive(Args)]
@@ -81,8 +81,7 @@ impl ScanCommand {
             .map_err(CliError::from)?;
 
         // 4. Get reserved ports from database
-        let reserved_ports = db
-            .get_reserved_ports_in_range(&range)
+        let reserved_ports = Database::get_reserved_ports_in_range(db.connection(), &range)
             .map_err(CliError::from)?;
 
         // 5. Find unreserved occupied ports

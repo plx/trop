@@ -8,6 +8,7 @@
 #[cfg(test)]
 mod tests {
     use crate::database::test_util::create_test_database;
+    use crate::database::Database;
     use crate::port::allocator::PortAllocator;
     use crate::port::exclusions::ExclusionManager;
     use crate::port::group::{GroupAllocationRequest, ServiceAllocationRequest};
@@ -79,7 +80,7 @@ mod tests {
                 Port::try_from(min + 100).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -104,10 +105,10 @@ mod tests {
             };
 
             let config = OccupancyCheckConfig::default();
-            let result = allocator.allocate_group(&mut db, &request, &config);
+            let result = allocator.allocate_group(db.connection(), &request, &config);
 
             // Count how many reservations exist in the database for this path
-            let reservations = db.list_all_reservations().unwrap();
+            let reservations = Database::list_all_reservations(db.connection()).unwrap();
             let group_reservations: Vec<_> = reservations
                 .iter()
                 .filter(|r| r.key().path == PathBuf::from("/test/group"))
@@ -182,7 +183,7 @@ mod tests {
                 Port::try_from(min + 1000).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -205,7 +206,7 @@ mod tests {
 
             let config = OccupancyCheckConfig::default();
 
-            if let Ok(result) = allocator.allocate_group(&mut db, &request, &config) {
+            if let Ok(result) = allocator.allocate_group(db.connection(), &request, &config) {
                 // Verify base port exists
                 let base = result.base_port.expect("Base port should exist for offset-based allocation");
 
@@ -269,7 +270,7 @@ mod tests {
             occupied.insert(Port::try_from(blocked_base + 1).unwrap());
             occupied.insert(Port::try_from(blocked_base + 2).unwrap());
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(occupied);
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -299,7 +300,7 @@ mod tests {
             };
 
             let config = OccupancyCheckConfig::default();
-            let result = allocator.allocate_group(&mut db, &request, &config);
+            let result = allocator.allocate_group(db.connection(), &request, &config);
 
             // Should succeed and skip the blocked pattern
             prop_assert!(result.is_ok(), "Allocation should succeed by skipping occupied pattern");
@@ -354,7 +355,7 @@ mod tests {
                 Port::try_from(min + 100).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -380,7 +381,7 @@ mod tests {
             };
 
             let config = OccupancyCheckConfig::default();
-            let result = allocator.allocate_group(&mut db, &request, &config);
+            let result = allocator.allocate_group(db.connection(), &request, &config);
 
             // Must fail with validation error
             prop_assert!(result.is_err(), "Duplicate tags should cause error");
@@ -423,7 +424,7 @@ mod tests {
                 Port::try_from(min + 1000).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -448,7 +449,7 @@ mod tests {
 
             let config = OccupancyCheckConfig::default();
 
-            if let Ok(result) = allocator.allocate_group(&mut db, &request, &config) {
+            if let Ok(result) = allocator.allocate_group(db.connection(), &request, &config) {
                 // Result must have exactly the same number of allocations
                 prop_assert_eq!(
                     result.allocations.len(),
@@ -504,7 +505,7 @@ mod tests {
                 Port::try_from(min + 1000).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -527,7 +528,7 @@ mod tests {
 
             let config = OccupancyCheckConfig::default();
 
-            if let Ok(result) = allocator.allocate_group(&mut db, &request, &config) {
+            if let Ok(result) = allocator.allocate_group(db.connection(), &request, &config) {
                 // Collect all allocated ports
                 let ports: Vec<Port> = result.allocations.values().copied().collect();
 
@@ -570,7 +571,7 @@ mod tests {
                 Port::try_from(min + 100).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -582,7 +583,7 @@ mod tests {
             };
 
             let config = OccupancyCheckConfig::default();
-            let result = allocator.allocate_group(&mut db, &request, &config);
+            let result = allocator.allocate_group(db.connection(), &request, &config);
 
             prop_assert!(result.is_err(), "Empty services should cause error");
 
@@ -629,7 +630,7 @@ mod tests {
                 Port::try_from(Port::MAX).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -654,7 +655,7 @@ mod tests {
             };
 
             let config = OccupancyCheckConfig::default();
-            let result = allocator.allocate_group(&mut db, &request, &config);
+            let result = allocator.allocate_group(db.connection(), &request, &config);
 
             // Either succeeds (found valid base) or fails (no valid base)
             // Should never panic
@@ -707,7 +708,7 @@ mod tests {
 
             let preferred_port = Port::try_from(min + preferred_port_offset).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -738,7 +739,7 @@ mod tests {
 
             let config = OccupancyCheckConfig::default();
 
-            if let Ok(result) = allocator.allocate_group(&mut db, &request, &config) {
+            if let Ok(result) = allocator.allocate_group(db.connection(), &request, &config) {
                 // Verify preferred service got its preferred port
                 let preferred_allocated = result.allocations.get("preferred").unwrap();
                 prop_assert_eq!(
@@ -788,7 +789,7 @@ mod tests {
                 Port::try_from(min + 1000).unwrap()
             ).unwrap();
 
-            let mut db = create_test_database();
+            let db = create_test_database();
             let checker = MockOccupancyChecker::new(HashSet::new());
             let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
 
@@ -822,7 +823,7 @@ mod tests {
 
             let config = OccupancyCheckConfig::default();
 
-            if let Ok(result) = allocator.allocate_group(&mut db, &request, &config) {
+            if let Ok(result) = allocator.allocate_group(db.connection(), &request, &config) {
                 if has_zero_offset {
                     // Should have a base port
                     let base = result.base_port.expect("Should have base port");

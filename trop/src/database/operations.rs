@@ -7,7 +7,7 @@ use std::env;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use rusqlite::{params, TransactionBehavior};
+use rusqlite::{params, Connection, TransactionBehavior};
 
 use crate::error::{Error, Result};
 use crate::path::PathRelationship;
@@ -178,6 +178,60 @@ impl Database {
         Ok(())
     }
 
+    /// Creates or updates a reservation using an existing connection or transaction.
+    ///
+    /// This method is intended for use within an existing transaction context.
+    /// Unlike `create_reservation`, it does not create its own transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the insert fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use trop::database::{Database, DatabaseConfig};
+    /// use trop::{Reservation, ReservationKey, Port};
+    /// use std::path::PathBuf;
+    ///
+    /// let config = DatabaseConfig::new("/tmp/trop.db");
+    /// let mut db = Database::open(config).unwrap();
+    ///
+    /// let key = ReservationKey::new(PathBuf::from("/path"), None).unwrap();
+    /// let port = Port::try_from(8080).unwrap();
+    /// let reservation = Reservation::builder(key, port).build().unwrap();
+    ///
+    /// let tx = db.begin_transaction().unwrap();
+    /// Database::create_reservation_simple(&tx, &reservation).unwrap();
+    /// tx.commit().unwrap();
+    /// ```
+    pub fn create_reservation_simple(conn: &Connection, reservation: &Reservation) -> Result<()> {
+        // For NULL tags, explicitly delete first to ensure replacement works
+        // (INSERT OR REPLACE doesn't work with NULL in PRIMARY KEY due to NULL != NULL)
+        conn.execute(
+            DELETE_RESERVATION,
+            params![reservation.key().path_as_string(), reservation.key().tag],
+        )?;
+
+        let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
+        let last_used_secs = systemtime_to_unix_secs(reservation.last_used_at())?;
+
+        conn.execute(
+            INSERT_RESERVATION,
+            params![
+                reservation.key().path_as_string(),
+                reservation.key().tag,
+                reservation.port().value(),
+                reservation.project(),
+                reservation.task(),
+                created_secs,
+                last_used_secs,
+            ],
+        )?;
+
+        Ok(())
+    }
+
     /// Retrieves a reservation from the database.
     ///
     /// # Errors
@@ -201,10 +255,10 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let key = ReservationKey::new(PathBuf::from("/path"), None).unwrap();
-    /// let reservation = db.get_reservation(&key).unwrap();
+    /// let reservation = Database::get_reservation(db.connection(), &key).unwrap();
     /// ```
-    pub fn get_reservation(&self, key: &ReservationKey) -> Result<Option<Reservation>> {
-        let mut stmt = self.conn.prepare(SELECT_RESERVATION)?;
+    pub fn get_reservation(conn: &Connection, key: &ReservationKey) -> Result<Option<Reservation>> {
+        let mut stmt = conn.prepare(SELECT_RESERVATION)?;
 
         match stmt.query_row(params![key.path_as_string(), key.tag], |row| {
             let port_value: u16 = row.get(0)?;
@@ -309,6 +363,37 @@ impl Database {
         Ok(rows_affected > 0)
     }
 
+    /// Updates the last used timestamp for a reservation (without creating a transaction).
+    ///
+    /// This method is intended for use within an existing transaction.
+    /// For standalone use, use `update_last_used` instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the timestamp conversion fails or the database update fails.
+    pub fn update_last_used_simple(conn: &Connection, key: &ReservationKey) -> Result<bool> {
+        let now = systemtime_to_unix_secs(SystemTime::now())?;
+        let rows_affected = conn.execute(
+            UPDATE_LAST_USED,
+            params![now, key.path_as_string(), key.tag],
+        )?;
+        Ok(rows_affected > 0)
+    }
+
+    /// Deletes a reservation from the database (without creating a transaction).
+    ///
+    /// This method is intended for use within an existing transaction.
+    /// For standalone use, use `delete_reservation` instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database deletion fails.
+    pub fn delete_reservation_simple(conn: &Connection, key: &ReservationKey) -> Result<bool> {
+        let rows_affected =
+            conn.execute(DELETE_RESERVATION, params![key.path_as_string(), key.tag])?;
+        Ok(rows_affected > 0)
+    }
+
     /// Lists all reservations in the database.
     ///
     /// # Errors
@@ -324,13 +409,13 @@ impl Database {
     /// let config = DatabaseConfig::new("/tmp/trop.db");
     /// let db = Database::open(config).unwrap();
     ///
-    /// let reservations = db.list_all_reservations().unwrap();
+    /// let reservations = Database::list_all_reservations(db.connection()).unwrap();
     /// for reservation in reservations {
     ///     println!("{:?}", reservation);
     /// }
     /// ```
-    pub fn list_all_reservations(&self) -> Result<Vec<Reservation>> {
-        let mut stmt = self.conn.prepare(LIST_RESERVATIONS)?;
+    pub fn list_all_reservations(conn: &Connection) -> Result<Vec<Reservation>> {
+        let mut stmt = conn.prepare(LIST_RESERVATIONS)?;
 
         let reservations = stmt
             .query_map([], row_to_reservation)?
@@ -361,10 +446,10 @@ impl Database {
     /// let max = Port::try_from(5100).unwrap();
     /// let range = PortRange::new(min, max).unwrap();
     ///
-    /// let reserved = db.get_reserved_ports(&range).unwrap();
+    /// let reserved = Database::get_reserved_ports(db.connection(), &range).unwrap();
     /// ```
-    pub fn get_reserved_ports(&self, range: &PortRange) -> Result<Vec<Port>> {
-        let mut stmt = self.conn.prepare(SELECT_RESERVED_PORTS)?;
+    pub fn get_reserved_ports(conn: &Connection, range: &PortRange) -> Result<Vec<Port>> {
+        let mut stmt = conn.prepare(SELECT_RESERVED_PORTS)?;
 
         let ports = stmt
             .query_map(params![range.min().value(), range.max().value()], |row| {
@@ -395,10 +480,13 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let prefix = Path::new("/home/user/projects");
-    /// let reservations = db.get_reservations_by_path_prefix(prefix).unwrap();
+    /// let reservations = Database::get_reservations_by_path_prefix(db.connection(), prefix).unwrap();
     /// ```
-    pub fn get_reservations_by_path_prefix(&self, prefix: &Path) -> Result<Vec<Reservation>> {
-        let mut stmt = self.conn.prepare(SELECT_BY_PATH_PREFIX)?;
+    pub fn get_reservations_by_path_prefix(
+        conn: &Connection,
+        prefix: &Path,
+    ) -> Result<Vec<Reservation>> {
+        let mut stmt = conn.prepare(SELECT_BY_PATH_PREFIX)?;
 
         let reservations = stmt
             .query_map([prefix.to_string_lossy().to_string()], row_to_reservation)?
@@ -425,15 +513,18 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let max_age = Duration::from_secs(86400 * 7); // 7 days
-    /// let expired = db.find_expired_reservations(max_age).unwrap();
+    /// let expired = Database::find_expired_reservations(db.connection(), max_age).unwrap();
     /// ```
-    pub fn find_expired_reservations(&self, max_age: Duration) -> Result<Vec<Reservation>> {
+    pub fn find_expired_reservations(
+        conn: &Connection,
+        max_age: Duration,
+    ) -> Result<Vec<Reservation>> {
         let now_secs = systemtime_to_unix_secs(SystemTime::now())?;
         #[allow(clippy::cast_possible_wrap)]
         let max_age_secs = max_age.as_secs() as i64;
         let cutoff = now_secs.saturating_sub(max_age_secs);
 
-        let mut stmt = self.conn.prepare(SELECT_EXPIRED)?;
+        let mut stmt = conn.prepare(SELECT_EXPIRED)?;
 
         let reservations = stmt
             .query_map([cutoff], row_to_reservation)?
@@ -458,12 +549,11 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let port = Port::try_from(8080).unwrap();
-    /// let is_reserved = db.is_port_reserved(port).unwrap();
+    /// let is_reserved = Database::is_port_reserved(db.connection(), port).unwrap();
     /// ```
-    pub fn is_port_reserved(&self, port: Port) -> Result<bool> {
+    pub fn is_port_reserved(conn: &Connection, port: Port) -> Result<bool> {
         let count: i32 =
-            self.conn
-                .query_row(CHECK_PORT_RESERVED, params![port.value()], |row| row.get(0))?;
+            conn.query_row(CHECK_PORT_RESERVED, params![port.value()], |row| row.get(0))?;
         Ok(count > 0)
     }
 
@@ -489,10 +579,10 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     ///
     /// let port = Port::try_from(8080).unwrap();
-    /// let reservation = db.get_reservation_by_port(port).unwrap();
+    /// let reservation = Database::get_reservation_by_port(db.connection(), port).unwrap();
     /// ```
-    pub fn get_reservation_by_port(&self, port: Port) -> Result<Option<Reservation>> {
-        let mut stmt = self.conn.prepare_cached(SELECT_BY_PORT)?;
+    pub fn get_reservation_by_port(conn: &Connection, port: Port) -> Result<Option<Reservation>> {
+        let mut stmt = conn.prepare_cached(SELECT_BY_PORT)?;
         let mut rows = stmt.query_map(params![port.value()], row_to_reservation)?;
 
         match rows.next() {
@@ -524,11 +614,11 @@ impl Database {
     /// let max = Port::try_from(5100).unwrap();
     /// let range = PortRange::new(min, max).unwrap();
     ///
-    /// let reserved = db.get_reserved_ports_in_range(&range).unwrap();
+    /// let reserved = Database::get_reserved_ports_in_range(db.connection(), &range).unwrap();
     /// ```
-    pub fn get_reserved_ports_in_range(&self, range: &PortRange) -> Result<Vec<Port>> {
+    pub fn get_reserved_ports_in_range(conn: &Connection, range: &PortRange) -> Result<Vec<Port>> {
         // This is the same as get_reserved_ports - we just provide both names
-        self.get_reserved_ports(range)
+        Self::get_reserved_ports(conn, range)
     }
 
     /// Gets all unique project identifiers from reservations.
@@ -548,17 +638,17 @@ impl Database {
     /// let config = DatabaseConfig::new("/tmp/trop.db");
     /// let db = Database::open(config).unwrap();
     ///
-    /// let projects = db.list_projects().unwrap();
+    /// let projects = Database::list_projects(db.connection()).unwrap();
     /// for project in projects {
     ///     println!("{}", project);
     /// }
     /// ```
-    pub fn list_projects(&self) -> Result<Vec<String>> {
+    pub fn list_projects(conn: &Connection) -> Result<Vec<String>> {
         let query = "SELECT DISTINCT project FROM reservations
                      WHERE project IS NOT NULL
                      ORDER BY project";
 
-        let mut stmt = self.conn.prepare(query)?;
+        let mut stmt = conn.prepare(query)?;
 
         let projects = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -623,13 +713,9 @@ impl Database {
     ///
     /// // Check if we can operate on a path
     /// let target = Path::new("/home/user/project");
-    /// let result = db.validate_path_relationship(target, false);
+    /// let result = Database::validate_path_relationship(target, false);
     /// ```
-    pub fn validate_path_relationship(
-        &self,
-        target_path: &Path,
-        allow_unrelated: bool,
-    ) -> Result<()> {
+    pub fn validate_path_relationship(target_path: &Path, allow_unrelated: bool) -> Result<()> {
         let current_dir = env::current_dir()?;
         let relationship = PathRelationship::between(target_path, &current_dir);
 
@@ -657,7 +743,7 @@ mod tests {
         db.create_reservation(&reservation).unwrap();
 
         // Verify it was created
-        let loaded = db.get_reservation(reservation.key()).unwrap();
+        let loaded = Database::get_reservation(db.connection(), reservation.key()).unwrap();
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().port(), reservation.port());
     }
@@ -667,7 +753,7 @@ mod tests {
         let db = create_test_database();
         let key = ReservationKey::new(PathBuf::from("/nonexistent"), None).unwrap();
 
-        let result = db.get_reservation(&key).unwrap();
+        let result = Database::get_reservation(db.connection(), &key).unwrap();
         assert!(result.is_none());
     }
 
@@ -685,7 +771,9 @@ mod tests {
         assert!(updated);
 
         // Verify timestamp was updated
-        let loaded = db.get_reservation(reservation.key()).unwrap().unwrap();
+        let loaded = Database::get_reservation(db.connection(), reservation.key())
+            .unwrap()
+            .unwrap();
         assert!(loaded.last_used_at() > reservation.last_used_at());
     }
 
@@ -709,7 +797,7 @@ mod tests {
         assert!(deleted);
 
         // Verify it was deleted
-        let loaded = db.get_reservation(reservation.key()).unwrap();
+        let loaded = Database::get_reservation(db.connection(), reservation.key()).unwrap();
         assert!(loaded.is_none());
     }
 
@@ -735,7 +823,7 @@ mod tests {
         db.create_reservation(&r2).unwrap();
         db.create_reservation(&r3).unwrap();
 
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 3);
 
         // Verify they're sorted by path
@@ -747,7 +835,7 @@ mod tests {
     #[test]
     fn test_list_all_reservations_empty() {
         let db = create_test_database();
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 0);
     }
 
@@ -765,7 +853,9 @@ mod tests {
 
         db.create_reservation(&reservation).unwrap();
 
-        let loaded = db.get_reservation(reservation.key()).unwrap().unwrap();
+        let loaded = Database::get_reservation(db.connection(), reservation.key())
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.project(), Some("my-project"));
         assert_eq!(loaded.task(), Some("my-task"));
     }
@@ -780,7 +870,9 @@ mod tests {
 
         db.create_reservation(&reservation).unwrap();
 
-        let loaded = db.get_reservation(reservation.key()).unwrap().unwrap();
+        let loaded = Database::get_reservation(db.connection(), reservation.key())
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.key().tag, Some("web".to_string()));
     }
 
@@ -801,11 +893,13 @@ mod tests {
         db.create_reservation(&r2).unwrap();
 
         // Should have the new port
-        let loaded = db.get_reservation(&key).unwrap().unwrap();
+        let loaded = Database::get_reservation(db.connection(), &key)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.port(), port2);
 
         // Should still have only one reservation
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
     }
 
@@ -828,7 +922,7 @@ mod tests {
         let max = Port::try_from(5010).unwrap();
         let range = PortRange::new(min, max).unwrap();
 
-        let reserved = db.get_reserved_ports(&range).unwrap();
+        let reserved = Database::get_reserved_ports(db.connection(), &range).unwrap();
         assert_eq!(reserved.len(), 3);
         assert_eq!(reserved[0].value(), 5000);
         assert_eq!(reserved[1].value(), 5005);
@@ -849,7 +943,8 @@ mod tests {
 
         // Query for /home/user prefix
         let prefix = Path::new("/home/user");
-        let reservations = db.get_reservations_by_path_prefix(prefix).unwrap();
+        let reservations =
+            Database::get_reservations_by_path_prefix(db.connection(), prefix).unwrap();
 
         assert_eq!(reservations.len(), 2);
         assert!(reservations[0]
@@ -883,9 +978,8 @@ mod tests {
             .unwrap();
 
         // Find expired (older than 100 seconds)
-        let expired = db
-            .find_expired_reservations(Duration::from_secs(100))
-            .unwrap();
+        let expired =
+            Database::find_expired_reservations(db.connection(), Duration::from_secs(100)).unwrap();
 
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].key().path, PathBuf::from("/old/path"));
@@ -899,29 +993,29 @@ mod tests {
         let port2 = Port::try_from(5001).unwrap();
 
         // Port not reserved initially
-        assert!(!db.is_port_reserved(port1).unwrap());
+        assert!(!Database::is_port_reserved(db.connection(), port1).unwrap());
 
         // Create reservation
         db.create_reservation(&create_test_reservation("/path", 5000))
             .unwrap();
 
         // Port should now be reserved
-        assert!(db.is_port_reserved(port1).unwrap());
+        assert!(Database::is_port_reserved(db.connection(), port1).unwrap());
 
         // Different port still not reserved
-        assert!(!db.is_port_reserved(port2).unwrap());
+        assert!(!Database::is_port_reserved(db.connection(), port2).unwrap());
     }
 
     #[test]
     fn test_validate_path_relationship_ancestor() {
         use std::env;
 
-        let db = create_test_database();
+        let _db = create_test_database();
         let cwd = env::current_dir().unwrap();
 
         // Ancestor path (parent of cwd) should be allowed
         if let Some(parent) = cwd.parent() {
-            let result = db.validate_path_relationship(parent, false);
+            let result = Database::validate_path_relationship(parent, false);
             assert!(result.is_ok());
         }
     }
@@ -930,12 +1024,12 @@ mod tests {
     fn test_validate_path_relationship_descendant() {
         use std::env;
 
-        let db = create_test_database();
+        let _db = create_test_database();
         let cwd = env::current_dir().unwrap();
 
         // Descendant path (child of cwd) should be allowed
         let child = cwd.join("subdir");
-        let result = db.validate_path_relationship(&child, false);
+        let result = Database::validate_path_relationship(&child, false);
         assert!(result.is_ok());
     }
 
@@ -943,23 +1037,23 @@ mod tests {
     fn test_validate_path_relationship_same() {
         use std::env;
 
-        let db = create_test_database();
+        let _db = create_test_database();
         let cwd = env::current_dir().unwrap();
 
         // Same path should be allowed
-        let result = db.validate_path_relationship(&cwd, false);
+        let result = Database::validate_path_relationship(&cwd, false);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_path_relationship_unrelated_denied() {
-        let db = create_test_database();
+        let _db = create_test_database();
 
         // Create a path that's definitely unrelated to the current directory
         let unrelated = Path::new("/unrelated/path/xyz");
 
         // Should fail without allow_unrelated
-        let result = db.validate_path_relationship(unrelated, false);
+        let result = Database::validate_path_relationship(unrelated, false);
         assert!(result.is_err());
 
         // Check that it's the right error type
@@ -971,20 +1065,20 @@ mod tests {
 
     #[test]
     fn test_validate_path_relationship_unrelated_allowed() {
-        let db = create_test_database();
+        let _db = create_test_database();
 
         // Create a path that's definitely unrelated to the current directory
         let unrelated = Path::new("/unrelated/path/xyz");
 
         // Should succeed with allow_unrelated
-        let result = db.validate_path_relationship(unrelated, true);
+        let result = Database::validate_path_relationship(unrelated, true);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_list_projects_empty() {
         let db = create_test_database();
-        let projects = db.list_projects().unwrap();
+        let projects = Database::list_projects(db.connection()).unwrap();
         assert_eq!(projects.len(), 0);
     }
 
@@ -1001,7 +1095,7 @@ mod tests {
 
         db.create_reservation(&reservation).unwrap();
 
-        let projects = db.list_projects().unwrap();
+        let projects = Database::list_projects(db.connection()).unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0], "project-a");
     }
@@ -1039,7 +1133,7 @@ mod tests {
         db.create_reservation(&r2).unwrap();
         db.create_reservation(&r3).unwrap();
 
-        let projects = db.list_projects().unwrap();
+        let projects = Database::list_projects(db.connection()).unwrap();
         assert_eq!(projects.len(), 3);
         // Should be sorted alphabetically
         assert_eq!(projects[0], "alpha");
@@ -1071,7 +1165,7 @@ mod tests {
         db.create_reservation(&r1).unwrap();
         db.create_reservation(&r2).unwrap();
 
-        let projects = db.list_projects().unwrap();
+        let projects = Database::list_projects(db.connection()).unwrap();
         // Should only return distinct values
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0], "same-project");
@@ -1101,7 +1195,7 @@ mod tests {
         db.create_reservation(&r1).unwrap();
         db.create_reservation(&r2).unwrap();
 
-        let projects = db.list_projects().unwrap();
+        let projects = Database::list_projects(db.connection()).unwrap();
         // Should only return non-NULL projects
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0], "has-project");
