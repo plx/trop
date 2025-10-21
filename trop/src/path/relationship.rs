@@ -202,8 +202,10 @@ impl PathRelationship {
     /// let rel = PathRelationship::Ancestor;
     ///
     /// let desc = rel.description(p1, p2);
-    /// assert!(desc.contains("/a"));
-    /// assert!(desc.contains("/a/b"));
+    /// let p1_str = p1.display().to_string();
+    /// let p2_str = p2.display().to_string();
+    /// assert!(desc.contains(&p1_str));
+    /// assert!(desc.contains(&p2_str));
     /// assert!(desc.contains("ancestor"));
     /// ```
     #[must_use]
@@ -361,23 +363,29 @@ mod tests {
 
     #[test]
     fn test_description() {
-        let desc = PathRelationship::Ancestor.description(Path::new("/a"), Path::new("/a/b"));
-        assert!(desc.contains("/a"));
-        assert!(desc.contains("/a/b"));
+        let path_a = Path::new("/a");
+        let path_ab = Path::new("/a/b");
+        let desc = PathRelationship::Ancestor.description(path_a, path_ab);
+        let path_a_str = path_a.display().to_string();
+        let path_ab_str = path_ab.display().to_string();
+        assert!(desc.contains(&path_a_str));
+        assert!(desc.contains(&path_ab_str));
         assert!(desc.contains("ancestor"));
 
-        let desc = PathRelationship::Descendant.description(Path::new("/a/b"), Path::new("/a"));
-        assert!(desc.contains("/a"));
-        assert!(desc.contains("/a/b"));
+        let desc = PathRelationship::Descendant.description(path_ab, path_a);
+        assert!(desc.contains(&path_a_str));
+        assert!(desc.contains(&path_ab_str));
         assert!(desc.contains("descendant"));
 
-        let desc = PathRelationship::Same.description(Path::new("/a"), Path::new("/a"));
-        assert!(desc.contains("/a"));
+        let desc = PathRelationship::Same.description(path_a, path_a);
+        assert!(desc.contains(&path_a_str));
         assert!(desc.contains("same"));
 
-        let desc = PathRelationship::Unrelated.description(Path::new("/a"), Path::new("/b"));
-        assert!(desc.contains("/a"));
-        assert!(desc.contains("/b"));
+        let path_b = Path::new("/b");
+        let path_b_str = path_b.display().to_string();
+        let desc = PathRelationship::Unrelated.description(path_a, path_b);
+        assert!(desc.contains(&path_a_str));
+        assert!(desc.contains(&path_b_str));
         assert!(desc.contains("unrelated"));
     }
 
