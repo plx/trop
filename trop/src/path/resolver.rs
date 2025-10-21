@@ -410,6 +410,7 @@ mod tests {
     }
 
     // Property-based tests
+    #[cfg(feature = "property-tests")]
     mod property_tests {
         use super::*;
         use proptest::prelude::*;

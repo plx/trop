@@ -885,6 +885,16 @@ fn test_init_permission_denied() {
 
     let env = TestEnv::new();
 
+    // Skip this test when running as root. A privileged user can bypass
+    // the permission restrictions we set up here, which would cause the
+    // initialization to succeed unexpectedly and lead to false negatives
+    // in environments (like some CI runners) that execute the tests as
+    // root.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping test_init_permission_denied as root user");
+        return;
+    }
+
     // Create a directory with no write permission
     let readonly_parent = env.temp_path.join("readonly");
     fs::create_dir_all(&readonly_parent).expect("Failed to create directory");

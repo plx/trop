@@ -203,6 +203,7 @@ mod tests {
 
     // Property-based testing module
     // These tests verify mathematical properties and invariants of the plan system
+    #[cfg(feature = "property-tests")]
     mod property_tests {
         use super::*;
         use proptest::prelude::*;

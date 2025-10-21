@@ -1070,19 +1070,29 @@ mod edge_cases {
     ///
     /// WHY THIS MATTERS: While unusual, some projects or workflows might use
     /// long, descriptive names. The inference should handle these robustly.
+    ///
+    /// NOTE: Windows has more restrictive path length limits (MAX_PATH = 260),
+    /// so we use shorter names on Windows while still testing the same functionality.
     #[test]
     fn test_very_long_names() {
         let temp = TempDir::new().unwrap();
 
-        // Create a long but valid repository name (not too long to exceed filesystem limits)
-        let long_name = "a".repeat(100);
+        // Create a long but valid repository name
+        // Windows: use shorter names to stay within MAX_PATH (260 chars)
+        // Unix: can use longer names safely
+        #[cfg(target_os = "windows")]
+        let (repo_name_len, branch_name_len) = (30, 30);
+        #[cfg(not(target_os = "windows"))]
+        let (repo_name_len, branch_name_len) = (100, 100);
+
+        let long_name = "a".repeat(repo_name_len);
         let repo_path = temp.path().join(&long_name);
         std::fs::create_dir(&repo_path).unwrap();
 
         helpers::create_test_repo(&repo_path).unwrap();
 
         // Create a long branch name
-        let long_branch = "feature-".to_string() + &"b".repeat(100);
+        let long_branch = "feature-".to_string() + &"b".repeat(branch_name_len);
         helpers::switch_branch(&repo_path, &long_branch).unwrap();
 
         let project = infer_project(&repo_path);

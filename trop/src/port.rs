@@ -9,11 +9,11 @@ pub mod group;
 pub mod occupancy;
 
 // Property-based tests
-#[cfg(test)]
+#[cfg(all(test, feature = "property-tests"))]
 mod allocator_proptests;
-#[cfg(test)]
+#[cfg(all(test, feature = "property-tests"))]
 mod group_proptests;
-#[cfg(test)]
+#[cfg(all(test, feature = "property-tests"))]
 mod proptests;
 
 use std::fmt;

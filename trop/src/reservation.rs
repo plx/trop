@@ -437,7 +437,7 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
-#[cfg(test)]
+#[cfg(all(test, feature = "property-tests"))]
 mod proptests;
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ mod tests {
     use crate::{Port, PortRange};
     use proptest::prelude::*;
     use std::collections::HashSet;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     // ============================================================================
     // STRATEGY DEFINITIONS
@@ -111,7 +111,7 @@ mod tests {
             let reservations = Database::list_all_reservations(db.connection()).unwrap();
             let group_reservations: Vec<_> = reservations
                 .iter()
-                .filter(|r| r.key().path == PathBuf::from("/test/group"))
+                .filter(|r| r.key().path == Path::new("/test/group"))
                 .collect();
 
             match result {

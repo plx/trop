@@ -10,6 +10,7 @@ repository = "https://github.com/prb/trop"
 [[bin]]
 name = "trop"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 trop = { path = "../trop" }
@@ -28,7 +29,13 @@ predicates = "3.1"
 tempfile = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
+libc = "0.2"
+criterion = "0.5"
 
 [build-dependencies]
 clap = { workspace = true, features = ["derive", "env"] }
 clap_mangen = "0.2"  # Compatible with clap 4.5
+
+[[bench]]
+name = "cli_bench"
+harness = false

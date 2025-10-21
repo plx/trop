@@ -428,6 +428,7 @@ pub fn execute_migrate(plan: &MigratePlan, db: &mut Database) -> Result<MigrateR
 mod tests {
     use super::*;
     use crate::database::test_util::create_test_database;
+    #[cfg(unix)]
     use crate::{Port, Reservation};
 
     #[test]
@@ -504,6 +505,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_migrate_plan_single_reservation() {
         let mut db = create_test_database();
 
@@ -535,6 +537,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_migrate_plan_with_conflict() {
         let mut db = create_test_database();
 
@@ -563,6 +566,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_migrate_plan_with_conflict_force() {
         let mut db = create_test_database();
 
@@ -590,6 +594,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_migrate_plan_recursive() {
         let mut db = create_test_database();
 

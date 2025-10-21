@@ -461,7 +461,7 @@ cleanup:
 }
 
 // Property-based tests for schema components
-#[cfg(test)]
+#[cfg(all(test, feature = "property-tests"))]
 #[allow(unused_doc_comments)] // proptest! macro doesn't support doc comments
 mod property_tests {
     use super::*;

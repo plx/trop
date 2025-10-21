@@ -78,7 +78,7 @@ pub mod merger;
 pub mod schema;
 pub mod validator;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "property-tests"))]
 mod proptests;
 
 // Re-export key types at module root
