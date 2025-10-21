@@ -46,7 +46,7 @@ pub mod release;
 pub mod reserve;
 pub mod reserve_group;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "property-tests"))]
 mod proptests;
 
 pub use autoreserve::{AutoreserveOptions, AutoreservePlan};
