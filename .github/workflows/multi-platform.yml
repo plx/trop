@@ -61,15 +61,22 @@ jobs:
 
       - name: Announce Success
         if: success()
+        shell: bash
         run: |
           echo "All tests passed successfully!"
-          echo "### Build Status: PASSED" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "All multi-platform tests and integration tests completed successfully." >> $GITHUB_STEP_SUMMARY
+          {
+            echo "### Build Status: PASSED"
+            echo ""
+            echo "All multi-platform tests and integration tests completed successfully."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Announce Failure
         if: failure()
+        shell: bash
         run: |
-            echo "Some tests failed."
-            echo "### Build Status: FAILED" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Some tests failed."
+          {
+            echo "### Build Status: FAILED"
+            echo ""
+            echo "Please review the logs for details on the failing steps."
+          } >> "$GITHUB_STEP_SUMMARY"
