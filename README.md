@@ -2,6 +2,10 @@
 
 [![CI](https://github.com/prb/trop/actions/workflows/ci.yml/badge.svg)](https://github.com/prb/trop/actions/workflows/ci.yml)
 
+> **Note:** GitHub only renders a status badge after the referenced workflow has produced at least one run. If the badge above
+> shows "no status" or a gray placeholder, trigger the workflow manually via the "Run workflow" button or push a commit to
+> `main` or `develop` so the CI pipeline records an initial result that the badge can display.
+
 A lightweight, directory-aware port reservation tool for managing ephemeral port allocations in concurrent development workflows.
 
 ## Overview
