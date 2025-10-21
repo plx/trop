@@ -29,7 +29,7 @@ gix = { version = "0.68", default-features = false, features = ["revision"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 proptest = "1.0"
-criterion = "0.5"
+criterion = "0.7"
 serial_test = "3.2"
 mockall = "0.13"
 assert_cmd = "2.0"
