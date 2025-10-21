@@ -348,8 +348,13 @@ excluded_ports:
         ..Default::default()
     };
 
+    // Use empty data dir to isolate from user's global config
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+
     let config = ConfigBuilder::new()
         .with_working_dir(temp.path())
+        .with_data_dir(&data_dir)
         .with_config(programmatic)
         .build()
         .unwrap();
@@ -536,12 +541,17 @@ ports:
 fn test_env_var_excluded_ports_formats() {
     let temp = TempDir::new().unwrap();
 
+    // Use empty data dir to isolate from user's global config
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+
     // Single port
     {
         let _guards = clear_trop_env_vars();
         let _env = EnvGuard::new("TROP_EXCLUDED_PORTS", "5001");
         let config = ConfigBuilder::new()
             .with_working_dir(temp.path())
+            .with_data_dir(&data_dir)
             .build()
             .unwrap();
         assert_eq!(config.excluded_ports.as_ref().unwrap().len(), 1);
@@ -553,6 +563,7 @@ fn test_env_var_excluded_ports_formats() {
         let _env = EnvGuard::new("TROP_EXCLUDED_PORTS", "5001,5002,5003");
         let config = ConfigBuilder::new()
             .with_working_dir(temp.path())
+            .with_data_dir(&data_dir)
             .build()
             .unwrap();
         assert_eq!(config.excluded_ports.as_ref().unwrap().len(), 3);
@@ -564,6 +575,7 @@ fn test_env_var_excluded_ports_formats() {
         let _env = EnvGuard::new("TROP_EXCLUDED_PORTS", "5000..5010");
         let config = ConfigBuilder::new()
             .with_working_dir(temp.path())
+            .with_data_dir(&data_dir)
             .build()
             .unwrap();
         let excluded = config.excluded_ports.as_ref().unwrap();
@@ -583,6 +595,7 @@ fn test_env_var_excluded_ports_formats() {
         let _env = EnvGuard::new("TROP_EXCLUDED_PORTS", "5001,5010..5020,5030");
         let config = ConfigBuilder::new()
             .with_working_dir(temp.path())
+            .with_data_dir(&data_dir)
             .build()
             .unwrap();
         assert_eq!(config.excluded_ports.as_ref().unwrap().len(), 3);
@@ -1121,8 +1134,13 @@ fn test_yaml_parsing_complete_config() {
     let fixture_content = fs::read_to_string(fixture_path("valid/complete.yaml")).unwrap();
     create_temp_config(temp.path(), "trop.yaml", &fixture_content);
 
+    // Use empty data dir to isolate from user's global config
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+
     let config = ConfigBuilder::new()
         .with_working_dir(temp.path())
+        .with_data_dir(&data_dir)
         .skip_env()
         .build()
         .unwrap();

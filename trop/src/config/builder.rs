@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 /// ```
 pub struct ConfigBuilder {
     working_dir: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
     skip_env: bool,
     skip_files: bool,
     additional_config: Option<Config>,
@@ -37,6 +38,7 @@ impl ConfigBuilder {
     pub fn new() -> Self {
         Self {
             working_dir: None,
+            data_dir: None,
             skip_env: false,
             skip_files: false,
             additional_config: None,
@@ -50,6 +52,16 @@ impl ConfigBuilder {
     #[must_use]
     pub fn with_working_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.working_dir = Some(dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// Set the data directory for user config loading.
+    ///
+    /// This overrides the default data directory (`~/.trop` or `$TROP_DATA_DIR`)
+    /// when loading the user configuration file.
+    #[must_use]
+    pub fn with_data_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.data_dir = Some(dir.as_ref().to_path_buf());
         self
     }
 
@@ -105,7 +117,7 @@ impl ConfigBuilder {
                 .working_dir
                 .as_deref()
                 .unwrap_or_else(|| Path::new("."));
-            sources = ConfigLoader::load_all(working_dir)?;
+            sources = ConfigLoader::load_all(working_dir, self.data_dir.as_deref())?;
         }
 
         // Add default configuration at lowest precedence
@@ -297,30 +309,27 @@ mod tests {
 
     #[test]
     fn test_builder_merges_excluded_ports() {
-        let temp_dir = TempDir::new().unwrap();
+        // Test that ConfigMerger properly accumulates excluded_ports
+        // by using two programmatic configs to avoid user config interference
 
-        // File excludes 5001
-        fs::write(
-            temp_dir.path().join("trop.yaml"),
-            "excluded_ports:\n  - 5001\n",
-        )
-        .unwrap();
+        // First config excludes 5001
+        let config1 = Config {
+            excluded_ports: Some(vec![PortExclusion::Single(5001)]),
+            ..Default::default()
+        };
 
-        // Additional config excludes 5002
-        let additional = Config {
+        // Second config excludes 5002
+        let config2 = Config {
             excluded_ports: Some(vec![PortExclusion::Single(5002)]),
             ..Default::default()
         };
 
-        let config = ConfigBuilder::new()
-            .with_working_dir(temp_dir.path())
-            .skip_env()
-            .with_config(additional)
-            .build()
-            .unwrap();
+        // Merge them programmatically
+        let mut merged = config1;
+        ConfigMerger::merge_into(&mut merged, &config2);
 
         // Both should be present
-        assert_eq!(config.excluded_ports.as_ref().unwrap().len(), 2);
+        assert_eq!(merged.excluded_ports.as_ref().unwrap().len(), 2);
     }
 
     #[test]
@@ -361,5 +370,28 @@ mod tests {
 
         // Output format
         assert_eq!(defaults.output_format, Some(OutputFormat::Table));
+    }
+
+    #[test]
+    fn test_builder_with_data_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().join("custom_data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Create a config file in the custom data directory
+        fs::write(data_dir.join("config.yaml"), "excluded_ports:\n  - 9999\n").unwrap();
+
+        // Build config with custom data directory
+        let config = ConfigBuilder::new()
+            .with_data_dir(&data_dir)
+            .skip_env()
+            .build()
+            .unwrap();
+
+        // Verify the exclusion from custom data dir config was loaded
+        assert!(config.excluded_ports.is_some());
+        let exclusions = config.excluded_ports.unwrap();
+        assert_eq!(exclusions.len(), 1);
+        assert_eq!(exclusions[0], PortExclusion::Single(9999));
     }
 }

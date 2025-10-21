@@ -7,6 +7,7 @@ use crate::error::CliError;
 use crate::utils::{load_configuration, open_database, resolve_path, GlobalOptions};
 use clap::Args;
 use std::path::PathBuf;
+use trop::config::DEFAULT_MIN_PORT;
 use trop::{PlanExecutor, Port, ReservationKey, ReserveOptions, ReservePlan};
 
 /// Reserve a port for a directory.
@@ -156,8 +157,8 @@ impl ReserveCommand {
             use trop::config::PortConfig;
             // Override config port range with CLI arguments
             let port_config = PortConfig {
-                min: min.unwrap_or(5000), // Use min from CLI or default
-                max,                      // max from CLI (already Option<u16>)
+                min: min.unwrap_or(DEFAULT_MIN_PORT), // Use min from CLI or default
+                max,                                  // max from CLI (already Option<u16>)
                 max_offset: None,
             };
             config.ports = Some(port_config);
@@ -172,7 +173,9 @@ impl ReserveCommand {
             .with_force(self.force)
             .with_allow_unrelated_path(self.allow_unrelated_path)
             .with_allow_project_change(self.allow_project_change || self.allow_change)
-            .with_allow_task_change(self.allow_task_change || self.allow_change);
+            .with_allow_task_change(self.allow_task_change || self.allow_change)
+            .with_disable_autoprune(self.disable_autoprune || self.disable_autoclean)
+            .with_disable_autoexpire(self.disable_autoexpire || self.disable_autoclean);
 
         // 8. Handle dry-run mode
         if self.dry_run {
@@ -187,14 +190,22 @@ impl ReserveCommand {
         // 8. Open database
         let mut db = open_database(global, &config)?;
 
-        // 9. Build plan
+        // 9. Begin transaction - wraps entire operation (planning + execution)
+        let tx = db.begin_transaction().map_err(CliError::from)?;
+
+        // 10. Build plan (inside transaction - sees consistent view)
         let plan = ReservePlan::new(options, &config)
-            .build_plan(&db)
+            .build_plan(&tx)
             .map_err(CliError::from)?;
 
-        // 10. Execute plan
-        let mut executor = PlanExecutor::new(&mut db);
+        // 11. Execute plan (inside same transaction)
+        let mut executor = PlanExecutor::new(&tx);
         let result = executor.execute(&plan).map_err(CliError::from)?;
+
+        // 12. Commit transaction - all or nothing
+        tx.commit()
+            .map_err(trop::Error::from)
+            .map_err(CliError::from)?;
 
         // 11. Output just the port number (shell-friendly) to stdout
         if let Some(port) = result.port {

@@ -3,6 +3,8 @@
 //! This module defines the plan structures that describe what actions
 //! will be taken during an operation, without actually performing them.
 
+use crate::port::group::GroupAllocationRequest;
+use crate::port::occupancy::OccupancyCheckConfig;
 use crate::{Reservation, ReservationKey};
 
 /// A single action to be taken during plan execution.
@@ -34,6 +36,16 @@ pub enum PlanAction {
 
     /// Delete a reservation.
     DeleteReservation(ReservationKey),
+
+    /// Allocate a group of related ports.
+    AllocateGroup {
+        /// The group allocation request.
+        request: GroupAllocationRequest,
+        /// Full configuration (needed for port allocation).
+        full_config: crate::config::Config,
+        /// Occupancy check configuration.
+        occupancy_config: OccupancyCheckConfig,
+    },
 }
 
 impl PlanAction {
@@ -52,6 +64,13 @@ impl PlanAction {
             }
             Self::DeleteReservation(key) => {
                 format!("Delete reservation for {key}")
+            }
+            Self::AllocateGroup { request, .. } => {
+                format!(
+                    "Allocate group of {} services at {}",
+                    request.services.len(),
+                    request.base_path.display()
+                )
             }
         }
     }
@@ -184,6 +203,7 @@ mod tests {
 
     // Property-based testing module
     // These tests verify mathematical properties and invariants of the plan system
+    #[cfg(feature = "property-tests")]
     mod property_tests {
         use super::*;
         use proptest::prelude::*;

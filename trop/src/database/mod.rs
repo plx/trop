@@ -22,7 +22,7 @@
 //! db.create_reservation(&reservation).unwrap();
 //!
 //! // List all reservations
-//! let all = db.list_all_reservations().unwrap();
+//! let all = Database::list_all_reservations(db.connection()).unwrap();
 //! for reservation in all {
 //!     println!("{:?}", reservation);
 //! }

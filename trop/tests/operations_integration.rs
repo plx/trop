@@ -5,11 +5,12 @@ use common::create_test_config;
 
 use common::database::create_test_database;
 use std::path::PathBuf;
+use trop::Database;
 use trop::{Port, ReleaseOptions, ReleasePlan, ReservationKey, ReserveOptions, ReservePlan};
 
 #[test]
 fn test_reserve_and_release_cycle() {
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/project"), None).unwrap();
     let port = Port::try_from(8080).unwrap();
 
@@ -19,11 +20,11 @@ fn test_reserve_and_release_cycle() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(reserve_opts, &create_test_config())
-        .build_plan(&db)
+        .build_plan(db.connection())
         .unwrap();
     assert_eq!(plan.actions.len(), 1);
 
-    let mut executor = trop::PlanExecutor::new(&mut db);
+    let mut executor = trop::PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).unwrap();
     assert!(result.success);
     assert!(result.port.is_some(), "Should allocate a port");
@@ -32,7 +33,7 @@ fn test_reserve_and_release_cycle() {
     let allocated_port = result.port.unwrap();
 
     // Verify reservation exists
-    let reservation = db.get_reservation(&key).unwrap();
+    let reservation = Database::get_reservation(db.connection(), &key).unwrap();
     assert!(reservation.is_some());
     assert_eq!(reservation.as_ref().unwrap().port(), allocated_port);
     assert_eq!(
@@ -43,21 +44,23 @@ fn test_reserve_and_release_cycle() {
     // Release the port
     let release_opts = ReleaseOptions::new(key.clone()).with_allow_unrelated_path(true);
 
-    let plan = ReleasePlan::new(release_opts).build_plan(&db).unwrap();
+    let plan = ReleasePlan::new(release_opts)
+        .build_plan(db.connection())
+        .unwrap();
     assert_eq!(plan.actions.len(), 1);
 
-    let mut executor = trop::PlanExecutor::new(&mut db);
+    let mut executor = trop::PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).unwrap();
     assert!(result.success);
 
     // Verify reservation is gone
-    let reservation = db.get_reservation(&key).unwrap();
+    let reservation = Database::get_reservation(db.connection(), &key).unwrap();
     assert!(reservation.is_none());
 }
 
 #[test]
 fn test_idempotent_reserve() {
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/project"), None).unwrap();
     let port = Port::try_from(8080).unwrap();
 
@@ -67,9 +70,9 @@ fn test_idempotent_reserve() {
 
     // First reservation
     let plan = ReservePlan::new(reserve_opts.clone(), &create_test_config())
-        .build_plan(&db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = trop::PlanExecutor::new(&mut db);
+    let mut executor = trop::PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).unwrap();
     assert!(result.success);
     assert!(
@@ -82,7 +85,7 @@ fn test_idempotent_reserve() {
 
     // Second reservation with same parameters
     let plan2 = ReservePlan::new(reserve_opts, &create_test_config())
-        .build_plan(&db)
+        .build_plan(db.connection())
         .unwrap();
 
     // Should update timestamp, not create new reservation
@@ -92,7 +95,7 @@ fn test_idempotent_reserve() {
         trop::PlanAction::UpdateLastUsed(_)
     ));
 
-    let mut executor = trop::PlanExecutor::new(&mut db);
+    let mut executor = trop::PlanExecutor::new(db.connection());
     let result = executor.execute(&plan2).unwrap();
     assert!(result.success);
     assert_eq!(
@@ -102,13 +105,13 @@ fn test_idempotent_reserve() {
     );
 
     // Verify only one reservation exists
-    let all = db.list_all_reservations().unwrap();
+    let all = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(all.len(), 1);
 }
 
 #[test]
 fn test_sticky_field_protection() {
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/project"), None).unwrap();
     let port = Port::try_from(8080).unwrap();
 
@@ -118,9 +121,9 @@ fn test_sticky_field_protection() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(reserve_opts, &create_test_config())
-        .build_plan(&db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = trop::PlanExecutor::new(&mut db);
+    let mut executor = trop::PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
     // Try to change project without force
@@ -128,7 +131,7 @@ fn test_sticky_field_protection() {
         .with_project(Some("project2".to_string()))
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(reserve_opts2, &create_test_config()).build_plan(&db);
+    let result = ReservePlan::new(reserve_opts2, &create_test_config()).build_plan(db.connection());
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
@@ -142,16 +145,16 @@ fn test_sticky_field_protection() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(reserve_opts3, &create_test_config())
-        .build_plan(&db)
+        .build_plan(db.connection())
         .unwrap();
-    let mut executor = trop::PlanExecutor::new(&mut db);
+    let mut executor = trop::PlanExecutor::new(db.connection());
     let result = executor.execute(&plan);
     assert!(result.is_ok());
 }
 
 #[test]
 fn test_dry_run_mode() {
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/project"), None).unwrap();
     let port = Port::try_from(8080).unwrap();
 
@@ -160,11 +163,11 @@ fn test_dry_run_mode() {
         .with_allow_unrelated_path(true);
 
     let plan = ReservePlan::new(reserve_opts, &create_test_config())
-        .build_plan(&db)
+        .build_plan(db.connection())
         .unwrap();
 
     // Execute in dry-run mode
-    let mut executor = trop::PlanExecutor::new(&mut db).dry_run();
+    let mut executor = trop::PlanExecutor::new(db.connection()).dry_run();
     let result = executor.execute(&plan).unwrap();
 
     assert!(result.success);
@@ -175,20 +178,20 @@ fn test_dry_run_mode() {
     );
 
     // Verify no reservation was created
-    let reservation = db.get_reservation(&key).unwrap();
+    let reservation = Database::get_reservation(db.connection(), &key).unwrap();
     assert!(reservation.is_none());
 }
 
 #[test]
 fn test_release_idempotent() {
-    let mut db = create_test_database();
+    let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/project"), None).unwrap();
 
     // Release non-existent reservation
     let release_opts = ReleaseOptions::new(key.clone()).with_allow_unrelated_path(true);
 
     let plan = ReleasePlan::new(release_opts.clone())
-        .build_plan(&db)
+        .build_plan(db.connection())
         .unwrap();
 
     // Should have no actions, just a warning
@@ -196,14 +199,14 @@ fn test_release_idempotent() {
     assert_eq!(plan.warnings.len(), 1);
     assert!(plan.warnings[0].contains("No reservation found"));
 
-    let mut executor = trop::PlanExecutor::new(&mut db);
+    let mut executor = trop::PlanExecutor::new(db.connection());
     let result = executor.execute(&plan).unwrap();
     assert!(result.success);
 }
 
 #[test]
 fn test_multiple_tagged_reservations() {
-    let mut db = create_test_database();
+    let db = create_test_database();
     let path = PathBuf::from("/test/project");
 
     // Create multiple reservations for same path with different tags
@@ -219,13 +222,13 @@ fn test_multiple_tagged_reservations() {
     for (key, port) in [(key1, port1), (key2, port2), (key3, port3)] {
         let opts = ReserveOptions::new(key, Some(port)).with_allow_unrelated_path(true);
         let plan = ReservePlan::new(opts, &create_test_config())
-            .build_plan(&db)
+            .build_plan(db.connection())
             .unwrap();
-        let mut executor = trop::PlanExecutor::new(&mut db);
+        let mut executor = trop::PlanExecutor::new(db.connection());
         executor.execute(&plan).unwrap();
     }
 
     // Verify all three exist
-    let all = db.list_all_reservations().unwrap();
+    let all = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(all.len(), 3);
 }

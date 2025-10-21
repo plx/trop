@@ -108,12 +108,17 @@ impl DatabaseConfig {
 
 /// Returns the default data directory for trop.
 ///
-/// The default directory is `~/.trop` on Unix-like systems and
-/// `%USERPROFILE%\.trop` on Windows.
+/// Resolution order:
+/// 1. `$TROP_DATA_DIR` if set
+/// 2. `~/.trop` on Unix-like systems or `%USERPROFILE%\.trop` on Windows
+///
+/// This directory contains the database file, config file, and other
+/// persistent data.
 ///
 /// # Errors
 ///
-/// Returns an error if the home directory cannot be determined.
+/// Returns an error if the home directory cannot be determined and
+/// `TROP_DATA_DIR` is not set.
 ///
 /// # Examples
 ///
@@ -124,6 +129,12 @@ impl DatabaseConfig {
 /// println!("Data directory: {}", data_dir.display());
 /// ```
 pub fn default_data_dir() -> Result<PathBuf> {
+    // Check TROP_DATA_DIR first
+    if let Ok(data_dir) = std::env::var("TROP_DATA_DIR") {
+        return Ok(PathBuf::from(data_dir));
+    }
+
+    // Fall back to ~/.trop
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map_err(|_| Error::Validation {
@@ -214,5 +225,35 @@ mod tests {
 
         // Clean up
         std::env::remove_var("TROP_DATA_DIR");
+    }
+
+    #[test]
+    fn test_data_dir_consistency() {
+        // Test that database and config paths use the same data directory
+
+        // Test with custom TROP_DATA_DIR
+        std::env::set_var("TROP_DATA_DIR", "/custom/trop/data");
+
+        let db_path = resolve_database_path().unwrap();
+        let data_dir = default_data_dir().unwrap();
+        let config_path = data_dir.join("config.yaml");
+
+        // Both should be in /custom/trop/data
+        assert_eq!(db_path, PathBuf::from("/custom/trop/data/trop.db"));
+        assert_eq!(config_path, PathBuf::from("/custom/trop/data/config.yaml"));
+        assert_eq!(db_path.parent(), config_path.parent());
+
+        // Clean up
+        std::env::remove_var("TROP_DATA_DIR");
+
+        // Test with default (HOME-based)
+        if std::env::var("HOME").is_ok() || std::env::var("USERPROFILE").is_ok() {
+            let db_path = resolve_database_path().unwrap();
+            let data_dir = default_data_dir().unwrap();
+            let config_path = data_dir.join("config.yaml");
+
+            // Both should be in the same directory
+            assert_eq!(db_path.parent(), config_path.parent());
+        }
     }
 }

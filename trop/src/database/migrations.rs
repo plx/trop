@@ -94,7 +94,7 @@ pub fn get_schema_version(conn: &Connection) -> Result<i32> {
 /// 2. If version is 0, initializes the schema
 /// 3. If version is older than current, returns an error (migrations needed)
 /// 4. If version is newer than current, returns an error (client too old)
-/// 5. If version matches, returns success
+/// 5. If version matches, applies any necessary schema fixes
 ///
 /// # Errors
 ///
@@ -135,7 +135,117 @@ pub fn check_schema_compatibility(conn: &Connection) -> Result<()> {
                 "Database schema version {version} is newer than client version {CURRENT_SCHEMA_VERSION}. Please upgrade trop."
             ),
         });
+    } else {
+        // Version matches - apply any necessary schema fixes for databases
+        // created before critical bug fixes (e.g., UNIQUE constraint on port)
+        apply_schema_fixes_v1(conn)?;
     }
+
+    Ok(())
+}
+
+/// Applies schema fixes for version 1 databases.
+///
+/// This function checks if the port column has a UNIQUE constraint and
+/// adds it if missing. This is necessary for databases created before
+/// the concurrency bug fix that added the UNIQUE constraint.
+///
+/// The migration approach is conservative:
+/// - First checks if any duplicate ports exist
+/// - If duplicates exist, returns an error requiring manual cleanup
+/// - If no duplicates, recreates the table with the UNIQUE constraint
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Duplicate ports are found in the database
+/// - The migration SQL fails to execute
+fn apply_schema_fixes_v1(conn: &Connection) -> Result<()> {
+    // Simple read-only check using pragma_data_version (always succeeds on readonly)
+    // If we can write, test with an actual write operation
+    let is_readonly = conn.execute("BEGIN IMMEDIATE", []).is_err();
+
+    // If we started a transaction, roll it back
+    let _ = conn.execute("ROLLBACK", []);
+
+    if is_readonly {
+        // Can't modify a read-only database, skip migration
+        return Ok(());
+    }
+
+    // Check if port column already has UNIQUE constraint
+    // Use sqlite_master instead of pragma functions to avoid issues
+    let has_unique_constraint: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master
+             WHERE type = 'table'
+             AND name = 'reservations'
+             AND sql LIKE '%port INTEGER NOT NULL UNIQUE%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if has_unique_constraint {
+        // Already has the constraint, nothing to do
+        return Ok(());
+    }
+
+    // Check for duplicate ports before migration
+    let duplicate_count: i32 = conn.query_row(
+        "SELECT COUNT(*) FROM (
+            SELECT port FROM reservations GROUP BY port HAVING COUNT(*) > 1
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if duplicate_count > 0 {
+        return Err(Error::DatabaseCorruption {
+            details: format!(
+                "Database contains {duplicate_count} duplicate port allocation(s). \
+                 Please run 'trop cleanup' to remove duplicates before upgrading, \
+                 or delete the database and recreate your reservations."
+            ),
+        });
+    }
+
+    // Recreate table with UNIQUE constraint
+    // SQLite doesn't support adding UNIQUE constraints to existing columns,
+    // so we need to recreate the table
+    conn.execute_batch(
+        "BEGIN TRANSACTION;
+
+         -- Create new table with UNIQUE constraint
+         CREATE TABLE reservations_new (
+             path TEXT NOT NULL,
+             tag TEXT,
+             port INTEGER NOT NULL UNIQUE,
+             project TEXT,
+             task TEXT,
+             created_at INTEGER NOT NULL,
+             last_used_at INTEGER NOT NULL,
+             PRIMARY KEY (path, tag)
+         );
+
+         -- Copy data from old table
+         INSERT INTO reservations_new
+         SELECT path, tag, port, project, task, created_at, last_used_at
+         FROM reservations;
+
+         -- Drop old table
+         DROP TABLE reservations;
+
+         -- Rename new table
+         ALTER TABLE reservations_new RENAME TO reservations;
+
+         -- Recreate indices
+         CREATE INDEX IF NOT EXISTS idx_reservations_port ON reservations(port);
+         CREATE INDEX IF NOT EXISTS idx_reservations_project ON reservations(project);
+         CREATE INDEX IF NOT EXISTS idx_reservations_last_used ON reservations(last_used_at);
+
+         COMMIT;",
+    )?;
 
     Ok(())
 }

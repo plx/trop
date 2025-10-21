@@ -118,9 +118,9 @@ mod tests {
             let config = OccupancyCheckConfig::default();
 
             // Allocate multiple times
-            let result1 = allocator.allocate_single(&db, &options, &config).unwrap();
-            let result2 = allocator.allocate_single(&db, &options, &config).unwrap();
-            let result3 = allocator.allocate_single(&db, &options, &config).unwrap();
+            let result1 = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+            let result2 = allocator.allocate_single(db.connection(), &options, &config).unwrap();
+            let result3 = allocator.allocate_single(db.connection(), &options, &config).unwrap();
 
             // All results must be identical
             prop_assert_eq!(&result1, &result2);
@@ -167,7 +167,7 @@ mod tests {
             let options = AllocationOptions::default();
             let config = OccupancyCheckConfig::default();
 
-            match allocator.allocate_single(&db, &options, &config).unwrap() {
+            match allocator.allocate_single(db.connection(), &options, &config).unwrap() {
                 AllocationResult::Allocated(port) => {
                     // The allocated port must NOT be excluded
                     prop_assert!(!exclusions.is_excluded(port),
@@ -233,7 +233,7 @@ mod tests {
             };
             let config = OccupancyCheckConfig::default();
 
-            match allocator.allocate_single(&db, &options, &config).unwrap() {
+            match allocator.allocate_single(db.connection(), &options, &config).unwrap() {
                 AllocationResult::Allocated(port) => {
                     // The allocated port must NOT be occupied
                     prop_assert!(!occupied.contains(&port),
@@ -288,7 +288,7 @@ mod tests {
             let options = AllocationOptions::default();
             let config = OccupancyCheckConfig::default();
 
-            match allocator.allocate_single(&db, &options, &config).unwrap() {
+            match allocator.allocate_single(db.connection(), &options, &config).unwrap() {
                 AllocationResult::Allocated(port) => {
                     // The allocated port must be within the range
                     prop_assert!(range.contains(port),
@@ -348,7 +348,7 @@ mod tests {
             let options = AllocationOptions::default();
             let config = OccupancyCheckConfig::default();
 
-            match allocator.allocate_single(&db, &options, &config).unwrap() {
+            match allocator.allocate_single(db.connection(), &options, &config).unwrap() {
                 AllocationResult::Allocated(port) => {
                     // Verify no lower port is available
                     // We expect the port to be either min (if not occupied) or
@@ -388,7 +388,7 @@ mod tests {
             num_reserved in 0usize..20usize,
         ) {
             // PROPERTY: If allocate_single returns Allocated(port), then
-            // db.is_port_reserved(port) must be false (before allocation).
+            // Database::is_port_reserved(db.connection(), port) must be false (before allocation).
             //
             // WHY THIS MATTERS: The database tracks port assignments. Allocating
             // an already-reserved port would create a conflict between multiple
@@ -428,7 +428,7 @@ mod tests {
             let options = AllocationOptions::default();
             let config = OccupancyCheckConfig::default();
 
-            match allocator.allocate_single(&db, &options, &config).unwrap() {
+            match allocator.allocate_single(db.connection(), &options, &config).unwrap() {
                 AllocationResult::Allocated(port) => {
                     // The allocated port must NOT be in the reserved set
                     prop_assert!(!reserved_ports.contains(&port),
@@ -487,7 +487,7 @@ mod tests {
             };
             let config = OccupancyCheckConfig::default();
 
-            match allocator.allocate_single(&db, &options, &config).unwrap() {
+            match allocator.allocate_single(db.connection(), &options, &config).unwrap() {
                 AllocationResult::Allocated(port) => {
                     // Must be the preferred port
                     prop_assert_eq!(port, preferred,
@@ -554,7 +554,7 @@ mod tests {
             let options = AllocationOptions::default();
             let config = OccupancyCheckConfig::default();
 
-            let result = allocator.allocate_single(&db, &options, &config).unwrap();
+            let result = allocator.allocate_single(db.connection(), &options, &config).unwrap();
 
             // Should be exhausted since all ports are occupied
             prop_assert!(
@@ -619,7 +619,7 @@ mod tests {
             };
             let config = OccupancyCheckConfig::default();
 
-            match allocator.allocate_single(&db, &options, &config).unwrap() {
+            match allocator.allocate_single(db.connection(), &options, &config).unwrap() {
                 AllocationResult::Allocated(port) => {
                     // Should get the preferred port despite it being occupied
                     prop_assert_eq!(port, preferred);
@@ -690,8 +690,8 @@ mod tests {
             let config = OccupancyCheckConfig::default();
 
             // Both should produce identical results
-            let result1 = allocator1.allocate_single(&db, &options, &config).unwrap();
-            let result2 = allocator2.allocate_single(&db, &options, &config).unwrap();
+            let result1 = allocator1.allocate_single(db.connection(), &options, &config).unwrap();
+            let result2 = allocator2.allocate_single(db.connection(), &options, &config).unwrap();
 
             prop_assert_eq!(result1, result2,
                 "Two identical allocators produced different results");

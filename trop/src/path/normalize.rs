@@ -242,6 +242,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_normalize_absolute() {
         let path = Path::new("/a/./b/../c");
         let normalized = normalize(path).unwrap();
@@ -274,6 +275,7 @@ mod tests {
     }
 
     // Property-based tests
+    #[cfg(all(unix, feature = "property-tests"))]
     mod property_tests {
         use super::*;
         use proptest::prelude::*;

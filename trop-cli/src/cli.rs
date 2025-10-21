@@ -3,7 +3,13 @@
 //! This module defines the main CLI structure using clap's derive macros,
 //! including global options and subcommands.
 
-use crate::commands::{ListCommand, ReleaseCommand, ReserveCommand};
+use crate::commands::{
+    AssertDataDirCommand, AssertPortCommand, AssertReservationCommand, AutocleanCommand,
+    AutoreserveCommand, CompactExclusionsCommand, CompletionsCommand, ExcludeCommand,
+    ExpireCommand, InitCommand, ListCommand, ListProjectsCommand, MigrateCommand, PortInfoCommand,
+    PruneCommand, ReleaseCommand, ReserveCommand, ReserveGroupCommand, ScanCommand,
+    ShowDataDirCommand, ShowPathCommand, ValidateCommand,
+};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -47,4 +53,62 @@ pub enum Command {
 
     /// List active reservations
     List(ListCommand),
+
+    /// Reserve ports for a group of services defined in a config file
+    ReserveGroup(ReserveGroupCommand),
+
+    /// Automatically discover and reserve ports from project config
+    Autoreserve(AutoreserveCommand),
+
+    /// Remove reservations for non-existent directories
+    Prune(PruneCommand),
+
+    /// Remove reservations based on age
+    Expire(ExpireCommand),
+
+    /// Combined cleanup (prune + expire)
+    Autoclean(AutocleanCommand),
+
+    /// Assert that a reservation exists for a path/tag
+    AssertReservation(AssertReservationCommand),
+
+    /// Assert that a specific port is reserved
+    AssertPort(AssertPortCommand),
+
+    /// Assert that the data directory exists and is valid
+    AssertDataDir(AssertDataDirCommand),
+
+    /// Display information about a specific port
+    #[command(name = "port-info")]
+    PortInfo(PortInfoCommand),
+
+    /// Show the resolved data directory path
+    ShowDataDir(ShowDataDirCommand),
+
+    /// Show the resolved path for a reservation
+    ShowPath(ShowPathCommand),
+
+    /// Scan port range for occupied ports
+    Scan(ScanCommand),
+
+    /// Validate a configuration file
+    Validate(ValidateCommand),
+
+    /// Add port or range to exclusion list
+    Exclude(ExcludeCommand),
+
+    /// Compact exclusion list to minimal representation
+    CompactExclusions(CompactExclusionsCommand),
+
+    /// Initialize trop data directory and database
+    Init(InitCommand),
+
+    /// List all unique project identifiers
+    ListProjects(ListProjectsCommand),
+
+    /// Migrate reservations between paths
+    Migrate(MigrateCommand),
+
+    /// Generate shell completion scripts
+    Completions(CompletionsCommand),
 }

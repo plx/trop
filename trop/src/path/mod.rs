@@ -71,6 +71,9 @@ pub mod relationship;
 pub mod resolver;
 mod types;
 
+#[cfg(all(test, feature = "property-tests"))]
+mod proptests;
+
 // Re-export key types
 pub use relationship::PathRelationship;
 pub use resolver::PathResolver;

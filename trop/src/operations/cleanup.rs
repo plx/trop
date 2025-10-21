@@ -103,7 +103,7 @@ impl CleanupOperations {
     /// ```
     pub fn prune(db: &mut Database, dry_run: bool) -> Result<PruneResult> {
         // Get all reservations
-        let all_reservations = db.list_all_reservations()?;
+        let all_reservations = Database::list_all_reservations(db.connection())?;
 
         // Filter to those with non-existent paths
         let mut to_remove = Vec::new();
@@ -188,7 +188,7 @@ impl CleanupOperations {
         let max_age = Duration::from_secs(expire_after_days as u64 * SECONDS_PER_DAY);
 
         // Find expired reservations
-        let to_remove = db.find_expired_reservations(max_age)?;
+        let to_remove = Database::find_expired_reservations(db.connection(), max_age)?;
         let removed_count = to_remove.len();
 
         // If not dry-run, actually delete the reservations
@@ -303,7 +303,7 @@ mod tests {
         assert_eq!(result.removed_count, 0);
 
         // Verify reservation still exists
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
     }
 
@@ -324,7 +324,7 @@ mod tests {
         assert_eq!(result.removed_reservations[0].key().path, nonexistent);
 
         // Verify reservation was actually deleted
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 0);
     }
 
@@ -344,7 +344,7 @@ mod tests {
         assert_eq!(result.removed_count, 1);
 
         // But reservation should still exist
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
     }
 
@@ -372,7 +372,7 @@ mod tests {
         assert_eq!(result.removed_count, 1);
 
         // Only the existing path should remain
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
     }
 
@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(result.removed_count, 0);
 
         // Verify reservation still exists
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
     }
 
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(result.removed_count, 1);
 
         // Verify reservation was actually deleted
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 0);
     }
 
@@ -460,7 +460,7 @@ mod tests {
         assert_eq!(result.removed_count, 1);
 
         // But reservation should still exist
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
     }
 
@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(result.removed_count, 1);
 
         // Only the fresh reservation should remain
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].key().path, PathBuf::from("/test/fresh"));
     }
@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(result.total_removed, 2);
 
         // Only the fresh reservation should remain
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
     }
 
@@ -563,7 +563,7 @@ mod tests {
         assert_eq!(result.total_removed, 1);
 
         // But all reservations should still exist
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
     }
 
@@ -584,7 +584,7 @@ mod tests {
         let result = CleanupOperations::prune(&mut db, false).unwrap();
         assert_eq!(result.removed_count, 5);
 
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 0);
     }
 
@@ -622,7 +622,7 @@ mod tests {
         // The 5-day-old reservation should remain
         assert_eq!(result.removed_count, 1);
 
-        let remaining = db.list_all_reservations().unwrap();
+        let remaining = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].key().path, PathBuf::from("/test/fresh"));
     }
@@ -738,7 +738,7 @@ mod tests {
         assert_eq!(result.total_removed, 0);
 
         // Verify reservation still exists
-        let all = db.list_all_reservations().unwrap();
+        let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
     }
 
@@ -795,7 +795,7 @@ mod tests {
         let result = CleanupOperations::expire(&mut db, &config, false).unwrap();
         assert_eq!(result.removed_count, 2);
 
-        let remaining = db.list_all_reservations().unwrap();
+        let remaining = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(remaining.len(), 1);
     }
 }

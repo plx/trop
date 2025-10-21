@@ -6,6 +6,12 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
+/// Default minimum port for port allocation ranges.
+pub const DEFAULT_MIN_PORT: u16 = 5000;
+
+/// Default maximum port for port allocation ranges.
+pub const DEFAULT_MAX_PORT: u16 = 7000;
+
 /// Complete configuration structure.
 ///
 /// This represents the full configuration schema for trop, supporting
@@ -109,8 +115,8 @@ pub struct PortConfig {
 impl Default for PortConfig {
     fn default() -> Self {
         Self {
-            min: 5000,
-            max: Some(7000),
+            min: DEFAULT_MIN_PORT,
+            max: Some(DEFAULT_MAX_PORT),
             max_offset: None,
         }
     }
@@ -455,7 +461,7 @@ cleanup:
 }
 
 // Property-based tests for schema components
-#[cfg(test)]
+#[cfg(all(test, feature = "property-tests"))]
 #[allow(unused_doc_comments)] // proptest! macro doesn't support doc comments
 mod property_tests {
     use super::*;

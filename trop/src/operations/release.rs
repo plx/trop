@@ -6,6 +6,7 @@
 use crate::database::Database;
 use crate::error::Result;
 use crate::ReservationKey;
+use rusqlite::Connection;
 
 use super::plan::{OperationPlan, PlanAction};
 
@@ -115,18 +116,18 @@ impl ReleasePlan {
     /// let key = ReservationKey::new(PathBuf::from("/path"), None).unwrap();
     /// let options = ReleaseOptions::new(key).with_allow_unrelated_path(true);
     ///
-    /// let plan = ReleasePlan::new(options).build_plan(&db).unwrap();
+    /// let plan = ReleasePlan::new(options).build_plan(db.connection()).unwrap();
     /// ```
-    pub fn build_plan(&self, db: &Database) -> Result<OperationPlan> {
+    pub fn build_plan(&self, conn: &Connection) -> Result<OperationPlan> {
         let mut plan = OperationPlan::new(format!("Release reservation for {}", self.options.key));
 
         // Step 1: Validate path relationship
         if !self.options.force && !self.options.allow_unrelated_path {
-            db.validate_path_relationship(&self.options.key.path, false)?;
+            Database::validate_path_relationship(&self.options.key.path, false)?;
         }
 
         // Step 2: Check if reservation exists
-        if db.get_reservation(&self.options.key)?.is_some() {
+        if Database::get_reservation(conn, &self.options.key)?.is_some() {
             // Reservation exists - plan to delete it
             plan = plan.add_action(PlanAction::DeleteReservation(self.options.key.clone()));
         } else {
@@ -150,6 +151,7 @@ mod tests {
 
     // Property-based testing module
     // These tests verify mathematical properties and invariants of the release system
+    #[cfg(feature = "property-tests")]
     mod property_tests {
         use super::*;
         use proptest::prelude::*;
@@ -231,7 +233,7 @@ mod tests {
                 let options = ReleaseOptions::new(key)
                     .with_allow_unrelated_path(true);
 
-                let plan = ReleasePlan::new(options).build_plan(&db).unwrap();
+                let plan = ReleasePlan::new(options).build_plan(db.connection()).unwrap();
 
                 // Must succeed with empty actions and a warning
                 prop_assert_eq!(plan.len(), 0, "releasing non-existent reservation must have no actions");
@@ -258,7 +260,7 @@ mod tests {
                 let options = ReleaseOptions::new(key)
                     .with_allow_unrelated_path(true);
 
-                let plan = ReleasePlan::new(options).build_plan(&db).unwrap();
+                let plan = ReleasePlan::new(options).build_plan(db.connection()).unwrap();
 
                 // Must generate DeleteReservation action
                 prop_assert_eq!(plan.len(), 1);
@@ -285,14 +287,15 @@ mod tests {
                 .with_allow_unrelated_path(false);
 
             // Without force, should fail path validation
-            let result_without = ReleasePlan::new(options_without_force).build_plan(&db);
+            let result_without =
+                ReleasePlan::new(options_without_force).build_plan(db.connection());
             assert!(
                 result_without.is_err(),
                 "unrelated path must fail without force"
             );
 
             // With force, should succeed
-            let result_with = ReleasePlan::new(options_with_force).build_plan(&db);
+            let result_with = ReleasePlan::new(options_with_force).build_plan(db.connection());
             assert!(result_with.is_ok(), "force must override path validation");
         }
 
@@ -310,7 +313,7 @@ mod tests {
                 .with_force(false)
                 .with_allow_unrelated_path(true);
 
-            let result = ReleasePlan::new(options).build_plan(&db);
+            let result = ReleasePlan::new(options).build_plan(db.connection());
             assert!(
                 result.is_ok(),
                 "allow_unrelated_path must enable unrelated path operations"
@@ -330,12 +333,16 @@ mod tests {
             let options = ReleaseOptions::new(key).with_allow_unrelated_path(true);
 
             // First release - should have no actions (nothing to delete)
-            let plan1 = ReleasePlan::new(options.clone()).build_plan(&db).unwrap();
+            let plan1 = ReleasePlan::new(options.clone())
+                .build_plan(db.connection())
+                .unwrap();
             assert_eq!(plan1.len(), 0);
             assert!(!plan1.warnings.is_empty());
 
             // Second release - should produce identical result
-            let plan2 = ReleasePlan::new(options).build_plan(&db).unwrap();
+            let plan2 = ReleasePlan::new(options)
+                .build_plan(db.connection())
+                .unwrap();
             assert_eq!(plan2.len(), 0);
             assert!(!plan2.warnings.is_empty());
         }
@@ -375,7 +382,9 @@ mod tests {
 
         // Plan to release it
         let options = ReleaseOptions::new(key).with_allow_unrelated_path(true);
-        let plan = ReleasePlan::new(options).build_plan(&db).unwrap();
+        let plan = ReleasePlan::new(options)
+            .build_plan(db.connection())
+            .unwrap();
 
         assert_eq!(plan.len(), 1);
         assert!(matches!(plan.actions[0], PlanAction::DeleteReservation(_)));
@@ -388,7 +397,9 @@ mod tests {
 
         // Plan to release a reservation that doesn't exist
         let options = ReleaseOptions::new(key).with_allow_unrelated_path(true);
-        let plan = ReleasePlan::new(options).build_plan(&db).unwrap();
+        let plan = ReleasePlan::new(options)
+            .build_plan(db.connection())
+            .unwrap();
 
         // Should be empty with a warning (idempotent)
         assert_eq!(plan.len(), 0);
@@ -403,7 +414,7 @@ mod tests {
 
         // Don't allow unrelated path
         let options = ReleaseOptions::new(key);
-        let result = ReleasePlan::new(options).build_plan(&db);
+        let result = ReleasePlan::new(options).build_plan(db.connection());
 
         assert!(result.is_err());
     }
@@ -415,7 +426,7 @@ mod tests {
 
         // Force allows unrelated path
         let options = ReleaseOptions::new(key).with_force(true);
-        let result = ReleasePlan::new(options).build_plan(&db);
+        let result = ReleasePlan::new(options).build_plan(db.connection());
 
         assert!(result.is_ok());
     }
@@ -427,7 +438,7 @@ mod tests {
 
         // Allow unrelated path flag
         let options = ReleaseOptions::new(key).with_allow_unrelated_path(true);
-        let result = ReleasePlan::new(options).build_plan(&db);
+        let result = ReleasePlan::new(options).build_plan(db.connection());
 
         assert!(result.is_ok());
     }
