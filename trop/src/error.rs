@@ -317,7 +317,8 @@ mod tests {
         };
         let display = format!("{err}");
         assert!(display.contains("invalid path"));
-        assert!(display.contains("/invalid/path"));
+        let normalized = display.replace(std::path::MAIN_SEPARATOR, "/");
+        assert!(normalized.contains("/invalid/path"));
         assert!(display.contains("does not exist"));
     }
 
@@ -422,7 +423,8 @@ mod tests {
         };
         let display = format!("{err}");
         assert!(display.contains("unrelated path"));
-        assert!(display.contains("/unrelated/path"));
+        let normalized = display.replace(std::path::MAIN_SEPARATOR, "/");
+        assert!(normalized.contains("/unrelated/path"));
     }
 
     #[test]

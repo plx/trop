@@ -24,14 +24,16 @@ use crate::Port;
 ///
 /// // Untagged reservation
 /// let key = ReservationKey::new(PathBuf::from("/path/to/project"), None).unwrap();
-/// assert_eq!(format!("{key}"), "/path/to/project");
+/// let display = format!("{key}").replace(std::path::MAIN_SEPARATOR, "/");
+/// assert_eq!(display, "/path/to/project");
 ///
 /// // Tagged reservation
 /// let key = ReservationKey::new(
 ///     PathBuf::from("/path/to/project"),
 ///     Some("web".to_string())
 /// ).unwrap();
-/// assert_eq!(format!("{key}"), "/path/to/project:web");
+/// let display = format!("{key}").replace(std::path::MAIN_SEPARATOR, "/");
+/// assert_eq!(display, "/path/to/project:web");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReservationKey {

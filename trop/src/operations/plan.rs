@@ -406,7 +406,8 @@ mod tests {
 
         let action = PlanAction::CreateReservation(reservation);
         let desc = action.description();
-        assert!(desc.contains("/path"));
+        let normalized = desc.replace(std::path::MAIN_SEPARATOR, "/");
+        assert!(normalized.contains("/path"));
         assert!(desc.contains("8080"));
     }
 
