@@ -53,7 +53,11 @@ impl DatabaseConfig {
     /// use trop::database::DatabaseConfig;
     ///
     /// let config = DatabaseConfig::new("/tmp/trop.db");
-    /// assert_eq!(config.path.to_str().unwrap(), "/tmp/trop.db");
+    /// let normalized = config
+    ///     .path
+    ///     .to_string_lossy()
+    ///     .replace(std::path::MAIN_SEPARATOR, "/");
+    /// assert_eq!(normalized, "/tmp/trop.db");
     /// ```
     #[must_use]
     pub fn new(path: impl AsRef<Path>) -> Self {
