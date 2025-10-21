@@ -2293,6 +2293,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "criterion",
  "csv",
  "home",
  "libc",

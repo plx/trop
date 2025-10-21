@@ -65,6 +65,26 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           cargo llvm-cov --workspace --summary-only | tee -a $GITHUB_STEP_SUMMARY
 
+      - name: Run library benchmarks
+        run: bash -o pipefail -c "cargo bench -p trop --bench operations_bench -- --sample-size 10 --measurement-time 2 | tee operations-bench.txt"
+
+      - name: Run CLI benchmarks
+        run: bash -o pipefail -c "cargo bench -p trop-cli --bench cli_bench -- --sample-size 10 --measurement-time 2 | tee cli-bench.txt"
+
+      - name: Combine benchmark output
+        run: cat operations-bench.txt cli-bench.txt > benchmark-results.txt
+
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: trop benchmark
+          tool: 'cargo'
+          output-file-path: benchmark-results.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: false
+          alert-threshold: '150%'
+          comment-on-alert: true
+
       # Notice if CODECOV_TOKEN is not set
       - name: Notice about Codecov
         if: secrets.CODECOV_TOKEN == ''
