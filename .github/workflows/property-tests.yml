@@ -1,12 +1,19 @@
 name: Property Tests (On Demand)
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
 on:
   workflow_dispatch:
     inputs:
       runner_matrix:
         description: 'JSON array of GitHub runner labels (e.g. ["ubuntu-latest","windows-latest"])'
         required: false
-        default: '["ubuntu-latest","windows-latest"]'
+        default: '["ubuntu-latest","windows-latest", "macos-latest"]'
+      profile_matrix:
+        description: 'JSON array of profile names (e.g. ["debug","release"])'
+        required: false
+        default: '["debug","release"]'
       proptest_cases:
         description: 'Number of cases to run per property (PROPTEST_CASES)'
         required: false
@@ -18,12 +25,13 @@ env:
 
 jobs:
   property-tests:
-    name: Property tests on ${{ matrix.os }}
+    name: Property tests ( ${{ matrix.profile }}) on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: ${{ fromJson(inputs.runner_matrix) }}
+        profile: ${{ fromJson(inputs.profile_matrix) }}
     env:
       PROPTEST_CASES: ${{ inputs.proptest_cases }}
 
@@ -38,4 +46,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run property-based tests
-        run: cargo test --workspace --features property-tests -- --nocapture
+        run: just ci-run-property-tests-${{ matrix.profile }}
