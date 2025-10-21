@@ -2,7 +2,7 @@ name: Multi-Platform Tests
 
 on:
   push:
-    branches: [ main, develop, 'phase-*' ]
+    branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
 
