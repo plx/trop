@@ -39,7 +39,7 @@ jobs:
 
       # Upload to Codecov if token is available
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           files: lcov.info
           fail_ci_if_error: false  # Don't fail if Codecov is down or token missing
