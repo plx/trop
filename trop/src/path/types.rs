@@ -50,7 +50,11 @@ pub enum PathProvenance {
 /// use trop::path::{NormalizedPath, PathProvenance};
 /// use std::path::PathBuf;
 ///
-/// let path = PathBuf::from("/absolute/path");
+/// let path = if cfg!(windows) {
+///     PathBuf::from(r"C:\absolute\path")
+/// } else {
+///     PathBuf::from("/absolute/path")
+/// };
 /// let normalized = NormalizedPath::new(path, PathProvenance::Explicit).unwrap();
 /// assert!(normalized.as_path().is_absolute());
 /// ```
@@ -73,7 +77,11 @@ impl NormalizedPath {
     /// use trop::path::{NormalizedPath, PathProvenance};
     /// use std::path::PathBuf;
     ///
-    /// let path = PathBuf::from("/absolute/path");
+    /// let path = if cfg!(windows) {
+    ///     PathBuf::from(r"C:\absolute\path")
+    /// } else {
+    ///     PathBuf::from("/absolute/path")
+    /// };
     /// let normalized = NormalizedPath::new(path, PathProvenance::Explicit).unwrap();
     /// ```
     pub fn new(path: PathBuf, provenance: PathProvenance) -> Result<Self> {
@@ -94,7 +102,11 @@ impl NormalizedPath {
     /// use trop::path::{NormalizedPath, PathProvenance};
     /// use std::path::PathBuf;
     ///
-    /// let path = PathBuf::from("/absolute/path");
+    /// let path = if cfg!(windows) {
+    ///     PathBuf::from(r"C:\absolute\path")
+    /// } else {
+    ///     PathBuf::from("/absolute/path")
+    /// };
     /// let normalized = NormalizedPath::new(path.clone(), PathProvenance::Explicit).unwrap();
     /// assert_eq!(normalized.as_path(), path.as_path());
     /// ```
@@ -111,7 +123,11 @@ impl NormalizedPath {
     /// use trop::path::{NormalizedPath, PathProvenance};
     /// use std::path::PathBuf;
     ///
-    /// let path = PathBuf::from("/absolute/path");
+    /// let path = if cfg!(windows) {
+    ///     PathBuf::from(r"C:\absolute\path")
+    /// } else {
+    ///     PathBuf::from("/absolute/path")
+    /// };
     /// let normalized = NormalizedPath::new(path, PathProvenance::Explicit).unwrap();
     /// assert_eq!(normalized.provenance(), PathProvenance::Explicit);
     /// ```
@@ -128,7 +144,11 @@ impl NormalizedPath {
     /// use trop::path::{NormalizedPath, PathProvenance};
     /// use std::path::PathBuf;
     ///
-    /// let path = PathBuf::from("/absolute/path");
+    /// let path = if cfg!(windows) {
+    ///     PathBuf::from(r"C:\absolute\path")
+    /// } else {
+    ///     PathBuf::from("/absolute/path")
+    /// };
     /// let normalized = NormalizedPath::new(path.clone(), PathProvenance::Explicit).unwrap();
     /// assert_eq!(normalized.into_path_buf(), path);
     /// ```
