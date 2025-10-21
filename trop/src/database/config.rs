@@ -178,6 +178,7 @@ pub fn resolve_database_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_config_new() {
@@ -203,8 +204,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_default_data_dir() {
         // This test requires HOME or USERPROFILE to be set
+        std::env::remove_var("TROP_DATA_DIR");
         let result = default_data_dir();
         if std::env::var("HOME").is_ok() || std::env::var("USERPROFILE").is_ok() {
             let dir = result.unwrap();
@@ -213,6 +216,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_database_path() {
         // Test with default (no TROP_DATA_DIR set)
         std::env::remove_var("TROP_DATA_DIR");
@@ -232,10 +236,12 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_data_dir_consistency() {
         // Test that database and config paths use the same data directory
 
         // Test with custom TROP_DATA_DIR
+        std::env::remove_var("TROP_DATA_DIR");
         std::env::set_var("TROP_DATA_DIR", "/custom/trop/data");
 
         let db_path = resolve_database_path().unwrap();
@@ -251,6 +257,7 @@ mod tests {
         std::env::remove_var("TROP_DATA_DIR");
 
         // Test with default (HOME-based)
+        std::env::remove_var("TROP_DATA_DIR");
         if std::env::var("HOME").is_ok() || std::env::var("USERPROFILE").is_ok() {
             let db_path = resolve_database_path().unwrap();
             let data_dir = default_data_dir().unwrap();
