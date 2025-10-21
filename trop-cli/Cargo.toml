@@ -13,7 +13,7 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-trop = { path = "../trop" }
+trop = { version = "0.1.0", path = "../trop" }
 clap = { workspace = true, features = ["derive", "env"] }
 clap_complete = "4.5"
 serde = { workspace = true }
