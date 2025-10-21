@@ -17,8 +17,8 @@ The trop project now has comprehensive CI/CD pipelines that provide:
 ### 1. Multi-Platform Tests (`.github/workflows/multi-platform.yml`)
 
 **Triggers:**
-- Push to `main`, `develop`, or `phase-*` branches
-- Pull requests to `main` or `develop`
+- Push to `main` or `develop`
+- Pull requests targeting `main` or `develop`
 
 **What it does:**
 - Tests on **3 operating systems**: Ubuntu (Linux), macOS, Windows
