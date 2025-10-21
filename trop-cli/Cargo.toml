@@ -30,7 +30,7 @@ tempfile = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 libc = "0.2"
-criterion = "0.5"
+criterion = "0.7"
 
 [build-dependencies]
 clap = { workspace = true, features = ["derive", "env"] }
