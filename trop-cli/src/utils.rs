@@ -179,14 +179,8 @@ pub fn format_allocations(
 /// Resolve the data directory path.
 ///
 /// Respects `TROP_DATA_DIR` environment variable, otherwise defaults to `~/.trop`.
-///
-/// # Panics
-///
-/// Panics if the home directory cannot be determined and `TROP_DATA_DIR` is not set.
-pub fn resolve_data_dir() -> PathBuf {
-    trop::database::default_data_dir().expect(
-        "Failed to determine data directory (home directory not found and TROP_DATA_DIR not set)",
-    )
+pub fn resolve_data_dir() -> Result<PathBuf, CliError> {
+    trop::database::default_data_dir().map_err(|_| CliError::NoDataDirectory)
 }
 
 /// Find project configuration file (trop.yaml) starting from current directory.
@@ -237,11 +231,11 @@ pub fn find_project_config() -> Result<Option<PathBuf>, CliError> {
 ///
 /// Path to the configuration file to use (may not exist yet).
 pub fn resolve_config_file(global: &GlobalOptions) -> Result<PathBuf, CliError> {
-    let global_config = global
-        .data_dir
-        .as_ref()
-        .map(|d| d.join("config.yaml"))
-        .unwrap_or_else(|| resolve_data_dir().join("config.yaml"));
+    let global_config = if let Some(ref data_dir) = global.data_dir {
+        data_dir.join("config.yaml")
+    } else {
+        resolve_data_dir()?.join("config.yaml")
+    };
 
     Ok(find_project_config()?.unwrap_or(global_config))
 }

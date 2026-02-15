@@ -237,6 +237,68 @@ fn test_explicit_missing_data_dir_exit_code() {
     );
 }
 
+/// Test missing HOME/USERPROFILE and TROP_DATA_DIR for show-data-dir.
+///
+/// This should return a typed CLI error (code 3) instead of panicking.
+#[test]
+fn test_show_data_dir_without_home_or_data_dir_env() {
+    let mut cmd = assert_cmd::Command::cargo_bin("trop").unwrap();
+    let output = cmd
+        .env_remove("TROP_DATA_DIR")
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .arg("show-data-dir")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "Missing home directory should map to no-data-directory error"
+    );
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Error:") && stderr.contains("Data directory"),
+        "Should report a user-facing data directory error: {stderr}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains("panicked at"),
+        "Should not panic: {stderr}"
+    );
+}
+
+/// Test missing HOME/USERPROFILE and TROP_DATA_DIR for assert-data-dir.
+///
+/// This should return code 3 instead of crashing before assertion logic.
+#[test]
+fn test_assert_data_dir_without_home_or_data_dir_env() {
+    let mut cmd = assert_cmd::Command::cargo_bin("trop").unwrap();
+    let output = cmd
+        .env_remove("TROP_DATA_DIR")
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .arg("assert-data-dir")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "Missing home directory should map to no-data-directory error"
+    );
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Error:") && stderr.contains("Data directory"),
+        "Should report a user-facing data directory error: {stderr}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains("panicked at"),
+        "Should not panic: {stderr}"
+    );
+}
+
 // ============================================================================
 // Invalid Arguments (Exit Code 4)
 // ============================================================================
