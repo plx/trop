@@ -40,6 +40,11 @@ fn reserve_with_preferred_command(env: &TestEnv, path: &Path, preferred: u16) ->
     cmd
 }
 
+fn write_global_config(env: &TestEnv, yaml: &str) {
+    std::fs::create_dir_all(&env.data_dir).expect("Failed to create data directory");
+    std::fs::write(env.data_dir.join("config.yaml"), yaml).expect("Failed to write config");
+}
+
 // ============================================================================
 // Basic Reservation Tests
 // ============================================================================
@@ -387,6 +392,153 @@ fn test_reserve_with_port_range() {
         port >= min_port && port <= max_port,
         "Port {port} should be in range [{min_port}, {max_port}]"
     );
+}
+
+#[test]
+fn test_reserve_with_only_min_preserves_configured_max() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("only-min-preserves-max");
+    write_global_config(
+        &env,
+        r#"
+ports:
+  min: 30000
+  max: 30040
+"#,
+    );
+
+    let output = env
+        .command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--min")
+        .arg("30020")
+        .arg("--allow-unrelated-path")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let port = parse_port(&String::from_utf8(output.stdout).unwrap());
+    assert!(
+        (30020..=30040).contains(&port),
+        "Port {port} should preserve configured max bound"
+    );
+}
+
+#[test]
+fn test_reserve_with_only_max_preserves_configured_min() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("only-max-preserves-min");
+    write_global_config(
+        &env,
+        r#"
+ports:
+  min: 30100
+  max: 30140
+"#,
+    );
+
+    let output = env
+        .command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--max")
+        .arg("30120")
+        .arg("--allow-unrelated-path")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let port = parse_port(&String::from_utf8(output.stdout).unwrap());
+    assert!(
+        (30100..=30120).contains(&port),
+        "Port {port} should preserve configured min bound"
+    );
+}
+
+#[test]
+fn test_reserve_with_min_and_max_overrides_configured_bounds() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("both-override-bounds");
+    write_global_config(
+        &env,
+        r#"
+ports:
+  min: 30200
+  max: 30280
+"#,
+    );
+
+    let output = env
+        .command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--min")
+        .arg("30240")
+        .arg("--max")
+        .arg("30250")
+        .arg("--allow-unrelated-path")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let port = parse_port(&String::from_utf8(output.stdout).unwrap());
+    assert!(
+        (30240..=30250).contains(&port),
+        "Port {port} should use CLI min/max bounds"
+    );
+}
+
+#[test]
+fn test_reserve_with_only_min_preserves_default_max() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("only-min-preserves-default-max");
+
+    let output = env
+        .command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--min")
+        .arg("6800")
+        .arg("--allow-unrelated-path")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let port = parse_port(&String::from_utf8(output.stdout).unwrap());
+    assert!(
+        (6800..=7000).contains(&port),
+        "Port {port} should preserve built-in default max bound"
+    );
+}
+
+#[test]
+fn test_reserve_with_partial_override_rejects_invalid_effective_range() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("invalid-effective-range");
+    write_global_config(
+        &env,
+        r#"
+ports:
+  min: 30400
+  max: 30420
+"#,
+    );
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--max")
+        .arg("30390")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid port range"));
 }
 
 // ============================================================================

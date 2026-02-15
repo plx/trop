@@ -7,7 +7,7 @@ use crate::error::CliError;
 use crate::utils::{load_configuration, open_database, resolve_path, GlobalOptions};
 use clap::Args;
 use std::path::PathBuf;
-use trop::config::DEFAULT_MIN_PORT;
+use trop::config::PortConfig;
 use trop::{PlanExecutor, Port, ReservationKey, ReserveOptions, ReservePlan};
 
 /// Reserve a port for a directory.
@@ -143,26 +143,8 @@ impl ReserveCommand {
 
         let max = self.max.as_deref().map(parse_port_string).transpose()?;
 
-        // 5. Validate port range (min <= max)
-        if let (Some(min_val), Some(max_val)) = (min, max) {
-            if min_val > max_val {
-                return Err(CliError::InvalidArguments(format!(
-                    "Invalid port range: min ({min_val}) must be less than or equal to max ({max_val})"
-                )));
-            }
-        }
-
-        // 6. Modify config for port range if min/max specified
-        if min.is_some() || max.is_some() {
-            use trop::config::PortConfig;
-            // Override config port range with CLI arguments
-            let port_config = PortConfig {
-                min: min.unwrap_or(DEFAULT_MIN_PORT), // Use min from CLI or default
-                max,                                  // max from CLI (already Option<u16>)
-                max_offset: None,
-            };
-            config.ports = Some(port_config);
-        }
+        // 5. Modify config for port range if min/max specified
+        apply_port_range_overrides(&mut config, min, max)?;
 
         // 7. Build library ReserveOptions
         let options = ReserveOptions::new(key, port)
@@ -265,6 +247,59 @@ impl ReserveCommand {
     }
 }
 
+fn apply_port_range_overrides(
+    config: &mut trop::Config,
+    min: Option<u16>,
+    max: Option<u16>,
+) -> Result<(), CliError> {
+    if min.is_none() && max.is_none() {
+        return Ok(());
+    }
+
+    let mut effective = config.ports.clone().unwrap_or_default();
+
+    if let Some(min_val) = min {
+        effective.min = min_val;
+    }
+
+    // CLI --max overrides any configured max_offset semantics.
+    if let Some(max_val) = max {
+        effective.max = Some(max_val);
+        effective.max_offset = None;
+    }
+
+    validate_effective_port_range(&effective)?;
+    config.ports = Some(effective);
+
+    Ok(())
+}
+
+fn validate_effective_port_range(port_config: &PortConfig) -> Result<(), CliError> {
+    let resolved_max = if let Some(max) = port_config.max {
+        max
+    } else if let Some(offset) = port_config.max_offset {
+        port_config.min.checked_add(offset).ok_or_else(|| {
+            CliError::InvalidArguments(format!(
+                "Invalid port range: min ({}) + max_offset ({offset}) exceeds 65535",
+                port_config.min
+            ))
+        })?
+    } else {
+        return Err(CliError::InvalidArguments(
+            "Invalid port range: either max or max_offset must be configured".to_string(),
+        ));
+    };
+
+    if port_config.min > resolved_max {
+        return Err(CliError::InvalidArguments(format!(
+            "Invalid port range: min ({}) must be less than or equal to max ({resolved_max})",
+            port_config.min
+        )));
+    }
+
+    Ok(())
+}
+
 /// Parse a port number from a string, validating it's in the valid range (1-65535).
 ///
 /// Returns an error if the string cannot be parsed as a number or if the number
@@ -289,4 +324,74 @@ fn parse_port_string(s: &str) -> Result<u16, CliError> {
     }
 
     Ok(parsed as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_apply_port_range_overrides_only_min_preserves_max_offset() {
+        let mut config = trop::Config {
+            ports: Some(PortConfig {
+                min: 4000,
+                max: None,
+                max_offset: Some(25),
+            }),
+            ..Default::default()
+        };
+
+        apply_port_range_overrides(&mut config, Some(5000), None).unwrap();
+
+        assert_eq!(
+            config.ports,
+            Some(PortConfig {
+                min: 5000,
+                max: None,
+                max_offset: Some(25),
+            })
+        );
+    }
+
+    #[test]
+    fn test_apply_port_range_overrides_only_max_clears_max_offset() {
+        let mut config = trop::Config {
+            ports: Some(PortConfig {
+                min: 4000,
+                max: None,
+                max_offset: Some(25),
+            }),
+            ..Default::default()
+        };
+
+        apply_port_range_overrides(&mut config, None, Some(4100)).unwrap();
+
+        assert_eq!(
+            config.ports,
+            Some(PortConfig {
+                min: 4000,
+                max: Some(4100),
+                max_offset: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_apply_port_range_overrides_rejects_invalid_effective_range() {
+        let mut config = trop::Config {
+            ports: Some(PortConfig {
+                min: 4000,
+                max: Some(4100),
+                max_offset: None,
+            }),
+            ..Default::default()
+        };
+
+        let err = apply_port_range_overrides(&mut config, Some(4200), None).unwrap_err();
+
+        assert!(
+            err.to_string().contains("Invalid port range"),
+            "Expected invalid range error, got: {err}"
+        );
+    }
 }
