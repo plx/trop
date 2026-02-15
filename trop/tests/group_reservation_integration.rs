@@ -961,6 +961,70 @@ reservations:
     );
 }
 
+/// Test that insert-time conflicts rollback the entire group allocation.
+///
+/// This test forces a mid-stream insert failure with a database trigger:
+/// - first insert succeeds
+/// - second insert aborts
+/// - transaction must roll back both
+///
+/// Invariants tested:
+/// - Group inserts are atomic (all-or-nothing)
+/// - No partial rows persist after failure
+#[test]
+fn test_error_insert_failure_rolls_back_group() {
+    let temp_dir = create_temp_dir();
+    let config_content = r#"
+project: test-project
+ports:
+  min: 5000
+  max: 5100
+reservations:
+  services:
+    preferred:
+      preferred: 5000
+    offset:
+      offset: 1
+"#;
+    let config_path = create_config_file(temp_dir.path(), "trop.yaml", config_content);
+    let db = create_test_database();
+
+    db.connection()
+        .execute_batch(
+            r#"
+            CREATE TRIGGER fail_offset_insert
+            BEFORE INSERT ON reservations
+            WHEN NEW.tag = 'offset'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced insert failure');
+            END;
+            "#,
+        )
+        .expect("Should create test trigger");
+
+    let options = ReserveGroupOptions::new(config_path);
+    let planner = ReserveGroupPlan::new(options).expect("Should create planner");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
+
+    let mut executor = PlanExecutor::new(db.connection());
+    let result = executor.execute(&plan);
+
+    assert!(
+        result.is_err(),
+        "Should fail on forced mid-stream insert error"
+    );
+
+    let all_reservations =
+        Database::list_all_reservations(db.connection()).expect("Should be able to list");
+    assert_eq!(
+        all_reservations.len(),
+        0,
+        "Failed group allocation must not leave partial reservations"
+    );
+}
+
 /// Test error when preferred port is already occupied.
 ///
 /// This test verifies port availability checking:

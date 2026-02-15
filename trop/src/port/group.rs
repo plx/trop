@@ -130,12 +130,11 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     /// 1. Separate services into those with preferred ports and those with offsets
     /// 2. For offset-based services, find a base port where all offsets are available
     /// 3. Create reservations for all services
-    /// 4. Each individual reservation creation is atomic (transactional)
+    /// 4. Persist all group reservations in one transaction (all-or-nothing)
     /// 5. The group as a whole is validated upfront, so failures should be rare
     ///
-    /// Note: Currently, reservations are created one-by-one. If a later creation fails
-    /// (e.g., due to database errors), earlier reservations will have been committed.
-    /// This could be improved with bulk transaction support in the future.
+    /// Note: If any insert fails, the transaction is rolled back and no partial
+    /// group reservations are persisted.
     ///
     /// # Errors
     ///
@@ -322,11 +321,21 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
             }
         }
 
-        // Create all reservations using simple create (within transaction managed by caller)
-        // If any creation fails, the transaction managed by the caller will roll back
+        // Persist the entire group atomically.
+        // A savepoint keeps this operation all-or-nothing and works both
+        // standalone and inside a caller-managed outer transaction.
+        conn.execute_batch("SAVEPOINT trop_group_allocate")?;
+
         for reservation in &reservations_to_create {
-            Database::create_reservation_simple(conn, reservation)?;
+            if let Err(err) = Database::create_reservation_simple(conn, reservation) {
+                conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT trop_group_allocate; RELEASE SAVEPOINT trop_group_allocate;",
+                )?;
+                return Err(err);
+            }
         }
+
+        conn.execute_batch("RELEASE SAVEPOINT trop_group_allocate")?;
 
         Ok(GroupAllocationResult {
             allocations,
@@ -743,6 +752,58 @@ mod tests {
                 .unwrap();
             assert_eq!(reservation.port(), *port);
         }
+    }
+
+    #[test]
+    fn test_group_allocation_rolls_back_on_insert_failure() {
+        let db = create_test_database();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
+
+        db.connection()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_offset_insert
+                BEFORE INSERT ON reservations
+                WHEN NEW.tag = 'offset'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced insert failure');
+                END;
+                "#,
+            )
+            .unwrap();
+
+        // The trigger forces the second insert to fail after the first succeeds,
+        // proving the group write is all-or-nothing.
+        let request = GroupAllocationRequest {
+            base_path: PathBuf::from("/test/project"),
+            project: Some("test".to_string()),
+            task: None,
+            services: vec![
+                ServiceAllocationRequest {
+                    tag: "preferred".to_string(),
+                    offset: None,
+                    preferred: Some(Port::try_from(5000).unwrap()),
+                },
+                ServiceAllocationRequest {
+                    tag: "offset".to_string(),
+                    offset: Some(1),
+                    preferred: None,
+                },
+            ],
+        };
+
+        let config = OccupancyCheckConfig::default();
+        let result = allocator.allocate_group(db.connection(), &request, &config);
+        assert!(
+            result.is_err(),
+            "Allocation should fail on forced mid-stream insert error"
+        );
+
+        let all_reservations = Database::list_all_reservations(db.connection()).unwrap();
+        assert!(
+            all_reservations.is_empty(),
+            "Failed group allocation must not leave partial reservations"
+        );
     }
 
     #[test]
