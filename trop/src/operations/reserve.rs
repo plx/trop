@@ -306,12 +306,28 @@ impl<'a> ReservePlan<'a> {
 
         // Step 2: Check for existing reservation
         if let Some(existing) = Database::get_reservation(conn, &self.options.key)? {
-            // Reservation exists - validate sticky fields and return idempotent result
+            // Reservation exists - validate sticky fields first
             self.validate_sticky_fields(&existing)?;
 
-            // Idempotent case: reservation exists with compatible metadata
-            // Just update the timestamp
-            plan = plan.add_action(PlanAction::UpdateLastUsed(self.options.key.clone()));
+            let project_changed = self.options.project.as_deref() != existing.project();
+            let task_changed = self.options.task.as_deref() != existing.task();
+
+            if project_changed || task_changed {
+                // Sticky fields changed and change is allowed: rewrite row with updated metadata
+                // while preserving original creation time.
+                let updated_reservation =
+                    Reservation::builder(existing.key().clone(), existing.port())
+                        .project(self.options.project.clone())
+                        .task(self.options.task.clone())
+                        .created_at(existing.created_at())
+                        .build()?;
+
+                plan = plan.add_action(PlanAction::UpdateReservation(updated_reservation));
+            } else {
+                // Idempotent case: metadata unchanged, only refresh last_used_at
+                plan = plan.add_action(PlanAction::UpdateLastUsed(self.options.key.clone()));
+            }
+
             return Ok(plan);
         }
 
@@ -897,15 +913,25 @@ mod tests {
         db.create_reservation(&reservation).unwrap();
 
         // Change project with force flag
-        let options = ReserveOptions::new(key, Some(port))
+        let options = ReserveOptions::new(key.clone(), Some(port))
             .with_project(Some("project2".to_string()))
             .with_force(true)
             .with_allow_unrelated_path(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(db.connection());
+        let plan = ReservePlan::new(options, &config)
+            .build_plan(db.connection())
+            .unwrap();
 
-        // Should succeed with force
-        assert!(result.is_ok());
+        assert_eq!(plan.len(), 1);
+        match &plan.actions[0] {
+            PlanAction::UpdateReservation(updated) => {
+                assert_eq!(updated.project(), Some("project2"));
+                assert_eq!(updated.task(), None);
+                assert_eq!(updated.key(), &key);
+                assert_eq!(updated.port(), port);
+            }
+            action => panic!("Expected UpdateReservation action, got: {action:?}"),
+        }
     }
 
     #[test]
@@ -923,15 +949,25 @@ mod tests {
         db.create_reservation(&reservation).unwrap();
 
         // Change project with specific allow flag
-        let options = ReserveOptions::new(key, Some(port))
+        let options = ReserveOptions::new(key.clone(), Some(port))
             .with_project(Some("project2".to_string()))
             .with_allow_project_change(true)
             .with_allow_unrelated_path(true);
 
-        let result = ReservePlan::new(options, &config).build_plan(db.connection());
+        let plan = ReservePlan::new(options, &config)
+            .build_plan(db.connection())
+            .unwrap();
 
-        // Should succeed with allow flag
-        assert!(result.is_ok());
+        assert_eq!(plan.len(), 1);
+        match &plan.actions[0] {
+            PlanAction::UpdateReservation(updated) => {
+                assert_eq!(updated.project(), Some("project2"));
+                assert_eq!(updated.task(), None);
+                assert_eq!(updated.key(), &key);
+                assert_eq!(updated.port(), port);
+            }
+            action => panic!("Expected UpdateReservation action, got: {action:?}"),
+        }
     }
 
     #[test]
@@ -960,6 +996,120 @@ mod tests {
             result.unwrap_err(),
             Error::StickyFieldChange { .. }
         ));
+    }
+
+    #[test]
+    fn test_plan_sticky_field_task_change_with_allow_flag() {
+        let mut db = create_test_database();
+        let config = create_test_config();
+        let key = ReservationKey::new(PathBuf::from("/test/path"), None).unwrap();
+        let port = Port::try_from(8080).unwrap();
+
+        // Create initial reservation with task
+        let reservation = Reservation::builder(key.clone(), port)
+            .task(Some("task1".to_string()))
+            .build()
+            .unwrap();
+        db.create_reservation(&reservation).unwrap();
+
+        // Change task with specific allow flag
+        let options = ReserveOptions::new(key.clone(), Some(port))
+            .with_task(Some("task2".to_string()))
+            .with_allow_task_change(true)
+            .with_allow_unrelated_path(true);
+
+        let plan = ReservePlan::new(options, &config)
+            .build_plan(db.connection())
+            .unwrap();
+
+        assert_eq!(plan.len(), 1);
+        match &plan.actions[0] {
+            PlanAction::UpdateReservation(updated) => {
+                assert_eq!(updated.project(), None);
+                assert_eq!(updated.task(), Some("task2"));
+                assert_eq!(updated.key(), &key);
+                assert_eq!(updated.port(), port);
+            }
+            action => panic!("Expected UpdateReservation action, got: {action:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_sticky_field_both_change_with_force() {
+        let mut db = create_test_database();
+        let config = create_test_config();
+        let key = ReservationKey::new(PathBuf::from("/test/path"), None).unwrap();
+        let port = Port::try_from(8080).unwrap();
+
+        // Create initial reservation with both sticky fields
+        let reservation = Reservation::builder(key.clone(), port)
+            .project(Some("project1".to_string()))
+            .task(Some("task1".to_string()))
+            .build()
+            .unwrap();
+        db.create_reservation(&reservation).unwrap();
+
+        // Change both with force
+        let options = ReserveOptions::new(key.clone(), Some(port))
+            .with_project(Some("project2".to_string()))
+            .with_task(Some("task2".to_string()))
+            .with_force(true)
+            .with_allow_unrelated_path(true);
+
+        let plan = ReservePlan::new(options, &config)
+            .build_plan(db.connection())
+            .unwrap();
+
+        assert_eq!(plan.len(), 1);
+        match &plan.actions[0] {
+            PlanAction::UpdateReservation(updated) => {
+                assert_eq!(updated.project(), Some("project2"));
+                assert_eq!(updated.task(), Some("task2"));
+                assert_eq!(updated.key(), &key);
+                assert_eq!(updated.port(), port);
+            }
+            action => panic!("Expected UpdateReservation action, got: {action:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_sticky_field_both_change_with_allow_change_equivalent() {
+        let mut db = create_test_database();
+        let config = create_test_config();
+        let key = ReservationKey::new(PathBuf::from("/test/path"), None).unwrap();
+        let port = Port::try_from(8080).unwrap();
+
+        // Create initial reservation with both sticky fields
+        let reservation = Reservation::builder(key.clone(), port)
+            .project(Some("project1".to_string()))
+            .task(Some("task1".to_string()))
+            .build()
+            .unwrap();
+        db.create_reservation(&reservation).unwrap();
+
+        // Change both with both allow flags set.
+        // This is the same planner state produced by CLI --allow-change.
+        let options = ReserveOptions::new(key.clone(), Some(port))
+            .with_project(Some("project2".to_string()))
+            .with_task(Some("task2".to_string()))
+            .with_allow_project_change(true)
+            .with_allow_task_change(true)
+            .with_allow_unrelated_path(true);
+
+        let plan = ReservePlan::new(options, &config)
+            .build_plan(db.connection())
+            .unwrap();
+
+        assert_eq!(plan.len(), 1);
+        match &plan.actions[0] {
+            PlanAction::UpdateReservation(updated) => {
+                assert_eq!(updated.project(), Some("project2"));
+                assert_eq!(updated.task(), Some("task2"));
+                assert_eq!(updated.key(), &key);
+                assert_eq!(updated.port(), port);
+            }
+            action => panic!("Expected UpdateReservation action, got: {action:?}"),
+        }
     }
 
     #[test]

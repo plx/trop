@@ -139,7 +139,7 @@ fn test_sticky_field_protection() {
     ));
 
     // Change project with force flag
-    let reserve_opts3 = ReserveOptions::new(key, Some(port))
+    let reserve_opts3 = ReserveOptions::new(key.clone(), Some(port))
         .with_project(Some("project2".to_string()))
         .with_force(true)
         .with_allow_unrelated_path(true);
@@ -147,9 +147,18 @@ fn test_sticky_field_protection() {
     let plan = ReservePlan::new(reserve_opts3, &create_test_config())
         .build_plan(db.connection())
         .unwrap();
+    assert!(matches!(
+        plan.actions[0],
+        trop::PlanAction::UpdateReservation(_)
+    ));
     let mut executor = trop::PlanExecutor::new(db.connection());
     let result = executor.execute(&plan);
     assert!(result.is_ok());
+
+    let updated = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.project(), Some("project2"));
 }
 
 #[test]

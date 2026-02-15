@@ -444,6 +444,10 @@ fn test_reserve_with_allow_project_change() {
         .arg("--allow-unrelated-path")
         .assert()
         .success();
+
+    let list_output = env.list();
+    assert!(list_output.contains("different-project"));
+    assert!(!list_output.contains("original-project"));
 }
 
 /// Test reserve with --allow-task-change flag.
@@ -476,6 +480,10 @@ fn test_reserve_with_allow_task_change() {
         .arg("--allow-unrelated-path")
         .assert()
         .success();
+
+    let list_output = env.list();
+    assert!(list_output.contains("task-2"));
+    assert!(!list_output.contains("task-1"));
 }
 
 /// Test reserve with --allow-change flag (both project and task).
@@ -513,6 +521,12 @@ fn test_reserve_with_allow_change() {
         .arg("--allow-unrelated-path")
         .assert()
         .success();
+
+    let list_output = env.list();
+    assert!(list_output.contains("proj2"));
+    assert!(list_output.contains("task2"));
+    assert!(!list_output.contains("proj1"));
+    assert!(!list_output.contains("task1"));
 }
 
 // ============================================================================

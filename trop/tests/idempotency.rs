@@ -327,16 +327,20 @@ fn test_can_change_project_with_force_flag() {
         .with_force(true)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
+    let plan2 = ReservePlan::new(opts2, &create_test_config())
+        .build_plan(db.connection())
+        .unwrap();
+    assert_eq!(plan2.actions.len(), 1);
+    assert!(matches!(plan2.actions[0], PlanAction::UpdateReservation(_)));
 
-    assert!(
-        result.is_ok(),
-        "Force flag should allow planning project change"
-    );
+    let mut executor = PlanExecutor::new(db.connection());
+    executor.execute(&plan2).unwrap();
 
-    // Note: Currently the implementation validates that force allows the change,
-    // but doesn't actually update sticky fields (generates UpdateLastUsed not UpdateReservation).
-    // This test verifies that the validation passes with force, which is the current behavior.
+    let updated = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.project(), Some("project2"));
+    assert_eq!(updated.task(), None);
 }
 
 #[test]
@@ -367,12 +371,20 @@ fn test_can_change_project_with_allow_project_change_flag() {
         .with_allow_project_change(true)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
+    let plan2 = ReservePlan::new(opts2, &create_test_config())
+        .build_plan(db.connection())
+        .unwrap();
+    assert_eq!(plan2.actions.len(), 1);
+    assert!(matches!(plan2.actions[0], PlanAction::UpdateReservation(_)));
 
-    assert!(
-        result.is_ok(),
-        "allow_project_change flag should allow planning project change"
-    );
+    let mut executor = PlanExecutor::new(db.connection());
+    executor.execute(&plan2).unwrap();
+
+    let updated = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.project(), Some("project2"));
+    assert_eq!(updated.task(), None);
 }
 
 #[test]
@@ -404,12 +416,11 @@ fn test_can_keep_same_project_value() {
         .with_project(Some("project1".to_string()))
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
-
-    assert!(
-        result.is_ok(),
-        "Should allow keeping the same project value"
-    );
+    let plan2 = ReservePlan::new(opts2, &create_test_config())
+        .build_plan(db.connection())
+        .unwrap();
+    assert_eq!(plan2.actions.len(), 1);
+    assert!(matches!(plan2.actions[0], PlanAction::UpdateLastUsed(_)));
 }
 
 #[test]
@@ -579,12 +590,20 @@ fn test_can_change_task_with_force_flag() {
         .with_force(true)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
+    let plan2 = ReservePlan::new(opts2, &create_test_config())
+        .build_plan(db.connection())
+        .unwrap();
+    assert_eq!(plan2.actions.len(), 1);
+    assert!(matches!(plan2.actions[0], PlanAction::UpdateReservation(_)));
 
-    assert!(
-        result.is_ok(),
-        "Force flag should allow planning task change"
-    );
+    let mut executor = PlanExecutor::new(db.connection());
+    executor.execute(&plan2).unwrap();
+
+    let updated = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.project(), None);
+    assert_eq!(updated.task(), Some("task2"));
 }
 
 #[test]
@@ -612,12 +631,20 @@ fn test_can_change_task_with_allow_task_change_flag() {
         .with_allow_task_change(true)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
+    let plan2 = ReservePlan::new(opts2, &create_test_config())
+        .build_plan(db.connection())
+        .unwrap();
+    assert_eq!(plan2.actions.len(), 1);
+    assert!(matches!(plan2.actions[0], PlanAction::UpdateReservation(_)));
 
-    assert!(
-        result.is_ok(),
-        "allow_task_change flag should allow planning task change"
-    );
+    let mut executor = PlanExecutor::new(db.connection());
+    executor.execute(&plan2).unwrap();
+
+    let updated = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.project(), None);
+    assert_eq!(updated.task(), Some("task2"));
 }
 
 #[test]
@@ -644,9 +671,11 @@ fn test_can_keep_same_task_value() {
         .with_task(Some("task1".to_string()))
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
-
-    assert!(result.is_ok(), "Should allow keeping the same task value");
+    let plan2 = ReservePlan::new(opts2, &create_test_config())
+        .build_plan(db.connection())
+        .unwrap();
+    assert_eq!(plan2.actions.len(), 1);
+    assert!(matches!(plan2.actions[0], PlanAction::UpdateLastUsed(_)));
 }
 
 // =============================================================================
@@ -718,17 +747,26 @@ fn test_can_change_both_with_force() {
         .with_force(true)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
+    let plan2 = ReservePlan::new(opts2, &create_test_config())
+        .build_plan(db.connection())
+        .unwrap();
+    assert_eq!(plan2.actions.len(), 1);
+    assert!(matches!(plan2.actions[0], PlanAction::UpdateReservation(_)));
 
-    assert!(
-        result.is_ok(),
-        "Force should allow planning changes to both fields"
-    );
+    let mut executor = PlanExecutor::new(db.connection());
+    executor.execute(&plan2).unwrap();
+
+    let updated = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.project(), Some("project2"));
+    assert_eq!(updated.task(), Some("task2"));
 }
 
 #[test]
 fn test_can_change_both_with_individual_flags() {
     // Tests that setting both allow flags enables changing both fields.
+    // This is the same planner input produced by CLI --allow-change.
 
     let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/both-allow"), None).unwrap();
@@ -754,12 +792,20 @@ fn test_can_change_both_with_individual_flags() {
         .with_allow_task_change(true)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
+    let plan2 = ReservePlan::new(opts2, &create_test_config())
+        .build_plan(db.connection())
+        .unwrap();
+    assert_eq!(plan2.actions.len(), 1);
+    assert!(matches!(plan2.actions[0], PlanAction::UpdateReservation(_)));
 
-    assert!(
-        result.is_ok(),
-        "Individual flags should allow planning changes to both fields"
-    );
+    let mut executor = PlanExecutor::new(db.connection());
+    executor.execute(&plan2).unwrap();
+
+    let updated = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.project(), Some("project2"));
+    assert_eq!(updated.task(), Some("task2"));
 }
 
 #[test]
