@@ -5,6 +5,10 @@
 //! allowing both real system checks and mock implementations for testing.
 
 use std::collections::HashSet;
+use std::io;
+use std::net::{
+    Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, UdpSocket,
+};
 
 use crate::config::OccupancyConfig;
 use crate::{Port, PortRange, Result};
@@ -34,11 +38,13 @@ impl From<&OccupancyConfig> for OccupancyCheckConfig {
         // and `skip_ipv4`/`skip_ipv6` (in OccupancyCheckConfig) is intentional.
         // The config uses abbreviated names for brevity, while the runtime struct uses
         // full names for clarity.
+        let skip_all = config.skip.unwrap_or(false);
+
         Self {
-            skip_tcp: config.skip_tcp.unwrap_or(false),
-            skip_udp: config.skip_udp.unwrap_or(false),
-            skip_ipv4: config.skip_ip4.unwrap_or(false),
-            skip_ipv6: config.skip_ip6.unwrap_or(false),
+            skip_tcp: skip_all || config.skip_tcp.unwrap_or(false),
+            skip_udp: skip_all || config.skip_udp.unwrap_or(false),
+            skip_ipv4: skip_all || config.skip_ip4.unwrap_or(false),
+            skip_ipv6: skip_all || config.skip_ip6.unwrap_or(false),
             check_all_interfaces: config.check_all_interfaces.unwrap_or(false),
         }
     }
@@ -100,9 +106,10 @@ pub trait PortOccupancyChecker: Send + Sync {
     }
 }
 
-/// Production implementation using the port-selector crate.
+/// Production implementation using socket bind probes.
 ///
-/// This checker uses actual system calls to determine port availability.
+/// This checker attempts to bind sockets with the requested protocol/IP/interface
+/// scope and considers the port occupied if any required bind fails.
 ///
 /// # Examples
 ///
@@ -120,6 +127,78 @@ pub trait PortOccupancyChecker: Send + Sync {
 #[derive(Debug, Clone, Copy)]
 pub struct SystemOccupancyChecker;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeResult {
+    Available,
+    Occupied,
+    UnsupportedFamily,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TransportProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IpVersion {
+    Ipv4,
+    Ipv6,
+}
+
+impl SystemOccupancyChecker {
+    fn probe(
+        port: Port,
+        protocol: TransportProtocol,
+        ip_version: IpVersion,
+        check_all_interfaces: bool,
+    ) -> ProbeResult {
+        let addr = match (ip_version, check_all_interfaces) {
+            (IpVersion::Ipv4, false) => {
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port.value()))
+            }
+            (IpVersion::Ipv4, true) => {
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port.value()))
+            }
+            (IpVersion::Ipv6, false) => {
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port.value(), 0, 0))
+            }
+            (IpVersion::Ipv6, true) => {
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port.value(), 0, 0))
+            }
+        };
+
+        let bind_result = match protocol {
+            TransportProtocol::Tcp => TcpListener::bind(addr).map(|listener| {
+                drop(listener);
+            }),
+            TransportProtocol::Udp => UdpSocket::bind(addr).map(|socket| {
+                drop(socket);
+            }),
+        };
+
+        match bind_result {
+            Ok(()) => ProbeResult::Available,
+            Err(error) if Self::is_unsupported_family_error(&error) => {
+                ProbeResult::UnsupportedFamily
+            }
+            Err(_) => ProbeResult::Occupied,
+        }
+    }
+
+    fn is_unsupported_family_error(error: &io::Error) -> bool {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+        ) {
+            return true;
+        }
+
+        // Common platform error codes for unavailable/unsupported address families.
+        matches!(error.raw_os_error(), Some(47 | 49 | 97 | 10047 | 10049))
+    }
+}
+
 impl PortOccupancyChecker for SystemOccupancyChecker {
     fn is_occupied(&self, port: Port, config: &OccupancyCheckConfig) -> Result<bool> {
         // If we're skipping all checks, the port is available
@@ -130,18 +209,48 @@ impl PortOccupancyChecker for SystemOccupancyChecker {
             return Ok(false);
         }
 
-        // Use port-selector to check availability
-        // The port-selector crate's is_free checks if we can bind to the port
-        let port_u16 = port.value();
+        let protocols = [
+            (!config.skip_tcp, TransportProtocol::Tcp),
+            (!config.skip_udp, TransportProtocol::Udp),
+        ];
+        let ip_versions = [
+            (!config.skip_ipv4, IpVersion::Ipv4),
+            (!config.skip_ipv6, IpVersion::Ipv6),
+        ];
 
-        // By default, port-selector checks localhost binding
-        // If the port is free, we can bind to it, so it's NOT occupied
-        // Note: `check_all_interfaces` is currently reserved for future use when we implement
-        // interface-specific binding checks. For now, we always check localhost.
-        let is_free = port_selector::is_free(port_u16);
+        let mut probed_any = false;
 
-        // Port is occupied if it's NOT free
-        Ok(!is_free)
+        for (enabled_protocol, protocol) in protocols {
+            if !enabled_protocol {
+                continue;
+            }
+
+            for (enabled_ip_version, ip_version) in ip_versions {
+                if !enabled_ip_version {
+                    continue;
+                }
+
+                match Self::probe(port, protocol, ip_version, config.check_all_interfaces) {
+                    ProbeResult::Available => {
+                        probed_any = true;
+                    }
+                    ProbeResult::Occupied => {
+                        return Ok(true);
+                    }
+                    ProbeResult::UnsupportedFamily => {
+                        // Skip unavailable address families and keep evaluating others.
+                    }
+                }
+            }
+        }
+
+        // If no usable checks could be performed (for example, only unsupported
+        // families remained after applying skip flags), fail closed.
+        if !probed_any {
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 }
 
@@ -296,6 +405,24 @@ mod tests {
         assert!(config.check_all_interfaces);
         assert!(!config.skip_udp);
         assert!(!config.skip_ipv6);
+    }
+
+    #[test]
+    fn test_occupancy_check_config_skip_all_sets_all_skip_flags() {
+        let occ_config = OccupancyConfig {
+            skip: Some(true),
+            skip_tcp: Some(false),
+            skip_udp: Some(false),
+            skip_ip4: Some(false),
+            skip_ip6: Some(false),
+            check_all_interfaces: Some(false),
+        };
+
+        let config = OccupancyCheckConfig::from(&occ_config);
+        assert!(config.skip_tcp);
+        assert!(config.skip_udp);
+        assert!(config.skip_ipv4);
+        assert!(config.skip_ipv6);
     }
 
     #[test]

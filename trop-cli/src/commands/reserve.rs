@@ -118,15 +118,16 @@ pub struct ReserveCommand {
 impl ReserveCommand {
     /// Execute the reserve command.
     pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
-        // 1. Resolve path (use CWD if not specified, canonicalize if implicit)
+        // 1. Load configuration
+        let mut config = load_configuration(global)?;
+        self.apply_occupancy_overrides(&mut config);
+
+        // 2. Resolve path (use CWD if not specified, canonicalize if implicit)
         let path = resolve_path(self.path)?;
 
-        // 2. Build ReservationKey
+        // 3. Build ReservationKey
         let key = ReservationKey::new(path, self.tag)
             .map_err(|e| CliError::InvalidArguments(e.to_string()))?;
-
-        // 3. Load configuration
-        let config = load_configuration(global)?;
 
         // 4. Parse and validate port arguments
         let port = self
@@ -152,7 +153,6 @@ impl ReserveCommand {
         }
 
         // 6. Modify config for port range if min/max specified
-        let mut config = config;
         if min.is_some() || max.is_some() {
             use trop::config::PortConfig;
             // Override config port range with CLI arguments
@@ -168,7 +168,7 @@ impl ReserveCommand {
         let options = ReserveOptions::new(key, port)
             .with_project(self.project)
             .with_task(self.task)
-            .with_ignore_occupied(self.ignore_occupied || self.skip_occupancy_check)
+            .with_ignore_occupied(self.ignore_occupied)
             .with_ignore_exclusions(self.ignore_exclusions)
             .with_force(self.force)
             .with_allow_unrelated_path(self.allow_unrelated_path)
@@ -220,6 +220,48 @@ impl ReserveCommand {
         }
 
         Ok(())
+    }
+
+    /// Apply reserve-specific occupancy CLI flags over loaded configuration.
+    ///
+    /// Precedence: CLI flags override merged config defaults/env values.
+    fn apply_occupancy_overrides(&self, config: &mut trop::Config) {
+        let has_occupancy_flag = self.skip_occupancy_check
+            || self.skip_tcp
+            || self.skip_udp
+            || self.skip_ipv4
+            || self.skip_ipv6
+            || self.check_all_interfaces;
+
+        if !has_occupancy_flag {
+            return;
+        }
+
+        let occupancy = config.occupancy_check.get_or_insert_with(Default::default);
+
+        if self.skip_occupancy_check {
+            occupancy.skip = Some(true);
+            occupancy.skip_tcp = Some(true);
+            occupancy.skip_udp = Some(true);
+            occupancy.skip_ip4 = Some(true);
+            occupancy.skip_ip6 = Some(true);
+        }
+
+        if self.skip_tcp {
+            occupancy.skip_tcp = Some(true);
+        }
+        if self.skip_udp {
+            occupancy.skip_udp = Some(true);
+        }
+        if self.skip_ipv4 {
+            occupancy.skip_ip4 = Some(true);
+        }
+        if self.skip_ipv6 {
+            occupancy.skip_ip6 = Some(true);
+        }
+        if self.check_all_interfaces {
+            occupancy.check_all_interfaces = Some(true);
+        }
     }
 }
 
