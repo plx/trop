@@ -197,16 +197,17 @@ impl SystemOccupancyChecker {
         // Common platform error codes for unavailable/unsupported address families.
         matches!(error.raw_os_error(), Some(47 | 49 | 97 | 10047 | 10049))
     }
-}
 
-impl PortOccupancyChecker for SystemOccupancyChecker {
-    fn is_occupied(&self, port: Port, config: &OccupancyCheckConfig) -> Result<bool> {
-        // If we're skipping all checks, the port is available
+    fn is_occupied_with_probe<F>(port: Port, config: &OccupancyCheckConfig, mut probe: F) -> bool
+    where
+        F: FnMut(Port, TransportProtocol, IpVersion, bool) -> ProbeResult,
+    {
+        // If we're skipping all checks, the port is available.
         if config.skip_tcp && config.skip_udp {
-            return Ok(false);
+            return false;
         }
         if config.skip_ipv4 && config.skip_ipv6 {
-            return Ok(false);
+            return false;
         }
 
         let protocols = [
@@ -218,8 +219,6 @@ impl PortOccupancyChecker for SystemOccupancyChecker {
             (!config.skip_ipv6, IpVersion::Ipv6),
         ];
 
-        let mut probed_any = false;
-
         for (enabled_protocol, protocol) in protocols {
             if !enabled_protocol {
                 continue;
@@ -230,27 +229,24 @@ impl PortOccupancyChecker for SystemOccupancyChecker {
                     continue;
                 }
 
-                match Self::probe(port, protocol, ip_version, config.check_all_interfaces) {
-                    ProbeResult::Available => {
-                        probed_any = true;
-                    }
-                    ProbeResult::Occupied => {
-                        return Ok(true);
-                    }
-                    ProbeResult::UnsupportedFamily => {
-                        // Skip unavailable address families and keep evaluating others.
-                    }
+                if matches!(
+                    probe(port, protocol, ip_version, config.check_all_interfaces),
+                    ProbeResult::Occupied
+                ) {
+                    return true;
                 }
             }
         }
 
-        // If no usable checks could be performed (for example, only unsupported
-        // families remained after applying skip flags), fail closed.
-        if !probed_any {
-            return Ok(true);
-        }
+        // If no probe reported an occupied state, treat the port as available.
+        // This includes the case where all configured probes were unsupported.
+        false
+    }
+}
 
-        Ok(false)
+impl PortOccupancyChecker for SystemOccupancyChecker {
+    fn is_occupied(&self, port: Port, config: &OccupancyCheckConfig) -> Result<bool> {
+        Ok(Self::is_occupied_with_probe(port, config, Self::probe))
     }
 }
 
@@ -701,5 +697,47 @@ mod tests {
         };
         let result2 = checker.is_occupied(port, &config2);
         assert!(result2.is_ok());
+    }
+
+    #[test]
+    fn test_system_checker_unsupported_only_probes_do_not_mark_occupied() {
+        let port = Port::try_from(8080).unwrap();
+        let config = OccupancyCheckConfig {
+            skip_ipv4: true,
+            ..Default::default()
+        };
+
+        let occupied = SystemOccupancyChecker::is_occupied_with_probe(
+            port,
+            &config,
+            |_port, _protocol, _ip_version, _all_interfaces| ProbeResult::UnsupportedFamily,
+        );
+
+        assert!(!occupied);
+    }
+
+    #[test]
+    fn test_system_checker_occupied_probe_wins_with_mixed_results() {
+        let port = Port::try_from(8080).unwrap();
+        let config = OccupancyCheckConfig {
+            skip_ipv4: true,
+            ..Default::default()
+        };
+
+        let mut probe_count = 0;
+        let occupied = SystemOccupancyChecker::is_occupied_with_probe(
+            port,
+            &config,
+            |_port, _protocol, _ip_version, _all_interfaces| {
+                probe_count += 1;
+                if probe_count == 1 {
+                    ProbeResult::UnsupportedFamily
+                } else {
+                    ProbeResult::Occupied
+                }
+            },
+        );
+
+        assert!(occupied);
     }
 }
