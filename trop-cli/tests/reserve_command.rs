@@ -1299,6 +1299,57 @@ fn test_reserve_check_all_interfaces_changes_probe_scope() {
     );
 }
 
+#[test]
+fn test_reserve_combined_occupancy_flags_override_check_all_interfaces() {
+    let env = TestEnv::new();
+    let path_without_skip = env.create_dir("occupancy-combo-without-skip");
+    let path_with_skip = env.create_dir("occupancy-combo-with-skip");
+
+    // Bind on a non-default loopback address so --check-all-interfaces has a
+    // deterministic effect compared to localhost-only checks.
+    let listener = match TcpListener::bind("127.0.0.2:0") {
+        Ok(listener) => listener,
+        Err(_) => return,
+    };
+    let occupied_port = listener.local_addr().unwrap().port();
+
+    let output_without_skip =
+        reserve_with_preferred_command(&env, &path_without_skip, occupied_port)
+            .arg("--check-all-interfaces")
+            .output()
+            .unwrap();
+    assert!(
+        output_without_skip.status.success(),
+        "reserve without skip combo failed: {}",
+        String::from_utf8_lossy(&output_without_skip.stderr)
+    );
+    let allocated_without_skip =
+        parse_port(&String::from_utf8(output_without_skip.stdout).unwrap());
+    assert_ne!(
+        allocated_without_skip, occupied_port,
+        "With --check-all-interfaces and no skip flags, occupied preferred port should not be chosen"
+    );
+
+    let output_with_skip = reserve_with_preferred_command(&env, &path_with_skip, occupied_port)
+        .arg("--check-all-interfaces")
+        .arg("--skip-tcp")
+        .arg("--skip-udp")
+        .arg("--skip-ipv4")
+        .arg("--skip-ipv6")
+        .output()
+        .unwrap();
+    assert!(
+        output_with_skip.status.success(),
+        "reserve with skip combo failed: {}",
+        String::from_utf8_lossy(&output_with_skip.stderr)
+    );
+    let allocated_with_skip = parse_port(&String::from_utf8(output_with_skip.stdout).unwrap());
+    assert_eq!(
+        allocated_with_skip, occupied_port,
+        "Combined skip flags should disable occupancy probes, even with --check-all-interfaces"
+    );
+}
+
 // ============================================================================
 // Flag Combination Tests
 // ============================================================================
