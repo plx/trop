@@ -1,8 +1,9 @@
 //! Stress tests for trop.
 //!
 //! This module contains high-volume stress tests that verify trop's behavior
-//! under extreme load conditions. These tests are marked with `#[ignore]` to
-//! prevent them from slowing down regular CI runs.
+//! under extreme load conditions.
+//! Most heavy tests are marked with `#[ignore]` to prevent them from slowing
+//! down regular CI runs, while a lightweight smoke test runs by default.
 //!
 //! Run these tests explicitly with: `cargo test --ignored`
 //!
@@ -27,6 +28,72 @@ use tempfile::TempDir;
 /// Helper function to create a Command for the trop binary.
 fn trop_cmd() -> Command {
     Command::new(cargo_bin("trop"))
+}
+
+/// Stress smoke test: small concurrent burst that runs in default CI.
+///
+/// This is a lightweight companion to the ignored heavy stress suite.
+/// It provides a basic concurrency/performance regression signal without
+/// materially increasing normal test runtime.
+#[test]
+fn stress_smoke_concurrent_reservations() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_dir = temp_dir.path().join("data");
+
+    trop_cmd()
+        .args([
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "init",
+            "--with-config",
+        ])
+        .status()
+        .unwrap();
+
+    let threads = 8;
+    let per_thread = 15;
+    let total = threads * per_thread;
+
+    let handles: Vec<_> = (0..threads)
+        .map(|batch| {
+            let data_dir = data_dir.clone();
+            thread::spawn(move || {
+                for i in 0..per_thread {
+                    let idx = batch * per_thread + i;
+                    let status = trop_cmd()
+                        .args([
+                            "--data-dir",
+                            data_dir.to_str().unwrap(),
+                            "reserve",
+                            "--path",
+                            &format!("/tmp/stress-smoke-{idx}"),
+                            "--allow-unrelated-path",
+                        ])
+                        .status()
+                        .unwrap();
+                    assert!(status.success(), "reserve failed for stress-smoke-{idx}");
+                }
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let output = trop_cmd()
+        .args(["--data-dir", data_dir.to_str().unwrap(), "list"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "list should succeed after smoke stress");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let count = stdout
+        .lines()
+        .filter(|line| line.contains("stress-smoke-"))
+        .count();
+    assert_eq!(count, total as usize, "smoke stress reservation count mismatch");
 }
 
 /// Stress test: Create 10,000 reservations using 100 concurrent threads.

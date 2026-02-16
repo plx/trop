@@ -12,6 +12,7 @@ mod common;
 
 use common::TestEnv;
 use predicates::prelude::*;
+use std::fs;
 
 // ============================================================================
 // Basic Release Tests
@@ -80,23 +81,38 @@ fn test_release_with_tag() {
 ///
 /// Like reserve, release should default to the current working directory
 /// when no --path is specified.
-///
-/// Note: This test is temporarily ignored due to path normalization issues with
-/// symlinked temp directories on macOS (/var -> /private/var). The functionality
-/// works correctly in real usage, but the test infrastructure has a mismatch.
 #[test]
-#[ignore]
 fn test_release_without_path_uses_cwd() {
     let env = TestEnv::new();
     let test_path = env.create_dir("test-project");
+    let canonical_test_path = fs::canonicalize(&test_path).expect("Failed to canonicalize path");
 
-    // Reserve a port
-    let port = env.reserve_simple(&test_path);
+    // Reserve from within the target directory so the key exactly matches
+    // default-path (CWD-based) behavior used by `release`.
+    let reserve_output = env
+        .command()
+        .arg("reserve")
+        .arg("--allow-unrelated-path")
+        .current_dir(&canonical_test_path)
+        .output()
+        .expect("Failed to run reserve");
+
+    assert!(
+        reserve_output.status.success(),
+        "Reserve failed: {}",
+        String::from_utf8_lossy(&reserve_output.stderr)
+    );
+
+    let port: u16 = String::from_utf8(reserve_output.stdout)
+        .expect("Invalid UTF-8 in reserve output")
+        .trim()
+        .parse()
+        .expect("Reserve output is not a port number");
 
     // Release from within the directory (using current_dir)
     let mut cmd = env.command();
     cmd.arg("release")
-        .current_dir(&test_path)
+        .current_dir(&canonical_test_path)
         .assert()
         .success();
 
