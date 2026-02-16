@@ -135,12 +135,8 @@ mod tests {
                 }
                 Err(_) => {
                     // Failure: no reservations should exist
-                    // Note: Current implementation may leave partial reservations
-                    // due to lack of bulk transaction support. This is a known
-                    // limitation documented in the code.
-                    // For now, we check that either all or none exist.
                     prop_assert!(
-                        group_reservations.is_empty() || group_reservations.len() == num_services,
+                        group_reservations.is_empty(),
                         "Partial allocation detected: {} of {} services have reservations",
                         group_reservations.len(),
                         num_services

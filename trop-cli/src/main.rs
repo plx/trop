@@ -8,14 +8,10 @@
 //! - `reserve-group`: Reserve ports for a group of services
 //! - `autoreserve`: Automatically discover and reserve ports
 
-mod cli;
-mod commands;
-mod error;
-mod utils;
-
 use clap::Parser;
-use cli::Cli;
-use utils::GlobalOptions;
+use trop_cli::cli::Command;
+use trop_cli::utils::GlobalOptions;
+use trop_cli::Cli;
 
 fn main() {
     // Parse CLI arguments
@@ -35,28 +31,28 @@ fn main() {
 
     // Execute the command
     let result = match cli.command {
-        cli::Command::Reserve(cmd) => cmd.execute(&global),
-        cli::Command::Release(cmd) => cmd.execute(&global),
-        cli::Command::List(cmd) => cmd.execute(&global),
-        cli::Command::ReserveGroup(cmd) => cmd.execute(&global),
-        cli::Command::Autoreserve(cmd) => cmd.execute(&global),
-        cli::Command::Prune(cmd) => cmd.execute(&global),
-        cli::Command::Expire(cmd) => cmd.execute(&global),
-        cli::Command::Autoclean(cmd) => cmd.execute(&global),
-        cli::Command::AssertReservation(cmd) => cmd.execute(&global),
-        cli::Command::AssertPort(cmd) => cmd.execute(&global),
-        cli::Command::AssertDataDir(cmd) => cmd.execute(&global),
-        cli::Command::PortInfo(cmd) => cmd.execute(&global),
-        cli::Command::ShowDataDir(cmd) => cmd.execute(&global),
-        cli::Command::ShowPath(cmd) => cmd.execute(&global),
-        cli::Command::Scan(cmd) => cmd.execute(&global),
-        cli::Command::Validate(cmd) => cmd.execute(&global),
-        cli::Command::Exclude(cmd) => cmd.execute(&global),
-        cli::Command::CompactExclusions(cmd) => cmd.execute(&global),
-        cli::Command::Init(cmd) => cmd.execute(&global),
-        cli::Command::ListProjects(cmd) => cmd.execute(&global),
-        cli::Command::Migrate(cmd) => cmd.execute(&global),
-        cli::Command::Completions(cmd) => cmd.execute(&global),
+        Command::Reserve(cmd) => cmd.execute(&global),
+        Command::Release(cmd) => cmd.execute(&global),
+        Command::List(cmd) => cmd.execute(&global),
+        Command::ReserveGroup(cmd) => cmd.execute(&global),
+        Command::Autoreserve(cmd) => cmd.execute(&global),
+        Command::Prune(cmd) => cmd.execute(&global),
+        Command::Expire(cmd) => cmd.execute(&global),
+        Command::Autoclean(cmd) => cmd.execute(&global),
+        Command::AssertReservation(cmd) => cmd.execute(&global),
+        Command::AssertPort(cmd) => cmd.execute(&global),
+        Command::AssertDataDir(cmd) => cmd.execute(&global),
+        Command::PortInfo(cmd) => cmd.execute(&global),
+        Command::ShowDataDir(cmd) => cmd.execute(&global),
+        Command::ShowPath(cmd) => cmd.execute(&global),
+        Command::Scan(cmd) => cmd.execute(&global),
+        Command::Validate(cmd) => cmd.execute(&global),
+        Command::Exclude(cmd) => cmd.execute(&global),
+        Command::CompactExclusions(cmd) => cmd.execute(&global),
+        Command::Init(cmd) => cmd.execute(&global),
+        Command::ListProjects(cmd) => cmd.execute(&global),
+        Command::Migrate(cmd) => cmd.execute(&global),
+        Command::Completions(cmd) => cmd.execute(&global),
     };
 
     // Handle errors and set exit code

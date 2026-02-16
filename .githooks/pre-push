@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+echo "[pre-push] Running rustfmt..."
+cargo fmt --all
+
+echo "[pre-push] Verifying rustfmt output is clean..."
+cargo fmt --all -- --check
+
+echo "[pre-push] Formatting checks passed."

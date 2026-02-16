@@ -16,6 +16,34 @@ mod common;
 use assert_cmd::Command;
 use common::{parse_port, TestEnv};
 use predicates::prelude::*;
+use std::net::{TcpListener, UdpSocket};
+use std::path::Path;
+
+fn range_bounds_around(port: u16) -> (u16, u16) {
+    (port.saturating_sub(5).max(1), port.saturating_add(5))
+}
+
+fn reserve_with_preferred_command(env: &TestEnv, path: &Path, preferred: u16) -> Command {
+    let (min, max) = range_bounds_around(preferred);
+
+    let mut cmd = env.command();
+    cmd.arg("reserve")
+        .arg("--path")
+        .arg(path)
+        .arg("--port")
+        .arg(preferred.to_string())
+        .arg("--min")
+        .arg(min.to_string())
+        .arg("--max")
+        .arg(max.to_string())
+        .arg("--allow-unrelated-path");
+    cmd
+}
+
+fn write_global_config(env: &TestEnv, yaml: &str) {
+    std::fs::create_dir_all(&env.data_dir).expect("Failed to create data directory");
+    std::fs::write(env.data_dir.join("config.yaml"), yaml).expect("Failed to write config");
+}
 
 // ============================================================================
 // Basic Reservation Tests
@@ -366,6 +394,153 @@ fn test_reserve_with_port_range() {
     );
 }
 
+#[test]
+fn test_reserve_with_only_min_preserves_configured_max() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("only-min-preserves-max");
+    write_global_config(
+        &env,
+        r#"
+ports:
+  min: 30000
+  max: 30040
+"#,
+    );
+
+    let output = env
+        .command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--min")
+        .arg("30020")
+        .arg("--allow-unrelated-path")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let port = parse_port(&String::from_utf8(output.stdout).unwrap());
+    assert!(
+        (30020..=30040).contains(&port),
+        "Port {port} should preserve configured max bound"
+    );
+}
+
+#[test]
+fn test_reserve_with_only_max_preserves_configured_min() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("only-max-preserves-min");
+    write_global_config(
+        &env,
+        r#"
+ports:
+  min: 30100
+  max: 30140
+"#,
+    );
+
+    let output = env
+        .command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--max")
+        .arg("30120")
+        .arg("--allow-unrelated-path")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let port = parse_port(&String::from_utf8(output.stdout).unwrap());
+    assert!(
+        (30100..=30120).contains(&port),
+        "Port {port} should preserve configured min bound"
+    );
+}
+
+#[test]
+fn test_reserve_with_min_and_max_overrides_configured_bounds() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("both-override-bounds");
+    write_global_config(
+        &env,
+        r#"
+ports:
+  min: 30200
+  max: 30280
+"#,
+    );
+
+    let output = env
+        .command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--min")
+        .arg("30240")
+        .arg("--max")
+        .arg("30250")
+        .arg("--allow-unrelated-path")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let port = parse_port(&String::from_utf8(output.stdout).unwrap());
+    assert!(
+        (30240..=30250).contains(&port),
+        "Port {port} should use CLI min/max bounds"
+    );
+}
+
+#[test]
+fn test_reserve_with_only_min_preserves_default_max() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("only-min-preserves-default-max");
+
+    let output = env
+        .command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--min")
+        .arg("6800")
+        .arg("--allow-unrelated-path")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let port = parse_port(&String::from_utf8(output.stdout).unwrap());
+    assert!(
+        (6800..=7000).contains(&port),
+        "Port {port} should preserve built-in default max bound"
+    );
+}
+
+#[test]
+fn test_reserve_with_partial_override_rejects_invalid_effective_range() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("invalid-effective-range");
+    write_global_config(
+        &env,
+        r#"
+ports:
+  min: 30400
+  max: 30420
+"#,
+    );
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--max")
+        .arg("30390")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid port range"));
+}
+
 // ============================================================================
 // Force and Override Tests
 // ============================================================================
@@ -444,6 +619,10 @@ fn test_reserve_with_allow_project_change() {
         .arg("--allow-unrelated-path")
         .assert()
         .success();
+
+    let list_output = env.list();
+    assert!(list_output.contains("different-project"));
+    assert!(!list_output.contains("original-project"));
 }
 
 /// Test reserve with --allow-task-change flag.
@@ -476,6 +655,10 @@ fn test_reserve_with_allow_task_change() {
         .arg("--allow-unrelated-path")
         .assert()
         .success();
+
+    let list_output = env.list();
+    assert!(list_output.contains("task-2"));
+    assert!(!list_output.contains("task-1"));
 }
 
 /// Test reserve with --allow-change flag (both project and task).
@@ -513,6 +696,12 @@ fn test_reserve_with_allow_change() {
         .arg("--allow-unrelated-path")
         .assert()
         .success();
+
+    let list_output = env.list();
+    assert!(list_output.contains("proj2"));
+    assert!(list_output.contains("task2"));
+    assert!(!list_output.contains("proj1"));
+    assert!(!list_output.contains("task1"));
 }
 
 // ============================================================================
@@ -898,6 +1087,267 @@ fn test_reserve_quiet_suppresses_warnings() {
 
     // Stderr should be minimal/empty
     // Note: errors still go to stderr, but warnings should be suppressed
+}
+
+// ============================================================================
+// Occupancy Flag Tests
+// ============================================================================
+
+#[test]
+fn test_reserve_skip_occupancy_check_affects_allocation_behavior() {
+    let env = TestEnv::new();
+    let path_without_skip = env.create_dir("without-skip-occupancy");
+    let path_with_skip = env.create_dir("with-skip-occupancy");
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied_port = listener.local_addr().unwrap().port();
+
+    let output_without_skip =
+        reserve_with_preferred_command(&env, &path_without_skip, occupied_port)
+            .output()
+            .unwrap();
+    assert!(
+        output_without_skip.status.success(),
+        "reserve without skip flag failed: {}",
+        String::from_utf8_lossy(&output_without_skip.stderr)
+    );
+    let allocated_without_skip =
+        parse_port(&String::from_utf8(output_without_skip.stdout).unwrap());
+    assert_ne!(
+        allocated_without_skip, occupied_port,
+        "Without --skip-occupancy-check, occupied preferred port should not be chosen"
+    );
+
+    let output_with_skip = reserve_with_preferred_command(&env, &path_with_skip, occupied_port)
+        .arg("--skip-occupancy-check")
+        .output()
+        .unwrap();
+    assert!(
+        output_with_skip.status.success(),
+        "reserve with skip flag failed: {}",
+        String::from_utf8_lossy(&output_with_skip.stderr)
+    );
+    let allocated_with_skip = parse_port(&String::from_utf8(output_with_skip.stdout).unwrap());
+    assert_eq!(
+        allocated_with_skip, occupied_port,
+        "--skip-occupancy-check should allow selecting the occupied preferred port"
+    );
+}
+
+#[test]
+fn test_reserve_skip_tcp_overrides_config_defaults() {
+    let env = TestEnv::new();
+    let path_without_skip = env.create_dir("without-skip-tcp");
+    let path_with_skip = env.create_dir("with-skip-tcp");
+
+    // Occupy TCP only; UDP remains free.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied_port = listener.local_addr().unwrap().port();
+
+    // Config default skips UDP, so TCP is still checked until CLI adds --skip-tcp.
+    let output_without_skip =
+        reserve_with_preferred_command(&env, &path_without_skip, occupied_port)
+            .env("TROP_SKIP_UDP", "true")
+            .output()
+            .unwrap();
+    assert!(output_without_skip.status.success());
+    let allocated_without_skip =
+        parse_port(&String::from_utf8(output_without_skip.stdout).unwrap());
+    assert_ne!(allocated_without_skip, occupied_port);
+
+    let output_with_skip = reserve_with_preferred_command(&env, &path_with_skip, occupied_port)
+        .env("TROP_SKIP_UDP", "true")
+        .arg("--skip-tcp")
+        .output()
+        .unwrap();
+    assert!(output_with_skip.status.success());
+    let allocated_with_skip = parse_port(&String::from_utf8(output_with_skip.stdout).unwrap());
+    assert_eq!(allocated_with_skip, occupied_port);
+}
+
+#[test]
+fn test_reserve_skip_udp_overrides_config_defaults() {
+    let env = TestEnv::new();
+    let path_without_skip = env.create_dir("without-skip-udp");
+    let path_with_skip = env.create_dir("with-skip-udp");
+
+    // Occupy UDP only; TCP remains free.
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let occupied_port = socket.local_addr().unwrap().port();
+
+    // Config default skips TCP, so UDP is still checked until CLI adds --skip-udp.
+    let output_without_skip =
+        reserve_with_preferred_command(&env, &path_without_skip, occupied_port)
+            .env("TROP_SKIP_TCP", "true")
+            .output()
+            .unwrap();
+    assert!(output_without_skip.status.success());
+    let allocated_without_skip =
+        parse_port(&String::from_utf8(output_without_skip.stdout).unwrap());
+    assert_ne!(allocated_without_skip, occupied_port);
+
+    let output_with_skip = reserve_with_preferred_command(&env, &path_with_skip, occupied_port)
+        .env("TROP_SKIP_TCP", "true")
+        .arg("--skip-udp")
+        .output()
+        .unwrap();
+    assert!(output_with_skip.status.success());
+    let allocated_with_skip = parse_port(&String::from_utf8(output_with_skip.stdout).unwrap());
+    assert_eq!(allocated_with_skip, occupied_port);
+}
+
+#[test]
+fn test_reserve_skip_ipv4_overrides_config_defaults() {
+    let env = TestEnv::new();
+    let path_without_skip = env.create_dir("without-skip-ipv4");
+    let path_with_skip = env.create_dir("with-skip-ipv4");
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied_port = listener.local_addr().unwrap().port();
+
+    // Config default skips IPv6; IPv4 remains checked until CLI adds --skip-ipv4.
+    let output_without_skip =
+        reserve_with_preferred_command(&env, &path_without_skip, occupied_port)
+            .env("TROP_SKIP_IPV6", "true")
+            .output()
+            .unwrap();
+    assert!(output_without_skip.status.success());
+    let allocated_without_skip =
+        parse_port(&String::from_utf8(output_without_skip.stdout).unwrap());
+    assert_ne!(allocated_without_skip, occupied_port);
+
+    let output_with_skip = reserve_with_preferred_command(&env, &path_with_skip, occupied_port)
+        .env("TROP_SKIP_IPV6", "true")
+        .arg("--skip-ipv4")
+        .output()
+        .unwrap();
+    assert!(output_with_skip.status.success());
+    let allocated_with_skip = parse_port(&String::from_utf8(output_with_skip.stdout).unwrap());
+    assert_eq!(allocated_with_skip, occupied_port);
+}
+
+#[test]
+fn test_reserve_skip_ipv6_overrides_config_defaults() {
+    let env = TestEnv::new();
+    let path_without_skip = env.create_dir("without-skip-ipv6");
+    let path_with_skip = env.create_dir("with-skip-ipv6");
+
+    let listener = match TcpListener::bind("[::1]:0") {
+        Ok(listener) => listener,
+        Err(_) => return, // Environment has no IPv6 loopback support.
+    };
+    let occupied_port = listener.local_addr().unwrap().port();
+
+    // Config default skips IPv4; IPv6 remains checked until CLI adds --skip-ipv6.
+    let output_without_skip =
+        reserve_with_preferred_command(&env, &path_without_skip, occupied_port)
+            .env("TROP_SKIP_IPV4", "true")
+            .output()
+            .unwrap();
+    assert!(output_without_skip.status.success());
+    let allocated_without_skip =
+        parse_port(&String::from_utf8(output_without_skip.stdout).unwrap());
+    assert_ne!(allocated_without_skip, occupied_port);
+
+    let output_with_skip = reserve_with_preferred_command(&env, &path_with_skip, occupied_port)
+        .env("TROP_SKIP_IPV4", "true")
+        .arg("--skip-ipv6")
+        .output()
+        .unwrap();
+    assert!(output_with_skip.status.success());
+    let allocated_with_skip = parse_port(&String::from_utf8(output_with_skip.stdout).unwrap());
+    assert_eq!(allocated_with_skip, occupied_port);
+}
+
+#[test]
+fn test_reserve_check_all_interfaces_changes_probe_scope() {
+    // Bind on a non-default loopback address. Localhost-only checks should not see this,
+    // but all-interface checks should.
+    let listener = match TcpListener::bind("127.0.0.2:0") {
+        Ok(listener) => listener,
+        Err(_) => return,
+    };
+    let occupied_port = listener.local_addr().unwrap().port();
+
+    let env_localhost_only = TestEnv::new();
+    let path_localhost_only = env_localhost_only.create_dir("localhost-only");
+    let output_localhost_only =
+        reserve_with_preferred_command(&env_localhost_only, &path_localhost_only, occupied_port)
+            .output()
+            .unwrap();
+    assert!(output_localhost_only.status.success());
+    let allocated_localhost_only =
+        parse_port(&String::from_utf8(output_localhost_only.stdout).unwrap());
+    assert_eq!(
+        allocated_localhost_only, occupied_port,
+        "Without --check-all-interfaces, reserve should only consider localhost"
+    );
+
+    let env_all_interfaces = TestEnv::new();
+    let path_all_interfaces = env_all_interfaces.create_dir("all-interfaces");
+    let output_all_interfaces =
+        reserve_with_preferred_command(&env_all_interfaces, &path_all_interfaces, occupied_port)
+            .arg("--check-all-interfaces")
+            .output()
+            .unwrap();
+    assert!(output_all_interfaces.status.success());
+    let allocated_all_interfaces =
+        parse_port(&String::from_utf8(output_all_interfaces.stdout).unwrap());
+    assert_ne!(
+        allocated_all_interfaces, occupied_port,
+        "--check-all-interfaces should expand occupancy checks beyond localhost"
+    );
+}
+
+#[test]
+fn test_reserve_combined_occupancy_flags_override_check_all_interfaces() {
+    let env = TestEnv::new();
+    let path_without_skip = env.create_dir("occupancy-combo-without-skip");
+    let path_with_skip = env.create_dir("occupancy-combo-with-skip");
+
+    // Bind on a non-default loopback address so --check-all-interfaces has a
+    // deterministic effect compared to localhost-only checks.
+    let listener = match TcpListener::bind("127.0.0.2:0") {
+        Ok(listener) => listener,
+        Err(_) => return,
+    };
+    let occupied_port = listener.local_addr().unwrap().port();
+
+    let output_without_skip =
+        reserve_with_preferred_command(&env, &path_without_skip, occupied_port)
+            .arg("--check-all-interfaces")
+            .output()
+            .unwrap();
+    assert!(
+        output_without_skip.status.success(),
+        "reserve without skip combo failed: {}",
+        String::from_utf8_lossy(&output_without_skip.stderr)
+    );
+    let allocated_without_skip =
+        parse_port(&String::from_utf8(output_without_skip.stdout).unwrap());
+    assert_ne!(
+        allocated_without_skip, occupied_port,
+        "With --check-all-interfaces and no skip flags, occupied preferred port should not be chosen"
+    );
+
+    let output_with_skip = reserve_with_preferred_command(&env, &path_with_skip, occupied_port)
+        .arg("--check-all-interfaces")
+        .arg("--skip-tcp")
+        .arg("--skip-udp")
+        .arg("--skip-ipv4")
+        .arg("--skip-ipv6")
+        .output()
+        .unwrap();
+    assert!(
+        output_with_skip.status.success(),
+        "reserve with skip combo failed: {}",
+        String::from_utf8_lossy(&output_with_skip.stderr)
+    );
+    let allocated_with_skip = parse_port(&String::from_utf8(output_with_skip.stdout).unwrap());
+    assert_eq!(
+        allocated_with_skip, occupied_port,
+        "Combined skip flags should disable occupancy probes, even with --check-all-interfaces"
+    );
 }
 
 // ============================================================================

@@ -29,7 +29,7 @@ Key features:
 
 - **Idempotent reservations**: Reservations are sticky and keyed by directory—repeated invocations in the same directory receive a stable port.
 - **Directory-based lifecycle**: Reservations can be automatically pruned once their associated directory has been removed—no need to register hooks or perform manual clean up.
-- **Cross-process safety**: Safe to invoke `trop` concurrently from multiple processes (e.g. by multiple concurrent, indenently-operating agents).
+- **Cross-process safety**: Safe to invoke `trop` concurrently from multiple processes (e.g. by multiple concurrent, independently operating agents).
 - **Port occupancy detection & Exclusion Management**: `trop` avoids conflict with non-`trop` managed ports by:
   - verifying a prospective port is unoccupied before creating the reservation
   - allowing users to explicitly exclude specific ports and port-ranges from `trop` 
@@ -39,7 +39,7 @@ See `trop --help` or `man trop` for complete usage details.
 
 ## Advanced Usage
 
-Full documentation for `trop` advanced's features is forthcoming, but here's a brief overview of `trop`'s advanced features.
+Advanced workflows are available today for tagged reservations, group reservation files, and metadata.
 
 ### Tags & `trop autoreserve`
 
@@ -47,7 +47,7 @@ For projects with multiple services, you can reserve a distinct port for each se
 
 ```bash
 WEB_PORT=$(trop reserve --tag web)
-API_PORT=$(trop reserve --api db)
+API_PORT=$(trop reserve --tag api)
 DB_PORT=$(trop reserve --tag db)
 ```
 
@@ -56,9 +56,14 @@ As with `trop reserve`, these reservations will be associated with the current d
 For recurring reservation patterns, you add a "tropfile" (`trop.yaml`) file to your project root, which can then define a "reservation group" like so:
 
 ```yaml
+project: my-app
+ports:
+  min: 5000
+  max: 7000
 reservations:
   services:
     web:
+      offset: 0
       env: WEB_PORT
     api:
       offset: 1
@@ -113,6 +118,12 @@ The project includes comprehensive test coverage:
 - Property-based tests for correctness guarantees
 - Concurrency tests for race condition detection
 - Benchmarks for performance regression testing
+
+For contributors, enable repository hooks once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
 
 ## Status
 

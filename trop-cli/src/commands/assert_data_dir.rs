@@ -25,10 +25,11 @@ pub struct AssertDataDirCommand {
 impl AssertDataDirCommand {
     pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
         // 1. Resolve data directory
-        let data_dir = self
-            .data_dir
-            .or(global.data_dir.clone())
-            .unwrap_or_else(resolve_data_dir);
+        let data_dir = if let Some(data_dir) = self.data_dir.or(global.data_dir.clone()) {
+            data_dir
+        } else {
+            resolve_data_dir()?
+        };
 
         // 2. Check existence
         let exists = data_dir.exists();

@@ -1,32 +1,145 @@
 <agentic-navigation-guide>
-- AGENTS.md # Physical location of "memory file" for coding agents
-- AGENTIC_NAVIGATION_GUIDE.md # This file - explains project structure
-- CLAUDE.md # Memory file for Claude (symlink to AGENTS.md)
-- LICENSE # Project license — do not modify
-- README.md # Human-readable project overview
-- plans/ # Implementation planning documents
-  - phases/ # Phase-specific implementation plans
-    - phase-01-project-scaffold.md # COMPLETED: Foundation, core types, errors
-- reference/ # Authoritative project specifications (DO NOT MODIFY)
-  - ImplementationPlan.md # High-level phased development plan
-  - ImplementationSpecification.md # Complete spec - SOURCE OF TRUTH
-- trop/ # Library workspace member - core functionality
-  - README.md # Library-specific, human-readable README
-  - src/ # Library source code
-    - error.rs # Error types using thiserror
-    - lib.rs # Library root - exports public API
-    - logging.rs # Logging infrastructure (stderr output)
-    - port.rs # Port and PortRange types with validation
-    - reservation.rs # Reservation and ReservationKey types
-  - tests/ # Integration tests
-    - common/ # Shared test utilities
-      - mod.rs # Common test helpers
-    - integration_test.rs # Integration test suite
-- trop-cli/ # Binary workspace member - CLI interface
-  - Cargo.toml # Binary manifest with dependencies
-  - README.md # CLI documentation
-  - src/ # CLI source code
-    - main.rs # Entry point with argument parsing
-  - tests/ # CLI integration tests
-    - cli.rs # Command-line interface tests
+- AGENTS.md # Primary agent instructions and navigation pointer
+- AGENTIC_NAVIGATION_GUIDE.md # This file; update when adding top-level modules or new CLI command families
+- CLAUDE.md # Symlink to AGENTS.md for Claude tooling
+- README.md # Project overview and user-facing usage
+- DevelopmentLog.md # Historical implementation log
+- Cargo.toml # Workspace manifest (`trop`, `trop-cli`)
+- justfile # Canonical local + CI task entry points
+- reference/ # Source-of-truth project specs
+  - ImplementationSpecification.md # Authoritative behavior/specification (do not modify)
+  - ImplementationPlan.md # High-level phased roadmap
+- plans/ # Supporting planning artifacts
+  - phases/ # Phase-by-phase implementation docs
+  - FutureDirections-MigrationTesting.md # Follow-on migration testing plan
+- remediation/ # Targeted remediation tasks and completion records (`P*-*.md` and `DONE-P*-*.md`)
+- .github/workflows/
+  - ci.yml # Main CI pipeline (includes `navigation-guide` verification job)
+  - property-tests.yml # Dedicated property-test CI workflow
+- .claude/ # Agent/command assets for autonomous delegation workflows
+  - agents/ # Specialized role prompts
+  - commands/trop/ # Project slash-command playbooks
+  - hooks/ # Local automation hooks
+- .githooks/ # Repository-managed Git hooks (enable via `git config core.hooksPath .githooks`)
+  - pre-push # Enforces rustfmt before push
+- trop/ # Core library crate
+  - Cargo.toml # Library manifest
+  - src/
+    - lib.rs # Crate root; exports public API
+    - config/ # Config loading/merge/validation and precedence handling
+      - mod.rs
+      - builder.rs
+      - loader.rs
+      - merger.rs
+      - schema.rs
+      - validator.rs
+      - environment.rs
+    - database/ # SQLite config, connection, migrations, transaction operations
+      - mod.rs
+      - config.rs
+      - connection.rs
+      - migrations.rs
+      - operations.rs
+      - transaction.rs
+    - operations/ # Plan/execute flows for reserve/release/group/cleanup/migrate/init
+      - mod.rs
+      - plan.rs
+      - executor.rs
+      - reserve.rs
+      - release.rs
+      - reserve_group.rs
+      - autoreserve.rs
+      - cleanup.rs
+      - migrate.rs
+      - init.rs
+      - inference.rs
+    - path/ # Normalization, canonicalization, and path relationship logic
+      - mod.rs
+      - resolver.rs
+      - normalize.rs
+      - canonicalize.rs
+      - relationship.rs
+    - output/ # Table/json/csv/tsv/shell formatting helpers
+      - mod.rs
+      - formatters.rs
+      - shell.rs
+    - port.rs # Port/PortRange types and port module entry point
+    - port/ # Port allocator, occupancy checks, exclusions, group helpers
+      - allocator.rs
+      - occupancy.rs
+      - exclusions.rs
+      - group.rs
+    - reservation.rs # Reservation and ReservationKey domain types
+    - error.rs # Shared error/result types
+    - logging.rs # Logging initialization and log levels
+  - tests/ # Integration + concurrency + stress suites
+    - integration_test.rs # Baseline end-to-end library behavior
+    - operations_integration.rs # Planning/execution operation coverage
+    - group_reservation_integration.rs # Group reservation workflows
+    - config_integration.rs # Config precedence and loading behavior
+    - database_integration.rs # Database CRUD/migration behavior
+    - git_inference.rs # Project/task inference behavior
+    - path_validation.rs # Path safety and relationship checks
+    - planning.rs # Planning-layer invariants
+    - idempotency.rs # Sticky reservation/idempotency guarantees
+    - concurrent_operations.rs # Concurrency correctness
+    - race_conditions.rs # Race-focused scenarios
+    - stress_testing.rs # High-volume stress coverage
+    - common/ # Shared integration-test helpers
+    - fixtures/configs/ # YAML fixture tree for config test cases
+  - benches/
+    - operations_bench.rs # Operation performance benchmark
+    - path_bench.rs # Path-handling performance benchmark
+  - proptest-regressions/ # Persisted failing cases from property tests
+- trop-cli/ # CLI crate
+  - Cargo.toml # CLI manifest
+  - build.rs # Build-time manpage generator; keep in sync with `src/cli.rs`
+  - src/
+    - main.rs # CLI entrypoint and command dispatch
+    - cli.rs # Clap command/flag definitions
+    - commands/ # Subcommand implementations (by command family)
+      - mod.rs # Command registry/re-exports
+      - reserve.rs
+      - release.rs
+      - list.rs
+      - reserve_group.rs
+      - autoreserve.rs
+      - prune.rs
+      - expire.rs
+      - autoclean.rs
+      - migrate.rs
+      - init.rs
+      - validate.rs
+      - scan.rs
+      - exclude.rs
+      - compact_exclusions.rs
+      - assert_reservation.rs
+      - assert_port.rs
+      - assert_data_dir.rs
+      - port_info.rs
+      - list_projects.rs
+      - show_data_dir.rs
+      - show_path.rs
+      - completions.rs
+    - utils.rs # Global options and shared CLI helpers
+    - error.rs # CLI error type + exit code mapping
+    - lib.rs # Exports for build tooling/docs
+  - tests/ # CLI integration suites by command family
+    - integration_test.rs # Cross-command end-to-end coverage
+    - cli.rs # CLI parsing behavior
+    - global_options.rs # Global flag behavior
+    - reserve_command.rs
+    - release_command.rs
+    - list_command.rs
+    - group_commands.rs
+    - cleanup_commands.rs
+    - migrate_command.rs
+    - init_command.rs
+    - completions_command.rs
+    - list_projects_command.rs
+    - error_handling.rs
+    - phase_10_commands.rs # Assertion/utility command coverage
+    - common/ # Shared CLI test harness/utilities
+  - benches/
+    - cli_bench.rs # CLI performance benchmark
 </agentic-navigation-guide>

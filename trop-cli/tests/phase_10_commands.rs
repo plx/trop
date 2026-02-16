@@ -1053,12 +1053,7 @@ fn test_exclude_port_range() {
 /// With --global, it writes to ~/.trop/config.yaml.
 ///
 /// **Location precedence**: Project config > Global config > Built-in defaults
-///
-/// NOTE: This test is currently ignored because the exclude command's --global
-/// flag implementation needs database initialization which affects the test setup.
-/// The functionality works in practice but requires more complex test infrastructure.
 #[test]
-#[ignore]
 fn test_exclude_global_flag() {
     let env = TestEnv::new();
 
