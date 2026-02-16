@@ -31,6 +31,7 @@ Additionally, this repository is an experiment in "hands off", "high-autonomy" a
 - Run clippy: `cargo clippy`
 - Format code: `cargo fmt`
 - Build release: `cargo build --release`
+- Before commit/push, ensure formatting is clean via `cargo fmt --all` (the repo pre-push hook also enforces this)
 
 ## GitHub PR Comments
 

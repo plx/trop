@@ -20,6 +20,8 @@
   - agents/ # Specialized role prompts
   - commands/trop/ # Project slash-command playbooks
   - hooks/ # Local automation hooks
+- .githooks/ # Repository-managed Git hooks (enable via `git config core.hooksPath .githooks`)
+  - pre-push # Enforces rustfmt before push
 - trop/ # Core library crate
   - Cargo.toml # Library manifest
   - src/

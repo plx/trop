@@ -86,14 +86,20 @@ fn stress_smoke_concurrent_reservations() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "list should succeed after smoke stress");
+    assert!(
+        output.status.success(),
+        "list should succeed after smoke stress"
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let count = stdout
         .lines()
         .filter(|line| line.contains("stress-smoke-"))
         .count();
-    assert_eq!(count, total as usize, "smoke stress reservation count mismatch");
+    assert_eq!(
+        count, total as usize,
+        "smoke stress reservation count mismatch"
+    );
 }
 
 /// Stress test: Create 10,000 reservations using 100 concurrent threads.

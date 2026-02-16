@@ -119,6 +119,12 @@ The project includes comprehensive test coverage:
 - Concurrency tests for race condition detection
 - Benchmarks for performance regression testing
 
+For contributors, enable repository hooks once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Status
 
 This release should be considered a "preview" release: the core functionality is implemented, heavily-tested, and appears to work, but has not *yet* been heavily used in real-world scenarios. 
