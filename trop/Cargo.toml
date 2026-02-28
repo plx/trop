@@ -23,7 +23,7 @@ anyhow = { workspace = true }
 log = { workspace = true }
 home = { workspace = true }
 port-selector = "0.1"
-gix = { version = "0.68", default-features = false, features = ["revision"] }
+gix = { version = "0.73", default-features = false, features = ["revision"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
