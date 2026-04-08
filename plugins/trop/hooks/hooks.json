@@ -1,0 +1,27 @@
+{
+  "description": "Automatic trop port reservation for worktree lifecycle",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "EnterWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/worktree-enter.sh",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "ExitWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/worktree-exit.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
