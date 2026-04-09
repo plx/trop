@@ -29,18 +29,18 @@
 
 | Command | Description |
 |---------|-------------|
-| `trop prune` | Remove reservations for non-existent directories. Options: `--dry-run` |
-| `trop expire` | Remove stale reservations by age. Options: `--days` (default: 30), `--dry-run` |
-| `trop autoclean` | Combined prune + expire. Options: `--days`, `--dry-run` |
+| `trop prune` | Remove reservations for non-existent directories. Options: `--dry-run`, `--force` |
+| `trop expire` | Remove stale reservations by age. Options: `--days` (default: 30), `--dry-run`, `--force` |
+| `trop autoclean` | Combined prune + expire. Options: `--days`, `--dry-run`, `--force` |
 
 ## Management Commands
 
 | Command | Description |
 |---------|-------------|
-| `trop init` | Initialize database and config. Options: `--data-dir`, `--dry-run`, `--overwrite` |
+| `trop init` | Initialize database and config. Options: `--data-dir`, `--dry-run`, `--overwrite`, `--force` |
 | `trop validate <config>` | Verify trop.yaml syntax and semantics. Exit 0 if valid, exit 1 with issues |
 | `trop exclude <port-or-range>` | Add to exclusion list. Options: `--global`, `--force` |
-| `trop compact-exclusions <path>` | Optimize exclusion list to minimal representation. Options: `--dry-run` |
+| `trop compact-exclusions <path>` | Optimize exclusion list to minimal representation. Options: `--dry-run`, `--force` |
 | `trop migrate --from <old> --to <new>` | Move reservations between paths. Options: `--recursive`, `--force`, `--dry-run` |
 | `trop completions` | Generate shell completion scripts |
 
@@ -56,7 +56,23 @@
 
 All commands accept: `--verbose`, `--quiet`, `--data-dir <path>`, `--busy-timeout <seconds>`, `--help` / `-h`
 
-Mutating commands also accept: `--dry-run`, `--force`
+The mutating commands listed below accept `--force`. All except `exclude` also accept `--dry-run`. Note: `scan` can optionally mutate config (via `--autoexclude`/`--autocompact`) but does not support `--force` or `--dry-run`.
+
+### Mutating-command flag matrix
+
+| Command | `--dry-run` | `--force` |
+|---------|-------------|-----------|
+| reserve | yes | yes |
+| release | yes | yes |
+| reserve-group | yes | yes |
+| autoreserve | yes | yes |
+| prune | yes | yes |
+| expire | yes | yes |
+| autoclean | yes | yes |
+| init | yes | yes |
+| exclude | no | yes |
+| compact-exclusions | yes | yes |
+| migrate | yes | yes |
 
 Most commands accept occupancy options: `--skip-occupancy-check`, `--skip-tcp`, `--skip-udp`, `--skip-ipv4`, `--skip-ipv6`, `--check-all-interfaces`
 
