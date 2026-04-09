@@ -93,6 +93,15 @@ jobs:
             echo "  $script: executable"
           done
 
+      - name: Run hook tests
+        run: |
+          echo "--- Running hook tests ---"
+          shopt -s globstar nullglob
+          for test_script in plugins/*/hooks/tests/*.sh; do
+            echo "  Running $test_script"
+            bash "$test_script"
+          done
+
       - name: Audit skill word counts
         run: |
           echo "--- Skill word count audit ---"

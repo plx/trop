@@ -2,25 +2,21 @@
 # Release trop port reservations when exiting a worktree.
 # Runs trop release --recursive for the worktree directory.
 
-set -euo pipefail
+set -uo pipefail
 
-INPUT=$(cat)
+allow() { printf '%s\n' '{"permissionDecision":"allow"}'; }
 
-# Check if trop is installed
-if ! command -v trop >/dev/null 2>&1; then
-    echo '{"permissionDecision": "allow"}'
-    exit 0
+INPUT="$(cat || true)"
+
+# Extract worktree path from tool input or result (requires jq)
+WORKTREE_PATH=""
+if command -v jq >/dev/null 2>&1; then
+    WORKTREE_PATH="$(jq -r '.tool_input.path // .tool_result.path // empty' <<<"$INPUT" 2>/dev/null || true)"
 fi
 
-# Extract worktree path from tool input or result
-WORKTREE_PATH=$(echo "$INPUT" | jq -r '.tool_input.path // .tool_result.path // empty')
-
-if [[ -z "$WORKTREE_PATH" ]]; then
-    echo '{"permissionDecision": "allow"}'
-    exit 0
+if command -v trop >/dev/null 2>&1 && [[ -n "$WORKTREE_PATH" ]]; then
+    trop release --recursive --quiet --path "$WORKTREE_PATH" 2>/dev/null || true
 fi
 
-trop release --recursive --quiet --path "$WORKTREE_PATH" 2>/dev/null || true
-
-echo '{"permissionDecision": "allow"}'
+allow
 exit 0

@@ -19,6 +19,8 @@ cargo install --path trop-cli
 cargo install trop-cli
 ```
 
+The worktree hooks use [`jq`](https://jqlang.github.io/jq/) to parse hook payloads. If `jq` is not installed, hooks degrade safely — they skip the trop action and still return valid hook JSON, so worktree workflows are never disrupted.
+
 ## Installation
 
 ```bash
