@@ -93,3 +93,27 @@ fn test_cli_invalid_flag() {
         .failure()
         .stderr(predicate::str::contains("error:"));
 }
+
+/// Test that the short `-v` flag is not supported (verbose is long-only).
+#[test]
+fn test_cli_short_verbose_flag_not_supported() {
+    let mut cmd = Command::cargo_bin("trop").expect("Failed to find trop binary");
+
+    cmd.arg("-v").arg("list");
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("error:"));
+}
+
+/// Test that the short `-q` flag is not supported (quiet is long-only).
+#[test]
+fn test_cli_short_quiet_flag_not_supported() {
+    let mut cmd = Command::cargo_bin("trop").expect("Failed to find trop binary");
+
+    cmd.arg("-q").arg("list");
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("error:"));
+}

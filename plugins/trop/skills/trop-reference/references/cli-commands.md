@@ -54,7 +54,7 @@
 
 ## Global Options
 
-All commands accept: `--verbose` / `-v`, `--quiet` / `-q`, `--data-dir <path>`, `--busy-timeout <seconds>`, `--help` / `-h`
+All commands accept: `--verbose`, `--quiet`, `--data-dir <path>`, `--busy-timeout <seconds>`, `--help` / `-h`
 
 Mutating commands also accept: `--dry-run`, `--force`
 
