@@ -53,8 +53,8 @@ For detailed regex patterns per file type, see `references/port-patterns.md`.
    - **Low**: bare number in ambiguous context
 
 5. **Check existing trop state.**
-   - Look for `trop.yaml` or `.trop.yaml` in the project root
-   - Run `trop list --format json` to see existing reservations for this directory
+   - Look for `trop.yaml` or `trop.local.yaml` in the project root
+   - Run `trop list --format json --filter-path "$PWD"` to see existing reservations for this directory (without `--filter-path`, `trop list` returns all reservations)
    - Note which ports are already trop-managed
 
 ## Output Format
