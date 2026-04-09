@@ -213,7 +213,8 @@ impl Default for ConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::PortExclusion;
+    use crate::config::schema::{PortExclusion, ReservationGroup, ServiceDefinition};
+    use std::collections::HashMap;
     use std::fs;
     use tempfile::TempDir;
 
@@ -393,5 +394,171 @@ mod tests {
         let exclusions = config.excluded_ports.unwrap();
         assert_eq!(exclusions.len(), 1);
         assert_eq!(exclusions[0], PortExclusion::Single(9999));
+    }
+
+    #[test]
+    fn test_user_config_rejects_project() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        // Global config.yaml with project field should be rejected
+        fs::write(data_dir.join("config.yaml"), "project: forbidden\n").unwrap();
+
+        let result = ConfigBuilder::new()
+            .with_data_dir(&data_dir)
+            .skip_env()
+            .build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("project"), "Error should mention 'project': {err}");
+    }
+
+    #[test]
+    fn test_user_config_rejects_reservations() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        // Global config.yaml with reservations field should be rejected
+        fs::write(
+            data_dir.join("config.yaml"),
+            "reservations:\n  services:\n    web:\n      offset: 0\n",
+        )
+        .unwrap();
+
+        let result = ConfigBuilder::new()
+            .with_data_dir(&data_dir)
+            .skip_env()
+            .build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("reservations"),
+            "Error should mention 'reservations': {err}"
+        );
+    }
+
+    #[test]
+    fn test_tropfile_allows_project() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("trop.yaml"), "project: allowed\n").unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_working_dir(temp_dir.path())
+            .skip_env()
+            .build()
+            .unwrap();
+
+        assert_eq!(config.project, Some("allowed".to_string()));
+    }
+
+    #[test]
+    fn test_tropfile_allows_reservations() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join("trop.yaml"),
+            "project: test\nreservations:\n  services:\n    web:\n      offset: 0\n      env: WEB_PORT\n",
+        )
+        .unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_working_dir(temp_dir.path())
+            .skip_env()
+            .build()
+            .unwrap();
+
+        assert!(config.reservations.is_some());
+    }
+
+    #[test]
+    fn test_additional_config_allows_project() {
+        // CLI / programmatic config with project should still work
+        let additional = Config {
+            project: Some("cli-project".to_string()),
+            ..Default::default()
+        };
+
+        let config = ConfigBuilder::new()
+            .skip_files()
+            .skip_env()
+            .with_config(additional)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.project, Some("cli-project".to_string()));
+    }
+
+    #[test]
+    fn test_additional_config_allows_reservations() {
+        // CLI / programmatic config with reservations should still work
+        // (when combined with a tropfile or additional config)
+        let mut services = HashMap::new();
+        services.insert(
+            "web".to_string(),
+            ServiceDefinition {
+                offset: Some(0),
+                preferred: None,
+                env: Some("WEB_PORT".to_string()),
+            },
+        );
+
+        let additional = Config {
+            project: Some("test".to_string()),
+            reservations: Some(ReservationGroup {
+                base: Some(5000),
+                services,
+            }),
+            ..Default::default()
+        };
+
+        let config = ConfigBuilder::new()
+            .skip_files()
+            .skip_env()
+            .with_config(additional)
+            .build()
+            .unwrap();
+
+        assert!(config.reservations.is_some());
+    }
+
+    #[test]
+    fn test_trop_local_yaml_allows_reservations() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join("trop.local.yaml"),
+            "project: local\nreservations:\n  services:\n    web:\n      offset: 0\n      env: WEB_PORT\n",
+        )
+        .unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_working_dir(temp_dir.path())
+            .skip_env()
+            .build()
+            .unwrap();
+
+        assert_eq!(config.project, Some("local".to_string()));
+        assert!(config.reservations.is_some());
+    }
+
+    #[test]
+    fn test_env_var_project_override_works() {
+        // Env override for project should work even without a tropfile
+        let temp_dir = TempDir::new().unwrap();
+
+        // Temporarily set the env var
+        std::env::set_var("TROP_PROJECT", "env-project");
+
+        let result = ConfigBuilder::new()
+            .with_working_dir(temp_dir.path())
+            .build();
+
+        // Clean up env var regardless of result
+        std::env::remove_var("TROP_PROJECT");
+
+        let config = result.unwrap();
+        assert_eq!(config.project, Some("env-project".to_string()));
     }
 }
