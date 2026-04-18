@@ -184,7 +184,7 @@ mod tests {
     fn test_config_new() {
         let config = DatabaseConfig::new("/tmp/test.db");
         assert_eq!(config.path, PathBuf::from("/tmp/test.db"));
-        assert_eq!(config.busy_timeout, Duration::from_millis(5000));
+        assert_eq!(config.busy_timeout, Duration::from_secs(5));
         assert!(config.auto_create);
         assert!(!config.read_only);
     }
@@ -192,8 +192,8 @@ mod tests {
     #[test]
     fn test_config_with_busy_timeout() {
         let config =
-            DatabaseConfig::new("/tmp/test.db").with_busy_timeout(Duration::from_millis(10000));
-        assert_eq!(config.busy_timeout, Duration::from_millis(10000));
+            DatabaseConfig::new("/tmp/test.db").with_busy_timeout(Duration::from_secs(10));
+        assert_eq!(config.busy_timeout, Duration::from_secs(10));
     }
 
     #[test]

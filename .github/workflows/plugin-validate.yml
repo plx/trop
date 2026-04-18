@@ -124,7 +124,7 @@ jobs:
       # --- Semantic drift checks ---
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo build
         uses: actions/cache@v4
