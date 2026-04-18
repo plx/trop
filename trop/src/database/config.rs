@@ -63,7 +63,7 @@ impl DatabaseConfig {
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
-            busy_timeout: Duration::from_millis(5000),
+            busy_timeout: Duration::from_secs(5),
             auto_create: true,
             read_only: false,
         }
