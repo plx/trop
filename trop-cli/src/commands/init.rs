@@ -22,6 +22,10 @@ pub struct InitCommand {
     #[arg(long)]
     overwrite: bool,
 
+    /// Force operation (alias for --overwrite; may bypass additional safety checks in the future)
+    #[arg(long)]
+    force: bool,
+
     /// Create default configuration file
     #[arg(long)]
     with_config: bool,
@@ -37,6 +41,9 @@ impl InitCommand {
     /// Note: This command does NOT accept --disable-autoinit (would be paradoxical).
     /// The --data-dir flag has a different meaning here (where to create, not where to find).
     pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
+        // --force is an alias for --overwrite (and may bypass additional checks in the future)
+        let overwrite = self.overwrite || self.force;
+
         // Determine data directory to initialize
         // Priority: command flag > global flag > default
         let data_dir = self
@@ -63,12 +70,12 @@ impl InitCommand {
 
             let db_path = data_dir.join("trop.db");
             if db_path.exists() {
-                if self.overwrite {
+                if overwrite {
                     println!("  - Remove existing database: {}", db_path.display());
                     println!("  - Create new database: {}", db_path.display());
                 } else {
                     println!(
-                        "  - ERROR: Database already exists (use --overwrite to replace): {}",
+                        "  - ERROR: Database already exists (use --overwrite or --force to replace): {}",
                         db_path.display()
                     );
                 }
@@ -93,7 +100,7 @@ impl InitCommand {
 
         // Build initialization options
         let options = InitOptions::new(data_dir.clone())
-            .with_overwrite(self.overwrite)
+            .with_overwrite(overwrite)
             .with_create_config(self.with_config);
 
         // Execute initialization
@@ -107,7 +114,7 @@ impl InitCommand {
         }
 
         if result.database_created {
-            if self.overwrite {
+            if overwrite {
                 println!("  - Recreated database");
             } else {
                 println!("  - Created database");

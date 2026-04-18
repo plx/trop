@@ -1,0 +1,5 @@
+{
+  "name": "trop",
+  "version": "0.1.0",
+  "description": "Directory-aware port reservation for concurrent AI agents. Eliminates port collisions across worktrees."
+}

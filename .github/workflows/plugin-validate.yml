@@ -1,0 +1,151 @@
+name: Plugin Validation
+
+on:
+  push:
+    paths:
+      - '.claude-plugin/**'
+      - 'plugins/**'
+      - '.github/scripts/**'
+      - '.github/workflows/plugin-validate.yml'
+      - 'trop-cli/**'
+  pull_request:
+    paths:
+      - '.claude-plugin/**'
+      - 'plugins/**'
+      - '.github/scripts/**'
+      - '.github/workflows/plugin-validate.yml'
+      - 'trop-cli/**'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate marketplace.json
+        run: |
+          echo "--- Checking marketplace.json ---"
+          jq -e '.name' .claude-plugin/marketplace.json
+          jq -e '.plugins | length > 0' .claude-plugin/marketplace.json
+          jq -e '.plugins[] | .name, .source, .description' .claude-plugin/marketplace.json
+          echo "marketplace.json: OK"
+
+      - name: Validate plugin source paths
+        run: |
+          echo "--- Checking plugin source paths ---"
+          jq -r '.plugins[].source' .claude-plugin/marketplace.json | while read source; do
+            if [ ! -d "$source" ]; then
+              echo "ERROR: Plugin source directory not found: $source"
+              exit 1
+            fi
+            echo "  $source: exists"
+          done
+
+      - name: Validate plugin.json files
+        run: |
+          echo "--- Checking plugin.json files ---"
+          for plugin_dir in plugins/*/; do
+            pj="${plugin_dir}.claude-plugin/plugin.json"
+            if [ ! -f "$pj" ]; then
+              echo "ERROR: Missing $pj"
+              exit 1
+            fi
+            jq -e '.name' "$pj" > /dev/null
+            jq -e '.description' "$pj" > /dev/null
+            echo "  $pj: OK"
+          done
+
+      - name: Validate SKILL.md frontmatter
+        run: |
+          echo "--- Checking SKILL.md files ---"
+          shopt -s globstar nullglob
+          for skill_md in plugins/*/skills/*/SKILL.md; do
+            head -1 "$skill_md" | grep -q '^---$' || { echo "ERROR: $skill_md missing frontmatter"; exit 1; }
+            fm=$(sed -n '2,/^---$/p' "$skill_md" | head -n -1)
+            echo "$fm" | grep -q 'name:' || { echo "ERROR: $skill_md missing name field"; exit 1; }
+            echo "$fm" | grep -q 'description:' || { echo "ERROR: $skill_md missing description field"; exit 1; }
+            echo "  $skill_md: OK"
+          done
+
+      - name: Validate command frontmatter
+        run: |
+          echo "--- Checking command files ---"
+          shopt -s globstar nullglob
+          for cmd_md in plugins/*/commands/*.md; do
+            head -1 "$cmd_md" | grep -q '^---$' || { echo "ERROR: $cmd_md missing frontmatter"; exit 1; }
+            fm=$(sed -n '2,/^---$/p' "$cmd_md" | head -n -1)
+            echo "$fm" | grep -q 'description:' || { echo "ERROR: $cmd_md missing description field"; exit 1; }
+            echo "  $cmd_md: OK"
+          done
+
+      - name: Validate hooks.json
+        run: |
+          echo "--- Checking hooks.json files ---"
+          shopt -s globstar nullglob
+          for hj in plugins/*/hooks/hooks.json; do
+            jq -e '.hooks' "$hj" > /dev/null || { echo "ERROR: $hj missing hooks key"; exit 1; }
+            echo "  $hj: OK"
+          done
+
+      - name: Check hook scripts are executable
+        run: |
+          echo "--- Checking hook script permissions ---"
+          shopt -s globstar nullglob
+          for script in plugins/*/hooks/scripts/*.sh; do
+            if [ ! -x "$script" ]; then
+              echo "ERROR: $script is not executable"
+              exit 1
+            fi
+            echo "  $script: executable"
+          done
+
+      - name: Run hook tests
+        run: |
+          echo "--- Running hook tests ---"
+          shopt -s globstar nullglob
+          for test_script in plugins/*/hooks/tests/*.sh; do
+            echo "  Running $test_script"
+            bash "$test_script"
+          done
+
+      - name: Audit skill word counts
+        run: |
+          echo "--- Skill word count audit ---"
+          shopt -s globstar nullglob
+          for skill_md in plugins/*/skills/*/SKILL.md; do
+            body=$(awk '/^---$/{c++;next} c>=2{print}' "$skill_md")
+            wc=$(echo "$body" | wc -w | tr -d ' ')
+            status="OK"
+            if [ "$wc" -lt 200 ]; then status="WARNING: too short"; fi
+            if [ "$wc" -gt 3000 ]; then status="WARNING: too long"; fi
+            echo "  $skill_md: $wc words ($status)"
+          done
+
+      # --- Semantic drift checks ---
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-plugin-validate-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-plugin-validate-
+
+      - name: Build trop-cli
+        run: cargo build -q -p trop-cli
+
+      - name: Validate plugin doc semantics
+        run: |
+          echo "--- Docs-to-CLI semantic check ---"
+          TROP_BIN="./target/debug/trop" ./.github/scripts/validate-plugin-semantics.sh
+
+      - name: Validate hook behavior fixtures
+        run: |
+          echo "--- Hook behavior fixture tests ---"
+          ./.github/scripts/test-plugin-hooks.sh

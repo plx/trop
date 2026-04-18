@@ -398,6 +398,62 @@ fn test_list_filter_by_path() {
     assert!(!filtered.contains(&port_sibling.to_string()));
 }
 
+/// Test that unfiltered `trop list --format json` returns all reservations
+/// regardless of path, while `--filter-path` restricts to a specific path.
+///
+/// This validates the semantics documented in the migrate-scan skill:
+/// without `--filter-path`, `trop list` returns all reservations.
+#[test]
+fn test_list_unfiltered_returns_all_paths() {
+    let env = TestEnv::new();
+    let path_a = env.create_dir("project_a");
+    let path_b = env.create_dir("project_b");
+
+    // Seed reservations under two different paths
+    let port_a = env.reserve_simple(&path_a);
+    let port_b = env.reserve_simple(&path_b);
+
+    // Unfiltered list should return BOTH reservations
+    let output = env
+        .command()
+        .arg("list")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let unfiltered = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        unfiltered.contains(&port_a.to_string()),
+        "unfiltered list should contain port_a"
+    );
+    assert!(
+        unfiltered.contains(&port_b.to_string()),
+        "unfiltered list should contain port_b"
+    );
+
+    // Filtered list should return ONLY path_a reservations
+    let output = env
+        .command()
+        .arg("list")
+        .arg("--format")
+        .arg("json")
+        .arg("--filter-path")
+        .arg(&path_a)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let filtered = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        filtered.contains(&port_a.to_string()),
+        "filtered list should contain port_a"
+    );
+    assert!(
+        !filtered.contains(&port_b.to_string()),
+        "filtered list should NOT contain port_b"
+    );
+}
+
 /// Test combining multiple filters.
 ///
 /// Multiple filters should be AND'ed together (all must match).

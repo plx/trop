@@ -17,6 +17,10 @@ pub struct CompactExclusionsCommand {
     /// Dry run (show changes without applying)
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Force operation (currently accepted for consistency; reserved for future safety overrides)
+    #[arg(long)]
+    pub force: bool,
 }
 
 impl CompactExclusionsCommand {

@@ -1,0 +1,16 @@
+{
+  "name": "trop-marketplace",
+  "owner": {
+    "name": "plx"
+  },
+  "plugins": [
+    {
+      "name": "trop",
+      "source": "./plugins/trop",
+      "description": "Port reservation management for concurrent AI agent workflows",
+      "author": {
+        "name": "plx"
+      }
+    }
+  ]
+}

@@ -32,9 +32,9 @@ impl ConfigValidator {
     ///
     /// Returns validation errors for invalid configurations.
     pub fn validate(config: &Config, is_tropfile: bool) -> Result<()> {
-        // Validate project field
-        // Note: We allow project from any source (env vars, CLI flags, trop.yaml)
-        // The tropfile restriction was overly strict and prevented valid CLI usage
+        // Validate project field format (source-level restriction is enforced
+        // earlier in ConfigLoader::load_user_config, which rejects project in
+        // global config before it reaches the merged validator).
         if let Some(ref project) = config.project {
             Self::validate_identifier("project", project)?;
         }
@@ -343,8 +343,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_project_in_user_config() {
-        // Project is now allowed from any source (env vars, CLI, config files)
+    fn test_validate_project_without_tropfile() {
+        // Project is valid in the merged config even without a tropfile,
+        // since it can come from env vars or CLI flags. Source-level
+        // restriction (rejecting project in global config.yaml) is
+        // enforced in ConfigLoader::load_user_config, not here.
         let config = Config {
             project: Some("test".to_string()),
             ..Default::default()

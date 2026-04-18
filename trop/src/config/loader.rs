@@ -100,6 +100,23 @@ impl ConfigLoader {
         }
 
         let config = Self::load_file(&config_path)?;
+
+        // Global user config must not contain project-specific fields.
+        // These are only valid in trop.yaml / trop.local.yaml.
+        if config.project.is_some() {
+            return Err(Error::Validation {
+                field: "project".into(),
+                message: "project field is only valid in trop.yaml/trop.local.yaml, not in global config (~/.trop/config.yaml)".into(),
+            });
+        }
+
+        if config.reservations.is_some() {
+            return Err(Error::Validation {
+                field: "reservations".into(),
+                message: "reservations field is only valid in trop.yaml/trop.local.yaml, not in global config (~/.trop/config.yaml)".into(),
+            });
+        }
+
         Ok(Some(ConfigSource {
             path: config_path,
             precedence: 1, // Lowest precedence
@@ -276,5 +293,58 @@ mod tests {
         for i in 1..sources.len() {
             assert!(sources[i - 1].precedence <= sources[i].precedence);
         }
+    }
+
+    #[test]
+    fn test_user_config_rejects_project_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(data_dir.join("config.yaml"), "project: not-allowed\n").unwrap();
+
+        let result = ConfigLoader::load_all(temp_dir.path(), Some(&data_dir));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("project"),
+            "Error should mention 'project': {err}"
+        );
+    }
+
+    #[test]
+    fn test_user_config_rejects_reservations_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(
+            data_dir.join("config.yaml"),
+            "reservations:\n  services:\n    web:\n      offset: 0\n",
+        )
+        .unwrap();
+
+        let result = ConfigLoader::load_all(temp_dir.path(), Some(&data_dir));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("reservations"),
+            "Error should mention 'reservations': {err}"
+        );
+    }
+
+    #[test]
+    fn test_user_config_allows_other_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(
+            data_dir.join("config.yaml"),
+            "excluded_ports:\n  - 9999\ndisable_autoinit: true\n",
+        )
+        .unwrap();
+
+        let sources = ConfigLoader::load_all(temp_dir.path(), Some(&data_dir)).unwrap();
+        // Should load successfully with non-project-specific fields
+        let user_source = sources.iter().find(|s| s.precedence == 1);
+        assert!(user_source.is_some());
     }
 }
