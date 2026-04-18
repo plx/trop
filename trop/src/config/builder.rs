@@ -412,7 +412,10 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("project"), "Error should mention 'project': {err}");
+        assert!(
+            err.contains("project"),
+            "Error should mention 'project': {err}"
+        );
     }
 
     #[test]

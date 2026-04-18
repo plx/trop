@@ -305,7 +305,10 @@ mod tests {
         let result = ConfigLoader::load_all(temp_dir.path(), Some(&data_dir));
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("project"), "Error should mention 'project': {err}");
+        assert!(
+            err.contains("project"),
+            "Error should mention 'project': {err}"
+        );
     }
 
     #[test]
