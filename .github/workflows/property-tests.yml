@@ -40,7 +40,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Version pinned in rust-toolchain.toml; bump both together.
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
