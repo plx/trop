@@ -129,13 +129,8 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     /// This method implements group allocation with the following semantics:
     /// 1. Separate services into those with preferred ports and those with offsets
     /// 2. For offset-based services, find a base port where all offsets are available
-    /// 3. Create reservations for all services
-    /// 4. Each individual reservation creation is atomic (transactional)
-    /// 5. The group as a whole is validated upfront, so failures should be rare
-    ///
-    /// Note: Currently, reservations are created one-by-one. If a later creation fails
-    /// (e.g., due to database errors), earlier reservations will have been committed.
-    /// This could be improved with bulk transaction support in the future.
+    /// 3. Create reservations for all services inside one savepoint
+    /// 4. Roll back the whole group if any insert fails
     ///
     /// # Errors
     ///
@@ -322,11 +317,14 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
             }
         }
 
-        // Create all reservations using simple create (within transaction managed by caller)
-        // If any creation fails, the transaction managed by the caller will roll back
-        for reservation in &reservations_to_create {
-            Database::create_reservation_simple(conn, reservation)?;
-        }
+        // Create all reservations atomically. This covers races where another
+        // process claims a port after availability was checked but before insert.
+        Database::with_savepoint(conn, "trop_allocate_group", |conn| {
+            for reservation in &reservations_to_create {
+                Database::create_reservation_simple(conn, reservation)?;
+            }
+            Ok(())
+        })?;
 
         Ok(GroupAllocationResult {
             allocations,
@@ -450,6 +448,38 @@ mod tests {
 
         // Ports should be consecutive
         assert_eq!(api_port.value(), web_port.value() + 1);
+    }
+
+    #[test]
+    fn test_group_allocation_rolls_back_if_insert_conflicts() {
+        let db = create_test_database();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
+
+        let request = GroupAllocationRequest {
+            base_path: PathBuf::from("/test/project"),
+            project: Some("test".to_string()),
+            task: None,
+            services: vec![
+                ServiceAllocationRequest {
+                    tag: "web".to_string(),
+                    offset: None,
+                    preferred: Some(Port::try_from(5000).unwrap()),
+                },
+                ServiceAllocationRequest {
+                    tag: "api".to_string(),
+                    offset: None,
+                    preferred: Some(Port::try_from(5000).unwrap()),
+                },
+            ],
+        };
+
+        let config = OccupancyCheckConfig::default();
+        assert!(allocator
+            .allocate_group(db.connection(), &request, &config)
+            .is_err());
+
+        let reservations = Database::list_all_reservations(db.connection()).unwrap();
+        assert!(reservations.is_empty());
     }
 
     #[test]

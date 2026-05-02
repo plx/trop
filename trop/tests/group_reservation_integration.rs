@@ -99,6 +99,25 @@ reservations:
     .to_string()
 }
 
+fn base_port_config() -> String {
+    r#"
+project: test-project
+ports:
+  min: 5000
+  max: 9000
+occupancy_check:
+  skip: true
+reservations:
+  base: 8500
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 1
+"#
+    .to_string()
+}
+
 /// Creates a minimal valid configuration for discovery tests.
 fn minimal_config() -> String {
     r#"
@@ -332,6 +351,26 @@ fn test_group_reservation_preferred_ports_only() {
 
     // Note: We can't directly test base_port from ExecutionResult,
     // but we can verify the behavior is correct by checking the allocations
+}
+
+#[test]
+fn test_group_reservation_honors_base_port() {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(temp_dir.path(), "trop.yaml", &base_port_config());
+    let db = create_test_database();
+
+    let options = ReserveGroupOptions::new(config_path);
+    let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Failed to build plan");
+
+    let mut executor = PlanExecutor::new(db.connection());
+    let result = executor.execute(&plan).expect("Failed to execute plan");
+    let allocated_ports = result.allocated_ports.expect("Should have allocated ports");
+
+    assert_eq!(allocated_ports.get("web").unwrap().value(), 8500);
+    assert_eq!(allocated_ports.get("api").unwrap().value(), 8501);
 }
 
 /// Test that reservations include project and task fields.
@@ -871,23 +910,25 @@ reservations:
     );
 }
 
-/// Test error when service has neither offset nor preferred port.
+/// Test default offset allocation when service has neither offset nor preferred port.
 ///
-/// This test verifies service definition validation:
-/// - Each service must specify allocation strategy
-/// - Error identifies the problematic service
+/// This test verifies service definition defaults:
+/// - A service with no allocation fields is treated as offset 0
+/// - The group can allocate from the configured scan range
 ///
 /// Invariants tested:
-/// - Service validation occurs during planning
-/// - Error message includes service tag
+/// - Missing allocation fields resolve to the default offset service
+/// - Database state includes the expected tagged reservation
 #[test]
-fn test_error_service_without_allocation_strategy() {
+fn test_service_without_allocation_strategy_defaults_to_offset_zero() {
     let temp_dir = create_temp_dir();
     let config_content = r#"
 project: test-project
 ports:
   min: 5000
   max: 7000
+occupancy_check:
+  skip: true
 reservations:
   services:
     web: {}
@@ -897,18 +938,22 @@ reservations:
 
     let options = ReserveGroupOptions::new(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
-    let result = planner.build_plan(db.connection());
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build plan");
 
-    assert!(
-        result.is_err(),
-        "Should fail when service has no offset or preferred"
-    );
-    let err = result.unwrap_err();
-    let err_msg = err.to_string();
-    assert!(
-        err_msg.contains("offset or preferred"),
-        "Error should mention missing allocation strategy: {err_msg}"
-    );
+    let mut executor = PlanExecutor::new(db.connection());
+    let result = executor.execute(&plan).expect("Should execute plan");
+
+    let allocated_ports = result.allocated_ports.expect("Should allocate ports");
+    assert_eq!(allocated_ports.get("web").unwrap().value(), 5000);
+
+    let key = ReservationKey::new(temp_dir.path().to_path_buf(), Some("web".to_string()))
+        .expect("Should create reservation key");
+    let reservation = Database::get_reservation(db.connection(), &key)
+        .expect("Should query reservation")
+        .expect("Should create web reservation");
+    assert_eq!(reservation.port().value(), 5000);
 }
 
 /// Test error when preferred port is outside allowed range.

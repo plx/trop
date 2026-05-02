@@ -274,7 +274,7 @@ impl ExclusionManager {
         let mut range_end = ports[0];
 
         for &port in &ports[1..] {
-            if port.value() == range_end.value() + 1 {
+            if range_end.checked_add(1) == Some(port) {
                 // Extend the current range
                 range_end = port;
             } else {
@@ -501,6 +501,22 @@ mod tests {
                 start: 5000,
                 end: 5002
             }
+        );
+    }
+
+    #[test]
+    fn test_compact_range_ending_at_max_port() {
+        let mut manager = ExclusionManager::empty();
+        manager.add_port(Port::try_from(65534).unwrap());
+        manager.add_port(Port::try_from(65535).unwrap());
+
+        let compacted = manager.compact();
+        assert_eq!(
+            compacted,
+            vec![PortExclusion::Range {
+                start: 65534,
+                end: 65535,
+            }]
         );
     }
 

@@ -50,7 +50,7 @@ impl EnvironmentConfig {
             config.disable_autoexpire = Some(Self::parse_bool("TROP_DISABLE_AUTOEXPIRE", &val)?);
         }
 
-        // Port range from TROP_PORT_MIN and TROP_PORT_MAX
+        // Port range from TROP_PORT_MIN, TROP_PORT_MAX, and TROP_PORT_MAX_OFFSET
         Self::apply_port_overrides(config)?;
 
         // TROP_EXCLUDED_PORTS (comma-separated)
@@ -125,6 +125,16 @@ impl EnvironmentConfig {
                 field: "TROP_PORT_MAX".into(),
                 message: "Invalid port number".into(),
             })?);
+            port_config.max_offset = None;
+            modified = true;
+        }
+
+        if let Ok(max_offset) = env::var("TROP_PORT_MAX_OFFSET") {
+            port_config.max_offset = Some(max_offset.parse().map_err(|_| Error::Validation {
+                field: "TROP_PORT_MAX_OFFSET".into(),
+                message: "Invalid port offset".into(),
+            })?);
+            port_config.max = None;
             modified = true;
         }
 
@@ -237,6 +247,7 @@ impl EnvironmentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_parse_bool_true_variants() {
@@ -337,6 +348,27 @@ mod tests {
         let mut config = Config::default();
         let result = EnvironmentConfig::apply_overrides(&mut config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn test_apply_port_max_offset_override_clears_max() {
+        let mut config = Config {
+            ports: Some(crate::config::PortConfig {
+                min: 8000,
+                max: Some(9000),
+                max_offset: None,
+            }),
+            ..Default::default()
+        };
+
+        std::env::set_var("TROP_PORT_MAX_OFFSET", "25");
+        EnvironmentConfig::apply_overrides(&mut config).unwrap();
+        std::env::remove_var("TROP_PORT_MAX_OFFSET");
+
+        let ports = config.ports.unwrap();
+        assert_eq!(ports.max, None);
+        assert_eq!(ports.max_offset, Some(25));
     }
 }
 

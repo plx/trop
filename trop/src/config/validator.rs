@@ -243,23 +243,28 @@ impl ConfigValidator {
             // Validate tag
             Self::validate_identifier(&format!("reservations.services.{tag}"), tag)?;
 
-            // Check offset uniqueness
-            let offset = service.offset.unwrap_or(0);
-            if offset == 0 && has_default_offset {
-                return Err(Error::Validation {
-                    field: format!("reservations.services.{tag}.offset"),
-                    message: "Only one service can omit offset (default to 0)".into(),
-                });
-            }
-            if offset == 0 {
-                has_default_offset = true;
-            }
+            // Check offset uniqueness for services that participate in offset allocation.
+            // Preferred-only services don't use the offset pattern unless an explicit
+            // offset is supplied.
+            if service.offset.is_some() || service.preferred.is_none() {
+                let offset = service.offset.unwrap_or(0);
+                if offset == 0 && service.offset.is_none() && has_default_offset {
+                    return Err(Error::Validation {
+                        field: format!("reservations.services.{tag}.offset"),
+                        message: "Only one offset-based service can omit offset (default to 0)"
+                            .into(),
+                    });
+                }
+                if offset == 0 && service.offset.is_none() {
+                    has_default_offset = true;
+                }
 
-            if !seen_offsets.insert(offset) {
-                return Err(Error::Validation {
-                    field: format!("reservations.services.{tag}.offset"),
-                    message: format!("Duplicate offset: {offset}"),
-                });
+                if !seen_offsets.insert(offset) {
+                    return Err(Error::Validation {
+                        field: format!("reservations.services.{tag}.offset"),
+                        message: format!("Duplicate offset: {offset}"),
+                    });
+                }
             }
 
             // Check preferred port uniqueness
@@ -591,6 +596,34 @@ mod tests {
         };
 
         assert!(ConfigValidator::validate_reservation_group(&group).is_err());
+    }
+
+    #[test]
+    fn test_validate_reservation_group_preferred_only_services_do_not_duplicate_offsets() {
+        let mut services = HashMap::new();
+        services.insert(
+            "web".to_string(),
+            ServiceDefinition {
+                offset: None,
+                preferred: Some(5050),
+                env: None,
+            },
+        );
+        services.insert(
+            "api".to_string(),
+            ServiceDefinition {
+                offset: None,
+                preferred: Some(5051),
+                env: None,
+            },
+        );
+
+        let group = ReservationGroup {
+            base: Some(5000),
+            services,
+        };
+
+        assert!(ConfigValidator::validate_reservation_group(&group).is_ok());
     }
 
     #[test]

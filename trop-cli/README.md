@@ -8,20 +8,7 @@ Command-line interface for `trop`, a lightweight port reservation management too
 
 ## Current Status
 
-**Early Development - Phase 1 Complete**
-
-Currently, the CLI only provides version and help output. Full functionality is under active development.
-
-Phase 1 accomplishments:
-- Project scaffold and build system
-- Core library types implemented
-- CLI framework in place
-- Integration test infrastructure
-
-Coming in Phase 2:
-- Database layer
-- Port reservation commands
-- Configuration system
+The CLI implements the core reservation workflow, configuration handling, group reservations, cleanup, assertions, migration, validation, completion generation, and inspection commands. The interface should still be considered preview-stage while real-world usage hardens edge cases.
 
 ## Installation
 
@@ -46,9 +33,7 @@ Optionally, copy to a directory in your PATH:
 cp target/release/trop ~/.local/bin/  # or /usr/local/bin/, etc.
 ```
 
-### Future: Install from crates.io
-
-Once published (not yet available):
+### From crates.io
 
 ```bash
 cargo install trop-cli
@@ -59,16 +44,14 @@ cargo install trop-cli
 Currently available commands:
 
 ```bash
-# Show version
 trop --version
-
-# Show help
 trop --help
+trop reserve
+trop list
+trop release --path /path/to/project
 ```
 
-## Planned Usage
-
-Once fully implemented, typical workflows will include:
+## Common Usage
 
 ### Simple Reservation
 
@@ -153,14 +136,14 @@ See the [implementation specification](../reference/ImplementationSpecification.
 
 ## Environment Variables
 
-Key environment variables (planned):
+Key environment variables:
 
 - `TROP_DATA_DIR`: Override data directory location (default: `~/.trop`)
 - `TROP_LOG_MODE`: Control logging verbosity (`quiet`, `normal`, `verbose`)
 - `TROP_PROJECT`: Set project identifier
 - `TROP_DISABLE_AUTOINIT`: Disable automatic database initialization
 
-## Planned Commands
+## Commands
 
 ### Core Operations
 
@@ -308,4 +291,4 @@ This is an experimental project in active development. For issues or questions, 
 
 ## Warning
 
-This is alpha-stage software. The CLI interface and behavior will change. Not recommended for production use yet.
+This is preview-stage software. The CLI interface and behavior may change as the tool gets more real-world use.

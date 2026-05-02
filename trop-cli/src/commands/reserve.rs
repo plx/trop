@@ -7,7 +7,7 @@ use crate::error::CliError;
 use crate::utils::{load_configuration, open_database, resolve_path, GlobalOptions};
 use clap::Args;
 use std::path::PathBuf;
-use trop::config::DEFAULT_MIN_PORT;
+use trop::config::{PortConfig, DEFAULT_MIN_PORT};
 use trop::{PlanExecutor, Port, ReservationKey, ReserveOptions, ReservePlan};
 
 /// Reserve a port for a directory.
@@ -35,11 +35,11 @@ pub struct ReserveCommand {
     pub port: Option<String>,
 
     /// Minimum acceptable port
-    #[arg(long, value_name = "MIN", env = "TROP_MIN")]
+    #[arg(long, value_name = "MIN", env = "TROP_PORT_MIN")]
     pub min: Option<String>,
 
     /// Maximum acceptable port
-    #[arg(long, value_name = "MAX", env = "TROP_MAX")]
+    #[arg(long, value_name = "MAX", env = "TROP_PORT_MAX")]
     pub max: Option<String>,
 
     /// Overwrite existing reservation
@@ -154,21 +154,56 @@ impl ReserveCommand {
         // 6. Modify config for port range if min/max specified
         let mut config = config;
         if min.is_some() || max.is_some() {
-            use trop::config::PortConfig;
             // Override config port range with CLI arguments
-            let port_config = PortConfig {
-                min: min.unwrap_or(DEFAULT_MIN_PORT), // Use min from CLI or default
-                max,                                  // max from CLI (already Option<u16>)
+            let mut port_config = config.ports.clone().unwrap_or(PortConfig {
+                min: DEFAULT_MIN_PORT,
+                max: Some(trop::config::DEFAULT_MAX_PORT),
                 max_offset: None,
-            };
+            });
+            if let Some(min) = min {
+                port_config.min = min;
+            }
+            if let Some(max) = max {
+                port_config.max = Some(max);
+                port_config.max_offset = None;
+            }
             config.ports = Some(port_config);
+        }
+
+        if self.skip_occupancy_check
+            || self.skip_tcp
+            || self.skip_udp
+            || self.skip_ipv4
+            || self.skip_ipv6
+            || self.check_all_interfaces
+        {
+            let mut occupancy = config.occupancy_check.clone().unwrap_or_default();
+            if self.skip_occupancy_check {
+                occupancy.skip = Some(true);
+            }
+            if self.skip_tcp {
+                occupancy.skip_tcp = Some(true);
+            }
+            if self.skip_udp {
+                occupancy.skip_udp = Some(true);
+            }
+            if self.skip_ipv4 {
+                occupancy.skip_ip4 = Some(true);
+            }
+            if self.skip_ipv6 {
+                occupancy.skip_ip6 = Some(true);
+            }
+            if self.check_all_interfaces {
+                occupancy.check_all_interfaces = Some(true);
+            }
+            config.occupancy_check = Some(occupancy);
         }
 
         // 7. Build library ReserveOptions
         let options = ReserveOptions::new(key, port)
             .with_project(self.project)
             .with_task(self.task)
-            .with_ignore_occupied(self.ignore_occupied || self.skip_occupancy_check)
+            .with_ignore_occupied(self.ignore_occupied)
             .with_ignore_exclusions(self.ignore_exclusions)
             .with_force(self.force)
             .with_allow_unrelated_path(self.allow_unrelated_path)

@@ -299,8 +299,7 @@ impl Reservation {
     pub fn is_expired(&self, max_age: Duration) -> bool {
         SystemTime::now()
             .duration_since(self.last_used_at)
-            .map(|age| age > max_age)
-            .unwrap_or(false)
+            .is_ok_and(|age| age > max_age)
     }
 }
 

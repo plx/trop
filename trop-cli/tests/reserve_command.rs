@@ -366,6 +366,37 @@ fn test_reserve_with_port_range() {
     );
 }
 
+/// Test reserve with only --min preserves the configured/default max.
+#[test]
+fn test_reserve_with_min_only_uses_existing_max() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("test-project");
+    let min_port = 6900;
+
+    let output = env
+        .command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--min")
+        .arg(min_port.to_string())
+        .arg("--allow-unrelated-path")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "reserve with --min only should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let port = parse_port(&String::from_utf8(output.stdout).unwrap());
+
+    assert!(
+        (min_port..=7000).contains(&port),
+        "Port {port} should be in range [{min_port}, 7000]"
+    );
+}
+
 // ============================================================================
 // Force and Override Tests
 // ============================================================================

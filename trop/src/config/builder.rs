@@ -394,4 +394,25 @@ mod tests {
         assert_eq!(exclusions.len(), 1);
         assert_eq!(exclusions[0], PortExclusion::Single(9999));
     }
+
+    #[test]
+    fn test_builder_accepts_max_offset_over_defaults() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join("trop.yaml"),
+            "ports:\n  min: 8000\n  max_offset: 25\n",
+        )
+        .unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_working_dir(temp_dir.path())
+            .skip_env()
+            .build()
+            .unwrap();
+
+        let ports = config.ports.unwrap();
+        assert_eq!(ports.min, 8000);
+        assert_eq!(ports.max, None);
+        assert_eq!(ports.max_offset, Some(25));
+    }
 }

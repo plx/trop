@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use crate::config::{Config, ConfigLoader};
+use crate::config::{Config, ConfigLoader, ConfigValidator};
 use crate::error::{Error, Result};
 use crate::port::group::{GroupAllocationRequest, ServiceAllocationRequest};
 use crate::port::occupancy::OccupancyCheckConfig;
@@ -136,6 +136,7 @@ impl ReserveGroupPlan {
     pub fn new(options: ReserveGroupOptions) -> Result<Self> {
         // Load the configuration file
         let config = ConfigLoader::load_file(&options.config_path)?;
+        ConfigValidator::validate(&config, true)?;
 
         // Get the base path (parent directory of the config file)
         let base_path = options
@@ -224,10 +225,11 @@ impl ReserveGroupPlan {
         ));
 
         let occupancy_config = self.occupancy_config();
+        let full_config = self.config_with_group_base_as_scan_start(reservation_group)?;
 
         plan = plan.add_action(PlanAction::AllocateGroup {
             request,
-            full_config: self.config.clone(),
+            full_config,
             occupancy_config,
         });
 
@@ -242,19 +244,13 @@ impl ReserveGroupPlan {
         let mut services = Vec::new();
 
         for (tag, service_def) in &group.services {
-            // Validate service has either offset or preferred
-            if service_def.offset.is_none() && service_def.preferred.is_none() {
-                return Err(Error::Validation {
-                    field: format!("reservations.services.{tag}"),
-                    message: "Service must have either offset or preferred port".to_string(),
-                });
-            }
-
             let preferred = service_def.preferred.map(Port::try_from).transpose()?;
 
             services.push(ServiceAllocationRequest {
                 tag: tag.clone(),
-                offset: service_def.offset,
+                offset: service_def
+                    .offset
+                    .or_else(|| service_def.preferred.is_none().then_some(0)),
                 preferred,
             });
         }
@@ -265,6 +261,58 @@ impl ReserveGroupPlan {
             task: self.options.task.clone(),
             services,
         })
+    }
+
+    /// Returns configuration adjusted so `reservations.base` is the group scan start.
+    fn config_with_group_base_as_scan_start(
+        &self,
+        group: &crate::config::ReservationGroup,
+    ) -> Result<Config> {
+        let Some(base) = group.base else {
+            return Ok(self.config.clone());
+        };
+
+        let mut config = self.config.clone();
+        let ports = config.ports.as_mut().ok_or_else(|| Error::Validation {
+            field: "ports".to_string(),
+            message: "Port configuration is required when reservations.base is set".to_string(),
+        })?;
+
+        let max = if let Some(max) = ports.max {
+            max
+        } else if let Some(max_offset) = ports.max_offset {
+            ports
+                .min
+                .checked_add(max_offset)
+                .ok_or_else(|| Error::Validation {
+                    field: "ports.max_offset".to_string(),
+                    message: format!(
+                        "Offset {max_offset} would overflow when added to min port {}",
+                        ports.min
+                    ),
+                })?
+        } else {
+            return Err(Error::Validation {
+                field: "ports".to_string(),
+                message: "Either max or max_offset must be specified".to_string(),
+            });
+        };
+
+        if base < ports.min || base > max {
+            return Err(Error::Validation {
+                field: "reservations.base".to_string(),
+                message: format!(
+                    "Base port {base} must be within port range {}..{max}",
+                    ports.min
+                ),
+            });
+        }
+
+        ports.min = base;
+        ports.max = Some(max);
+        ports.max_offset = None;
+
+        Ok(config)
     }
 }
 
@@ -517,14 +565,64 @@ ports:
         let options = ReserveGroupOptions::new(config_path);
         let planner = ReserveGroupPlan::new(options).unwrap();
 
-        let result = planner.build_group_request(&group);
+        let request = planner.build_group_request(&group).unwrap();
 
-        assert!(result.is_err());
-        match result {
-            Err(Error::Validation { field, .. }) => {
-                assert!(field.contains("web"));
-            }
-            _ => panic!("Expected validation error"),
-        }
+        assert_eq!(request.services.len(), 1);
+        assert_eq!(request.services[0].tag, "web");
+        assert_eq!(request.services[0].offset, Some(0));
+        assert_eq!(request.services[0].preferred, None);
+    }
+
+    #[test]
+    fn test_group_base_becomes_scan_start() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r"
+project: test
+ports:
+  min: 5000
+  max: 7000
+reservations:
+  base: 6500
+  services:
+    web:
+      offset: 0
+";
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let options = ReserveGroupOptions::new(config_path);
+        let planner = ReserveGroupPlan::new(options).unwrap();
+        let group = planner.config.reservations.as_ref().unwrap();
+
+        let config = planner.config_with_group_base_as_scan_start(group).unwrap();
+        let ports = config.ports.unwrap();
+
+        assert_eq!(ports.min, 6500);
+        assert_eq!(ports.max, Some(7000));
+        assert_eq!(ports.max_offset, None);
+    }
+
+    #[test]
+    fn test_group_base_outside_range_is_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r"
+project: test
+ports:
+  min: 5000
+  max: 6000
+reservations:
+  base: 6500
+  services:
+    web:
+      offset: 0
+";
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let options = ReserveGroupOptions::new(config_path);
+        let planner = ReserveGroupPlan::new(options).unwrap();
+        let group = planner.config.reservations.as_ref().unwrap();
+
+        let err = planner
+            .config_with_group_base_as_scan_start(group)
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Validation { field, .. } if field == "reservations.base"));
     }
 }

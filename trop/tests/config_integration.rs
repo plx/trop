@@ -1,4 +1,4 @@
-//! Integration tests for the Phase 5 Configuration System.
+//! Integration tests for the configuration system.
 //!
 //! This test suite validates the complete workflow of the configuration system,
 //! including file discovery, merging, environment variable handling, and validation.
@@ -1368,12 +1368,12 @@ reservations:
     assert!(all_fields.env.is_some());
 }
 
-/// Test that only one service can have implicit offset of 0.
+/// Test that preferred-only services can omit offsets.
 ///
-/// If a service omits the offset field, it defaults to 0. But we can't
-/// have multiple services with offset 0, so only one can omit it.
+/// Preferred-only services reserve their absolute preferred ports and don't
+/// participate in offset-based allocation unless an offset is explicit.
 #[test]
-fn test_reservation_groups_multiple_default_offsets() {
+fn test_reservation_groups_preferred_only_services_without_offsets() {
     let temp = TempDir::new().unwrap();
     create_temp_config(
         temp.path(),
@@ -1395,8 +1395,10 @@ reservations:
         .skip_env()
         .build();
 
-    // Should fail because both web and api default to offset 0
-    assert!(result.is_err());
+    let config = result.unwrap();
+    let services = &config.reservations.as_ref().unwrap().services;
+    assert_eq!(services.get("web").unwrap().offset, None);
+    assert_eq!(services.get("api").unwrap().offset, None);
 }
 
 // ============================================================================

@@ -639,8 +639,6 @@ fn test_normal_execution_deletes_reservation() {
 fn test_plan_generation_uses_automatic_allocation_when_no_port() {
     // Tests that planning a new reservation without a port uses automatic allocation.
     //
-    // With Phase 6, automatic allocation is used when no port is specified.
-
     let db = create_test_database();
     let key = ReservationKey::new(PathBuf::from("/test/no-port"), None).unwrap();
 

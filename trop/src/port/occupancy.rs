@@ -30,15 +30,16 @@ pub struct OccupancyCheckConfig {
 
 impl From<&OccupancyConfig> for OccupancyCheckConfig {
     fn from(config: &OccupancyConfig) -> Self {
+        let skip_all = config.skip.unwrap_or(false);
         // Note: Field name divergence between `skip_ip4`/`skip_ip6` (in OccupancyConfig)
         // and `skip_ipv4`/`skip_ipv6` (in OccupancyCheckConfig) is intentional.
         // The config uses abbreviated names for brevity, while the runtime struct uses
         // full names for clarity.
         Self {
-            skip_tcp: config.skip_tcp.unwrap_or(false),
-            skip_udp: config.skip_udp.unwrap_or(false),
-            skip_ipv4: config.skip_ip4.unwrap_or(false),
-            skip_ipv6: config.skip_ip6.unwrap_or(false),
+            skip_tcp: skip_all || config.skip_tcp.unwrap_or(false),
+            skip_udp: skip_all || config.skip_udp.unwrap_or(false),
+            skip_ipv4: skip_all || config.skip_ip4.unwrap_or(false),
+            skip_ipv6: skip_all || config.skip_ip6.unwrap_or(false),
             check_all_interfaces: config.check_all_interfaces.unwrap_or(false),
         }
     }
@@ -248,15 +249,22 @@ impl MockOccupancyChecker {
 }
 
 impl PortOccupancyChecker for MockOccupancyChecker {
-    fn is_occupied(&self, port: Port, _config: &OccupancyCheckConfig) -> Result<bool> {
+    fn is_occupied(&self, port: Port, config: &OccupancyCheckConfig) -> Result<bool> {
+        if (config.skip_tcp && config.skip_udp) || (config.skip_ipv4 && config.skip_ipv6) {
+            return Ok(false);
+        }
         Ok(self.occupied_ports.contains(&port))
     }
 
     fn find_occupied_ports(
         &self,
         range: &PortRange,
-        _config: &OccupancyCheckConfig,
+        config: &OccupancyCheckConfig,
     ) -> Result<Vec<Port>> {
+        if (config.skip_tcp && config.skip_udp) || (config.skip_ipv4 && config.skip_ipv6) {
+            return Ok(Vec::new());
+        }
+
         let mut occupied = Vec::new();
         for port in *range {
             if self.occupied_ports.contains(&port) {
@@ -299,6 +307,20 @@ mod tests {
     }
 
     #[test]
+    fn test_occupancy_check_config_skip_all() {
+        let occ_config = OccupancyConfig {
+            skip: Some(true),
+            ..Default::default()
+        };
+
+        let config = OccupancyCheckConfig::from(&occ_config);
+        assert!(config.skip_tcp);
+        assert!(config.skip_udp);
+        assert!(config.skip_ipv4);
+        assert!(config.skip_ipv6);
+    }
+
+    #[test]
     fn test_mock_checker_empty() {
         let checker = MockOccupancyChecker::empty();
         let config = OccupancyCheckConfig::default();
@@ -324,6 +346,22 @@ mod tests {
             .unwrap());
         assert!(!checker
             .is_occupied(Port::try_from(8082).unwrap(), &config)
+            .unwrap());
+    }
+
+    #[test]
+    fn test_mock_checker_respects_skip_all_config() {
+        let mut occupied = HashSet::new();
+        occupied.insert(Port::try_from(8080).unwrap());
+        let checker = MockOccupancyChecker::new(occupied);
+        let config = OccupancyCheckConfig {
+            skip_tcp: true,
+            skip_udp: true,
+            ..Default::default()
+        };
+
+        assert!(!checker
+            .is_occupied(Port::try_from(8080).unwrap(), &config)
             .unwrap());
     }
 
