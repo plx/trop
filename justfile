@@ -182,3 +182,24 @@ ci-run-property-tests-release:
 
 # CI: run property tests (debug and release)
 ci-run-property-tests: ci-run-property-tests-debug ci-run-property-tests-release
+
+# Regenerate THIRD_PARTY_LICENSES.md from the current dependency tree.
+licenses:
+    cargo about generate --workspace --all-features about.hbs --output-file THIRD_PARTY_LICENSES.md
+
+# CI: regenerate THIRD_PARTY_LICENSES.md and fail if it differs from the
+# committed copy. Also fails if any dependency carries a license that is not
+# in `accepted` in about.toml. Run `just licenses` and commit the result to
+# fix.
+ci-check-licenses:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmpfile=$(mktemp)
+    trap 'rm -f "$tmpfile"' EXIT
+    cargo about generate --workspace --all-features about.hbs --output-file "$tmpfile"
+    if ! diff -u THIRD_PARTY_LICENSES.md "$tmpfile"; then
+        echo ""
+        echo "✗ THIRD_PARTY_LICENSES.md is stale. Run \`just licenses\` and commit the result."
+        exit 1
+    fi
+    echo "✓ THIRD_PARTY_LICENSES.md is up-to-date"
