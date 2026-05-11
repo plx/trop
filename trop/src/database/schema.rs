@@ -62,11 +62,13 @@ pub const SELECT_SCHEMA_VERSION: &str = "SELECT value FROM metadata WHERE key = 
 pub const INSERT_SCHEMA_VERSION: &str =
     "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)";
 
-/// SQL statement to insert or replace a reservation.
+/// SQL statement to insert a reservation.
 ///
-/// Used by both single and batch create operations.
+/// Callers delete the same reservation key before inserting when replacement is
+/// intended. This must stay as a plain insert so a unique-port conflict with a
+/// different reservation key fails instead of deleting that unrelated row.
 pub const INSERT_RESERVATION: &str = r"
-    INSERT OR REPLACE INTO reservations
+    INSERT INTO reservations
     (path, tag, port, project, task, created_at, last_used_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
 ";

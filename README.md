@@ -47,7 +47,7 @@ For projects with multiple services, you can reserve a distinct port for each se
 
 ```bash
 WEB_PORT=$(trop reserve --tag web)
-API_PORT=$(trop reserve --api db)
+API_PORT=$(trop reserve --tag api)
 DB_PORT=$(trop reserve --tag db)
 ```
 

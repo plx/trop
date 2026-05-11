@@ -7,6 +7,7 @@ use crate::error::CliError;
 use crate::utils::{format_allocations, load_configuration, open_database, GlobalOptions};
 use clap::Args;
 use std::env;
+use trop::config::ConfigLoader;
 use trop::operations::{AutoreserveOptions, AutoreservePlan};
 use trop::PlanExecutor;
 
@@ -119,7 +120,9 @@ impl AutoreserveCommand {
         // 9. Format output based on selected format
         let output_format = self.format.to_output_format(self.shell.as_deref())?;
 
-        let formatted_output = format_allocations(&output_format, &allocated_ports, &config)?;
+        let output_config = ConfigLoader::load_file(discovered_config).map_err(CliError::from)?;
+        let formatted_output =
+            format_allocations(&output_format, &allocated_ports, &output_config)?;
 
         // 10. Print to stdout (machine-readable)
         println!("{formatted_output}");

@@ -7,6 +7,7 @@ use crate::error::CliError;
 use crate::utils::{format_allocations, load_configuration, open_database, GlobalOptions};
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
+use trop::config::ConfigLoader;
 use trop::operations::{ReserveGroupOptions, ReserveGroupPlan};
 use trop::output::{OutputFormat, ShellType};
 use trop::PlanExecutor;
@@ -154,7 +155,9 @@ impl ReserveGroupCommand {
         // 8. Format output based on selected format
         let output_format = self.format.to_output_format(self.shell.as_deref())?;
 
-        let formatted_output = format_allocations(&output_format, &allocated_ports, &config)?;
+        let output_config = ConfigLoader::load_file(&self.config_path).map_err(CliError::from)?;
+        let formatted_output =
+            format_allocations(&output_format, &allocated_ports, &output_config)?;
 
         // 9. Print to stdout (machine-readable)
         println!("{formatted_output}");

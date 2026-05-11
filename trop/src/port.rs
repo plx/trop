@@ -302,7 +302,7 @@ impl PortRange {
     pub fn iter(self) -> PortRangeIter {
         PortRangeIter {
             range: self,
-            current: self.min.value(),
+            current: u32::from(self.min.value()),
         }
     }
 }
@@ -326,15 +326,16 @@ impl IntoIterator for PortRange {
 #[derive(Debug)]
 pub struct PortRangeIter {
     range: PortRange,
-    current: u16,
+    current: u32,
 }
 
 impl Iterator for PortRangeIter {
     type Item = Port;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current <= self.range.max.value() {
-            let port = Port(self.current);
+        if self.current <= u32::from(self.range.max.value()) {
+            let port =
+                Port(u16::try_from(self.current).expect("iterator current cannot exceed u16::MAX"));
             self.current += 1;
             Some(port)
         } else {
@@ -343,8 +344,8 @@ impl Iterator for PortRangeIter {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        if self.current <= self.range.max.value() {
-            let remaining = (self.range.max.value() - self.current + 1) as usize;
+        if self.current <= u32::from(self.range.max.value()) {
+            let remaining = (u32::from(self.range.max.value()) - self.current + 1) as usize;
             (remaining, Some(remaining))
         } else {
             (0, Some(0))
@@ -566,6 +567,16 @@ mod tests {
 
         assert_eq!(range.len(), 65535);
         assert!(range.contains(Port::try_from(32768).unwrap()));
+    }
+
+    #[test]
+    fn test_port_range_iterator_includes_max_port_without_overflow() {
+        let min = Port::try_from(65534).unwrap();
+        let max = Port::try_from(65535).unwrap();
+        let range = PortRange::new(min, max).unwrap();
+
+        let ports: Vec<Port> = range.iter().collect();
+        assert_eq!(ports, vec![min, max]);
     }
 
     #[test]
