@@ -64,7 +64,11 @@ jobs:
       - name: Install cargo-about
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-about
+          # Pinned: the license audit diffs generated output against the
+          # committed THIRD_PARTY_LICENSES.md, so a new cargo-about release
+          # that tweaks formatting or detection would flake this gate.
+          # Bump deliberately, regenerating the file in the same commit.
+          tool: cargo-about@0.9.0
 
       - name: Verify THIRD_PARTY_LICENSES.md is current
         run: just ci-check-licenses
