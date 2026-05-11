@@ -191,8 +191,7 @@ mod tests {
 
     #[test]
     fn test_config_with_busy_timeout() {
-        let config =
-            DatabaseConfig::new("/tmp/test.db").with_busy_timeout(Duration::from_secs(10));
+        let config = DatabaseConfig::new("/tmp/test.db").with_busy_timeout(Duration::from_secs(10));
         assert_eq!(config.busy_timeout, Duration::from_secs(10));
     }
 
