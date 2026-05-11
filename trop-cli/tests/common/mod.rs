@@ -51,8 +51,15 @@ impl TestEnv {
     /// to have full control over all flags including --data-dir.
     /// Use this when you need to override the data directory or test
     /// global flag behavior.
+    ///
+    /// `TROP_DATA_DIR` is set to this environment's isolated data dir so
+    /// that parallel tests do not all share `~/.trop` (which causes SQLite
+    /// "database is locked" failures under contention). The `--data-dir`
+    /// CLI flag still takes precedence over the env var.
     pub fn command_bare(&self) -> Command {
-        Command::cargo_bin("trop").expect("Failed to find trop binary")
+        let mut cmd = Command::cargo_bin("trop").expect("Failed to find trop binary");
+        cmd.env("TROP_DATA_DIR", &self.data_dir);
+        cmd
     }
 
     /// Get a command builder with the data directory pre-configured.
