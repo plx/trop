@@ -226,7 +226,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
 
             // Check if we should reject the preferred port
             match availability {
-                PortAvailability::Reserved if !options.ignore_occupied => {
+                PortAvailability::Reserved => {
                     return Ok(AllocationResult::PreferredUnavailable {
                         port: preferred,
                         reason: PortUnavailableReason::Reserved,
@@ -426,7 +426,16 @@ pub fn allocator_from_config(
     let max_value = if let Some(max) = port_config.max {
         max
     } else if let Some(offset) = port_config.max_offset {
-        port_config.min.saturating_add(offset)
+        port_config
+            .min
+            .checked_add(offset)
+            .ok_or_else(|| Error::Validation {
+                field: "ports.max_offset".into(),
+                message: format!(
+                    "Offset {offset} would overflow when added to min port {}",
+                    port_config.min
+                ),
+            })?
     } else {
         return Err(Error::Validation {
             field: "ports".into(),
@@ -708,6 +717,36 @@ mod tests {
         assert_eq!(
             result,
             AllocationResult::Allocated(Port::try_from(5005).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_ignore_occupied_does_not_ignore_reserved_preferred_port() {
+        let mut db = create_test_database();
+
+        let key = ReservationKey::new(PathBuf::from("/test/path"), None).unwrap();
+        let port = Port::try_from(5005).unwrap();
+        let reservation = Reservation::builder(key, port).build().unwrap();
+        db.create_reservation(&reservation).unwrap();
+
+        let allocator =
+            create_test_allocator(HashSet::new(), ExclusionManager::empty(), 5000, 5010);
+        let options = AllocationOptions {
+            preferred: Some(port),
+            ignore_occupied: true,
+            ..Default::default()
+        };
+        let config = OccupancyCheckConfig::default();
+
+        let result = allocator
+            .allocate_single(db.connection(), &options, &config)
+            .unwrap();
+        assert_eq!(
+            result,
+            AllocationResult::PreferredUnavailable {
+                port,
+                reason: PortUnavailableReason::Reserved,
+            }
         );
     }
 

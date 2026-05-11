@@ -54,12 +54,18 @@ impl Database {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         {
-            let mut stmt = tx.prepare(INSERT_RESERVATION)?;
+            let mut delete_stmt = tx.prepare(DELETE_RESERVATION)?;
+            let mut insert_stmt = tx.prepare(INSERT_RESERVATION)?;
             for reservation in reservations {
+                delete_stmt.execute(params![
+                    reservation.key().path.to_string_lossy().to_string(),
+                    reservation.key().tag,
+                ])?;
+
                 let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
                 let last_used_secs = systemtime_to_unix_secs(reservation.last_used_at())?;
 
-                stmt.execute(params![
+                insert_stmt.execute(params![
                     reservation.key().path.to_string_lossy().to_string(),
                     reservation.key().tag,
                     reservation.port().value(),
@@ -217,5 +223,25 @@ mod tests {
 
         let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 0);
+    }
+
+    #[test]
+    fn test_batch_create_port_conflict_rolls_back_without_replacing() {
+        let mut db = create_test_database();
+
+        let existing = create_test_reservation("/existing", 5000);
+        db.create_reservation(&existing).unwrap();
+
+        let conflicting = create_test_reservation("/conflicting", 5000);
+        let new_reservation = create_test_reservation("/new", 5001);
+
+        assert!(db
+            .batch_create_reservations(&[new_reservation, conflicting])
+            .is_err());
+
+        let all = Database::list_all_reservations(db.connection()).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].key().path, PathBuf::from("/existing"));
+        assert_eq!(all[0].port().value(), 5000);
     }
 }

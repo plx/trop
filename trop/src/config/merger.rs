@@ -134,10 +134,20 @@ impl ConfigMerger {
     ///
     /// Source values take precedence over target values.
     fn merge_port_config(target: &PortConfig, source: &PortConfig) -> PortConfig {
+        let (max, max_offset) = if source.max.is_some() && source.max_offset.is_some() {
+            (source.max, source.max_offset)
+        } else if source.max_offset.is_some() {
+            (None, source.max_offset)
+        } else if source.max.is_some() {
+            (source.max, None)
+        } else {
+            (target.max, target.max_offset)
+        };
+
         PortConfig {
             min: source.min, // Always use source
-            max: source.max.or(target.max),
-            max_offset: source.max_offset.or(target.max_offset),
+            max,
+            max_offset,
         }
     }
 
@@ -231,8 +241,60 @@ mod tests {
         ConfigMerger::merge_into(&mut target, &source);
         let ports = target.ports.unwrap();
         assert_eq!(ports.min, 7000); // Always use source
-        assert_eq!(ports.max, Some(6000)); // Source didn't specify, use target
+        assert_eq!(ports.max, None); // max_offset clears max
         assert_eq!(ports.max_offset, Some(100)); // Use source
+    }
+
+    #[test]
+    fn test_merge_port_config_max_offset_clears_default_max() {
+        let mut target = Config {
+            ports: Some(PortConfig {
+                min: 5000,
+                max: Some(7000),
+                max_offset: None,
+            }),
+            ..Default::default()
+        };
+        let source = Config {
+            ports: Some(PortConfig {
+                min: 8000,
+                max: None,
+                max_offset: Some(25),
+            }),
+            ..Default::default()
+        };
+
+        ConfigMerger::merge_into(&mut target, &source);
+        let ports = target.ports.unwrap();
+        assert_eq!(ports.min, 8000);
+        assert_eq!(ports.max, None);
+        assert_eq!(ports.max_offset, Some(25));
+    }
+
+    #[test]
+    fn test_merge_port_config_max_clears_prior_max_offset() {
+        let mut target = Config {
+            ports: Some(PortConfig {
+                min: 5000,
+                max: None,
+                max_offset: Some(100),
+            }),
+            ..Default::default()
+        };
+        let source = Config {
+            ports: Some(PortConfig {
+                min: 6000,
+                max: Some(6500),
+                max_offset: None,
+            }),
+            ..Default::default()
+        };
+
+        ConfigMerger::merge_into(&mut target, &source);
+        let ports = target.ports.unwrap();
+        assert_eq!(ports.min, 6000);
+        assert_eq!(ports.max, Some(6500));
+        assert_eq!(ports.max_offset, None);
     }
 
     #[test]

@@ -42,8 +42,7 @@ pub fn create_temp_dir() -> std::io::Result<tempfile::TempDir> {
 
 /// Creates a test database in a temporary location.
 ///
-/// This is a placeholder for Phase 2 when database functionality is implemented.
-/// For now, it just returns a path where the database should be created.
+/// Returns a path where the database should be created.
 #[allow(dead_code)]
 pub fn create_test_database() -> std::io::Result<PathBuf> {
     let temp_dir = tempfile::tempdir()?;

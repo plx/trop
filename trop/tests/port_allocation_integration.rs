@@ -1,4 +1,4 @@
-//! Integration tests for Phase 6: Port Allocation & Occupancy
+//! Integration tests for port allocation and occupancy.
 //!
 //! These tests verify end-to-end functionality of the port allocation system,
 //! including automatic port selection, occupancy checking, exclusions, cleanup,

@@ -10,14 +10,11 @@ Here's an overview of the repository's structure:
 
 ## Reference Documents
 
-The `reference` directory contains two important documents:
+The `reference` directory contains the authoritative product specification:
 
 - `ImplementationSpecification.md`: high-level specification for the `trop` tool
-- `ImplementationPlan.md`: high-level implementation plan for the `trop` tool (broken down into a linear sequence of "phases")
 
-These files should be treated as the source of truth for the `trop` tool; agents should consult them for context and clarification. Agents should **NEVER** modify the `ImplementationSpecification.md`; in some circumstances, agents *may* be asked to modify the `ImplementationPlan.md`, and should *only* modify that file if-and-when explcitly directed to do so.
-
-Development will generally follow the plan outlined in `ImplementationPlan.md`, mixed in with occasional ad-hoc directives.
+This file should be treated as the source of truth for the `trop` tool. Agents should consult it for context and clarification. Agents should **NEVER** modify `ImplementationSpecification.md`.
 
 ## Meta-Goal: Autonomous Development
 
@@ -38,20 +35,4 @@ When posting comments to PRs using `gh pr comment`, the comment will be attribut
 
 ## Current Status
 
-- Working On Initial Implementation (as per `ImplementationPlan.md`)
-- Phase 1 (Project Scaffold) is COMPLETED and merged
-- Phase 2 (SQLite Database Layer) is COMPLETED and merged
-- Phase 3 (Path Handling System) is COMPLETED and merged
-- Phase 4 (Basic Reservation Operations) is COMPLETED and merged
-- Phase 5 (Configuration System) is COMPLETED and merged
-- Phase 6 (Port Allocation & Occupancy) is COMPLETED and merged
-- Phase 7 (Essential CLI Commands) is COMPLETED and merged
-- Phase 8 (Group Reservations) is COMPLETED and merged
-- Phase 9 (Cleanup Operations) is COMPLETED and merged
-- Phase 10 (Assertion & Utility Commands) is COMPLETED and merged
-- Phase 11 (Migration & Advanced Operations) is COMPLETED and merged
-- Phase 12 (Testing and Polish) is IN PROGRESS
-  - Phase 12.1 (Property-Based Tests) is COMPLETED
-  - Phase 12.2 (Concurrency Tests) is COMPLETED
-  - Phase 12.3 (Documentation) is COMPLETED and merged
-  - Phase 12.4 (CI/CD Enhancements) is COMPLETED and ready for merge
+The implementation is functional and is no longer organized around checked-in phase plans. Use the specification, current code, and test suite as the active references.

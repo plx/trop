@@ -98,8 +98,8 @@ The library uses a custom `Error` type with variants for different failure modes
 
 - `InvalidPort`: Port number validation failures
 - `InvalidPath`: Path-related errors
-- `Database`: SQLite database errors (Phase 2+)
-- `Configuration`: Config file parsing errors (Phase 2+)
+- `Database`: SQLite database errors
+- `Configuration`: Config file parsing errors
 - `Validation`: Input validation failures
 - More variants as needed...
 
@@ -107,9 +107,7 @@ All fallible operations return `Result<T, Error>` or use the type alias `trop::R
 
 ## Current Status
 
-**Phase 1 Complete**: Core types and error handling implemented with comprehensive unit tests.
-
-**Coming in Phase 2**: Database layer, configuration parsing, and port allocation algorithms.
+The core library includes the SQLite database layer, path handling, configuration loading, port allocation, reservation operations, cleanup, migration, output formatting, and test utilities used by the CLI.
 
 ## Usage Example
 
@@ -195,7 +193,7 @@ Key dependencies:
 - `serde`: Serialization support
 - `thiserror`: Error type derivation
 - `chrono`: Timestamp handling
-- `rusqlite`: SQLite database (Phase 2+)
+- `rusqlite`: SQLite database
 - `log`: Logging facade
 
 ## License

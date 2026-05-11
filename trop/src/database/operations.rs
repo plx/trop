@@ -118,6 +118,27 @@ const SELECT_BY_PORT: &str = r"
 ";
 
 impl Database {
+    /// Executes an operation inside a `SQLite` savepoint.
+    pub(crate) fn with_savepoint<T>(
+        conn: &Connection,
+        name: &str,
+        operation: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+
+        match operation(conn) {
+            Ok(value) => {
+                conn.execute_batch(&format!("RELEASE {name}"))?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch(&format!("ROLLBACK TO {name}"));
+                let _ = conn.execute_batch(&format!("RELEASE {name}"));
+                Err(error)
+            }
+        }
+    }
+
     /// Creates or updates a reservation in the database.
     ///
     /// This operation uses a transaction with IMMEDIATE mode to ensure
@@ -206,30 +227,32 @@ impl Database {
     /// tx.commit().unwrap();
     /// ```
     pub fn create_reservation_simple(conn: &Connection, reservation: &Reservation) -> Result<()> {
-        // For NULL tags, explicitly delete first to ensure replacement works
-        // (INSERT OR REPLACE doesn't work with NULL in PRIMARY KEY due to NULL != NULL)
-        conn.execute(
-            DELETE_RESERVATION,
-            params![reservation.key().path_as_string(), reservation.key().tag],
-        )?;
+        Self::with_savepoint(conn, "trop_create_reservation", |conn| {
+            // For NULL tags, explicitly delete first to ensure replacement works
+            // (INSERT OR REPLACE doesn't work with NULL in PRIMARY KEY due to NULL != NULL)
+            conn.execute(
+                DELETE_RESERVATION,
+                params![reservation.key().path_as_string(), reservation.key().tag],
+            )?;
 
-        let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
-        let last_used_secs = systemtime_to_unix_secs(reservation.last_used_at())?;
+            let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
+            let last_used_secs = systemtime_to_unix_secs(reservation.last_used_at())?;
 
-        conn.execute(
-            INSERT_RESERVATION,
-            params![
-                reservation.key().path_as_string(),
-                reservation.key().tag,
-                reservation.port().value(),
-                reservation.project(),
-                reservation.task(),
-                created_secs,
-                last_used_secs,
-            ],
-        )?;
+            conn.execute(
+                INSERT_RESERVATION,
+                params![
+                    reservation.key().path_as_string(),
+                    reservation.key().tag,
+                    reservation.port().value(),
+                    reservation.project(),
+                    reservation.task(),
+                    created_secs,
+                    last_used_secs,
+                ],
+            )?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Retrieves a reservation from the database.
@@ -490,7 +513,10 @@ impl Database {
 
         let reservations = stmt
             .query_map([prefix.to_string_lossy().to_string()], row_to_reservation)?
-            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?
+            .into_iter()
+            .filter(|reservation| reservation.key().path.starts_with(prefix))
+            .collect();
 
         Ok(reservations)
     }
@@ -904,6 +930,55 @@ mod tests {
     }
 
     #[test]
+    fn test_create_reservation_port_conflict_does_not_replace_other_key() {
+        let mut db = create_test_database();
+
+        let port = Port::try_from(5000).unwrap();
+        let key1 = ReservationKey::new(PathBuf::from("/path1"), None).unwrap();
+        let key2 = ReservationKey::new(PathBuf::from("/path2"), None).unwrap();
+        let r1 = Reservation::builder(key1.clone(), port).build().unwrap();
+        let r2 = Reservation::builder(key2.clone(), port).build().unwrap();
+
+        db.create_reservation(&r1).unwrap();
+        assert!(db.create_reservation(&r2).is_err());
+
+        let loaded1 = Database::get_reservation(db.connection(), &key1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded1.port(), port);
+        assert!(Database::get_reservation(db.connection(), &key2)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_create_reservation_simple_port_conflict_preserves_original_key() {
+        let mut db = create_test_database();
+
+        let old_port = Port::try_from(5000).unwrap();
+        let conflicting_port = Port::try_from(5001).unwrap();
+        let key = ReservationKey::new(PathBuf::from("/path"), None).unwrap();
+        let other_key = ReservationKey::new(PathBuf::from("/other"), None).unwrap();
+        let original = Reservation::builder(key.clone(), old_port).build().unwrap();
+        let other = Reservation::builder(other_key, conflicting_port)
+            .build()
+            .unwrap();
+        let conflicting_update = Reservation::builder(key.clone(), conflicting_port)
+            .build()
+            .unwrap();
+
+        db.create_reservation(&original).unwrap();
+        db.create_reservation(&other).unwrap();
+
+        assert!(Database::create_reservation_simple(db.connection(), &conflicting_update).is_err());
+
+        let loaded = Database::get_reservation(db.connection(), &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.port(), old_port);
+    }
+
+    #[test]
     fn test_get_reserved_ports() {
         let mut db = create_test_database();
 
@@ -957,6 +1032,31 @@ mod tests {
             .path
             .to_string_lossy()
             .starts_with("/home/user"));
+    }
+
+    #[test]
+    fn test_get_reservations_by_path_prefix_is_component_aware() {
+        let mut db = create_test_database();
+
+        db.create_reservation(&create_test_reservation("/projects/foo", 5000))
+            .unwrap();
+        db.create_reservation(&create_test_reservation("/projects/foo/child", 5001))
+            .unwrap();
+        db.create_reservation(&create_test_reservation("/projects/foobar", 5002))
+            .unwrap();
+
+        let reservations =
+            Database::get_reservations_by_path_prefix(db.connection(), Path::new("/projects/foo"))
+                .unwrap();
+
+        let paths = reservations
+            .iter()
+            .map(|reservation| reservation.key().path.as_path())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&Path::new("/projects/foo")));
+        assert!(paths.contains(&Path::new("/projects/foo/child")));
+        assert!(!paths.contains(&Path::new("/projects/foobar")));
     }
 
     #[test]

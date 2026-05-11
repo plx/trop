@@ -1,6 +1,7 @@
-//! Comprehensive integration tests for Phase 10: Assertion and Utility Commands.
+//! Comprehensive integration tests for assertion and utility commands.
 //!
-//! This test suite provides end-to-end verification of all Phase 10 commands:
+//! This test suite provides end-to-end verification of assertion, inspection,
+//! configuration, and scanning commands:
 //!
 //! **Assertion Commands** (exit code 0/1 for success/failure):
 //! - `assert-reservation`: Verify reservation exists for path/tag

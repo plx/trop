@@ -64,8 +64,10 @@ preflight-pr:
     fi
     echo "✓ Format check passed"
 
-    # Clippy check
-    output=$(cargo clippy -- -D warnings 2>&1) || true
+    # Clippy check (matches the CI invocation, including --all-targets so test
+    # code is linted too — keep this delegating to ci-run-clippy-debug so the
+    # local preflight cannot drift from CI).
+    output=$(just ci-run-clippy-debug 2>&1) || true
     if echo "$output" | grep -q "error:\|warning:"; then
         echo "✗ Clippy failed"
         echo "$output" | grep -v "Checking\|Finished"
