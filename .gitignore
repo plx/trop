@@ -23,3 +23,6 @@ target
 
 # Test data directory (for manual testing with --data-dir ./data)
 /data/
+
+# Runtime lock file created by the Claude Code harness
+.claude/scheduled_tasks.lock

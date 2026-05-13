@@ -3,7 +3,7 @@ name = "trop"
 version = "0.1.0"
 edition = "2021"
 authors = ["trop contributors"]
-license = "MIT"
+license = "Apache-2.0 OR MIT"
 description = "Library for managing ephemeral port reservations"
 repository = "https://github.com/prb/trop"
 

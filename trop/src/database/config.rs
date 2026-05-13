@@ -25,7 +25,7 @@ use crate::error::{Error, Result};
 ///
 /// // Customize the configuration
 /// let config = DatabaseConfig::new("/tmp/trop.db")
-///     .with_busy_timeout(Duration::from_millis(10000));
+///     .with_busy_timeout(Duration::from_secs(10));
 /// ```
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
