@@ -1,0 +1,41 @@
+@import "./tokens.css";
+
+:root {
+  --sl-font: var(--typography-families-body);
+  --sl-font-mono: var(--typography-families-mono);
+  --sl-color-accent-low: #ddeaf2;
+  --sl-color-accent: #3e6478;
+  --sl-color-accent-high: #1e2a3a;
+  --sl-color-white: #ffffff;
+  --sl-color-gray-1: #f4f6f8;
+  --sl-color-gray-2: #e9edf1;
+  --sl-color-gray-3: #c9d1d8;
+  --sl-color-gray-4: #8ba8b9;
+  --sl-color-gray-5: #7c8896;
+  --sl-color-gray-6: #36424f;
+  --sl-color-black: #0b1220;
+}
+
+:root[data-theme="dark"] {
+  --sl-color-accent-low: #122b27;
+  --sl-color-accent: #8ba8b9;
+  --sl-color-accent-high: #ddeaf2;
+  --sl-color-white: #f4f6f8;
+  --sl-color-gray-1: #e9edf1;
+  --sl-color-gray-2: #c9d1d8;
+  --sl-color-gray-3: #7c8896;
+  --sl-color-gray-4: #36424f;
+  --sl-color-gray-5: #1e2a3a;
+  --sl-color-gray-6: #111827;
+  --sl-color-black: #0b1220;
+}
+
+.site-title {
+  letter-spacing: 0;
+}
+
+.sl-markdown-content code:not(:where(pre *)) {
+  border: 1px solid var(--sl-color-gray-3);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--sl-color-gray-2) 68%, transparent);
+}

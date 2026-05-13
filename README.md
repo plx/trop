@@ -8,6 +8,8 @@
 
 A lightweight, directory-aware port reservation tool for managing ephemeral port allocations in concurrent development workflows.
 
+Website and docs: https://plx.github.io/trop/
+
 ## Overview
 
 `trop` is a port-reservation management tool meant to act as a "drop-in" replacement for hardcoded ports, like so:

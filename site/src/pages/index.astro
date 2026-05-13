@@ -1,0 +1,294 @@
+---
+import "../styles/tokens.css";
+import "../styles/components.css";
+import "../styles/landing.css";
+
+const base = import.meta.env.BASE_URL;
+const githubUrl = "https://github.com/plx/trop";
+const docsUrl = `${base}guides/overview/`;
+const usageUrl = `${base}guides/usage/`;
+const configurationUrl = `${base}guides/configuration/`;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>trop - Port reservations for worktrees</title>
+    <meta
+      name="description"
+      content="trop is a small Rust CLI for stable localhost port reservations across worktrees and concurrent development agents."
+    />
+    <link rel="icon" href={`${base}favicon.svg`} type="image/svg+xml" />
+  </head>
+  <body class="landing-page mq-component-scope" style={`--harbor-backdrop: url("${base}assets/harbor-backdrop.png")`}>
+    <header class="mq-site-header landing-nav" data-mq-nav>
+      <div class="mq-site-header__inner">
+        <a class="mq-site-header__brand" href={base} aria-label="trop home">
+          <span class="mq-site-header__mark" aria-hidden="true">
+            <svg class="mq-icon" viewBox="0 0 24 24" fill="none" stroke-width="2">
+              <path d="M4 18h16"></path>
+              <path d="M7 18V9l5-3 5 3v9"></path>
+              <path d="M9 18v-5h6v5"></path>
+            </svg>
+          </span>
+          <span>trop</span>
+        </a>
+        <nav class="mq-site-header__nav" aria-label="Primary">
+          <a class="mq-site-header__nav-link" href={docsUrl}>Docs</a>
+          <a class="mq-site-header__nav-link" href="#model">Model</a>
+          <a class="mq-site-header__nav-link" href="#install">Install</a>
+          <a class="mq-site-header__nav-link" href={githubUrl}>GitHub</a>
+        </nav>
+        <div class="mq-site-header__actions">
+          <a class="mq-button mq-button--secondary mq-button--sm" href={githubUrl}>View on GitHub</a>
+          <button class="mq-site-header__toggle" type="button" aria-label="Open navigation" aria-controls="landing-nav-panel" aria-expanded="false">
+            <svg class="mq-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke-width="2">
+              <path d="M4 7h16"></path>
+              <path d="M4 12h16"></path>
+              <path d="M4 17h16"></path>
+            </svg>
+          </button>
+        </div>
+      </div>
+      <nav class="mq-site-header__panel" id="landing-nav-panel" aria-label="Mobile primary" hidden>
+        <a class="mq-site-header__panel-link" href={docsUrl}>Docs</a>
+        <a class="mq-site-header__panel-link" href="#model">Model</a>
+        <a class="mq-site-header__panel-link" href="#install">Install</a>
+        <a class="mq-site-header__panel-link" href={githubUrl}>GitHub</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="landing-hero" aria-labelledby="hero-title">
+        <div class="landing-hero__media" aria-hidden="true"></div>
+        <div class="landing-container landing-hero__inner">
+          <div class="landing-hero__content">
+            <p class="landing-eyebrow">Rust CLI - local coordination</p>
+            <h1 id="hero-title">trop</h1>
+            <p class="landing-hero__lede">
+              A minor Rust CLI for directory-aware localhost port reservations across worktrees and concurrent development agents.
+            </p>
+            <div class="landing-actions">
+              <a class="mq-button mq-button--primary" href="#install">
+                <svg class="mq-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke-width="2">
+                  <path d="M12 5v14"></path>
+                  <path d="m19 12-7 7-7-7"></path>
+                </svg>
+                Install
+              </a>
+              <a class="mq-button mq-button--secondary" href={docsUrl}>Read docs</a>
+            </div>
+            <div class="mq-code-panel landing-hero__code">
+              <div class="mq-code-panel__bar">
+                <span class="mq-code-panel__title">shell</span>
+                <button class="mq-code-panel__copy" type="button">copy</button>
+              </div>
+              <div class="mq-code-panel__body" role="region" aria-label="Basic trop reserve command">
+                <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">PORT=$(trop reserve)</span></div>
+                <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">npm run dev -- --port $PORT</span></div>
+                <div class="mq-code-line"><span class="mq-code-line__output">reserve -&gt; 49217</span></div>
+              </div>
+            </div>
+            <div class="landing-chip-row" aria-label="Key traits">
+              <span class="mq-chip"><span class="mq-status-dot mq-status-dot--success" aria-hidden="true"></span>available</span>
+              <span class="mq-chip">per-worktree</span>
+              <span class="mq-chip">sqlite lock</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="landing-section landing-container" id="model" aria-labelledby="reservations-title">
+        <div class="mq-section-heading">
+          <p class="mq-section-heading__eyebrow">Reservation model</p>
+          <h2 class="mq-section-heading__title" id="reservations-title">Reservations, live enough for scripts</h2>
+          <p class="mq-section-heading__body">
+            trop tracks port numbers by path and optional tag, then returns stable values that local tooling can reuse.
+          </p>
+        </div>
+        <div class="mq-data-table">
+          <div class="mq-data-table__scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Worktree</th>
+                  <th>Service</th>
+                  <th>Port</th>
+                  <th>Status</th>
+                  <th>Age</th>
+                  <th>PID</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr data-state="active">
+                  <td>main</td>
+                  <td>web</td>
+                  <td>5173</td>
+                  <td><span class="mq-status-dot mq-status-dot--success" aria-hidden="true"></span> active</td>
+                  <td>12m</td>
+                  <td>42817</td>
+                </tr>
+                <tr data-state="active">
+                  <td>feat/auth</td>
+                  <td>api</td>
+                  <td>6121</td>
+                  <td><span class="mq-status-dot mq-status-dot--success" aria-hidden="true"></span> active</td>
+                  <td>7m</td>
+                  <td>43302</td>
+                </tr>
+                <tr data-state="active">
+                  <td>feat/ui</td>
+                  <td>worker</td>
+                  <td>7022</td>
+                  <td><span class="mq-status-dot mq-status-dot--success" aria-hidden="true"></span> active</td>
+                  <td>4m</td>
+                  <td>43611</td>
+                </tr>
+                <tr data-state="idle">
+                  <td>docs</td>
+                  <td>preview</td>
+                  <td>8088</td>
+                  <td><span class="mq-status-dot mq-status-dot--warning" aria-hidden="true"></span> stale</td>
+                  <td>18h</td>
+                  <td>-</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="mq-metric-row landing-metrics">
+          <span class="mq-metric-row__item">
+            <span class="mq-metric-row__label">Active reservations</span>
+            <span class="mq-metric-row__value">4 across 4 worktrees</span>
+          </span>
+          <span class="mq-metric-row__item">
+            <span class="mq-metric-row__label">Collision retries</span>
+            <span class="mq-metric-row__value">2 in 24h</span>
+          </span>
+          <span class="mq-metric-row__item">
+            <span class="mq-metric-row__label">Oldest reservation</span>
+            <span class="mq-metric-row__value">18h, may be cleaned</span>
+          </span>
+        </div>
+      </section>
+
+      <section class="landing-section landing-container" id="docs" aria-labelledby="features-title">
+        <div class="mq-section-heading">
+          <p class="mq-section-heading__eyebrow">What trop provides</p>
+          <h2 class="mq-section-heading__title" id="features-title">Small guarantees for boring local ports</h2>
+          <p class="mq-section-heading__body">
+            The scope is deliberately narrow: predictable localhost port numbers for one user account, across local processes and worktrees.
+          </p>
+        </div>
+        <div class="mq-card-grid">
+          <article class="mq-feature-card">
+            <div class="mq-feature-card__icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" stroke-width="2"><path d="M21 12a9 9 0 0 1-15.5 6.2"></path><path d="M3 12A9 9 0 0 1 18.5 5.8"></path><path d="M18 3v4h-4"></path><path d="M6 21v-4h4"></path></svg>
+            </div>
+            <p class="mq-feature-card__eyebrow">Idempotent</p>
+            <h3 class="mq-feature-card__title">Same worktree, same port</h3>
+            <p class="mq-feature-card__body">Repeated calls return the same port for the same worktree and service. Nothing to release just to keep scripts stable.</p>
+            <footer class="mq-feature-card__footer">
+              <span class="mq-chip">reserve</span>
+              <span class="landing-card-code">same port</span>
+            </footer>
+          </article>
+          <article class="mq-feature-card">
+            <div class="mq-feature-card__icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" stroke-width="2"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8Z"></path><path d="M7 7h.01"></path></svg>
+            </div>
+            <p class="mq-feature-card__eyebrow">Tagged</p>
+            <h3 class="mq-feature-card__title">Name your services</h3>
+            <p class="mq-feature-card__body">Reserve separate stable ports for web, api, db, and other local services in one worktree.</p>
+            <footer class="mq-feature-card__footer">
+              <span class="mq-chip mq-chip--selected">--tag web</span>
+              <a class="mq-link" href={usageUrl}>details</a>
+            </footer>
+          </article>
+          <article class="mq-feature-card">
+            <div class="mq-feature-card__icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg>
+            </div>
+            <p class="mq-feature-card__eyebrow">Concurrent</p>
+            <h3 class="mq-feature-card__title">SQLite coordinates callers</h3>
+            <p class="mq-feature-card__body">A small local database and file locks keep concurrent agents from racing through the same range.</p>
+            <footer class="mq-feature-card__footer">
+              <span class="mq-chip">sqlite</span>
+              <span class="landing-card-code">file locks</span>
+            </footer>
+          </article>
+          <article class="mq-feature-card">
+            <div class="mq-feature-card__icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" stroke-width="2"><path d="m3 6 3 1 1-3"></path><path d="M6 7a9 9 0 0 1 14 4"></path><path d="M21 18l-3-1-1 3"></path><path d="M18 17A9 9 0 0 1 4 13"></path></svg>
+            </div>
+            <p class="mq-feature-card__eyebrow">Cleanup</p>
+            <h3 class="mq-feature-card__title">Prune stale reservations</h3>
+            <p class="mq-feature-card__body">Deleted worktrees and old reservations can be cleaned without wiring lifecycle hooks into every script.</p>
+            <footer class="mq-feature-card__footer">
+              <span class="mq-chip mq-chip--muted">autoclean</span>
+              <a class="mq-link" href={configurationUrl}>configuration</a>
+            </footer>
+          </article>
+        </div>
+      </section>
+
+      <section class="landing-section landing-container landing-scope" aria-labelledby="scope-title">
+        <div class="mq-callout">
+          <div class="mq-callout__content">
+            <div>
+              <h2 class="mq-callout__title" id="scope-title">Scope</h2>
+              <p class="mq-callout__body">Single-user coordination across worktrees and local processes on one machine.</p>
+            </div>
+            <div>
+              <h3 class="mq-callout__title">Non-goals</h3>
+              <p class="mq-callout__body">No system-wide enforcement. No multi-user broker. No container orchestration.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="landing-section landing-install" id="install" aria-labelledby="install-title">
+        <div class="landing-container landing-install__inner">
+          <div class="landing-install__content">
+            <div class="mq-section-heading">
+              <p class="mq-section-heading__eyebrow">Install</p>
+              <h2 class="mq-section-heading__title" id="install-title">Keep the justfile boring.</h2>
+              <p class="mq-section-heading__body">Install from Cargo, then replace hardcoded ports with one command.</p>
+            </div>
+            <div class="mq-code-panel">
+              <div class="mq-code-panel__bar">
+                <span class="mq-code-panel__title">terminal</span>
+                <button class="mq-code-panel__copy" type="button">copy</button>
+              </div>
+              <div class="mq-code-panel__body" role="region" aria-label="Install commands">
+                <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">cargo install trop-cli</span></div>
+                <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">trop --version</span></div>
+                <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">PORT=$(trop reserve)</span></div>
+                <div class="mq-code-line"><span class="mq-code-line__output"># use in your scripts</span></div>
+              </div>
+            </div>
+            <p class="landing-requirements">Requires Rust 1.70+ to build from source - macOS and Linux are the primary targets.</p>
+          </div>
+          <div class="landing-install__vignette" aria-hidden="true"></div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="landing-footer">
+      <div class="landing-container landing-footer__inner">
+        <p>trop - a Rust CLI for port reservations</p>
+        <nav aria-label="Footer">
+          <a class="mq-link" href={docsUrl}>Docs</a>
+          <a class="mq-link" href="#model">Model</a>
+          <a class="mq-link" href="#install">Install</a>
+          <a class="mq-link" href={githubUrl}>GitHub</a>
+          <span>MIT License</span>
+        </nav>
+      </div>
+    </footer>
+
+    <script is:inline src={`${base}scripts/components.js`} defer></script>
+  </body>
+</html>
