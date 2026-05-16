@@ -6,8 +6,6 @@ import "../styles/landing.css";
 const base = import.meta.env.BASE_URL;
 const githubUrl = "https://github.com/plx/trop";
 const docsUrl = `${base}guides/overview/`;
-const usageUrl = `${base}guides/usage/`;
-const configurationUrl = `${base}guides/configuration/`;
 ---
 
 <!doctype html>
@@ -18,7 +16,7 @@ const configurationUrl = `${base}guides/configuration/`;
     <title>trop - Port reservations for worktrees</title>
     <meta
       name="description"
-      content="trop is a small Rust CLI for stable localhost port reservations across worktrees and concurrent development agents."
+      content="A small CLI for stable localhost port numbers per worktree."
     />
     <link rel="icon" href={`${base}favicon.svg`} type="image/svg+xml" />
   </head>
@@ -65,10 +63,10 @@ const configurationUrl = `${base}guides/configuration/`;
         <div class="landing-hero__media" aria-hidden="true"></div>
         <div class="landing-container landing-hero__inner">
           <div class="landing-hero__content">
-            <p class="landing-eyebrow">Rust CLI - local coordination</p>
+            <p class="landing-eyebrow">localhost port reservations</p>
             <h1 id="hero-title">trop</h1>
             <p class="landing-hero__lede">
-              A minor Rust CLI for directory-aware localhost port reservations across worktrees and concurrent development agents.
+              Reserve a stable port for the current directory. Add a tag when one worktree runs more than one service.
             </p>
             <div class="landing-actions">
               <a class="mq-button mq-button--primary" href="#install">
@@ -88,13 +86,7 @@ const configurationUrl = `${base}guides/configuration/`;
               <div class="mq-code-panel__body" role="region" aria-label="Basic trop reserve command">
                 <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">PORT=$(trop reserve)</span></div>
                 <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">npm run dev -- --port $PORT</span></div>
-                <div class="mq-code-line"><span class="mq-code-line__output">reserve -&gt; 49217</span></div>
               </div>
-            </div>
-            <div class="landing-chip-row" aria-label="Key traits">
-              <span class="mq-chip"><span class="mq-status-dot mq-status-dot--success" aria-hidden="true"></span>available</span>
-              <span class="mq-chip">per-worktree</span>
-              <span class="mq-chip">sqlite lock</span>
             </div>
           </div>
         </div>
@@ -103,74 +95,10 @@ const configurationUrl = `${base}guides/configuration/`;
       <section class="landing-section landing-container" id="model" aria-labelledby="reservations-title">
         <div class="mq-section-heading">
           <p class="mq-section-heading__eyebrow">Reservation model</p>
-          <h2 class="mq-section-heading__title" id="reservations-title">Reservations, live enough for scripts</h2>
+          <h2 class="mq-section-heading__title" id="reservations-title">Same key, same port.</h2>
           <p class="mq-section-heading__body">
-            trop tracks port numbers by path and optional tag, then returns stable values that local tooling can reuse.
+            Reservations are keyed by directory and optional tag. Repeated calls return the same port.
           </p>
-        </div>
-        <div class="mq-data-table">
-          <div class="mq-data-table__scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>Worktree</th>
-                  <th>Service</th>
-                  <th>Port</th>
-                  <th>Status</th>
-                  <th>Age</th>
-                  <th>PID</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr data-state="active">
-                  <td>main</td>
-                  <td>web</td>
-                  <td>5173</td>
-                  <td><span class="mq-status-dot mq-status-dot--success" aria-hidden="true"></span> active</td>
-                  <td>12m</td>
-                  <td>42817</td>
-                </tr>
-                <tr data-state="active">
-                  <td>feat/auth</td>
-                  <td>api</td>
-                  <td>6121</td>
-                  <td><span class="mq-status-dot mq-status-dot--success" aria-hidden="true"></span> active</td>
-                  <td>7m</td>
-                  <td>43302</td>
-                </tr>
-                <tr data-state="active">
-                  <td>feat/ui</td>
-                  <td>worker</td>
-                  <td>7022</td>
-                  <td><span class="mq-status-dot mq-status-dot--success" aria-hidden="true"></span> active</td>
-                  <td>4m</td>
-                  <td>43611</td>
-                </tr>
-                <tr data-state="idle">
-                  <td>docs</td>
-                  <td>preview</td>
-                  <td>8088</td>
-                  <td><span class="mq-status-dot mq-status-dot--warning" aria-hidden="true"></span> stale</td>
-                  <td>18h</td>
-                  <td>-</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-        <div class="mq-metric-row landing-metrics">
-          <span class="mq-metric-row__item">
-            <span class="mq-metric-row__label">Active reservations</span>
-            <span class="mq-metric-row__value">4 across 4 worktrees</span>
-          </span>
-          <span class="mq-metric-row__item">
-            <span class="mq-metric-row__label">Collision retries</span>
-            <span class="mq-metric-row__value">2 in 24h</span>
-          </span>
-          <span class="mq-metric-row__item">
-            <span class="mq-metric-row__label">Oldest reservation</span>
-            <span class="mq-metric-row__value">18h, may be cleaned</span>
-          </span>
         </div>
       </section>
 
@@ -188,24 +116,16 @@ const configurationUrl = `${base}guides/configuration/`;
               <svg viewBox="0 0 24 24" stroke-width="2"><path d="M21 12a9 9 0 0 1-15.5 6.2"></path><path d="M3 12A9 9 0 0 1 18.5 5.8"></path><path d="M18 3v4h-4"></path><path d="M6 21v-4h4"></path></svg>
             </div>
             <p class="mq-feature-card__eyebrow">Idempotent</p>
-            <h3 class="mq-feature-card__title">Same worktree, same port</h3>
-            <p class="mq-feature-card__body">Repeated calls return the same port for the same worktree and service. Nothing to release just to keep scripts stable.</p>
-            <footer class="mq-feature-card__footer">
-              <span class="mq-chip">reserve</span>
-              <span class="landing-card-code">same port</span>
-            </footer>
+            <h3 class="mq-feature-card__title">Same directory, same port</h3>
+            <p class="mq-feature-card__body">Run <code>trop reserve</code> again from the same worktree and get the same number.</p>
           </article>
           <article class="mq-feature-card">
             <div class="mq-feature-card__icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" stroke-width="2"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8Z"></path><path d="M7 7h.01"></path></svg>
             </div>
             <p class="mq-feature-card__eyebrow">Tagged</p>
-            <h3 class="mq-feature-card__title">Name your services</h3>
-            <p class="mq-feature-card__body">Reserve separate stable ports for web, api, db, and other local services in one worktree.</p>
-            <footer class="mq-feature-card__footer">
-              <span class="mq-chip mq-chip--selected">--tag web</span>
-              <a class="mq-link" href={usageUrl}>details</a>
-            </footer>
+            <h3 class="mq-feature-card__title">Tags split services</h3>
+            <p class="mq-feature-card__body">Use <code>--tag web</code>, <code>--tag api</code>, or similar names when one worktree needs multiple ports.</p>
           </article>
           <article class="mq-feature-card">
             <div class="mq-feature-card__icon" aria-hidden="true">
@@ -213,23 +133,15 @@ const configurationUrl = `${base}guides/configuration/`;
             </div>
             <p class="mq-feature-card__eyebrow">Concurrent</p>
             <h3 class="mq-feature-card__title">SQLite coordinates callers</h3>
-            <p class="mq-feature-card__body">A small local database and file locks keep concurrent agents from racing through the same range.</p>
-            <footer class="mq-feature-card__footer">
-              <span class="mq-chip">sqlite</span>
-              <span class="landing-card-code">file locks</span>
-            </footer>
+            <p class="mq-feature-card__body">Concurrent invocations share a local SQLite database.</p>
           </article>
           <article class="mq-feature-card">
             <div class="mq-feature-card__icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" stroke-width="2"><path d="m3 6 3 1 1-3"></path><path d="M6 7a9 9 0 0 1 14 4"></path><path d="M21 18l-3-1-1 3"></path><path d="M18 17A9 9 0 0 1 4 13"></path></svg>
             </div>
             <p class="mq-feature-card__eyebrow">Cleanup</p>
-            <h3 class="mq-feature-card__title">Prune stale reservations</h3>
-            <p class="mq-feature-card__body">Deleted worktrees and old reservations can be cleaned without wiring lifecycle hooks into every script.</p>
-            <footer class="mq-feature-card__footer">
-              <span class="mq-chip mq-chip--muted">autoclean</span>
-              <a class="mq-link" href={configurationUrl}>configuration</a>
-            </footer>
+            <h3 class="mq-feature-card__title">Prune deleted worktrees</h3>
+            <p class="mq-feature-card__body">Remove reservations whose directories no longer exist.</p>
           </article>
         </div>
       </section>
@@ -239,7 +151,7 @@ const configurationUrl = `${base}guides/configuration/`;
           <div class="mq-callout__content">
             <div>
               <h2 class="mq-callout__title" id="scope-title">Scope</h2>
-              <p class="mq-callout__body">Single-user coordination across worktrees and local processes on one machine.</p>
+              <p class="mq-callout__body">Single-user coordination on one machine.</p>
             </div>
             <div>
               <h3 class="mq-callout__title">Non-goals</h3>
@@ -254,8 +166,8 @@ const configurationUrl = `${base}guides/configuration/`;
           <div class="landing-install__content">
             <div class="mq-section-heading">
               <p class="mq-section-heading__eyebrow">Install</p>
-              <h2 class="mq-section-heading__title" id="install-title">Keep the justfile boring.</h2>
-              <p class="mq-section-heading__body">Install from Cargo, then replace hardcoded ports with one command.</p>
+              <h2 class="mq-section-heading__title" id="install-title">Replace the fixed port.</h2>
+              <p class="mq-section-heading__body">Use <code>trop reserve</code> where a script expects a port.</p>
             </div>
             <div class="mq-code-panel">
               <div class="mq-code-panel__bar">
@@ -266,10 +178,8 @@ const configurationUrl = `${base}guides/configuration/`;
                 <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">cargo install trop-cli</span></div>
                 <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">trop --version</span></div>
                 <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">PORT=$(trop reserve)</span></div>
-                <div class="mq-code-line"><span class="mq-code-line__output"># use in your scripts</span></div>
               </div>
             </div>
-            <p class="landing-requirements">Requires Rust 1.70+ to build from source - macOS and Linux are the primary targets.</p>
           </div>
           <div class="landing-install__vignette" aria-hidden="true"></div>
         </div>

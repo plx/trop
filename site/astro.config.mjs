@@ -8,7 +8,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: "trop",
-      description: "Directory-aware localhost port reservations for worktrees.",
+      description: "A small CLI for stable localhost port numbers per worktree.",
       logo: {
         src: "./src/assets/trop-mark.svg",
         alt: "trop",
