@@ -26,3 +26,8 @@ target
 
 # Runtime lock file created by the Claude Code harness
 .claude/scheduled_tasks.lock
+
+# Astro/Starlight site output and local dependencies
+/site/node_modules/
+/site/dist/
+/site/.astro/

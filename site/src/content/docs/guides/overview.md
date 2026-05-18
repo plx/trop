@@ -1,0 +1,26 @@
+---
+title: Overview
+description: What trop reserves, why it exists, and where it fits.
+---
+
+`trop` is a small Rust CLI for reserving localhost ports in development worktrees. It is meant to replace hardcoded port numbers in scripts with stable, directory-aware reservations.
+
+```bash
+PORT=$(trop reserve)
+npm run dev -- --port "$PORT"
+```
+
+The main guarantee is idempotence: the same worktree and tag get the same reservation on repeated calls, while different worktrees can reserve independently.
+
+## Use Cases
+
+- Running several development worktrees at the same time.
+- Giving concurrent local agents stable ports without a shared spreadsheet.
+- Replacing fixed ports in `just`, `npm`, `cargo`, or shell scripts.
+- Cleaning up stale reservations after a worktree is removed.
+
+## Model
+
+Reservations are keyed by a directory and optional tag. `trop` stores reservations locally and coordinates concurrent callers with a SQLite-backed lock model.
+
+The tool is intentionally local. It coordinates one user account on one machine; it does not try to enforce system-wide policy or broker ports across users, containers, or hosts.

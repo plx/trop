@@ -1,0 +1,44 @@
+---
+title: Usage
+description: Basic commands and script patterns for local port reservations.
+---
+
+Install the CLI from Cargo:
+
+```bash
+cargo install trop-cli
+```
+
+Reserve a port for the current directory:
+
+```bash
+PORT=$(trop reserve)
+```
+
+Use tags when one worktree has multiple services:
+
+```bash
+WEB_PORT=$(trop reserve --tag web)
+API_PORT=$(trop reserve --tag api)
+DB_PORT=$(trop reserve --tag db)
+```
+
+Repeated calls with the same directory and tag return the same port. This keeps scripts stable across restarts without requiring each process to release a port before it exits.
+
+## Service Groups
+
+For recurring multi-service workflows, define reservations in `trop.yaml` and evaluate `trop autoreserve` in the shell:
+
+```yaml
+reservations:
+  services:
+    web:
+      env: WEB_PORT
+    api:
+      offset: 1
+      env: API_PORT
+```
+
+```bash
+eval "$(trop autoreserve)"
+```
