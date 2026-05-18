@@ -42,7 +42,7 @@ jobs:
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt
 
@@ -94,7 +94,7 @@ jobs:
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -121,7 +121,7 @@ jobs:
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy
 
@@ -145,7 +145,7 @@ jobs:
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -177,7 +177,7 @@ jobs:
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt, clippy
 
