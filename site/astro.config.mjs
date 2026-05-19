@@ -1,37 +1,62 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
+import { siteConfig } from "./src/site.config.mjs";
+
+const fontStylesheetUrl =
+  "https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Sans+3:wght@400;500;600;700&display=swap";
+
+const basePath =
+  siteConfig.site.basePath === "/" ? "" : siteConfig.site.basePath;
+/** @param {string} path */
+const siteAsset = (path) => `${basePath}/${path.replace(/^\/+/, "")}`;
 
 export default defineConfig({
-  site: "https://plx.github.io",
-  base: "/trop",
+  site: siteConfig.site.host,
+  base: siteConfig.site.basePath,
   trailingSlash: "always",
   integrations: [
     starlight({
-      title: "trop",
-      description: "A small CLI for stable localhost port numbers per worktree.",
+      title: siteConfig.project.title,
+      description: siteConfig.project.description,
       logo: {
-        src: "./src/assets/trop-mark.svg",
-        alt: "trop",
+        src: "./src/assets/tool-mark.svg",
+        alt: "",
       },
+      customCss: ["./src/styles/starlight.css"],
+      head: [
+        {
+          tag: "link",
+          attrs: { rel: "preconnect", href: "https://fonts.googleapis.com" },
+        },
+        {
+          tag: "link",
+          attrs: {
+            rel: "preconnect",
+            href: "https://fonts.gstatic.com",
+            crossorigin: "",
+          },
+        },
+        { tag: "link", attrs: { rel: "stylesheet", href: fontStylesheetUrl } },
+        {
+          tag: "link",
+          attrs: {
+            rel: "icon",
+            href: siteAsset("favicon.svg"),
+            type: "image/svg+xml",
+          },
+        },
+      ],
       social: [
         {
           icon: "github",
           label: "GitHub",
-          href: "https://github.com/plx/trop",
+          href: siteConfig.repository.url,
         },
       ],
-      customCss: ["./src/styles/starlight.css"],
-      sidebar: [
-        {
-          label: "Guides",
-          items: [
-            { label: "Overview", slug: "guides/overview" },
-            { label: "Usage", slug: "guides/usage" },
-            { label: "Configuration", slug: "guides/configuration" },
-            { label: "Scope", slug: "guides/scope" },
-          ],
-        },
-      ],
+      editLink: {
+        baseUrl: `${siteConfig.repository.url}/edit/${siteConfig.repository.defaultBranch}/site/src/content/docs/`,
+      },
+      sidebar: siteConfig.docs.sidebar,
     }),
   ],
 });

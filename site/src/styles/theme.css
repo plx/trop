@@ -1,0 +1,36 @@
+:root {
+  color-scheme: light;
+  --tool-accent: #3a6b5f;
+  --tool-accent-2: #8ba8b9;
+  --tool-ink: #0b1220;
+  --tool-muted: #36424f;
+  --tool-surface: #f4f6f8;
+  --tool-code: #0b1220;
+  --tool-panel: #ffffff;
+  --tool-line: #dde3e8;
+  --tool-success: #0f9f6e;
+  --tool-warning: #c27803;
+  --tool-radius: 8px;
+  --tool-shadow: 0 22px 70px rgb(17 24 39 / 14%);
+  --tool-font-sans:
+    "Source Sans 3", ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --tool-font-heading:
+    "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --tool-font-mono:
+    "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --tool-ink: #e5edf8;
+    --tool-muted: #9aa8bb;
+    --tool-surface: #0d1117;
+    --tool-panel: #151b23;
+    --tool-line: #303846;
+    --tool-code: #08111f;
+    --tool-shadow: 0 24px 80px rgb(0 0 0 / 35%);
+  }
+}
