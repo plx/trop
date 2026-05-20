@@ -1,21 +1,18 @@
 # trop site
 
-Astro/Starlight static site for `trop`, configured to publish at:
+Static Astro/Starlight site generated from `static-tool-page-template`.
 
-```text
-https://plx.github.io/trop/
+## Common commands
+
+```sh
+just install
+just dev
+just check
+just test
+just build
 ```
 
-## Development
+The site is configured for `https://plx.github.io/trop/` with the GitHub Pages base path `/trop`.
 
-```bash
-npm install
-npm run dev
-```
-
-## Verification
-
-```bash
-npm run check
-npm run build
-```
+The generated Playwright suite runs against mobile, tablet, and desktop projects.
+Use `just install-browsers` once locally before `just test`.
