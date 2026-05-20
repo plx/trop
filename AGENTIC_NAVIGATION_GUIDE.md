@@ -10,7 +10,8 @@
 - about.toml # cargo-about configuration (accepted SPDX ids, target triples)
 - about.hbs # Handlebars template that renders THIRD_PARTY_LICENSES.md
 - .github/ # Repository automation and CI
-  - workflows/deploy-site.yml # Builds and deploys the Astro/Starlight site to GitHub Pages
+  - workflows/site-check.yml # Validates the Astro/Starlight site on pull requests
+  - workflows/site-publish.yml # Builds and deploys the Astro/Starlight site to GitHub Pages
 - reference/ # Authoritative project specifications (DO NOT MODIFY)
   - ImplementationSpecification.md # Complete spec - SOURCE OF TRUTH
 - site/ # Astro/Starlight static website for https://plx.github.io/trop/
