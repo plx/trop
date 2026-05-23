@@ -36,8 +36,18 @@ jobs:
           else
             npm install
           fi
+      - name: Check formatting
+        run: npm run format:check
+      - name: Spellcheck content
+        run: npm run spellcheck
+      - name: Typecheck Astro content
+        run: npm run check
       - name: Build
         run: npm run build
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+      - name: Run validation tests
+        run: npm run test
       - uses: actions/upload-pages-artifact@v4
         with:
           path: site/dist
