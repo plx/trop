@@ -1,204 +1,245 @@
 ---
-import "../styles/tokens.css";
-import "../styles/components.css";
+import markUrl from "../assets/tool-mark.svg?url";
+import { siteConfig } from "../site.config.mjs";
+import "../styles/theme.css";
 import "../styles/landing.css";
 
-const base = import.meta.env.BASE_URL;
-const githubUrl = "https://github.com/plx/trop";
-const docsUrl = `${base}guides/overview/`;
+const siteBase = import.meta.env.BASE_URL.endsWith("/")
+  ? import.meta.env.BASE_URL
+  : `${import.meta.env.BASE_URL}/`;
+const sitePath = (path: string = "") => `${siteBase}${path.replace(/^\/+/, "")}`;
+const isExternal = (href: string) => /^https?:\/\//.test(href);
+const resolveHref = (href: string) =>
+  isExternal(href) || href.startsWith("#") ? href : sitePath(href);
+const externalRel = (href: string) => (isExternal(href) ? "noopener noreferrer" : undefined);
+const externalTarget = (href: string) => (isExternal(href) ? "_blank" : undefined);
+const docsHref = siteConfig.docs.pages[0]?.href || "docs/";
+const harborBackdrop = sitePath("assets/harbor-backdrop.png");
 ---
 
 <!doctype html>
-<html lang="en">
+<html lang={siteConfig.site.language}>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>trop - Port reservations for worktrees</title>
-    <meta
-      name="description"
-      content="A small CLI for stable localhost port numbers per worktree."
+    <title>{siteConfig.project.title} | {siteConfig.project.tagline}</title>
+    <meta name="description" content={siteConfig.project.description} />
+    <meta property="og:title" content={siteConfig.project.title} />
+    <meta property="og:description" content={siteConfig.project.description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={siteConfig.site.url} />
+    <meta name="twitter:card" content="summary" />
+    <link rel="icon" href={sitePath("favicon.svg")} type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Sans+3:wght@400;500;600;700&display=swap"
     />
-    <link rel="icon" href={`${base}favicon.svg`} type="image/svg+xml" />
   </head>
-  <body class="landing-page mq-component-scope" style={`--harbor-backdrop: url("${base}assets/harbor-backdrop.png")`}>
-    <header class="mq-site-header landing-nav" data-mq-nav>
-      <div class="mq-site-header__inner">
-        <a class="mq-site-header__brand" href={base} aria-label="trop home">
-          <span class="mq-site-header__mark" aria-hidden="true">
-            <svg class="mq-icon" viewBox="0 0 24 24" fill="none" stroke-width="2">
-              <path d="M4 18h16"></path>
-              <path d="M7 18V9l5-3 5 3v9"></path>
-              <path d="M9 18v-5h6v5"></path>
-            </svg>
-          </span>
-          <span>trop</span>
+  <body class="landing-page" style={`--harbor-backdrop: url("${harborBackdrop}")`}>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header" data-site-header>
+      <nav class="site-nav" aria-label="Primary navigation">
+        <a class="site-nav__brand" href={sitePath()} aria-label={`${siteConfig.project.title} home`}>
+          <img src={markUrl} alt="" width="36" height="36" />
+          <span>{siteConfig.project.title}</span>
         </a>
-        <nav class="mq-site-header__nav" aria-label="Primary">
-          <a class="mq-site-header__nav-link" href={docsUrl}>Docs</a>
-          <a class="mq-site-header__nav-link" href="#model">Model</a>
-          <a class="mq-site-header__nav-link" href="#install">Install</a>
-          <a class="mq-site-header__nav-link" href={githubUrl}>GitHub</a>
-        </nav>
-        <div class="mq-site-header__actions">
-          <a class="mq-button mq-button--secondary mq-button--sm" href={githubUrl}>View on GitHub</a>
-          <button class="mq-site-header__toggle" type="button" aria-label="Open navigation" aria-controls="landing-nav-panel" aria-expanded="false">
-            <svg class="mq-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke-width="2">
-              <path d="M4 7h16"></path>
-              <path d="M4 12h16"></path>
-              <path d="M4 17h16"></path>
+
+        <div class="site-nav__links">
+          {siteConfig.landing.nav.map((link) => (
+            <a
+              class="site-nav__link"
+              href={resolveHref(link.href)}
+              target={externalTarget(link.href)}
+              rel={externalRel(link.href)}
+            >
+              {link.label}
+            </a>
+          ))}
+        </div>
+
+        <div class="site-nav__actions">
+          <a class="button button--ghost button--sm" href={resolveHref(docsHref)}>Docs</a>
+          <button
+            class="site-nav__toggle"
+            type="button"
+            aria-label="Open navigation"
+            aria-controls="mobile-nav"
+            aria-expanded="false"
+            data-nav-toggle
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 7h16M4 12h16M4 17h16"></path>
             </svg>
           </button>
         </div>
-      </div>
-      <nav class="mq-site-header__panel" id="landing-nav-panel" aria-label="Mobile primary" hidden>
-        <a class="mq-site-header__panel-link" href={docsUrl}>Docs</a>
-        <a class="mq-site-header__panel-link" href="#model">Model</a>
-        <a class="mq-site-header__panel-link" href="#install">Install</a>
-        <a class="mq-site-header__panel-link" href={githubUrl}>GitHub</a>
       </nav>
+
+      <div class="mobile-nav" id="mobile-nav" data-nav-panel hidden>
+        {siteConfig.landing.nav.map((link) => (
+          <a
+            class="mobile-nav__link"
+            href={resolveHref(link.href)}
+            target={externalTarget(link.href)}
+            rel={externalRel(link.href)}
+            data-nav-link
+          >
+            {link.label}
+          </a>
+        ))}
+      </div>
     </header>
 
-    <main id="top">
-      <section class="landing-hero" aria-labelledby="hero-title">
-        <div class="landing-hero__media" aria-hidden="true"></div>
-        <div class="landing-container landing-hero__inner">
-          <div class="landing-hero__content">
-            <p class="landing-eyebrow">localhost port reservations</p>
-            <h1 id="hero-title">trop</h1>
-            <p class="landing-hero__lede">
-              Reserve a stable port for the current directory. Add a tag when one worktree runs more than one service.
-            </p>
-            <div class="landing-actions">
-              <a class="mq-button mq-button--primary" href="#install">
-                <svg class="mq-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke-width="2">
-                  <path d="M12 5v14"></path>
-                  <path d="m19 12-7 7-7-7"></path>
-                </svg>
-                Install
-              </a>
-              <a class="mq-button mq-button--secondary" href={docsUrl}>Read docs</a>
-            </div>
-            <div class="mq-code-panel landing-hero__code">
-              <div class="mq-code-panel__bar">
-                <span class="mq-code-panel__title">shell</span>
-                <button class="mq-code-panel__copy" type="button">copy</button>
-              </div>
-              <div class="mq-code-panel__body" role="region" aria-label="Basic trop reserve command">
-                <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">PORT=$(trop reserve)</span></div>
-                <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">npm run dev -- --port $PORT</span></div>
-              </div>
-            </div>
+    <main id="main">
+      <section class="hero section-shell" aria-labelledby="hero-title">
+        <div class="hero__copy">
+          <p class="eyebrow">{siteConfig.project.category}</p>
+          <div class="hero__brand-line">
+            <img src={markUrl} alt="" width="64" height="64" />
+            <h1 id="hero-title">{siteConfig.project.title}</h1>
           </div>
+          <p class="hero__lede">{siteConfig.project.tagline}</p>
+          <p class="hero__body">{siteConfig.project.description}</p>
+
+          <div class="badge-row" aria-label="Project highlights">
+            {siteConfig.landing.badges.map((badge) => <span class="badge">{badge}</span>)}
+          </div>
+
+          <div class="hero__actions">
+            <a class="button button--primary" href={resolveHref(siteConfig.landing.primaryCta.href)}>
+              {siteConfig.landing.primaryCta.label}
+              <svg class="button__icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M5 12h14M13 6l6 6-6 6"></path>
+              </svg>
+            </a>
+            <a
+              class="button button--secondary"
+              href={resolveHref(siteConfig.landing.secondaryCta.href)}
+              target={externalTarget(siteConfig.landing.secondaryCta.href)}
+              rel={externalRel(siteConfig.landing.secondaryCta.href)}
+            >
+              {siteConfig.landing.secondaryCta.label}
+            </a>
+          </div>
+        </div>
+
+        <div class="command-card" aria-labelledby="command-card-title">
+          <div class="command-card__header">
+            <div>
+              <p class="eyebrow">Terminal</p>
+              <h2 id="command-card-title">{siteConfig.landing.terminal.title}</h2>
+            </div>
+            <span>{siteConfig.landing.terminal.meta}</span>
+          </div>
+          <pre class="command-card__body"><code>{siteConfig.landing.terminal.lines.join("\n")}</code></pre>
+          <button
+            class="copy-button"
+            type="button"
+            data-copy-text={siteConfig.landing.terminal.copy}
+            aria-label={`Copy command: ${siteConfig.landing.terminal.copy}`}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="8" y="8" width="11" height="12" rx="2"></rect>
+              <path d="M5 15V6a2 2 0 0 1 2-2h9"></path>
+            </svg>
+            <span>Copy</span>
+            <span class="sr-only" data-copy-status aria-live="polite"></span>
+          </button>
         </div>
       </section>
 
-      <section class="landing-section landing-container" id="model" aria-labelledby="reservations-title">
-        <div class="mq-section-heading">
-          <p class="mq-section-heading__eyebrow">Reservation model</p>
-          <h2 class="mq-section-heading__title" id="reservations-title">Same key, same port.</h2>
-          <p class="mq-section-heading__body">
+      <section class="section section-shell model-strip" id="model" aria-labelledby="model-title">
+        <div class="section-heading">
+          <p class="eyebrow">Reservation model</p>
+          <h2 id="model-title">Same key, same port.</h2>
+          <p>
             Reservations are keyed by directory and optional tag. Repeated calls return the same port.
           </p>
         </div>
       </section>
 
-      <section class="landing-section landing-container" id="docs" aria-labelledby="features-title">
-        <div class="mq-section-heading">
-          <p class="mq-section-heading__eyebrow">What trop provides</p>
-          <h2 class="mq-section-heading__title" id="features-title">Small guarantees for boring local ports</h2>
-          <p class="mq-section-heading__body">
-            The scope is deliberately narrow: predictable localhost port numbers for one user account, across local processes and worktrees.
-          </p>
-        </div>
-        <div class="mq-card-grid">
-          <article class="mq-feature-card">
-            <div class="mq-feature-card__icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" stroke-width="2"><path d="M21 12a9 9 0 0 1-15.5 6.2"></path><path d="M3 12A9 9 0 0 1 18.5 5.8"></path><path d="M18 3v4h-4"></path><path d="M6 21v-4h4"></path></svg>
-            </div>
-            <p class="mq-feature-card__eyebrow">Idempotent</p>
-            <h3 class="mq-feature-card__title">Same directory, same port</h3>
-            <p class="mq-feature-card__body">Run <code>trop reserve</code> again from the same worktree and get the same number.</p>
-          </article>
-          <article class="mq-feature-card">
-            <div class="mq-feature-card__icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" stroke-width="2"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8Z"></path><path d="M7 7h.01"></path></svg>
-            </div>
-            <p class="mq-feature-card__eyebrow">Tagged</p>
-            <h3 class="mq-feature-card__title">Tags split services</h3>
-            <p class="mq-feature-card__body">Use <code>--tag web</code>, <code>--tag api</code>, or similar names when one worktree needs multiple ports.</p>
-          </article>
-          <article class="mq-feature-card">
-            <div class="mq-feature-card__icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg>
-            </div>
-            <p class="mq-feature-card__eyebrow">Concurrent</p>
-            <h3 class="mq-feature-card__title">SQLite coordinates callers</h3>
-            <p class="mq-feature-card__body">Concurrent invocations share a local SQLite database.</p>
-          </article>
-          <article class="mq-feature-card">
-            <div class="mq-feature-card__icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" stroke-width="2"><path d="m3 6 3 1 1-3"></path><path d="M6 7a9 9 0 0 1 14 4"></path><path d="M21 18l-3-1-1 3"></path><path d="M18 17A9 9 0 0 1 4 13"></path></svg>
-            </div>
-            <p class="mq-feature-card__eyebrow">Cleanup</p>
-            <h3 class="mq-feature-card__title">Prune deleted worktrees</h3>
-            <p class="mq-feature-card__body">Remove reservations whose directories no longer exist.</p>
-          </article>
-        </div>
-      </section>
-
-      <section class="landing-section landing-container landing-scope" aria-labelledby="scope-title">
-        <div class="mq-callout">
-          <div class="mq-callout__content">
-            <div>
-              <h2 class="mq-callout__title" id="scope-title">Scope</h2>
-              <p class="mq-callout__body">Single-user coordination on one machine.</p>
-            </div>
-            <div>
-              <h3 class="mq-callout__title">Non-goals</h3>
-              <p class="mq-callout__body">No system-wide enforcement. No multi-user broker. No container orchestration.</p>
-            </div>
+      <section class="section section--muted" id="features" aria-labelledby="features-title">
+        <div class="section-shell">
+          <div class="section-heading">
+            <p class="eyebrow">What trop provides</p>
+            <h2 id="features-title">Small guarantees for boring local ports</h2>
+          </div>
+          <div class="feature-grid">
+            {siteConfig.landing.features.map((feature, index) => (
+              <article class="feature-card">
+                <span class="feature-card__index" aria-hidden="true">{String(index + 1).padStart(2, "0")}</span>
+                <p class="feature-card__eyebrow">{feature.eyebrow}</p>
+                <h3>{feature.title}</h3>
+                <p>{feature.body}</p>
+                <a class="text-link" href={resolveHref(feature.href)}>Learn more</a>
+              </article>
+            ))}
           </div>
         </div>
       </section>
 
-      <section class="landing-section landing-install" id="install" aria-labelledby="install-title">
-        <div class="landing-container landing-install__inner">
-          <div class="landing-install__content">
-            <div class="mq-section-heading">
-              <p class="mq-section-heading__eyebrow">Install</p>
-              <h2 class="mq-section-heading__title" id="install-title">Replace the fixed port.</h2>
-              <p class="mq-section-heading__body">Use <code>trop reserve</code> where a script expects a port.</p>
-            </div>
-            <div class="mq-code-panel">
-              <div class="mq-code-panel__bar">
-                <span class="mq-code-panel__title">terminal</span>
-                <button class="mq-code-panel__copy" type="button">copy</button>
-              </div>
-              <div class="mq-code-panel__body" role="region" aria-label="Install commands">
-                <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">cargo install trop-cli</span></div>
-                <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">trop --version</span></div>
-                <div class="mq-code-line"><span class="mq-code-line__prompt">$</span><span class="mq-code-line__command">PORT=$(trop reserve)</span></div>
-              </div>
-            </div>
+      <section class="section section-shell scope-strip" aria-labelledby="scope-title">
+        <div class="scope-panel">
+          <div>
+            <p class="eyebrow">Scope</p>
+            <h2 id="scope-title">Single-user coordination on one machine.</h2>
           </div>
-          <div class="landing-install__vignette" aria-hidden="true"></div>
+          <div>
+            <p class="scope-panel__label">Non-goals</p>
+            <p>No system-wide enforcement. No multi-user broker. No container orchestration.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section section-shell docs-preview" aria-labelledby="docs-title">
+        <div class="section-heading">
+          <p class="eyebrow">Documentation</p>
+          <h2 id="docs-title">Keep detailed guidance in Starlight.</h2>
+        </div>
+        <div class="docs-grid">
+          {siteConfig.docs.pages.map((page) => (
+            <article class="doc-card">
+              <h3>{page.title}</h3>
+              <p>{page.description}</p>
+              <a class="text-link" href={resolveHref(page.href)}>Open page</a>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <section class="section section--muted install-strip" id="install" aria-labelledby="install-title">
+        <div class="section-shell install-strip__inner">
+          <div class="section-heading">
+            <p class="eyebrow">Install</p>
+            <h2 id="install-title">Replace the fixed port.</h2>
+            <p>Use <code>trop reserve</code> where a script expects a port.</p>
+          </div>
+          <div class="command-card command-card--compact" aria-label="Install commands">
+            <pre class="command-card__body"><code>$ cargo install trop-cli
+$ trop --version
+$ PORT=$(trop reserve)</code></pre>
+          </div>
         </div>
       </section>
     </main>
 
-    <footer class="landing-footer">
-      <div class="landing-container landing-footer__inner">
-        <p>trop - a Rust CLI for port reservations</p>
+    <footer class="site-footer">
+      <div class="section-shell site-footer__inner">
+        <p>{siteConfig.project.title} / {siteConfig.project.category}</p>
         <nav aria-label="Footer">
-          <a class="mq-link" href={docsUrl}>Docs</a>
-          <a class="mq-link" href="#model">Model</a>
-          <a class="mq-link" href="#install">Install</a>
-          <a class="mq-link" href={githubUrl}>GitHub</a>
-          <span>MIT License</span>
+          {siteConfig.landing.footerLinks.map((link) => (
+            <a href={resolveHref(link.href)} target={externalTarget(link.href)} rel={externalRel(link.href)}>
+              {link.label}
+            </a>
+          ))}
         </nav>
       </div>
     </footer>
 
-    <script is:inline src={`${base}scripts/components.js`} defer></script>
+    <script>
+      import "../scripts/landing.ts";
+    </script>
   </body>
 </html>
