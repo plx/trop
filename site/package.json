@@ -18,7 +18,7 @@
     "validate": "npm run lint && npm run build && npm run test"
   },
   "dependencies": {
-    "@astrojs/starlight": "^0.39.0",
+    "@astrojs/starlight": "^0.39.3",
     "astro": "^6.0.0"
   },
   "devDependencies": {
