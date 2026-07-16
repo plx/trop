@@ -1,0 +1,25 @@
+<!-- @dsCard group="Colors" viewport="760x180" name="Dark theme" subtitle="The same tokens under a forced dark theme — harbor-night navy surfaces, ink, accent & terminal" -->
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../styles.css">
+<style>
+  body { margin: 0; font-family: var(--font-body); background: var(--surface-page); color: var(--tool-ink); }
+  .row { display: flex; gap: 14px; padding: 20px; align-items: stretch; }
+  .sw { flex: 1; }
+  .chip { height: 68px; border-radius: var(--tool-radius); border: 1px solid var(--tool-line); display: flex; align-items: center; justify-content: center; font-family: var(--font-mono); font-size: 12px; color: var(--tool-ink); }
+  .name { margin-top: 8px; font-size: 13px; font-weight: 800; color: var(--tool-ink); }
+  .hex { font-family: var(--font-mono); font-size: 12px; color: var(--tool-muted); }
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="sw"><div class="chip" style="background:var(--surface-page)">Page</div><div class="name">Surface</div><div class="hex">#0c1421</div></div>
+    <div class="sw"><div class="chip" style="background:var(--surface-card)">Card</div><div class="name">Panel</div><div class="hex">#141d2b</div></div>
+    <div class="sw"><div class="chip" style="background:var(--tool-accent);color:#08121a">Accent</div><div class="name">Harbor green</div><div class="hex">#6fb19d</div></div>
+    <div class="sw"><div class="chip" style="background:var(--tool-warm);color:#1a1206">Warm</div><div class="name">Dock amber</div><div class="hex">#f2d9a8</div></div>
+    <div class="sw"><div class="chip" style="background:var(--tool-code);color:var(--tool-code-ink)">$(trop reserve)</div><div class="name">Terminal</div><div class="hex">#0a1220 · #dbeafe</div></div>
+  </div>
+</body>
+</html>

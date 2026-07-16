@@ -1,0 +1,9 @@
+/* trop — Webfonts
+ * The trop site loads its three families from Google Fonts. We mirror that
+ * here so consumers get the exact typefaces. If you prefer self-hosted
+ * binaries, replace these @import lines with @font-face rules.
+ *
+ * Families: IBM Plex Sans (display), Source Sans 3 (body), JetBrains Mono (code).
+ */
+
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Source+Sans+3:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap");

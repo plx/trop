@@ -2,6 +2,59 @@ const navToggle =
   document.querySelector<HTMLButtonElement>("[data-nav-toggle]");
 const navPanel = document.querySelector<HTMLElement>("[data-nav-panel]");
 const navLinks = document.querySelectorAll<HTMLElement>("[data-nav-link]");
+const themeToggle = document.querySelector<HTMLElement>("[data-theme-toggle]");
+const themeButtons =
+  document.querySelectorAll<HTMLButtonElement>("[data-theme-mode]");
+
+type ThemeMode = "system" | "light" | "dark";
+const themeStorageKey = "trop-theme";
+
+function readTheme(): ThemeMode {
+  try {
+    const storedTheme = window.localStorage.getItem(themeStorageKey);
+    if (storedTheme === "light" || storedTheme === "dark") {
+      return storedTheme;
+    }
+  } catch {
+    // Storage can be unavailable in privacy-restricted browsing contexts.
+  }
+
+  return "system";
+}
+
+function setTheme(mode: ThemeMode): void {
+  if (mode === "system") {
+    document.documentElement.removeAttribute("data-theme");
+  } else {
+    document.documentElement.dataset.theme = mode;
+  }
+
+  try {
+    window.localStorage.setItem(themeStorageKey, mode);
+  } catch {
+    // The theme still applies for this page when persistence is unavailable.
+  }
+
+  themeButtons.forEach((button) => {
+    button.setAttribute(
+      "aria-checked",
+      String(button.dataset.themeMode === mode),
+    );
+  });
+
+  themeToggle?.setAttribute("data-theme-selection", mode);
+}
+
+setTheme(readTheme());
+
+themeButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    const mode = button.dataset.themeMode;
+    if (mode === "system" || mode === "light" || mode === "dark") {
+      setTheme(mode);
+    }
+  });
+});
 
 function setNavOpen(open: boolean): void {
   if (!navToggle || !navPanel) {

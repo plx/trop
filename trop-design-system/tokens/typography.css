@@ -1,0 +1,50 @@
+/* trop — Typography tokens
+ * Three families: IBM Plex Sans for display/headings (heavy, tight),
+ * Source Sans 3 for body/UI, JetBrains Mono for code & command output.
+ */
+
+:root {
+  /* ---- Families ---- */
+  --tool-font-sans:
+    "Source Sans 3", ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --tool-font-heading:
+    "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --tool-font-mono:
+    "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+
+  /* Semantic family aliases */
+  --font-display: var(--tool-font-heading);
+  --font-body: var(--tool-font-sans);
+  --font-mono: var(--tool-font-mono);
+
+  /* ---- Type scale (fluid where the brand uses it) ---- */
+  --text-hero: clamp(4.75rem, 12vw, 7.5rem);   /* huge display H1 */
+  --text-display: clamp(2rem, 5vw, 3.5rem);    /* section headings */
+  --text-lede: clamp(1.5rem, 4vw, 2.85rem);    /* hero lede */
+  --text-h3: 1.18rem;
+  --text-lg: 1.2rem;
+  --text-body-lg: 1.08rem;
+  --text-base: 1rem;
+  --text-sm: 0.9rem;
+  --text-xs: 0.84rem;
+  --text-eyebrow: 0.78rem;
+  --text-mono-sm: 0.82rem;
+
+  /* ---- Weights ---- */
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-bold: 700;
+  --weight-heavy: 800;
+
+  /* ---- Line heights ---- */
+  --leading-display: 0.9;    /* hero H1 */
+  --leading-tight: 1.05;     /* section headings */
+  --leading-snug: 1.1;
+  --leading-normal: 1.5;     /* body */
+  --leading-code: 1.75;      /* command output */
+
+  /* ---- Letter spacing ---- */
+  --tracking-eyebrow: 0.02em;
+}

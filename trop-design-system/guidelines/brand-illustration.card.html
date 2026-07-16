@@ -1,0 +1,30 @@
+<!-- @dsCard group="Brand" viewport="700x300" name="Harbor illustration" subtitle="Fine-line engraving — blue-grey-on-cream day view (light) and harbor-night view (dark)" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../styles.css">
+<style>
+  body { margin: 0; font-family: var(--font-body); background: var(--surface-page); }
+  .wrap { padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .cell { display: flex; flex-direction: column; gap: 6px; }
+  .frame { border: 1px solid var(--tool-line); border-radius: var(--tool-radius); overflow: hidden; height: 200px; }
+  .frame img { width: 100%; height: 100%; object-fit: cover; object-position: right center; display: block; }
+  .frame.day { background: #fbfcfd; }
+  .frame.night { background: #0c1421; }
+  .tag { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--tool-muted); }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="cell">
+      <div class="frame day"><img src="../assets/harbor-backdrop.png" alt="Harbor at day — container ship, cranes and bollards, blue-grey ink on cream"></div>
+      <span class="tag">Light — day</span>
+    </div>
+    <div class="cell">
+      <div class="frame night"><img src="../assets/harbor-backdrop-dark.png" alt="Harbor at night — moonlit sky, lit ship and cranes, buoy on the water"></div>
+      <span class="tag">Dark — harbor night</span>
+    </div>
+  </div>
+</body>
+</html>

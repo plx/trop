@@ -1,50 +1,33 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
+import { fileURLToPath } from "node:url";
 import { siteConfig } from "./src/site.config.mjs";
 
-const fontStylesheetUrl =
-  "https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Sans+3:wght@400;500;600;700&display=swap";
-
-const basePath =
-  siteConfig.site.basePath === "/" ? "" : siteConfig.site.basePath;
-/** @param {string} path */
-const siteAsset = (path) => `${basePath}/${path.replace(/^\/+/, "")}`;
+const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 
 export default defineConfig({
   site: siteConfig.site.host,
   base: siteConfig.site.basePath,
   trailingSlash: "always",
+  vite: {
+    server: {
+      fs: {
+        allow: [repositoryRoot],
+      },
+    },
+  },
   integrations: [
     starlight({
       title: siteConfig.project.title,
       description: siteConfig.project.description,
       logo: {
-        src: "./src/assets/tool-mark.svg",
+        src: "@trop/design-system/assets/tool-mark.svg",
         alt: "",
       },
-      customCss: ["./src/styles/starlight.css"],
-      head: [
-        {
-          tag: "link",
-          attrs: { rel: "preconnect", href: "https://fonts.googleapis.com" },
-        },
-        {
-          tag: "link",
-          attrs: {
-            rel: "preconnect",
-            href: "https://fonts.gstatic.com",
-            crossorigin: "",
-          },
-        },
-        { tag: "link", attrs: { rel: "stylesheet", href: fontStylesheetUrl } },
-        {
-          tag: "link",
-          attrs: {
-            rel: "icon",
-            href: siteAsset("favicon.svg"),
-            type: "image/svg+xml",
-          },
-        },
+      favicon: "/favicon.svg",
+      customCss: [
+        "@trop/design-system/styles.css",
+        "./src/styles/starlight.css",
       ],
       social: [
         {

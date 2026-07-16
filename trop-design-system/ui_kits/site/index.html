@@ -1,0 +1,72 @@
+<!-- @dsCard group="Site" viewport="1280x760" name="Landing page" subtitle="Full trop marketing + docs landing page" -->
+<!-- @startingPoint section="Site" subtitle="trop marketing landing page" viewport="1280x760" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>trop — stable localhost ports for agentic coding</title>
+<link rel="icon" href="../../assets/favicon.svg">
+<link rel="stylesheet" href="../../styles.css">
+<script>
+  (function () {
+    try {
+      var m = localStorage.getItem("trop-theme");
+      if (m === "light" || m === "dark") document.documentElement.setAttribute("data-theme", m);
+    } catch (e) {}
+  })();
+</script>
+<script src="../../_ds_bundle.js"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<style>
+  html { scroll-behavior: smooth; }
+  body { margin: 0; }
+  a { color: var(--tool-accent); }
+  a:hover { color: color-mix(in srgb, var(--tool-accent) 80%, #000); }
+  /* Hero engraving. Day view (blue-grey on cream) in light; the commissioned
+     harbor-night view in dark. */
+  .hero-art {
+    background:
+      linear-gradient(90deg,
+        color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
+        color-mix(in srgb, var(--surface-page) 86%, transparent) 39%,
+        color-mix(in srgb, var(--surface-page) 24%, transparent) 70%),
+      url(../../assets/harbor-backdrop.png) right center / cover no-repeat;
+    opacity: 0.96;
+  }
+  [data-theme="dark"] .hero-art {
+    background:
+      linear-gradient(90deg,
+        color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
+        color-mix(in srgb, var(--surface-page) 82%, transparent) 39%,
+        color-mix(in srgb, var(--surface-page) 14%, transparent) 70%),
+      url(../../assets/harbor-backdrop-dark.png) right center / cover no-repeat;
+    opacity: 1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .hero-art {
+      background:
+        linear-gradient(90deg,
+          color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
+          color-mix(in srgb, var(--surface-page) 82%, transparent) 39%,
+          color-mix(in srgb, var(--surface-page) 14%, transparent) 70%),
+        url(../../assets/harbor-backdrop-dark.png) right center / cover no-repeat;
+      opacity: 1;
+    }
+  }
+  @media (max-width: 860px) {
+    .nav-links { display: none !important; }
+    .feature-grid, .docs-grid, .install-grid { grid-template-columns: 1fr !important; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react" src="screens.jsx"></script>
+<script type="text/babel" data-presets="react">
+  ReactDOM.createRoot(document.getElementById("root")).render(<TropSite/>);
+</script>
+</body>
+</html>

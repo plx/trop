@@ -1,8 +1,8 @@
 ---
-import markUrl from "../assets/tool-mark.svg?url";
+import markUrl from "@trop/design-system/assets/tool-mark.svg?url";
+import "@trop/design-system/site.css";
+import "@trop/design-system/styles.css";
 import { siteConfig } from "../site.config.mjs";
-import "../styles/theme.css";
-import "../styles/landing.css";
 
 const siteBase = import.meta.env.BASE_URL.endsWith("/")
   ? import.meta.env.BASE_URL
@@ -14,7 +14,6 @@ const resolveHref = (href: string) =>
 const externalRel = (href: string) => (isExternal(href) ? "noopener noreferrer" : undefined);
 const externalTarget = (href: string) => (isExternal(href) ? "_blank" : undefined);
 const docsHref = siteConfig.docs.pages[0]?.href || "docs/";
-const harborBackdrop = sitePath("assets/harbor-backdrop.png");
 ---
 
 <!doctype html>
@@ -30,14 +29,20 @@ const harborBackdrop = sitePath("assets/harbor-backdrop.png");
     <meta property="og:url" content={siteConfig.site.url} />
     <meta name="twitter:card" content="summary" />
     <link rel="icon" href={sitePath("favicon.svg")} type="image/svg+xml" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      rel="stylesheet"
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Sans+3:wght@400;500;600;700&display=swap"
-    />
+    <script is:inline>
+      (() => {
+        try {
+          const theme = localStorage.getItem("trop-theme");
+          if (theme === "light" || theme === "dark") {
+            document.documentElement.dataset.theme = theme;
+          }
+        } catch {
+          // Storage can be unavailable in privacy-restricted browsing contexts.
+        }
+      })();
+    </script>
   </head>
-  <body class="landing-page" style={`--harbor-backdrop: url("${harborBackdrop}")`}>
+  <body class="landing-page">
     <a class="skip-link" href="#main">Skip to content</a>
 
     <header class="site-header" data-site-header>
@@ -61,7 +66,43 @@ const harborBackdrop = sitePath("assets/harbor-backdrop.png");
         </div>
 
         <div class="site-nav__actions">
-          <a class="button button--ghost button--sm" href={resolveHref(docsHref)}>Docs</a>
+          <div
+            class="theme-toggle"
+            role="radiogroup"
+            aria-label="Color theme"
+            data-ds-component="ThemeToggle"
+            data-theme-toggle
+          >
+            <button type="button" role="radio" data-theme-mode="system" title="System">
+              <span class="sr-only">System</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="2" y="3" width="20" height="14" rx="2"></rect>
+                <path d="M8 21h8M12 17v4"></path>
+              </svg>
+            </button>
+            <button type="button" role="radio" data-theme-mode="light" title="Light">
+              <span class="sr-only">Light</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="4"></circle>
+                <path
+                  d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"
+                ></path>
+              </svg>
+            </button>
+            <button type="button" role="radio" data-theme-mode="dark" title="Dark">
+              <span class="sr-only">Dark</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path>
+              </svg>
+            </button>
+          </div>
+          <a
+            class="button button--ghost button--sm"
+            href={resolveHref(docsHref)}
+            data-ds-component="Button"
+            data-ds-variant="ghost"
+            data-ds-size="sm"
+          >Docs</a>
           <button
             class="site-nav__toggle"
             type="button"
@@ -95,7 +136,7 @@ const harborBackdrop = sitePath("assets/harbor-backdrop.png");
     <main id="main">
       <section class="hero section-shell" aria-labelledby="hero-title">
         <div class="hero__copy">
-          <p class="eyebrow">{siteConfig.project.category}</p>
+          <p class="eyebrow" data-ds-component="Eyebrow">{siteConfig.project.category}</p>
           <div class="hero__brand-line">
             <img src={markUrl} alt="" width="64" height="64" />
             <h1 id="hero-title">{siteConfig.project.title}</h1>
@@ -104,11 +145,19 @@ const harborBackdrop = sitePath("assets/harbor-backdrop.png");
           <p class="hero__body">{siteConfig.project.description}</p>
 
           <div class="badge-row" aria-label="Project highlights">
-            {siteConfig.landing.badges.map((badge) => <span class="badge">{badge}</span>)}
+            {siteConfig.landing.badges.map((badge) => (
+              <span class="badge" data-ds-component="Badge" data-ds-tone="default">{badge}</span>
+            ))}
           </div>
 
           <div class="hero__actions">
-            <a class="button button--primary" href={resolveHref(siteConfig.landing.primaryCta.href)}>
+            <a
+              class="button button--primary"
+              href={resolveHref(siteConfig.landing.primaryCta.href)}
+              data-ds-component="Button"
+              data-ds-variant="primary"
+              data-ds-size="md"
+            >
               {siteConfig.landing.primaryCta.label}
               <svg class="button__icon" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M5 12h14M13 6l6 6-6 6"></path>
@@ -119,16 +168,23 @@ const harborBackdrop = sitePath("assets/harbor-backdrop.png");
               href={resolveHref(siteConfig.landing.secondaryCta.href)}
               target={externalTarget(siteConfig.landing.secondaryCta.href)}
               rel={externalRel(siteConfig.landing.secondaryCta.href)}
+              data-ds-component="Button"
+              data-ds-variant="secondary"
+              data-ds-size="md"
             >
               {siteConfig.landing.secondaryCta.label}
             </a>
           </div>
         </div>
 
-        <div class="command-card" aria-labelledby="command-card-title">
+        <div
+          class="command-card"
+          aria-labelledby="command-card-title"
+          data-ds-component="CommandCard"
+        >
           <div class="command-card__header">
             <div>
-              <p class="eyebrow">Terminal</p>
+              <p class="eyebrow" data-ds-component="Eyebrow">Terminal</p>
               <h2 id="command-card-title">{siteConfig.landing.terminal.title}</h2>
             </div>
             <span>{siteConfig.landing.terminal.meta}</span>
@@ -139,6 +195,7 @@ const harborBackdrop = sitePath("assets/harbor-backdrop.png");
             type="button"
             data-copy-text={siteConfig.landing.terminal.copy}
             aria-label={`Copy command: ${siteConfig.landing.terminal.copy}`}
+            data-ds-component="CopyButton"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <rect x="8" y="8" width="11" height="12" rx="2"></rect>
@@ -152,7 +209,7 @@ const harborBackdrop = sitePath("assets/harbor-backdrop.png");
 
       <section class="section section-shell model-strip" id="model" aria-labelledby="model-title">
         <div class="section-heading">
-          <p class="eyebrow">Reservation model</p>
+          <p class="eyebrow" data-ds-component="Eyebrow">Reservation model</p>
           <h2 id="model-title">Same key, same port.</h2>
           <p>
             Reservations are keyed by directory and optional tag. Repeated calls return the same port.
@@ -163,12 +220,12 @@ const harborBackdrop = sitePath("assets/harbor-backdrop.png");
       <section class="section section--muted" id="features" aria-labelledby="features-title">
         <div class="section-shell">
           <div class="section-heading">
-            <p class="eyebrow">What trop provides</p>
+            <p class="eyebrow" data-ds-component="Eyebrow">What trop provides</p>
             <h2 id="features-title">Small guarantees for boring local ports</h2>
           </div>
           <div class="feature-grid">
             {siteConfig.landing.features.map((feature, index) => (
-              <article class="feature-card">
+              <article class="feature-card" data-ds-component="FeatureCard">
                 <span class="feature-card__index" aria-hidden="true">{String(index + 1).padStart(2, "0")}</span>
                 <p class="feature-card__eyebrow">{feature.eyebrow}</p>
                 <h3>{feature.title}</h3>
@@ -181,9 +238,9 @@ const harborBackdrop = sitePath("assets/harbor-backdrop.png");
       </section>
 
       <section class="section section-shell scope-strip" aria-labelledby="scope-title">
-        <div class="scope-panel">
+        <div class="scope-panel" data-ds-component="ScopePanel">
           <div>
-            <p class="eyebrow">Scope</p>
+            <p class="eyebrow" data-ds-component="Eyebrow">Scope</p>
             <h2 id="scope-title">Single-user coordination on one machine.</h2>
           </div>
           <div>
@@ -195,12 +252,12 @@ const harborBackdrop = sitePath("assets/harbor-backdrop.png");
 
       <section class="section section-shell docs-preview" aria-labelledby="docs-title">
         <div class="section-heading">
-          <p class="eyebrow">Documentation</p>
+          <p class="eyebrow" data-ds-component="Eyebrow">Documentation</p>
           <h2 id="docs-title">Keep detailed guidance in Starlight.</h2>
         </div>
         <div class="docs-grid">
           {siteConfig.docs.pages.map((page) => (
-            <article class="doc-card">
+            <article class="doc-card" data-ds-component="DocCard">
               <h3>{page.title}</h3>
               <p>{page.description}</p>
               <a class="text-link" href={resolveHref(page.href)}>Open page</a>
@@ -212,11 +269,16 @@ const harborBackdrop = sitePath("assets/harbor-backdrop.png");
       <section class="section section--muted install-strip" id="install" aria-labelledby="install-title">
         <div class="section-shell install-strip__inner">
           <div class="section-heading">
-            <p class="eyebrow">Install</p>
+            <p class="eyebrow" data-ds-component="Eyebrow">Install</p>
             <h2 id="install-title">Replace the fixed port.</h2>
             <p>Use <code>trop reserve</code> where a script expects a port.</p>
           </div>
-          <div class="command-card command-card--compact" aria-label="Install commands">
+          <div
+            class="command-card command-card--compact"
+            aria-label="Install commands"
+            data-ds-component="CommandCard"
+            data-ds-compact="true"
+          >
             <pre class="command-card__body"><code>$ cargo install trop-cli
 $ trop --version
 $ PORT=$(trop reserve)</code></pre>

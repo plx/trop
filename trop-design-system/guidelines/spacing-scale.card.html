@@ -1,0 +1,25 @@
+<!-- @dsCard group="Spacing" viewport="700x170" name="Spacing scale" subtitle="rem-based steps used for padding & gaps" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../styles.css">
+<style>
+  body { margin: 0; font-family: var(--font-body); background: var(--surface-page); color: var(--tool-ink); }
+  .wrap { padding: 22px 24px; display: flex; align-items: flex-end; gap: 14px; }
+  .col { text-align: center; }
+  .bar { background: var(--tool-accent); border-radius: 3px; width: 26px; }
+  .lbl { margin-top: 8px; font-family: var(--font-mono); font-size: 11px; color: var(--tool-muted); }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="col"><div class="bar" style="height:4px"></div><div class="lbl">1 · 4px</div></div>
+    <div class="col"><div class="bar" style="height:11px"></div><div class="lbl">3 · 9px</div></div>
+    <div class="col"><div class="bar" style="height:16px"></div><div class="lbl">6 · 16px</div></div>
+    <div class="col"><div class="bar" style="height:24px"></div><div class="lbl">8 · 24px</div></div>
+    <div class="col"><div class="bar" style="height:32px"></div><div class="lbl">10 · 32px</div></div>
+    <div class="col"><div class="bar" style="height:48px"></div><div class="lbl">12 · 48px</div></div>
+  </div>
+</body>
+</html>

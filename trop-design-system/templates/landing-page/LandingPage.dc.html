@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<!-- @template name="Landing page" description="trop marketing + docs landing page — hero with harbor engraving, features, scope, install" -->
+<helmet>
+<script src="./ds-base.js"></script>
+<script>
+  (function () {
+    try {
+      var m = localStorage.getItem("trop-theme");
+      if (m === "light" || m === "dark") document.documentElement.setAttribute("data-theme", m);
+    } catch (e) {}
+  })();
+</script>
+<style>
+  body { margin: 0; background: var(--surface-page); font-family: "Source Sans 3", ui-sans-serif, system-ui, sans-serif; color: var(--text-strong); }
+  a { color: var(--tool-accent); text-decoration: none; }
+  a:hover { color: color-mix(in srgb, var(--tool-accent) 80%, #000); }
+  .shell { width: min(1120px, calc(100% - 2rem)); margin-inline: auto; }
+  /* Hero engraving. Day view (blue-grey on cream) in light; the commissioned
+     harbor-night view in dark. The protection gradient uses --surface-page, so
+     it blends into whichever theme is active. */
+  .hero-art {
+    position: absolute; inset: 0; opacity: 0.96;
+    background:
+      linear-gradient(90deg,
+        color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
+        color-mix(in srgb, var(--surface-page) 86%, transparent) 39%,
+        color-mix(in srgb, var(--surface-page) 24%, transparent) 70%),
+      url(../../assets/harbor-backdrop.png) right center / cover no-repeat;
+  }
+  [data-theme="dark"] .hero-art {
+    background:
+      linear-gradient(90deg,
+        color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
+        color-mix(in srgb, var(--surface-page) 82%, transparent) 39%,
+        color-mix(in srgb, var(--surface-page) 14%, transparent) 70%),
+      url(../../assets/harbor-backdrop-dark.png) right center / cover no-repeat;
+    opacity: 1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .hero-art {
+      background:
+        linear-gradient(90deg,
+          color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
+          color-mix(in srgb, var(--surface-page) 82%, transparent) 39%,
+          color-mix(in srgb, var(--surface-page) 14%, transparent) 70%),
+        url(../../assets/harbor-backdrop-dark.png) right center / cover no-repeat;
+      opacity: 1;
+    }
+  }
+</style>
+</helmet>
+
+<div style="min-height:100vh;background:var(--surface-page);">
+
+  <header style="position:sticky;top:0;z-index:10;border-bottom:1px solid color-mix(in srgb, var(--tool-line) 78%, transparent);background:color-mix(in srgb, var(--surface-page) 94%, transparent);backdrop-filter:blur(12px);">
+    <nav class="shell" style="display:flex;align-items:center;justify-content:space-between;gap:1rem;min-height:72px;">
+      <a href="#top" style="display:flex;align-items:center;gap:0.7rem;font-family:'IBM Plex Sans',sans-serif;font-weight:800;font-size:1.25rem;color:var(--text-strong);">
+        <img src="../../assets/tool-mark.svg" alt="" width="36" height="36" />trop
+      </a>
+      <div style="display:flex;align-items:center;gap:0.6rem;">
+        <x-import component-from-global-scope="TropDesignSystem_9d5100.ThemeToggle" hint-size="116px,38px"></x-import>
+        <x-import component-from-global-scope="TropDesignSystem_9d5100.Button" size="sm" variant="ghost" href="https://github.com/prb/trop" hint-size="90px,38px">GitHub</x-import>
+        <x-import component-from-global-scope="TropDesignSystem_9d5100.Button" size="sm" variant="primary" href="#install" hint-size="90px,38px">Install</x-import>
+      </div>
+    </nav>
+  </header>
+
+  <section id="top" style="position:relative;overflow:hidden;border-bottom:1px solid var(--border-default);">
+    <div class="hero-art" aria-hidden="true"></div>
+    <div class="shell" style="position:relative;display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,0.74fr);gap:clamp(2rem,6vw,5rem);align-items:center;min-height:620px;padding-block:clamp(4rem,10vw,6rem);">
+      <div style="min-width:0;">
+        <x-import component-from-global-scope="TropDesignSystem_9d5100.Eyebrow" hint-size="260px,20px">Port reservations for agentic coding</x-import>
+        <h1 style="margin:0;font-family:'IBM Plex Sans',sans-serif;font-weight:800;font-size:clamp(4.75rem,12vw,7.5rem);line-height:0.9;letter-spacing:-0.02em;color:var(--text-strong);">trop</h1>
+        <p style="max-width:16ch;margin:1rem 0 0;font-size:clamp(1.5rem,4vw,2.6rem);font-weight:700;line-height:1.08;">Stable, directory-aware localhost ports.</p>
+        <p style="max-width:56ch;margin:1.1rem 0 0;color:var(--text-body);font-size:1.08rem;">A small Rust CLI that replaces hardcoded port numbers with sticky, idempotent reservations — so concurrent worktrees and local agents never collide.</p>
+        <div style="display:flex;flex-wrap:wrap;gap:0.55rem;margin-top:1.5rem;">
+          <x-import component-from-global-scope="TropDesignSystem_9d5100.Badge" hint-size="90px,32px">Idempotent</x-import>
+          <x-import component-from-global-scope="TropDesignSystem_9d5100.Badge" hint-size="120px,32px">Directory-aware</x-import>
+          <x-import component-from-global-scope="TropDesignSystem_9d5100.Badge" hint-size="130px,32px">Cross-process safe</x-import>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:0.8rem;margin-top:2rem;">
+          <x-import component-from-global-scope="TropDesignSystem_9d5100.Button" variant="primary" href="#install" hint-size="140px,44px">Install trop</x-import>
+          <x-import component-from-global-scope="TropDesignSystem_9d5100.Button" variant="secondary" href="https://github.com/prb/trop" hint-size="150px,44px">Star on GitHub</x-import>
+        </div>
+      </div>
+      <x-import component-from-global-scope="TropDesignSystem_9d5100.CommandCard" title="Reserve a port" meta="bash" code="{{ heroCode }}" copy-text="PORT=$(trop reserve)" hint-size="100%,240px"></x-import>
+    </div>
+  </section>
+
+  <section id="features" style="padding-block:clamp(4rem,8vw,6rem);border-block:1px solid var(--border-default);background:color-mix(in srgb, var(--surface-card) 45%, transparent);">
+    <div class="shell">
+      <div style="max-width:760px;margin-bottom:1.5rem;">
+        <x-import component-from-global-scope="TropDesignSystem_9d5100.Eyebrow" hint-size="90px,20px">Why trop</x-import>
+        <h2 style="margin:0;font-family:'IBM Plex Sans',sans-serif;font-weight:800;font-size:clamp(2rem,5vw,3.25rem);line-height:1.05;">One job, done predictably</h2>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1rem;">
+        <x-import component-from-global-scope="TropDesignSystem_9d5100.FeatureCard" index="01" eyebrow="Idempotent" title="Same dir, same port" hint-size="100%,200px">Repeated calls in one worktree return the same reservation — scripts stay stable across restarts.</x-import>
+        <x-import component-from-global-scope="TropDesignSystem_9d5100.FeatureCard" index="02" eyebrow="Lifecycle" title="Directory-based cleanup" hint-size="100%,200px">Reservations are pruned once their worktree is removed. No teardown hooks in every script.</x-import>
+        <x-import component-from-global-scope="TropDesignSystem_9d5100.FeatureCard" index="03" eyebrow="Concurrency" title="Cross-process safe" hint-size="100%,200px">Safe to invoke from many processes at once — independent agents reserve without a shared spreadsheet.</x-import>
+      </div>
+    </div>
+  </section>
+
+  <section id="install" style="padding-block:clamp(4rem,8vw,6rem);">
+    <div class="shell" style="display:grid;grid-template-columns:minmax(0,0.72fr) minmax(320px,0.28fr);gap:clamp(1.5rem,5vw,4rem);align-items:end;">
+      <div>
+        <x-import component-from-global-scope="TropDesignSystem_9d5100.Eyebrow" hint-size="70px,20px">Install</x-import>
+        <h2 style="margin:0 0 1rem;font-family:'IBM Plex Sans',sans-serif;font-weight:800;font-size:clamp(2rem,5vw,3.25rem);line-height:1.05;">Get trop from Cargo</h2>
+        <p style="max-width:42rem;margin:0 0 1.25rem;color:var(--text-body);font-size:1.08rem;">A preview release: core functionality is implemented and heavily tested. Expect the occasional rough edge, and send feedback.</p>
+      </div>
+      <x-import component-from-global-scope="TropDesignSystem_9d5100.CommandCard" compact="{{ true }}" meta="shell" code="cargo install trop-cli" copy-text="cargo install trop-cli" hint-size="100%,120px"></x-import>
+    </div>
+  </section>
+
+  <footer style="border-top:1px solid var(--border-default);padding-block:2rem;color:var(--text-body);">
+    <div class="shell" style="display:flex;align-items:center;gap:0.6rem;">
+      <img src="../../assets/tool-mark.svg" alt="" width="24" height="24" /> trop — dual-licensed Apache-2.0 / MIT.
+    </div>
+  </footer>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  renderVals() {
+    return {
+      heroCode: '# reserve, then run your dev server\nPORT=$(trop reserve)\nnpm run dev -- --port "$PORT"\n\n# same directory → same port, every time',
+    };
+  }
+}
+</script>
+</body>
+</html>

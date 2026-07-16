@@ -15,11 +15,20 @@
 - reference/ # Authoritative project specifications (DO NOT MODIFY)
   - ImplementationSpecification.md # Complete spec - SOURCE OF TRUTH
 - site/ # Astro/Starlight static website for https://plx.github.io/trop/
+  - AGENTS.md # Scoped design-system adherence guidance for site work
   - astro.config.mjs # Site URL, /trop base path, and Starlight configuration
   - package.json # Node scripts and website dependencies
-  - src/pages/index.astro # Custom landing page converted from the Maquette concept
+  - scripts/check-design-system.mjs # Prevents local token/asset duplication and checks primitive adoption
+  - src/pages/index.astro # Landing content composed with design-system UI-kit recipes
   - src/content/docs/ # Starlight documentation pages
-  - public/ # Static assets copied directly into the built site
+  - public/ # Site-only static files; brand assets come from trop-design-system
+- trop-design-system/ # Canonical trop brand tokens, assets, components, guidance, and site UI kit
+  - styles.css # Global token entry point consumed by landing and docs pages
+  - tokens/ # Theme-aware color, type, spacing, and effects foundations
+  - components/ # Framework component contracts and reference implementations
+  - ui_kits/site/site.css # Framework-agnostic landing-page recipes consumed by Astro
+  - assets/ # Canonical mark, favicon, and light/dark harbor illustrations
+  - SKILL.md # Entry point for design agents working with the trop brand
 - trop/ # Library workspace member - core functionality
   - README.md # Library-specific, human-readable README
   - src/ # Library source code

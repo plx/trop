@@ -1,0 +1,22 @@
+{
+  "name": "@trop/design-system",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Design tokens, assets, components, and site UI kit for trop.",
+  "license": "MIT OR Apache-2.0",
+  "exports": {
+    "./styles.css": "./styles.css",
+    "./assets/*": "./assets/*",
+    "./components/*": "./components/*",
+    "./site.css": "./ui_kits/site/site.css"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  }
+}
