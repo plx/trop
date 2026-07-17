@@ -242,6 +242,32 @@ test.describe("rendered site", () => {
     await expect(system).toHaveAttribute("aria-checked", "true");
   });
 
+  test("applies reduced-motion theme changes without waiting for hero decode", async ({
+    page,
+  }) => {
+    await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
+    await page.addInitScript(() => {
+      Object.defineProperty(HTMLImageElement.prototype, "decode", {
+        configurable: true,
+        value: () => new Promise<void>(() => {}),
+      });
+    });
+    await page.goto(sitePath("/"));
+
+    const dark = page
+      .getByRole("radiogroup", { name: "Color theme" })
+      .getByRole("radio", { name: "Dark" });
+    await dark.click();
+
+    await expect(dark).toHaveAttribute("aria-checked", "true");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await expect
+      .poll(() =>
+        page.evaluate(() => window.localStorage.getItem("trop-theme")),
+      )
+      .toBe("dark");
+  });
+
   test("copies the primary command through the design-system affordance", async ({
     context,
     page,

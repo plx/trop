@@ -14,6 +14,7 @@ type ThemeViewTransition = {
 
 const themeStorageKey = "trop-theme";
 const themeTransitionFallbackMs = 760;
+const reducedMotionQuery = "(prefers-reduced-motion: reduce)";
 const heroImagePreloads = new Map<ResolvedTheme, Promise<void>>();
 let themeAnimationId = 0;
 let themeTransitionTimer: number | undefined;
@@ -82,13 +83,14 @@ function resolveTheme(mode: ThemeMode): ResolvedTheme {
     : "light";
 }
 
+function prefersReducedMotion(): boolean {
+  return window.matchMedia(reducedMotionQuery).matches;
+}
+
 function setTheme(mode: ThemeMode, animate = false): void {
   const root = document.documentElement;
-  const reduceMotion = window.matchMedia(
-    "(prefers-reduced-motion: reduce)",
-  ).matches;
 
-  if (!animate || reduceMotion) {
+  if (!animate || prefersReducedMotion()) {
     applyTheme(mode);
     return;
   }
@@ -138,6 +140,11 @@ themeButtons.forEach((button) => {
     const mode = button.dataset.themeMode;
     if (mode === "system" || mode === "light" || mode === "dark") {
       const requestId = ++themeAnimationId;
+      if (prefersReducedMotion()) {
+        setTheme(mode);
+        return;
+      }
+
       await heroImagePreloads.get(resolveTheme(mode));
       if (requestId === themeAnimationId) {
         setTheme(mode, true);
