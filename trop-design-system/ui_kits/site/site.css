@@ -295,6 +295,7 @@ a {
 
 .hero {
   position: relative;
+  isolation: isolate;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(320px, 0.74fr);
   gap: clamp(var(--space-10), 6vw, 6rem);
@@ -314,34 +315,50 @@ a {
   );
 }
 
-.hero::before {
+.hero::before,
+.hero::after {
   content: "";
   position: absolute;
   inset: 0;
+  z-index: 0;
+  pointer-events: none;
+}
+
+.hero::before {
   background:
     linear-gradient(
       90deg,
-      color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
-      color-mix(in srgb, var(--surface-page) 86%, transparent) 39%,
-      color-mix(in srgb, var(--surface-page) 24%, transparent) 70%
+      color-mix(in srgb, var(--_lt-surface) 98%, transparent) 0%,
+      color-mix(in srgb, var(--_lt-surface) 86%, transparent) 39%,
+      color-mix(in srgb, var(--_lt-surface) 24%, transparent) 70%
     ),
-    var(--harbor-backdrop) right center / cover no-repeat;
+    var(--harbor-backdrop-light) right center / cover no-repeat;
   opacity: 0.96;
 }
 
-:root[data-theme="dark"] .hero::before {
+.hero::after {
   background:
     linear-gradient(
       90deg,
-      color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
-      color-mix(in srgb, var(--surface-page) 82%, transparent) 39%,
-      color-mix(in srgb, var(--surface-page) 14%, transparent) 70%
+      color-mix(in srgb, var(--_dk-surface) 98%, transparent) 0%,
+      color-mix(in srgb, var(--_dk-surface) 82%, transparent) 39%,
+      color-mix(in srgb, var(--_dk-surface) 14%, transparent) 70%
     ),
-    var(--harbor-backdrop) right center / cover no-repeat;
+    var(--harbor-backdrop-dark) right center / cover no-repeat;
+  opacity: 0;
+}
+
+:root[data-theme="dark"] .hero::before {
+  opacity: 0;
+}
+
+:root[data-theme="dark"] .hero::after {
+  opacity: 0.96;
 }
 
 .hero > * {
   position: relative;
+  z-index: 1;
 }
 
 .hero__copy {
@@ -672,14 +689,11 @@ a {
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) .hero::before {
-    background:
-      linear-gradient(
-        90deg,
-        color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
-        color-mix(in srgb, var(--surface-page) 82%, transparent) 39%,
-        color-mix(in srgb, var(--surface-page) 14%, transparent) 70%
-      ),
-      var(--harbor-backdrop) right center / cover no-repeat;
+    opacity: 0;
+  }
+
+  :root:not([data-theme="light"]) .hero::after {
+    opacity: 0.96;
   }
 }
 
@@ -710,22 +724,22 @@ a {
     background:
       linear-gradient(
         180deg,
-        color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
-        color-mix(in srgb, var(--surface-page) 84%, transparent) 56%,
-        color-mix(in srgb, var(--surface-page) 44%, transparent) 100%
+        color-mix(in srgb, var(--_lt-surface) 98%, transparent) 0%,
+        color-mix(in srgb, var(--_lt-surface) 84%, transparent) 56%,
+        color-mix(in srgb, var(--_lt-surface) 44%, transparent) 100%
       ),
-      var(--harbor-backdrop) 62% bottom / auto 72% no-repeat;
+      var(--harbor-backdrop-light) 62% bottom / auto 72% no-repeat;
   }
 
-  :root[data-theme="dark"] .hero::before {
+  .hero::after {
     background:
       linear-gradient(
         180deg,
-        color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
-        color-mix(in srgb, var(--surface-page) 78%, transparent) 56%,
-        color-mix(in srgb, var(--surface-page) 34%, transparent) 100%
+        color-mix(in srgb, var(--_dk-surface) 98%, transparent) 0%,
+        color-mix(in srgb, var(--_dk-surface) 78%, transparent) 56%,
+        color-mix(in srgb, var(--_dk-surface) 34%, transparent) 100%
       ),
-      var(--harbor-backdrop) 62% bottom / auto 72% no-repeat;
+      var(--harbor-backdrop-dark) 62% bottom / auto 72% no-repeat;
   }
 
   .hero__lede {
@@ -744,15 +758,44 @@ a {
 
 @media (prefers-color-scheme: dark) and (max-width: 860px) {
   :root:not([data-theme="light"]) .hero::before {
-    background:
-      linear-gradient(
-        180deg,
-        color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
-        color-mix(in srgb, var(--surface-page) 78%, transparent) 56%,
-        color-mix(in srgb, var(--surface-page) 34%, transparent) 100%
-      ),
-      var(--harbor-backdrop) 62% bottom / auto 72% no-repeat;
+    opacity: 0;
   }
+
+  :root:not([data-theme="light"]) .hero::after {
+    opacity: 0.96;
+  }
+}
+
+/* Theme changes use the browser's root view transition when available. This
+ * property-level transition is the fallback for browsers without that API. */
+:root[data-theme-transition] body,
+:root[data-theme-transition] body *,
+:root[data-theme-transition] body *::before,
+:root[data-theme-transition] body *::after {
+  transition-property:
+    color, background-color, border-color, box-shadow, fill, stroke,
+    outline-color, text-decoration-color;
+  transition-duration: var(--duration-theme);
+  transition-timing-function: var(--ease-standard);
+}
+
+:root[data-theme-transition] .hero::before,
+:root[data-theme-transition] .hero::after {
+  transition-property: opacity;
+  transition-duration: var(--duration-theme-hero);
+}
+
+/* A view transition already cross-fades the complete rendered page. Keep the
+ * live hero layers synchronous so they form clean old/new snapshots. */
+:root[data-theme-view-transition] .hero::before,
+:root[data-theme-view-transition] .hero::after {
+  transition: none;
+}
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: var(--duration-theme);
+  animation-timing-function: var(--ease-standard);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -763,5 +806,10 @@ a {
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+  }
+
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation-duration: 0.01ms !important;
   }
 }

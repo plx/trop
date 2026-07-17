@@ -1,5 +1,7 @@
 ---
 import markUrl from "@trop/design-system/assets/tool-mark.svg?url";
+import harborDayUrl from "@trop/design-system/assets/harbor-backdrop.png?url";
+import harborNightUrl from "@trop/design-system/assets/harbor-backdrop-dark.png?url";
 import "@trop/design-system/site.css";
 import "@trop/design-system/styles.css";
 import { siteConfig } from "../site.config.mjs";
@@ -29,6 +31,20 @@ const docsHref = siteConfig.docs.pages[0]?.href || "docs/";
     <meta property="og:url" content={siteConfig.site.url} />
     <meta name="twitter:card" content="summary" />
     <link rel="icon" href={sitePath("favicon.svg")} type="image/svg+xml" />
+    <link
+      rel="preload"
+      as="image"
+      href={harborDayUrl}
+      fetchpriority="high"
+      data-theme-hero-preload="light"
+    />
+    <link
+      rel="preload"
+      as="image"
+      href={harborNightUrl}
+      fetchpriority="high"
+      data-theme-hero-preload="dark"
+    />
     <script is:inline>
       (() => {
         try {

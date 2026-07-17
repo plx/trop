@@ -121,6 +121,26 @@ test.describe("rendered site", () => {
     expect(response.status()).toBeLessThan(400);
   });
 
+  test("preloads both theme-matched hero illustrations", async ({
+    page,
+    request,
+  }) => {
+    await page.goto(sitePath("/"));
+
+    for (const theme of ["light", "dark"]) {
+      const preload = page.locator(
+        `link[rel="preload"][as="image"][data-theme-hero-preload="${theme}"]`,
+      );
+      await expect(preload).toHaveCount(1);
+      await expect(preload).toHaveAttribute("fetchpriority", "high");
+
+      const href = await preload.getAttribute("href");
+      expect(href).toBeTruthy();
+      const response = await request.get(href!);
+      expect(response.status()).toBeLessThan(400);
+    }
+  });
+
   test("renders every landing primitive from the design-system contract", async ({
     page,
   }) => {
@@ -184,14 +204,30 @@ test.describe("rendered site", () => {
       terminal: getComputedStyle(
         document.querySelector<HTMLElement>(".command-card__body")!,
       ).backgroundColor,
-      hero: getComputedStyle(
+      dayImage: getComputedStyle(
         document.querySelector<HTMLElement>(".hero")!,
         "::before",
       ).backgroundImage,
+      dayOpacity: getComputedStyle(
+        document.querySelector<HTMLElement>(".hero")!,
+        "::before",
+      ).opacity,
+      nightImage: getComputedStyle(
+        document.querySelector<HTMLElement>(".hero")!,
+        "::after",
+      ).backgroundImage,
+      nightOpacity: getComputedStyle(
+        document.querySelector<HTMLElement>(".hero")!,
+        "::after",
+      ).opacity,
     }));
     expect(darkTheme.page).toBe("rgb(12, 20, 33)");
     expect(darkTheme.terminal).toBe("rgb(10, 18, 32)");
-    expect(darkTheme.hero).toContain("harbor-backdrop-dark");
+    expect(darkTheme.dayImage).toContain("harbor-backdrop");
+    expect(darkTheme.dayImage).not.toContain("harbor-backdrop-dark");
+    expect(darkTheme.dayOpacity).toBe("0");
+    expect(darkTheme.nightImage).toContain("harbor-backdrop-dark");
+    expect(darkTheme.nightOpacity).toBe("0.96");
 
     await page.reload();
     await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
