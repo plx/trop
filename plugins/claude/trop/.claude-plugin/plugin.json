@@ -1,0 +1,9 @@
+{
+  "name": "trop",
+  "version": "0.1.0",
+  "description": "Claude Code integration for the trop port reservation CLI.",
+  "author": {
+    "name": "trop contributors"
+  },
+  "license": "MIT OR Apache-2.0"
+}

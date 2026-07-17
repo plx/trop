@@ -1,0 +1,19 @@
+{
+  "name": "trop",
+  "version": "0.1.0",
+  "description": "Codex integration for the trop port reservation CLI.",
+  "author": {
+    "name": "trop contributors"
+  },
+  "interface": {
+    "displayName": "trop",
+    "shortDescription": "Use trop from Codex.",
+    "longDescription": "Codex integration for the trop port reservation CLI.",
+    "developerName": "trop contributors",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": [
+      "Help me use trop."
+    ]
+  }
+}
