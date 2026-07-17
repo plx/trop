@@ -21,7 +21,7 @@
   "dependencies": {
     "@trop/design-system": "file:../trop-design-system",
     "@astrojs/starlight": "^0.39.0",
-    "astro": "^6.0.0"
+    "astro": "^7.1.0"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.10.0",
