@@ -29,6 +29,26 @@ Additionally, this repository is an experiment in "hands off", "high-autonomy" a
 - Format code: `cargo fmt`
 - Build release: `cargo build --release`
 
+## Website and Design System
+
+The canonical visual system lives in `trop-design-system/`. The Astro/Starlight
+site in `site/` consumes it through the local `@trop/design-system` package.
+
+- Treat design-system tokens, assets, and UI-kit recipes as the source of truth.
+  Do not reintroduce brand colors, font stacks, radii, shadows, or copied brand
+  assets under `site/src` or `site/public`.
+- Build landing-page UI from the existing design-system primitives. If the
+  system cannot express a needed visual pattern, update the design system first
+  and then consume that change from the site.
+- Keep `data-ds-component` annotations on landing primitives. They make the
+  framework-agnostic Astro implementation auditable against the component
+  inventory.
+- Run `cd site && npm run check:design-system` after visual changes. The full
+  `npm run validate` command includes this check, the build, accessibility, and
+  responsive browser tests.
+- Read `site/AGENTS.md` for the scoped implementation rules and
+  `trop-design-system/SKILL.md` for brand and component guidance.
+
 ## GitHub PR Comments
 
 When posting comments to PRs using `gh pr comment`, the comment will be attributed to whatever GitHub account is authenticated with the `gh` CLI (typically the user's account). To ensure proper attribution, add explicit bot attribution in comment text (e.g., "🤖 Posted by Claude Code" at the end of comments).

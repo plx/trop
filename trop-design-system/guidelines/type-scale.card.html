@@ -1,0 +1,24 @@
+<!-- @dsCard group="Type" viewport="700x220" name="Type scale" subtitle="Fluid display sizes down to steady body & mono" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../styles.css">
+<style>
+  body { margin: 0; font-family: var(--font-body); background: var(--surface-page); color: var(--tool-ink); }
+  .wrap { padding: 20px 24px; display: grid; gap: 6px; }
+  .r { display: flex; align-items: baseline; gap: 16px; border-bottom: 1px solid var(--tool-line); padding-bottom: 6px; }
+  .r span:first-child { font-family: var(--font-display); font-weight: 700; line-height: 1; }
+  .r .tok { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--tool-muted); }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="r"><span style="font-size:40px">Hero</span><span class="tok">--text-hero · clamp 4.75→7.5rem</span></div>
+    <div class="r"><span style="font-size:28px">Display</span><span class="tok">--text-display · clamp 2→3.5rem</span></div>
+    <div class="r"><span style="font-size:19px">Heading 3</span><span class="tok">--text-h3 · 1.18rem</span></div>
+    <div class="r"><span style="font-size:16px;font-family:var(--tool-font-sans);font-weight:400">Body</span><span class="tok">--text-base · 1rem</span></div>
+    <div class="r"><span style="font-size:13px;font-family:var(--tool-font-mono);font-weight:500">Eyebrow / mono</span><span class="tok">--text-eyebrow · 0.78rem</span></div>
+  </div>
+</body>
+</html>

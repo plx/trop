@@ -1,0 +1,23 @@
+<!-- @dsCard group="Colors" viewport="700x150" name="Status" subtitle="Success, warning, danger — used sparingly" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../styles.css">
+<style>
+  body { margin: 0; font-family: var(--font-body); background: var(--surface-page); }
+  .row { display: flex; gap: 14px; padding: 20px; }
+  .sw { flex: 1; }
+  .chip { height: 68px; border-radius: var(--tool-radius); border: 1px solid var(--tool-line); }
+  .name { margin-top: 8px; font-size: 13px; font-weight: 800; color: var(--tool-ink); }
+  .hex { font-family: var(--font-mono); font-size: 12px; color: var(--tool-muted); }
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="sw"><div class="chip" style="background:var(--tool-success)"></div><div class="name">Success</div><div class="hex">#0f9f6e</div></div>
+    <div class="sw"><div class="chip" style="background:var(--tool-warning)"></div><div class="name">Warning</div><div class="hex">#c27803</div></div>
+    <div class="sw"><div class="chip" style="background:var(--tool-danger)"></div><div class="name">Danger</div><div class="hex">#d64545</div></div>
+  </div>
+</body>
+</html>

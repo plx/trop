@@ -1,0 +1,23 @@
+<!-- @dsCard group="Spacing" viewport="700x160" name="Radius & elevation" subtitle="One 8px radius; one soft far-throw shadow" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../styles.css">
+<style>
+  body { margin: 0; font-family: var(--font-body); background: var(--surface-page); color: var(--tool-ink); }
+  .wrap { padding: 26px 24px; display: flex; gap: 28px; align-items: center; }
+  .box { width: 120px; height: 78px; background: var(--tool-panel); border: 1px solid var(--tool-line); border-radius: var(--tool-radius); display: flex; align-items: center; justify-content: center; font-family: var(--font-mono); font-size: 12px; color: var(--tool-muted); }
+  .box.sh { box-shadow: var(--tool-shadow); border-color: transparent; }
+  .box.pill { border-radius: var(--radius-pill); width: 150px; }
+  .cap { margin-top: 8px; font-family: var(--font-mono); font-size: 11px; color: var(--tool-muted); text-align: center; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div><div class="box">8px</div><div class="cap">--tool-radius</div></div>
+    <div><div class="box pill">pill</div><div class="cap">--radius-pill (badges)</div></div>
+    <div><div class="box sh">card</div><div class="cap">--tool-shadow</div></div>
+  </div>
+</body>
+</html>

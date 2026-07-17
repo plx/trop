@@ -57,6 +57,7 @@
     "README.md",
     "astro.config.mjs",
     "playwright.config.ts",
+    "scripts/**/*.mjs",
     "src/**/*.{astro,css,js,ts,md,mdx}",
     "tests/**/*.{js,ts}",
     "package.json"

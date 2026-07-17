@@ -1,5 +1,3 @@
-@import "./theme.css";
-
 :root {
   --sl-font: var(--tool-font-sans);
   --sl-font-mono: var(--tool-font-mono);

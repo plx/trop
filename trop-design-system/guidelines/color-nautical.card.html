@@ -1,0 +1,23 @@
+<!-- @dsCard group="Colors" viewport="700x150" name="Nautical tints" subtitle="Seafoam wash, hull rule, and code-ink text on deep navy" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../styles.css">
+<style>
+  body { margin: 0; font-family: var(--font-body); background: var(--surface-page); }
+  .row { display: flex; gap: 14px; padding: 20px; }
+  .sw { flex: 1; }
+  .chip { height: 68px; border-radius: var(--tool-radius); border: 1px solid var(--tool-line); display: flex; align-items: center; justify-content: center; font-family: var(--font-mono); font-size: 12px; }
+  .name { margin-top: 8px; font-size: 13px; font-weight: 800; color: var(--tool-ink); }
+  .hex { font-family: var(--font-mono); font-size: 12px; color: var(--tool-muted); }
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="sw"><div class="chip" style="background:var(--tool-seafoam)"></div><div class="name">Seafoam</div><div class="hex">#dcebe7</div></div>
+    <div class="sw"><div class="chip" style="background:var(--tool-hull)"></div><div class="name">Hull</div><div class="hex">#c9d1d8</div></div>
+    <div class="sw"><div class="chip" style="background:var(--tool-code);color:var(--tool-code-ink)">PORT=$(trop reserve)</div><div class="name">Code · terminal</div><div class="hex">theme-aware surface + ink</div></div>
+  </div>
+</body>
+</html>

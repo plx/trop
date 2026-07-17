@@ -43,6 +43,17 @@ const docsPages: DocsPage[] = [
   ];
 const pagesToCheck = ["/", ...docsPages.map((page) => page.href)];
 const pagesToAudit = ["/", docsPages[0]?.href].filter(Boolean);
+const designSystemComponents = [
+  "Badge",
+  "Button",
+  "CommandCard",
+  "CopyButton",
+  "DocCard",
+  "Eyebrow",
+  "FeatureCard",
+  "ScopePanel",
+  "ThemeToggle",
+];
 
 function sitePath(path = "/"): string {
   const cleanPath = path.startsWith("/") ? path : `/${path}`;
@@ -89,6 +100,127 @@ test.describe("rendered site", () => {
         `${pagePath} should not overflow horizontally`,
       ).toBe(false);
     }
+  });
+
+  test("keeps the favicon inside the deployment base path", async ({
+    page,
+    request,
+  }) => {
+    for (const pagePath of ["/", docsPages[0]?.href].filter(Boolean)) {
+      await page.goto(sitePath(pagePath));
+      const faviconHref = await page
+        .locator('link[rel~="icon"]')
+        .getAttribute("href");
+
+      expect(new URL(faviconHref!, origin).pathname).toBe(
+        sitePath("/favicon.svg"),
+      );
+    }
+
+    const response = await request.get(sitePath("/favicon.svg"));
+    expect(response.status()).toBeLessThan(400);
+  });
+
+  test("renders every landing primitive from the design-system contract", async ({
+    page,
+  }) => {
+    await page.goto(sitePath("/"));
+
+    for (const component of designSystemComponents) {
+      await expect(
+        page.locator(`[data-ds-component="${component}"]`),
+        `${component} should be represented on the landing page`,
+      ).not.toHaveCount(0);
+    }
+
+    const foundations = await page.evaluate(() => {
+      const root = getComputedStyle(document.documentElement);
+      const body = getComputedStyle(document.body);
+      const command = getComputedStyle(
+        document.querySelector<HTMLElement>(".command-card__body")!,
+      );
+      const docCard = getComputedStyle(
+        document.querySelector<HTMLElement>(".doc-card")!,
+      );
+
+      return {
+        accent: root.getPropertyValue("--tool-accent").trim(),
+        bodyFont: body.fontFamily,
+        commandFont: command.fontFamily,
+        docCardShadow: docCard.boxShadow,
+      };
+    });
+
+    expect(foundations.accent).toBe("#3a6b5f");
+    expect(foundations.bodyFont).toContain("Source Sans 3");
+    expect(foundations.commandFont).toContain("JetBrains Mono");
+    expect(foundations.docCardShadow).toBe("none");
+  });
+
+  test("applies and persists the design-system theme modes", async ({
+    page,
+  }) => {
+    await page.emulateMedia({ colorScheme: "light" });
+    await page.goto(sitePath("/"));
+
+    const themeGroup = page.getByRole("radiogroup", { name: "Color theme" });
+    const system = themeGroup.getByRole("radio", { name: "System" });
+    const light = themeGroup.getByRole("radio", { name: "Light" });
+    const dark = themeGroup.getByRole("radio", { name: "Dark" });
+
+    await expect(system).toHaveAttribute("aria-checked", "true");
+
+    await dark.click();
+    await expect(dark).toHaveAttribute("aria-checked", "true");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await expect
+      .poll(() =>
+        page.evaluate(() => window.localStorage.getItem("trop-theme")),
+      )
+      .toBe("dark");
+
+    const darkTheme = await page.evaluate(() => ({
+      page: getComputedStyle(document.body).backgroundColor,
+      terminal: getComputedStyle(
+        document.querySelector<HTMLElement>(".command-card__body")!,
+      ).backgroundColor,
+      hero: getComputedStyle(
+        document.querySelector<HTMLElement>(".hero")!,
+        "::before",
+      ).backgroundImage,
+    }));
+    expect(darkTheme.page).toBe("rgb(12, 20, 33)");
+    expect(darkTheme.terminal).toBe("rgb(10, 18, 32)");
+    expect(darkTheme.hero).toContain("harbor-backdrop-dark");
+
+    await page.reload();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await expect(dark).toHaveAttribute("aria-checked", "true");
+
+    await light.click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+    await expect(light).toHaveAttribute("aria-checked", "true");
+
+    await system.click();
+    await expect(page.locator("html")).not.toHaveAttribute("data-theme", /.+/);
+    await expect(system).toHaveAttribute("aria-checked", "true");
+  });
+
+  test("copies the primary command through the design-system affordance", async ({
+    context,
+    page,
+  }) => {
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    await page.goto(sitePath("/"));
+
+    const copyButton = page.getByRole("button", {
+      name: "Copy command: cargo install trop-cli",
+    });
+    await copyButton.click();
+    await expect(copyButton.locator("span:not(.sr-only)")).toHaveText("Copied");
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe("cargo install trop-cli");
   });
 
   test("manages the mobile navigation expanded state accessibly", async ({

@@ -4,11 +4,13 @@ on:
   pull_request:
     paths:
       - "site/**"
+      - "trop-design-system/**"
       - ".github/workflows/site-check.yml"
   push:
     branches: ["main"]
     paths:
       - "site/**"
+      - "trop-design-system/**"
       - ".github/workflows/site-check.yml"
 
 permissions:
@@ -35,6 +37,8 @@ jobs:
           fi
       - name: Check formatting
         run: npm run format:check
+      - name: Check design-system adherence
+        run: npm run check:design-system
       - name: Spellcheck content
         run: npm run spellcheck
       - name: Typecheck Astro content

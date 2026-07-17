@@ -12,6 +12,9 @@ build:
 check:
     npm run check
 
+check-design-system:
+    npm run check:design-system
+
 format:
     npm run format
 

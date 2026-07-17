@@ -1,0 +1,24 @@
+<!-- @dsCard group="Colors" viewport="700x150" name="Neutrals & surfaces" subtitle="Paper surface, panel white, slate text, hairline borders" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../styles.css">
+<style>
+  body { margin: 0; font-family: var(--font-body); background: var(--surface-page); }
+  .row { display: flex; gap: 14px; padding: 20px; }
+  .sw { flex: 1; }
+  .chip { height: 68px; border-radius: var(--tool-radius); border: 1px solid var(--tool-line); }
+  .name { margin-top: 8px; font-size: 13px; font-weight: 800; color: var(--tool-ink); }
+  .hex { font-family: var(--font-mono); font-size: 12px; color: var(--tool-muted); }
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="sw"><div class="chip" style="background:var(--tool-surface)"></div><div class="name">Surface</div><div class="hex">#f4f6f8</div></div>
+    <div class="sw"><div class="chip" style="background:var(--tool-panel)"></div><div class="name">Panel</div><div class="hex">#ffffff</div></div>
+    <div class="sw"><div class="chip" style="background:var(--tool-muted)"></div><div class="name">Muted</div><div class="hex">#36424f</div></div>
+    <div class="sw"><div class="chip" style="background:var(--tool-line)"></div><div class="name">Line</div><div class="hex">#dde3e8</div></div>
+  </div>
+</body>
+</html>

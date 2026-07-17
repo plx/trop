@@ -1,0 +1,154 @@
+/* trop — Color tokens
+ * A cool, nautical palette with two full, self-consistent themes:
+ *
+ *   LIGHT — cream paper surfaces, deep-navy ink, a light-mode terminal.
+ *   DARK  — deep harbor-night surfaces, pale ink, a dark-mode terminal.
+ *
+ * Every surface (page, cards, code panels, nav chrome) belongs to ONE theme
+ * at a time — no dark islands inside a light page. The active theme is chosen
+ * by (in priority order):
+ *   1. an explicit  html[data-theme="light"|"dark"]  (set by ThemeToggle), else
+ *   2. the OS setting via  prefers-color-scheme  (the "System" option).
+ *
+ * The LIGHT and DARK literals each live once (the --_lt-* / --_dk-* blocks);
+ * the theme selectors below only *map* them onto the live --tool-* tokens, so
+ * every colour has a single source of truth.
+ */
+
+:root {
+  /* ---- LIGHT palette literals ---- */
+  --_lt-accent: #3a6b5f;       /* harbor green — primary accent */
+  --_lt-accent-2: #8ba8b9;     /* steel blue — secondary accent */
+  --_lt-warm: #b0761c;         /* ochre highlight (light-theme counterpart of the dark amber) */
+  --_lt-ink: #0b1220;          /* near-black navy — primary text */
+  --_lt-muted: #36424f;        /* slate — secondary text */
+  --_lt-surface: #f4f6f8;      /* cool cream/paper — page background */
+  --_lt-panel: #ffffff;        /* card / panel fill */
+  --_lt-code: #e9eef3;         /* light-mode terminal surface */
+  --_lt-code-ink: #24303f;     /* navy ink on the light terminal */
+  --_lt-line: #dde3e8;         /* hairline borders / dividers */
+  --_lt-navy: #1e2a3a;         /* logo & deep-ink navy (mark fills) */
+  --_lt-seafoam: #dcebe7;      /* pale green wash (scope panel) */
+  --_lt-hull: #c9d1d8;         /* light rule / ledger lines */
+  --_lt-border-strong: #1e2a3a;
+
+  /* ---- DARK palette literals ---- */
+  --_dk-accent: #6fb19d;       /* harbor green, keyed to the teal navigation lights (#bddfc8) in the night engraving */
+  --_dk-accent-2: #8ba8b9;
+  --_dk-warm: #f2d9a8;         /* dock-light amber — sampled from the ship & quay lamps (#fbf8e5/#f9f0d5); a sparing highlight, not a primary accent */
+  --_dk-ink: #e5edf8;
+  --_dk-muted: #93a3b8;        /* cooled slightly toward the engraving's blue-grey haze */
+  --_dk-surface: #0c1421;      /* harbor-night navy — matches the illustration's sky (#0c1421) so the backdrop blends into the page */
+  --_dk-panel: #141d2b;        /* lifted navy, keyed to the moonlit water (#141d29) */
+  --_dk-code: #0a1220;         /* dark-mode terminal surface */
+  --_dk-code-ink: #dbeafe;     /* light-blue ink on the dark terminal */
+  --_dk-line: #26303e;         /* keyed to the dock-stone tone (#262e3a) */
+  --_dk-navy: #0b1220;
+  --_dk-seafoam: #16302b;      /* deep green wash */
+  --_dk-hull: #26303e;
+  --_dk-border-strong: #46566a;
+
+  /* ---- Semantic status (theme-independent) ---- */
+  --tool-success: #0f9f6e;
+  --tool-warning: #c27803;
+  --tool-danger: #d64545;
+
+  /* ---- Semantic aliases (resolve against the live --tool-* below) ---- */
+  --text-strong: var(--tool-ink);
+  --text-body: var(--tool-muted);
+  --text-accent: var(--tool-accent);
+  --text-on-accent: #ffffff;
+  --text-on-code: var(--tool-code-ink);
+
+  --surface-page: var(--tool-surface);
+  --surface-card: var(--tool-panel);
+  --surface-code: var(--tool-code);
+  --surface-accent: var(--tool-accent);
+  --surface-wash: var(--tool-seafoam);
+
+  --border-default: var(--tool-line);
+  --border-strong: var(--tool-navy);
+
+  /* Interaction tints */
+  --accent-tint-10: color-mix(in srgb, var(--tool-accent) 10%, transparent);
+  --accent-tint-18: color-mix(in srgb, var(--tool-accent) 18%, transparent);
+  --accent-tint-20: color-mix(in srgb, var(--tool-accent) 20%, transparent);
+}
+
+/* ==== LIGHT mapping (default, and when the user forces light) ==== */
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+  --tool-accent: var(--_lt-accent);
+  --tool-accent-2: var(--_lt-accent-2);
+  --tool-warm: var(--_lt-warm);
+  --tool-ink: var(--_lt-ink);
+  --tool-muted: var(--_lt-muted);
+  --tool-surface: var(--_lt-surface);
+  --tool-panel: var(--_lt-panel);
+  --tool-code: var(--_lt-code);
+  --tool-code-ink: var(--_lt-code-ink);
+  --tool-line: var(--_lt-line);
+  --tool-navy: var(--_lt-navy);
+  --tool-seafoam: var(--_lt-seafoam);
+  --tool-hull: var(--_lt-hull);
+  --border-strong: var(--_lt-border-strong);
+}
+
+/* ==== DARK mapping (when the user forces dark) ==== */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --tool-accent: var(--_dk-accent);
+  --tool-accent-2: var(--_dk-accent-2);
+  --tool-warm: var(--_dk-warm);
+  --tool-ink: var(--_dk-ink);
+  --tool-muted: var(--_dk-muted);
+  --tool-surface: var(--_dk-surface);
+  --tool-panel: var(--_dk-panel);
+  --tool-code: var(--_dk-code);
+  --tool-code-ink: var(--_dk-code-ink);
+  --tool-line: var(--_dk-line);
+  --tool-navy: var(--_dk-navy);
+  --tool-seafoam: var(--_dk-seafoam);
+  --tool-hull: var(--_dk-hull);
+  --border-strong: var(--_dk-border-strong);
+}
+
+/* ==== SYSTEM default ====
+ * OS prefers dark → dark, unless the user has explicitly forced light. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --tool-accent: var(--_dk-accent);
+    --tool-accent-2: var(--_dk-accent-2);
+    --tool-warm: var(--_dk-warm);
+    --tool-ink: var(--_dk-ink);
+    --tool-muted: var(--_dk-muted);
+    --tool-surface: var(--_dk-surface);
+    --tool-panel: var(--_dk-panel);
+    --tool-code: var(--_dk-code);
+    --tool-code-ink: var(--_dk-code-ink);
+    --tool-line: var(--_dk-line);
+    --tool-navy: var(--_dk-navy);
+    --tool-seafoam: var(--_dk-seafoam);
+    --tool-hull: var(--_dk-hull);
+    --border-strong: var(--_dk-border-strong);
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --tool-accent: var(--_lt-accent);
+    --tool-accent-2: var(--_lt-accent-2);
+    --tool-warm: var(--_lt-warm);
+    --tool-ink: var(--_lt-ink);
+    --tool-muted: var(--_lt-muted);
+    --tool-surface: var(--_lt-surface);
+    --tool-panel: var(--_lt-panel);
+    --tool-code: var(--_lt-code);
+    --tool-code-ink: var(--_lt-code-ink);
+    --tool-line: var(--_lt-line);
+    --tool-navy: var(--_lt-navy);
+    --tool-seafoam: var(--_lt-seafoam);
+    --tool-hull: var(--_lt-hull);
+    --border-strong: var(--_lt-border-strong);
+  }
+}
