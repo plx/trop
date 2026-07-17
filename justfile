@@ -39,8 +39,44 @@ build:
 build-release:
     cargo build --release
 
-# Run all checks (fmt, clippy, tests)
-check: fmt-check clippy test
+# Validate the Claude Code marketplace
+validate-claude-marketplace:
+    claude plugin validate --strict .
+
+# Validate the Claude Code plugin
+validate-claude-plugin:
+    claude plugin validate --strict plugins/claude/trop
+
+# Validate all Claude Code plugin artifacts
+validate-claude: validate-claude-marketplace validate-claude-plugin
+
+# Validate the Codex marketplace through an isolated marketplace ingestion
+validate-codex-marketplace:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    codex_home=$(mktemp -d)
+    trap 'rm -rf "$codex_home"' EXIT
+    CODEX_HOME="$codex_home" codex plugin marketplace add "$PWD" --json >/dev/null
+    plugins=$(CODEX_HOME="$codex_home" codex plugin list --marketplace trop --available --json)
+    grep -q '"pluginId": "trop@trop"' <<<"$plugins"
+
+# Validate the Codex plugin by installing it into an isolated Codex home
+validate-codex-plugin:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    codex_home=$(mktemp -d)
+    trap 'rm -rf "$codex_home"' EXIT
+    CODEX_HOME="$codex_home" codex plugin marketplace add "$PWD" --json >/dev/null
+    CODEX_HOME="$codex_home" codex plugin add trop@trop --json >/dev/null
+
+# Validate all Codex plugin artifacts
+validate-codex: validate-codex-marketplace validate-codex-plugin
+
+# Validate both plugin marketplaces and both plugins
+validate-plugins: validate-claude validate-codex
+
+# Run all checks (fmt, clippy, tests, plugin validation)
+check: fmt-check clippy test validate-plugins
 
 # Pre-flight checks for PR submission (minimal output)
 preflight-pr:
@@ -83,6 +119,14 @@ preflight-pr:
         exit 1
     fi
     echo "✓ Tests passed"
+
+    # Plugin marketplace and package checks
+    output=$(just validate-plugins 2>&1) || {
+        echo "✗ Plugin validation failed"
+        echo "$output"
+        exit 1
+    }
+    echo "✓ Plugin validation passed"
 
     echo ""
     echo "All pre-flight checks passed!"
