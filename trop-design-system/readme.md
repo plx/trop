@@ -122,8 +122,10 @@ pen lines on warm cream, a daytime view) for light and
 dock lamps, teal navigation lights) for dark. It bleeds full-height off the
 right edge of the hero behind a horizontal _protection gradient_ keyed to
 `--surface-page` (opaque at left → transparent at ~70%) so text stays legible in
-either theme. Elsewhere backgrounds are flat paper/navy or the seafoam wash — no
-photographic imagery, no busy gradients.
+either theme. Both variants remain mounted as stacked layers so a theme change
+can cross-fade between them without swapping a CSS image URL. Elsewhere
+backgrounds are flat paper/navy or the seafoam wash — no photographic imagery,
+no busy gradients.
 
 **Borders & dividers.** Everything structural is a single 1px hairline in
 `--tool-line`. Sections separate with top/bottom hairlines; the muted section
@@ -135,7 +137,9 @@ variant adds a translucent panel fill.
 beyond the header.
 
 **Motion.** Restrained. Smooth scrolling; short (120–200ms) background/border
-transitions on hover. No bounces, no parallax, no looping decorative animation.
+transitions on hover. Theme changes are the one deliberate exception: a 560ms
+page cross-fade, with a 680ms day/night hero fade in the property-transition
+fallback. No bounces, no parallax, no looping decorative animation.
 `prefers-reduced-motion` is fully honored (animations reduced to ~0).
 
 **Hover / press states.** Primary button _darkens_ on hover (mix toward black);

@@ -43,7 +43,8 @@ import { ThemeToggle } from "./ThemeToggle.jsx";
   other's state.
 - The hero engraving ships in **two theme-matched variants**:
   `harbor-backdrop.png` (day, blue-grey on cream) for light and
-  `harbor-backdrop-dark.png` (harbor night) for dark. Swap the image per theme
-  rather than hiding it (`[data-theme="dark"] .hero-art { background-image:
-  url(.../harbor-backdrop-dark.png) }`); the `--surface-page` protection
-  gradient blends into whichever theme is active.
+  `harbor-backdrop-dark.png` (harbor night) for dark. Preload both and keep them
+  mounted as stacked layers, then cross-fade their opacity per theme. Do not
+  swap a single layer's `background-image` URL: that can discover the other
+  asset too late and produces a blank frame on the first transition. Give each
+  layer its matching paper/night protection gradient.

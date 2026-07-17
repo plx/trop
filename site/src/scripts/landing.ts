@@ -7,7 +7,35 @@ const themeButtons =
   document.querySelectorAll<HTMLButtonElement>("[data-theme-mode]");
 
 type ThemeMode = "system" | "light" | "dark";
+type ResolvedTheme = Exclude<ThemeMode, "system">;
+type ThemeViewTransition = {
+  finished: Promise<void>;
+};
+
 const themeStorageKey = "trop-theme";
+const themeTransitionFallbackMs = 760;
+const reducedMotionQuery = "(prefers-reduced-motion: reduce)";
+const heroImagePreloads = new Map<ResolvedTheme, Promise<void>>();
+let themeAnimationId = 0;
+let themeTransitionTimer: number | undefined;
+
+document
+  .querySelectorAll<HTMLLinkElement>("[data-theme-hero-preload]")
+  .forEach((link) => {
+    const theme = link.dataset.themeHeroPreload;
+    if (theme !== "light" && theme !== "dark") {
+      return;
+    }
+
+    const image = new Image();
+    image.src = link.href;
+    heroImagePreloads.set(
+      theme,
+      image.decode().catch(() => {
+        // A failed preload must not prevent the reader from changing themes.
+      }),
+    );
+  });
 
 function readTheme(): ThemeMode {
   try {
@@ -22,7 +50,7 @@ function readTheme(): ThemeMode {
   return "system";
 }
 
-function setTheme(mode: ThemeMode): void {
+function applyTheme(mode: ThemeMode): void {
   if (mode === "system") {
     document.documentElement.removeAttribute("data-theme");
   } else {
@@ -45,13 +73,82 @@ function setTheme(mode: ThemeMode): void {
   themeToggle?.setAttribute("data-theme-selection", mode);
 }
 
+function resolveTheme(mode: ThemeMode): ResolvedTheme {
+  if (mode === "light" || mode === "dark") {
+    return mode;
+  }
+
+  return window.matchMedia("(prefers-color-scheme: dark)").matches
+    ? "dark"
+    : "light";
+}
+
+function prefersReducedMotion(): boolean {
+  return window.matchMedia(reducedMotionQuery).matches;
+}
+
+function setTheme(mode: ThemeMode, animate = false): void {
+  const root = document.documentElement;
+
+  if (!animate || prefersReducedMotion()) {
+    applyTheme(mode);
+    return;
+  }
+
+  const animationId = ++themeAnimationId;
+  const startViewTransition = (
+    document as Document & {
+      startViewTransition?: (update: () => void) => ThemeViewTransition;
+    }
+  ).startViewTransition;
+
+  if (startViewTransition) {
+    root.setAttribute("data-theme-view-transition", "");
+
+    try {
+      const transition = startViewTransition.call(document, () => {
+        applyTheme(mode);
+      });
+      const cleanup = () => {
+        if (animationId === themeAnimationId) {
+          root.removeAttribute("data-theme-view-transition");
+        }
+      };
+      void transition.finished.then(cleanup, cleanup);
+      return;
+    } catch {
+      root.removeAttribute("data-theme-view-transition");
+    }
+  }
+
+  window.clearTimeout(themeTransitionTimer);
+  root.setAttribute("data-theme-transition", "");
+  // Flush the current theme with transitions enabled before changing tokens.
+  void root.offsetWidth;
+  applyTheme(mode);
+  themeTransitionTimer = window.setTimeout(() => {
+    if (animationId === themeAnimationId) {
+      root.removeAttribute("data-theme-transition");
+    }
+  }, themeTransitionFallbackMs);
+}
+
 setTheme(readTheme());
 
 themeButtons.forEach((button) => {
-  button.addEventListener("click", () => {
+  button.addEventListener("click", async () => {
     const mode = button.dataset.themeMode;
     if (mode === "system" || mode === "light" || mode === "dark") {
-      setTheme(mode);
+      const requestId = ++themeAnimationId;
+      if (prefersReducedMotion()) {
+        setTheme(mode);
+        return;
+      }
+
+      await heroImagePreloads.get(resolveTheme(mode));
+      if (requestId === themeAnimationId) {
+        setTheme(mode, true);
+      }
     }
   });
 });

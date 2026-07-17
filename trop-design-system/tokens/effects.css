@@ -19,6 +19,8 @@
   --ease-standard: cubic-bezier(0.2, 0.8, 0.2, 1); /* @kind other */
   --duration-fast: 120ms; /* @kind other */
   --duration-base: 200ms; /* @kind other */
+  --duration-theme: 560ms; /* @kind other */
+  --duration-theme-hero: 680ms; /* @kind other */
 
   /* ---- Illustration reference ---- */
   /* The hero engraving has two commissioned variants: a blue-grey-on-cream
