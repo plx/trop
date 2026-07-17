@@ -102,6 +102,25 @@ test.describe("rendered site", () => {
     }
   });
 
+  test("keeps the favicon inside the deployment base path", async ({
+    page,
+    request,
+  }) => {
+    for (const pagePath of ["/", docsPages[0]?.href].filter(Boolean)) {
+      await page.goto(sitePath(pagePath));
+      const faviconHref = await page
+        .locator('link[rel~="icon"]')
+        .getAttribute("href");
+
+      expect(new URL(faviconHref!, origin).pathname).toBe(
+        sitePath("/favicon.svg"),
+      );
+    }
+
+    const response = await request.get(sitePath("/favicon.svg"));
+    expect(response.status()).toBeLessThan(400);
+  });
+
   test("renders every landing primitive from the design-system contract", async ({
     page,
   }) => {

@@ -24,7 +24,10 @@ export default defineConfig({
         src: "@trop/design-system/assets/tool-mark.svg",
         alt: "",
       },
-      favicon: "/favicon.svg",
+      favicon: new URL(
+        `${siteConfig.site.basePath}/favicon.svg`,
+        siteConfig.site.host,
+      ).href,
       customCss: [
         "@trop/design-system/styles.css",
         "./src/styles/starlight.css",
