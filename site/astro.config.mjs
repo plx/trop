@@ -9,6 +9,11 @@ export default defineConfig({
   site: siteConfig.site.host,
   base: siteConfig.site.basePath,
   trailingSlash: "always",
+  // Astro 7 changed the `compressHTML` default from `true` (HTML-aware) to
+  // `'jsx'` (JSX-style), which strips whitespace between inline elements and can
+  // drop rendered spaces. Pin the v6 behavior so the migration preserves the
+  // deployed HTML output exactly.
+  compressHTML: true,
   vite: {
     server: {
       fs: {
