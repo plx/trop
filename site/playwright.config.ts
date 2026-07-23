@@ -30,7 +30,7 @@ export default defineConfig({
     // that detection and keeps the server in the foreground. This is a no-op in
     // CI (GitHub Actions is not detected as an agent), but lets the suite run
     // when launched from an agent shell.
-    env: { ASTRO_DEV_BACKGROUND: "1" },
+    env: { ASTRO_DEV_BACKGROUND: "0" },
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
   },
