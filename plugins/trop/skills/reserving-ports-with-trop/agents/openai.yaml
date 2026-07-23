@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reserve Ports with trop"
+  short_description: "Reserve stable ports without collisions"
+  default_prompt: "Use $reserving-ports-with-trop to replace hardcoded development ports in this repository."

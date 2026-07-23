@@ -1,0 +1,48 @@
+name: Plugin validation
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Marketplaces and plugins
+    runs-on: ubuntu-latest
+    env:
+      CLAUDE_CODE_VERSION: 2.1.210
+      CODEX_VERSION: 0.144.1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Just
+        uses: extractions/setup-just@v3
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install plugin harnesses
+        run: npm install --global "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" "@openai/codex@$CODEX_VERSION"
+
+      - name: Validate Claude Code marketplace
+        run: just validate-claude-marketplace
+
+      - name: Validate Claude Code plugin
+        run: just validate-claude-plugin
+
+      - name: Validate Codex marketplace
+        run: just validate-codex-marketplace
+
+      - name: Validate Codex plugin
+        run: just validate-codex-plugin
+
+      - name: Validate all plugin artifacts
+        run: just validate-plugins
