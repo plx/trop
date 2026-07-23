@@ -23,27 +23,27 @@
   --duration-theme-hero: 680ms; /* @kind other */
 
   /* ---- Illustration reference ---- */
-  /* The hero engraving has two commissioned variants: a blue-grey-on-cream
-   * day view for light, and a harbor-night view for dark. --harbor-backdrop
-   * always points at the variant that matches the active theme. */
-  --harbor-backdrop: url("../assets/harbor-backdrop.png"); /* @kind other */
-  --harbor-backdrop-light: url("../assets/harbor-backdrop.png"); /* @kind other */
-  --harbor-backdrop-dark: url("../assets/harbor-backdrop-dark.png"); /* @kind other */
+  /* The hero engraving has two compositionally aligned variants: a
+   * blue-grey-on-cream day view for light, and a harbor-night view for dark.
+   * --harbor-hero always points at the variant for the active theme. */
+  --harbor-hero: url("../assets/harbor-hero-light.png"); /* @kind other */
+  --harbor-hero-light: url("../assets/harbor-hero-light.png"); /* @kind other */
+  --harbor-hero-dark: url("../assets/harbor-hero-dark.png"); /* @kind other */
 }
 
 /* Deeper throw in dark, where the light navy shadow all but disappears. */
 :root[data-theme="dark"] {
   --tool-shadow: 0 22px 70px rgb(0 0 0 / 46%);
-  --harbor-backdrop: var(--harbor-backdrop-dark);
+  --harbor-hero: var(--harbor-hero-dark);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
     --tool-shadow: 0 22px 70px rgb(0 0 0 / 46%);
-    --harbor-backdrop: var(--harbor-backdrop-dark);
+    --harbor-hero: var(--harbor-hero-dark);
   }
   :root[data-theme="light"] {
     --tool-shadow: 0 22px 70px rgb(17 24 39 / 14%);
-    --harbor-backdrop: var(--harbor-backdrop-light);
+    --harbor-hero: var(--harbor-hero-light);
   }
 }

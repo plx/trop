@@ -72,6 +72,16 @@ requireText(
   "import the design-system site UI kit",
 );
 requireText(
+  landingPagePath,
+  /@trop\/design-system\/assets\/harbor-hero-light\.png\?url/,
+  "load the light hero illustration from the design system",
+);
+requireText(
+  landingPagePath,
+  /@trop\/design-system\/assets\/harbor-hero-dark\.png\?url/,
+  "load the dark hero illustration from the design system",
+);
+requireText(
   join(siteRoot, "astro.config.mjs"),
   /src:\s*"@trop\/design-system\/assets\/tool-mark\.svg"/,
   "load the Starlight logo from the design system",
@@ -82,11 +92,24 @@ for (const legacyPath of [
   "src/styles/landing.css",
   "src/assets/tool-mark.svg",
   "public/favicon.svg",
+  "public/assets/harbor-hero-light.png",
+  "public/assets/harbor-hero-dark.png",
   "public/assets/harbor-backdrop.png",
+  "public/assets/harbor-backdrop-dark.png",
 ]) {
   requireMissing(
     join(siteRoot, legacyPath),
     "legacy brand definitions and assets must not be duplicated in the site",
+  );
+}
+
+for (const retiredAsset of [
+  "assets/harbor-backdrop.png",
+  "assets/harbor-backdrop-dark.png",
+]) {
+  requireMissing(
+    join(designSystemRoot, retiredAsset),
+    "retired hero artwork must not remain in the design system",
   );
 }
 

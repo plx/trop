@@ -127,6 +127,7 @@ test.describe("rendered site", () => {
   }) => {
     await page.goto(sitePath("/"));
 
+    const dimensions: Array<{ width: number; height: number }> = [];
     for (const theme of ["light", "dark"]) {
       const preload = page.locator(
         `link[rel="preload"][as="image"][data-theme-hero-preload="${theme}"]`,
@@ -136,9 +137,35 @@ test.describe("rendered site", () => {
 
       const href = await preload.getAttribute("href");
       expect(href).toBeTruthy();
+      expect(href).toContain(`harbor-hero-${theme}`);
       const response = await request.get(href!);
       expect(response.status()).toBeLessThan(400);
+
+      dimensions.push(
+        await page.evaluate(
+          (src) =>
+            new Promise<{ width: number; height: number }>(
+              (resolve, reject) => {
+                const image = new Image();
+                image.onload = () =>
+                  resolve({
+                    width: image.naturalWidth,
+                    height: image.naturalHeight,
+                  });
+                image.onerror = () =>
+                  reject(new Error(`Failed to load ${src}`));
+                image.src = src;
+              },
+            ),
+          href!,
+        ),
+      );
     }
+
+    expect(dimensions).toEqual([
+      { width: 1642, height: 958 },
+      { width: 1642, height: 958 },
+    ]);
   });
 
   test("renders every landing primitive from the design-system contract", async ({
@@ -223,10 +250,10 @@ test.describe("rendered site", () => {
     }));
     expect(darkTheme.page).toBe("rgb(12, 20, 33)");
     expect(darkTheme.terminal).toBe("rgb(10, 18, 32)");
-    expect(darkTheme.dayImage).toContain("harbor-backdrop");
-    expect(darkTheme.dayImage).not.toContain("harbor-backdrop-dark");
+    expect(darkTheme.dayImage).toContain("harbor-hero-light");
+    expect(darkTheme.dayImage).not.toContain("harbor-hero-dark");
     expect(darkTheme.dayOpacity).toBe("0");
-    expect(darkTheme.nightImage).toContain("harbor-backdrop-dark");
+    expect(darkTheme.nightImage).toContain("harbor-hero-dark");
     expect(darkTheme.nightOpacity).toBe("0.96");
 
     await page.reload();

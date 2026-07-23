@@ -1,7 +1,7 @@
 ---
 import markUrl from "@trop/design-system/assets/tool-mark.svg?url";
-import harborDayUrl from "@trop/design-system/assets/harbor-backdrop.png?url";
-import harborNightUrl from "@trop/design-system/assets/harbor-backdrop-dark.png?url";
+import harborLightUrl from "@trop/design-system/assets/harbor-hero-light.png?url";
+import harborDarkUrl from "@trop/design-system/assets/harbor-hero-dark.png?url";
 import "@trop/design-system/site.css";
 import "@trop/design-system/styles.css";
 import { siteConfig } from "../site.config.mjs";
@@ -34,14 +34,14 @@ const docsHref = siteConfig.docs.pages[0]?.href || "docs/";
     <link
       rel="preload"
       as="image"
-      href={harborDayUrl}
+      href={harborLightUrl}
       fetchpriority="high"
       data-theme-hero-preload="light"
     />
     <link
       rel="preload"
       as="image"
-      href={harborNightUrl}
+      href={harborDarkUrl}
       fetchpriority="high"
       data-theme-hero-preload="dark"
     />

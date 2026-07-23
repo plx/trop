@@ -116,16 +116,17 @@ throw shadow `0 22px 70px rgb(17 24 39 / 14%)`; doc cards and the scope panel ar
 wash (accent from top-left, steel-blue from bottom-right).
 
 **Backgrounds & imagery.** The signature device is the **harbor engraving**,
-shipping in two theme-matched variants: `harbor-backdrop.png` (fine blue-grey
-pen lines on warm cream, a daytime view) for light and
-`harbor-backdrop-dark.png` (the same harbor at night — moonlit navy sky, warm
-dock lamps, teal navigation lights) for dark. It bleeds full-height off the
-right edge of the hero behind a horizontal _protection gradient_ keyed to
-`--surface-page` (opaque at left → transparent at ~70%) so text stays legible in
-either theme. Both variants remain mounted as stacked layers so a theme change
-can cross-fade between them without swapping a CSS image URL. Elsewhere
-backgrounds are flat paper/navy or the seafoam wash — no photographic imagery,
-no busy gradients.
+shipping as a compositionally aligned 1642 × 958 pair:
+`harbor-hero-light.png` (fine blue-grey pen lines on warm cream, a daytime view)
+for light and `harbor-hero-dark.png` (the same harbor at night — moonlit navy
+sky, warm dock lamps, teal navigation lights) for dark. Their matching canvas
+and scene geometry keep the harbor fixed in place during a theme transition.
+The illustration bleeds full-height off the right edge of the hero behind a
+horizontal _protection gradient_ keyed to `--surface-page` (opaque at left →
+transparent at ~70%) so text stays legible in either theme. Both variants remain
+mounted as stacked layers so a theme change can cross-fade between them without
+swapping a CSS image URL. Elsewhere backgrounds are flat paper/navy or the
+seafoam wash — no photographic imagery, no busy gradients.
 
 **Borders & dividers.** Everything structural is a single 1px hairline in
 `--tool-line`. Sections separate with top/bottom hairlines; the muted section
@@ -179,8 +180,8 @@ stroke-linecap/linejoin: round`. This is set globally in the site CSS. Match
   `@import`-only.
 - `tokens/` — `colors.css`, `typography.css`, `spacing.css`, `effects.css`,
   `fonts.css` (webfonts). These files are the production source of truth.
-- `assets/` — `harbor-backdrop.png` (day engraving), `harbor-backdrop-dark.png`
-  (night engraving), `tool-mark.svg` (light
+- `assets/` — the aligned `harbor-hero-light.png` (day engraving) and
+  `harbor-hero-dark.png` (night engraving), `tool-mark.svg` (light
   mark), `favicon.svg` (dark mark).
 - `guidelines/` — the specimen cards shown on the Design System tab (Colors,
   Type, Spacing, Brand).
