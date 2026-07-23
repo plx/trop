@@ -20,18 +20,18 @@
   },
   "dependencies": {
     "@trop/design-system": "file:../trop-design-system",
-    "@astrojs/starlight": "^0.39.0",
-    "astro": "^6.0.0"
+    "@astrojs/starlight": "^0.41.3",
+    "astro": "^7.1.3"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.10.0",
-    "@astrojs/check": "^0.9.0",
+    "@astrojs/check": "^0.9.9",
     "@playwright/test": "^1.57.0",
     "cspell": "^9.2.0",
     "prettier": "^3.6.0",
     "typescript": "^6.0.0"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12.0"
   }
 }
