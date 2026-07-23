@@ -683,7 +683,6 @@ const {
   ScopePanel
 } = window.TropDesignSystem_9d5100;
 const MARK = "../../assets/tool-mark.svg";
-const BACKDROP = "../../assets/harbor-backdrop.png";
 const ghIcon = /*#__PURE__*/React.createElement("svg", {
   viewBox: "0 0 24 24",
   fill: "none",

@@ -172,9 +172,9 @@
       "--font-body",
       "--font-display",
       "--font-mono",
-      "--harbor-backdrop",
-      "--harbor-backdrop-dark",
-      "--harbor-backdrop-light",
+      "--harbor-hero",
+      "--harbor-hero-dark",
+      "--harbor-hero-light",
       "--hero-pad",
       "--hit-min",
       "--leading-code",
@@ -361,9 +361,9 @@
       "--ease-standard": "other",
       "--duration-fast": "other",
       "--duration-base": "other",
-      "--harbor-backdrop": "color",
-      "--harbor-backdrop-light": "other",
-      "--harbor-backdrop-dark": "other"
+      "--harbor-hero": "color",
+      "--harbor-hero-light": "other",
+      "--harbor-hero-dark": "other"
     },
     "fontFamilies": [
       "IBM Plex Sans",

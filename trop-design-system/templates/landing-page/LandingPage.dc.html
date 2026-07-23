@@ -23,9 +23,9 @@
   a { color: var(--tool-accent); text-decoration: none; }
   a:hover { color: color-mix(in srgb, var(--tool-accent) 80%, #000); }
   .shell { width: min(1120px, calc(100% - 2rem)); margin-inline: auto; }
-  /* Hero engraving. Day view (blue-grey on cream) in light; the commissioned
-     harbor-night view in dark. The protection gradient uses --surface-page, so
-     it blends into whichever theme is active. */
+  /* Compositionally aligned hero engravings: blue-grey day in light and
+     harbor night in dark. The protection gradient uses --surface-page, so it
+     blends into whichever theme is active. */
   .hero-art {
     position: absolute; inset: 0; opacity: 0.96;
     background:
@@ -33,7 +33,7 @@
         color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
         color-mix(in srgb, var(--surface-page) 86%, transparent) 39%,
         color-mix(in srgb, var(--surface-page) 24%, transparent) 70%),
-      url(../../assets/harbor-backdrop.png) right center / cover no-repeat;
+      url(../../assets/harbor-hero-light.png) right center / cover no-repeat;
   }
   [data-theme="dark"] .hero-art {
     background:
@@ -41,7 +41,7 @@
         color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
         color-mix(in srgb, var(--surface-page) 82%, transparent) 39%,
         color-mix(in srgb, var(--surface-page) 14%, transparent) 70%),
-      url(../../assets/harbor-backdrop-dark.png) right center / cover no-repeat;
+      url(../../assets/harbor-hero-dark.png) right center / cover no-repeat;
     opacity: 1;
   }
   @media (prefers-color-scheme: dark) {
@@ -51,7 +51,7 @@
           color-mix(in srgb, var(--surface-page) 98%, transparent) 0%,
           color-mix(in srgb, var(--surface-page) 82%, transparent) 39%,
           color-mix(in srgb, var(--surface-page) 14%, transparent) 70%),
-        url(../../assets/harbor-backdrop-dark.png) right center / cover no-repeat;
+        url(../../assets/harbor-hero-dark.png) right center / cover no-repeat;
       opacity: 1;
     }
   }

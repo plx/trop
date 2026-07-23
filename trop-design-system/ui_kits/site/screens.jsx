@@ -6,7 +6,6 @@ const { Button, Badge, Eyebrow, ThemeToggle, CommandCard, FeatureCard, DocCard, 
   window.TropDesignSystem_9d5100;
 
 const MARK = "../../assets/tool-mark.svg";
-const BACKDROP = "../../assets/harbor-backdrop.png";
 
 const ghIcon = (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
