@@ -26,6 +26,14 @@ relationships, and 74 native blocked-by relationships. An API-level graph check
 found no missing parent, missing label axis, missing milestone, or dependency
 cycle.
 
+The automatic work-selection setup later added 48 landed-only gate
+relationships: each component epic is blocked by all of its actionable
+sub-issues, and the top-level epic is blocked by the final audit. The live
+graph therefore has 122 native blocked-by relationships: 74 implementation
+prerequisites plus 48 gate prerequisites. See the
+[production-readiness work-selection guide](production-readiness-work-selection.md)
+for the operational contract.
+
 ## Label taxonomy
 
 Every issue created by this audit carries one label from each primary axis:
@@ -48,6 +56,19 @@ Cross-cutting labels have separate meanings:
 - `breaking-change`: requires an explicit compatibility decision.
 - `data-migration`: changes or migrates persistent representation.
 - `audit:2026-07`: belongs to this due-diligence program.
+
+Three additional labels support fail-closed automatic scheduling:
+
+- `workflow:production-readiness`: all 55 issues in the canonical audit
+  universe;
+- `workflow:production-readiness-leaf`: the 47 independently actionable
+  issues, #90-#136; and
+- `workflow:production-readiness-gate`: the eight aggregate gates, #83-#89
+  and #137.
+
+The selector requires the `audit:2026-07` and
+`workflow:production-readiness` cohorts to match exactly. Every member must
+carry exactly one leaf/gate label and exactly one recognized `P0`-`P3` label.
 
 The pre-existing `P0`-`P3` labels were retained so historical issues and the
 new program use one priority vocabulary.
@@ -219,10 +240,12 @@ wave, especially the immediate `SEC-1` public-safety work.
 
 ### Final gate
 
-Close component epics #84-#89 only after their native sub-issues and exit
-criteria are complete. Then execute #137 exactly as written in the
+The selector offers each component epic #84-#89 only after all of its native
+leaf blockers are actually closed. Execute the epic's aggregate acceptance
+criteria before closing it. Then execute #137 exactly as written in the
 [post-remediation audit runbook](post-remediation-production-readiness-audit.md).
-A `GO` decision is not implied by reaching this point.
+After #137 closes, #83 becomes the last selectable gate. A `GO` decision is not
+implied by reaching any of these points.
 
 ## Ticket execution standard
 
