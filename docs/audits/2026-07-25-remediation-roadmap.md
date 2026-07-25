@@ -20,6 +20,8 @@ understandable from a checkout, in review, and across agent context compaction.
   [#137 — Execute the independent post-remediation production-readiness audit](https://github.com/plx/trop/issues/137)
 - Audit runbook:
   [Post-remediation production-readiness audit](post-remediation-production-readiness-audit.md)
+- Remediation execution goal:
+  [Production-readiness remediation goal](production-readiness-remediation-goal.md)
 
 At creation time the program contained 55 issues, 54 native parent
 relationships, and 74 native blocked-by relationships. An API-level graph check

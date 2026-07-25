@@ -15,10 +15,11 @@
   - workflows/site-check.yml # Validates the Astro/Starlight site on pull requests
   - workflows/site-publish.yml # Builds and deploys the Astro/Starlight site to GitHub Pages
 - docs/ # Maintainer-facing project records and operational guidance
-  - audits/ # Production-readiness audit baselines, remediation map, and re-audit runbook
+  - audits/ # Production-readiness baselines, remediation execution, and re-audit guidance
     - 2026-07-25-pre-release-due-diligence.md # Historical baseline audit and release verdict
     - 2026-07-25-remediation-roadmap.md # GitHub epic, label, ticket, and dependency index
     - post-remediation-production-readiness-audit.md # Independent final-audit procedure and go/no-go rubric
+    - production-readiness-remediation-goal.md # Autonomous one-issue remediation, audit, and release execution contract
     - production-readiness-work-selection.md # Live GitHub scheduling contract and selector operations
 - scripts/ # Dependency-free maintainer automation
   - get_next_production_readiness_issue.py # Selects one ready audit issue from complete live GitHub snapshots
