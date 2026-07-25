@@ -12,6 +12,11 @@
 - .github/ # Repository automation and CI
   - workflows/site-check.yml # Validates the Astro/Starlight site on pull requests
   - workflows/site-publish.yml # Builds and deploys the Astro/Starlight site to GitHub Pages
+- docs/ # Maintainer-facing project records and operational guidance
+  - audits/ # Production-readiness audit baselines, remediation map, and re-audit runbook
+    - 2026-07-25-pre-release-due-diligence.md # Historical baseline audit and release verdict
+    - 2026-07-25-remediation-roadmap.md # GitHub epic, label, ticket, and dependency index
+    - post-remediation-production-readiness-audit.md # Independent final-audit procedure and go/no-go rubric
 - reference/ # Authoritative project specifications (DO NOT MODIFY)
   - ImplementationSpecification.md # Complete spec - SOURCE OF TRUTH
 - site/ # Astro/Starlight static website for https://plx.github.io/trop/
