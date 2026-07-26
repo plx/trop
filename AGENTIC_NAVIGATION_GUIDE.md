@@ -12,6 +12,7 @@
 - about.hbs # Handlebars template that renders THIRD_PARTY_LICENSES.md
 - .github/ # Repository automation and CI
   - workflows/ci.yml # Cross-platform Rust validation and selector unit-test gate
+  - workflows/security-release.yml # Issue-specific, approval-gated 0.2.0 crates.io security publisher
   - workflows/site-check.yml # Validates the Astro/Starlight site on pull requests
   - workflows/site-publish.yml # Builds and deploys the Astro/Starlight site to GitHub Pages
 - docs/ # Maintainer-facing project records and operational guidance

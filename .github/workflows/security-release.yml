@@ -1,0 +1,1037 @@
+# Issue-specific publisher for the approved 0.2.0 SEC-1 emergency release.
+#
+# This workflow cannot create or inspect its owner-managed trust boundaries.
+# Before dispatch, the owner must configure:
+# - a `security-release` GitHub environment with the approved reviewer,
+#   self-review, branch, and administrator-bypass policy; and
+# - crates.io Trusted Publisher entries for both crates, bound exactly to
+#   plx/trop, this workflow filename, and that environment, with
+#   trusted-publishing-only mode enabled.
+#
+# Only the environment-gated publication job can request OIDC credentials.
+# It packages and publishes with --no-verify, so package and dependency code
+# never runs in that job. A matching temporary token may authorize either
+# configured crate; it is passed only to a fixed cargo publish command and is
+# revoked by the authentication action's post-step when the job ends.
+#
+# The exact source, package checksums, publishers, advisory, and yank decision
+# require a separate maintainer checkpoint before this workflow may run.
+
+name: Emergency security release
+run-name: security-release/0.2.0 ${{ inputs.source_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Approved lowercase 40-hex main/workflow commit
+        required: true
+        type: string
+      expected_library_checksum:
+        description: Approved SHA-256 of trop 0.2.0.crate
+        required: true
+        type: string
+      expected_cli_checksum:
+        description: Approved SHA-256 of trop-cli 0.2.0.crate
+        required: true
+        type: string
+      confirmation:
+        description: Exact publication confirmation including version and SHA
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: security-release-0.2.0
+  cancel-in-progress: false
+
+env:
+  RELEASE_VERSION: "0.2.0"
+  EXPECTED_REPOSITORY: plx/trop
+  EXPECTED_REPOSITORY_ID: "1072210963"
+  EXPECTED_ACTOR: plx
+  EXPECTED_ACTOR_ID: "65440"
+  EXPECTED_WORKFLOW_REF: plx/trop/.github/workflows/security-release.yml@refs/heads/main
+  CRATES_IO_USER_AGENT: trop-security-release/0.2.0 (https://github.com/plx/trop)
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+  SOURCE_SHA: ${{ inputs.source_sha }}
+  EXPECTED_LIBRARY_CHECKSUM: ${{ inputs.expected_library_checksum }}
+  EXPECTED_CLI_CHECKSUM: ${{ inputs.expected_cli_checksum }}
+  CONFIRMATION: ${{ inputs.confirmation }}
+  EVENT_NAME: ${{ github.event_name }}
+  EVENT_SHA: ${{ github.sha }}
+  EVENT_REF: ${{ github.ref }}
+  WORKFLOW_REF: ${{ github.workflow_ref }}
+  WORKFLOW_SHA: ${{ github.workflow_sha }}
+  REPOSITORY: ${{ github.repository }}
+  REPOSITORY_ID: ${{ github.repository_id }}
+  ACTOR: ${{ github.actor }}
+  ACTOR_ID: ${{ github.actor_id }}
+  PUBLICATION_RUN_ID: ${{ github.run_id }}
+  RUN_ATTEMPT: ${{ github.run_attempt }}
+
+jobs:
+  preflight:
+    name: Preflight 0.2.0 without publication credentials
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Fail closed unless the dispatch matches the approved identity
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$EVENT_REF" == "refs/heads/main" ]]
+          [[ "$REPOSITORY" == "$EXPECTED_REPOSITORY" ]]
+          [[ "$REPOSITORY_ID" == "$EXPECTED_REPOSITORY_ID" ]]
+          [[ "$ACTOR" == "$EXPECTED_ACTOR" ]]
+          [[ "$ACTOR_ID" == "$EXPECTED_ACTOR_ID" ]]
+          [[ "$WORKFLOW_REF" == "$EXPECTED_WORKFLOW_REF" ]]
+          [[ "$RUN_ATTEMPT" == "1" ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EVENT_SHA" == "$SOURCE_SHA" ]]
+          [[ "$WORKFLOW_SHA" == "$SOURCE_SHA" ]]
+          [[ "$EXPECTED_LIBRARY_CHECKSUM" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_CLI_CHECKSUM" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CONFIRMATION" == "PUBLISH trop and trop-cli 0.2.0 from $SOURCE_SHA" ]]
+
+      - name: Checkout the exact approved commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Establish isolated, exact build state
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          [[ "$(git rev-parse --verify "HEAD^{commit}")" == "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          export CARGO_HOME="$RUNNER_TEMP/source-cargo-home"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/source-cargo-target"
+          export RUSTUP_TOOLCHAIN=1.95.0
+          mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
+          {
+            echo "CARGO_HOME=$CARGO_HOME"
+            echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+            echo "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN"
+          } >> "$GITHUB_ENV"
+          rustup toolchain install 1.95.0 --profile minimal
+          cargo --version | grep -E '^cargo 1\.95\.0 '
+          rustc --version | grep -E '^rustc 1\.95\.0 '
+
+      - name: Validate candidate metadata and publication eligibility
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import urllib.error
+          import urllib.request
+
+          metadata = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
+              text=True,
+          ))
+          packages = {package["name"]: package for package in metadata["packages"]}
+          assert set(packages) == {"trop", "trop-cli"}, set(packages)
+          for name in ("trop", "trop-cli"):
+              package = packages[name]
+              assert package["version"] == "0.2.0", (name, package["version"])
+              assert package["repository"] == "https://github.com/plx/trop"
+              assert package["license"] == "Apache-2.0 OR MIT"
+              assert package["publish"] is None
+          dependency = next(
+              item for item in packages["trop-cli"]["dependencies"]
+              if item["name"] == "trop"
+          )
+          assert dependency["req"] == "^0.2.0", dependency["req"]
+          for path in (
+              "LICENSE-APACHE",
+              "LICENSE-MIT",
+              "trop/LICENSE-APACHE",
+              "trop/LICENSE-MIT",
+              "trop-cli/LICENSE-APACHE",
+              "trop-cli/LICENSE-MIT",
+              "trop-cli/tests/installed_sec1.rs",
+          ):
+              assert pathlib.Path(path).is_file(), path
+
+          def request_json(url):
+              request = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": os.environ["CRATES_IO_USER_AGENT"]},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      return response.status, json.load(response)
+              except urllib.error.HTTPError as error:
+                  return error.code, None
+
+          for crate in ("trop", "trop-cli"):
+              status, body = request_json(f"https://crates.io/api/v1/crates/{crate}")
+              assert status == 200, (crate, status)
+              assert body["crate"]["trustpub_only"] is True, (
+                  crate,
+                  body["crate"]["trustpub_only"],
+              )
+              status, owners = request_json(
+                  f"https://crates.io/api/v1/crates/{crate}/owners"
+              )
+              assert status == 200, (crate, status)
+              assert [
+                  (owner["id"], owner["login"]) for owner in owners["users"]
+              ] == [(347210, "plx")], owners["users"]
+              status, _ = request_json(
+                  f"https://crates.io/api/v1/crates/{crate}/0.2.0"
+              )
+              assert status == 404, (f"{crate} 0.2.0 already exists", status)
+          PY
+
+      - name: Dry-run and bind both package archives
+        run: |
+          set -euo pipefail
+          cargo publish --dry-run --locked -p trop
+          standalone_library="$CARGO_TARGET_DIR/package/tmp-crate/trop-0.2.0.crate"
+          [[ -f "$standalone_library" ]]
+          standalone_snapshot="$RUNNER_TEMP/standalone-trop-0.2.0.crate"
+          cp "$standalone_library" "$standalone_snapshot"
+
+          cargo publish --dry-run --locked -p trop -p trop-cli
+          package_dir="$CARGO_TARGET_DIR/package"
+          library_archive="$package_dir/tmp-crate/trop-0.2.0.crate"
+          cli_archive="$package_dir/tmp-crate/trop-cli-0.2.0.crate"
+          registry_library="$package_dir/tmp-registry/trop-0.2.0.crate"
+          registry_cli="$package_dir/tmp-registry/trop-cli-0.2.0.crate"
+          library_index="$package_dir/tmp-registry/index/tr/op/trop"
+          cli_index="$package_dir/tmp-registry/index/tr/op/trop-cli"
+          for path in \
+            "$library_archive" "$cli_archive" \
+            "$registry_library" "$registry_cli" \
+            "$library_index" "$cli_index"
+          do
+            [[ -f "$path" ]]
+          done
+          cmp "$standalone_snapshot" "$library_archive"
+          cmp "$library_archive" "$registry_library"
+          cmp "$cli_archive" "$registry_cli"
+
+          actual_library="$(sha256sum "$library_archive" | awk '{print $1}')"
+          actual_cli="$(sha256sum "$cli_archive" | awk '{print $1}')"
+          [[ "$actual_library" == "$EXPECTED_LIBRARY_CHECKSUM" ]]
+          [[ "$actual_cli" == "$EXPECTED_CLI_CHECKSUM" ]]
+
+          LIBRARY_ARCHIVE="$library_archive" \
+          CLI_ARCHIVE="$cli_archive" \
+          LIBRARY_INDEX="$library_index" \
+          CLI_INDEX="$cli_index" \
+            python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import tarfile
+
+          source_sha = os.environ["SOURCE_SHA"]
+          expected = {
+              "trop": os.environ["EXPECTED_LIBRARY_CHECKSUM"],
+              "trop-cli": os.environ["EXPECTED_CLI_CHECKSUM"],
+          }
+          archives = {
+              "trop": pathlib.Path(os.environ["LIBRARY_ARCHIVE"]),
+              "trop-cli": pathlib.Path(os.environ["CLI_ARCHIVE"]),
+          }
+          indexes = {
+              "trop": pathlib.Path(os.environ["LIBRARY_INDEX"]),
+              "trop-cli": pathlib.Path(os.environ["CLI_INDEX"]),
+          }
+          for crate, archive in archives.items():
+              assert archive.stat().st_size < 10_000_000
+              assert hashlib.sha256(archive.read_bytes()).hexdigest() == expected[crate]
+              root = f"{crate}-0.2.0"
+              with tarfile.open(archive, mode="r:gz") as package:
+                  names = set(package.getnames())
+                  info = json.load(package.extractfile(f"{root}/.cargo_vcs_info.json"))
+                  assert info["git"]["sha1"] == source_sha, info
+                  assert info["git"].get("dirty", False) is False, info
+                  for license_name in ("LICENSE-APACHE", "LICENSE-MIT"):
+                      packaged = package.extractfile(f"{root}/{license_name}").read()
+                      assert packaged == pathlib.Path(license_name).read_bytes()
+                  if crate == "trop":
+                      assert f"{root}/src/identifier.rs" in names
+                      assert f"{root}/src/output/shell.rs" in names
+                  else:
+                      assert f"{root}/tests/installed_sec1.rs" in names
+
+              entries = [
+                  json.loads(line)
+                  for line in indexes[crate].read_text(encoding="utf-8").splitlines()
+                  if line.strip()
+              ]
+              matching = [entry for entry in entries if entry["vers"] == "0.2.0"]
+              assert len(matching) == 1, (crate, len(matching))
+              assert matching[0]["name"] == crate
+              assert matching[0]["cksum"] == expected[crate]
+          PY
+
+          {
+            echo "### Approved package identity"
+            echo
+            echo "- Source: \`$SOURCE_SHA\`"
+            echo "- \`trop 0.2.0\`: \`$actual_library\`"
+            echo "- \`trop-cli 0.2.0\`: \`$actual_cli\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish 0.2.0 without running package code
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    environment:
+      name: security-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Fail closed unless the dispatch matches the approved identity
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$EVENT_REF" == "refs/heads/main" ]]
+          [[ "$REPOSITORY" == "$EXPECTED_REPOSITORY" ]]
+          [[ "$REPOSITORY_ID" == "$EXPECTED_REPOSITORY_ID" ]]
+          [[ "$ACTOR" == "$EXPECTED_ACTOR" ]]
+          [[ "$ACTOR_ID" == "$EXPECTED_ACTOR_ID" ]]
+          [[ "$WORKFLOW_REF" == "$EXPECTED_WORKFLOW_REF" ]]
+          [[ "$RUN_ATTEMPT" == "1" ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EVENT_SHA" == "$SOURCE_SHA" ]]
+          [[ "$WORKFLOW_SHA" == "$SOURCE_SHA" ]]
+          [[ "$EXPECTED_LIBRARY_CHECKSUM" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_CLI_CHECKSUM" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CONFIRMATION" == "PUBLISH trop and trop-cli 0.2.0 from $SOURCE_SHA" ]]
+
+      - name: Checkout the exact approved commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind the library archive and revalidate public prestate
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          [[ "$(git rev-parse --verify "HEAD^{commit}")" == "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          [[ ! -e .cargo/config ]]
+          [[ ! -e .cargo/config.toml ]]
+          export CARGO_HOME="$RUNNER_TEMP/publish-cargo-home"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/publish-cargo-target"
+          export RUSTUP_TOOLCHAIN=1.95.0
+          mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
+          {
+            echo "CARGO_HOME=$CARGO_HOME"
+            echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+            echo "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN"
+          } >> "$GITHUB_ENV"
+          rustup toolchain install 1.95.0 --profile minimal
+          cargo --version | grep -E '^cargo 1\.95\.0 '
+          rustc --version | grep -E '^rustc 1\.95\.0 '
+
+          # --no-verify creates the archive without building it or executing
+          # package/dependency build scripts in this OIDC-capable job.
+          cargo package --locked --no-verify --registry crates-io -p trop
+          library_archive="$CARGO_TARGET_DIR/package/tmp-crate/trop-0.2.0.crate"
+          [[ -f "$library_archive" ]]
+          actual_library="$(sha256sum "$library_archive" | awk '{print $1}')"
+          [[ "$actual_library" == "$EXPECTED_LIBRARY_CHECKSUM" ]]
+
+          LIBRARY_ARCHIVE="$library_archive" python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import tarfile
+          import urllib.error
+          import urllib.request
+
+          archive = pathlib.Path(os.environ["LIBRARY_ARCHIVE"])
+          root = "trop-0.2.0"
+          with tarfile.open(archive, mode="r:gz") as package:
+              names = set(package.getnames())
+              info = json.load(package.extractfile(f"{root}/.cargo_vcs_info.json"))
+              assert info["git"]["sha1"] == os.environ["SOURCE_SHA"], info
+              assert info["git"].get("dirty", False) is False, info
+              for license_name in ("LICENSE-APACHE", "LICENSE-MIT"):
+                  packaged = package.extractfile(f"{root}/{license_name}").read()
+                  assert packaged == pathlib.Path(license_name).read_bytes()
+              assert f"{root}/src/identifier.rs" in names
+              assert f"{root}/src/output/shell.rs" in names
+
+          def request_json(url):
+              request = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": os.environ["CRATES_IO_USER_AGENT"]},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      return response.status, json.load(response)
+              except urllib.error.HTTPError as error:
+                  return error.code, None
+
+          for crate in ("trop", "trop-cli"):
+              status, body = request_json(f"https://crates.io/api/v1/crates/{crate}")
+              assert status == 200, (crate, status)
+              assert body["crate"]["trustpub_only"] is True, crate
+              status, owners = request_json(
+                  f"https://crates.io/api/v1/crates/{crate}/owners"
+              )
+              assert status == 200, (crate, status)
+              assert [
+                  (owner["id"], owner["login"]) for owner in owners["users"]
+              ] == [(347210, "plx")], owners["users"]
+              status, _ = request_json(
+                  f"https://crates.io/api/v1/crates/{crate}/0.2.0"
+              )
+              assert status == 404, (f"{crate} 0.2.0 already exists", status)
+          PY
+
+      - name: Exchange Trusted Publishing credentials before the library command
+        id: auth-library
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish the verified library
+        id: publish-library
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-library.outputs.token }}
+        run: |
+          set -euo pipefail
+          # A matching Trusted Publisher token may authorize either crate. Its
+          # environment exposure is confined to this static command, and the
+          # auth action's post-step revokes it when the job ends.
+          # --no-verify prevents package/dependency builds in the OIDC job.
+          cargo publish --locked --no-verify --registry crates-io -p trop
+
+      - name: Wait for and verify the public library
+        env:
+          CRATE_NAME: trop
+          EXPECTED_CHECKSUM: ${{ inputs.expected_library_checksum }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+
+          crate = os.environ["CRATE_NAME"]
+          expected = os.environ["EXPECTED_CHECKSUM"]
+          user_agent = os.environ["CRATES_IO_USER_AGENT"]
+          deadline = time.monotonic() + 600
+
+          def get_text(url):
+              remaining = deadline - time.monotonic()
+              if remaining <= 0:
+                  raise SystemExit(f"timed out waiting for {crate} 0.2.0")
+              request = urllib.request.Request(url, headers={"User-Agent": user_agent})
+              try:
+                  with urllib.request.urlopen(
+                      request,
+                      timeout=max(1, min(10, remaining)),
+                  ) as response:
+                      return response.status, response.read().decode("utf-8")
+              except urllib.error.HTTPError as error:
+                  return error.code, ""
+
+          verified = False
+          attempt = 0
+          while time.monotonic() < deadline:
+              attempt += 1
+              api_status, api_text = get_text(
+                  f"https://crates.io/api/v1/crates/{crate}/0.2.0"
+              )
+              index_status, index_text = get_text(
+                  f"https://index.crates.io/tr/op/{crate}"
+              )
+              if api_status not in (200, 404):
+                  raise SystemExit(f"unexpected API status {api_status}")
+              if index_status != 200:
+                  raise SystemExit(f"unexpected sparse-index status {index_status}")
+
+              version = json.loads(api_text)["version"] if api_status == 200 else None
+              if version is not None and (
+                  version["checksum"] != expected or version["yanked"] is not False
+              ):
+                  raise SystemExit(f"immutable API mismatch: {version}")
+              if version is not None:
+                  if version["license"] != "Apache-2.0 OR MIT":
+                      raise SystemExit(f"unexpected public license: {version['license']}")
+                  if version["repository"] != "https://github.com/plx/trop":
+                      raise SystemExit(
+                          f"unexpected public repository: {version['repository']}"
+                      )
+                  provenance = version["trustpub_data"]
+                  if version["published_by"] is not None or provenance is None:
+                      raise SystemExit(
+                          f"release was not attributed to Trusted Publishing: {version}"
+                      )
+                  expected_provenance = {
+                      "provider": "github",
+                      "repository": os.environ["EXPECTED_REPOSITORY"],
+                      "run_id": os.environ["PUBLICATION_RUN_ID"],
+                      "sha": os.environ["SOURCE_SHA"],
+                  }
+                  if any(
+                      provenance.get(key) != value
+                      for key, value in expected_provenance.items()
+                  ):
+                      raise SystemExit(
+                          f"unexpected Trusted Publishing provenance: {provenance}"
+                      )
+              entries = [
+                  json.loads(line) for line in index_text.splitlines() if line.strip()
+              ]
+              matching = [entry for entry in entries if entry["vers"] == "0.2.0"]
+              if matching and (
+                  len(matching) != 1
+                  or matching[0]["cksum"] != expected
+                  or matching[0]["yanked"] is not False
+              ):
+                  raise SystemExit(f"immutable sparse mismatch: {matching}")
+              if version is not None and len(matching) == 1:
+                  print(f"verified {crate} 0.2.0 checksum {expected}")
+                  verified = True
+                  break
+              remaining = deadline - time.monotonic()
+              if remaining > 0:
+                  time.sleep(min(5, remaining))
+          if not verified:
+              raise SystemExit(f"{crate} did not become available within 600 seconds")
+          PY
+
+      - name: Bind the CLI archive and reverify the partial public state
+        run: |
+          set -euo pipefail
+          # The build-capable CLI dry-run already passed in the no-OIDC
+          # preflight job. Package without verification in this OIDC job.
+          cargo package --locked --no-verify --registry crates-io -p trop-cli
+          cli_archive="$CARGO_TARGET_DIR/package/tmp-crate/trop-cli-0.2.0.crate"
+          [[ -f "$cli_archive" ]]
+          actual_cli="$(sha256sum "$cli_archive" | awk '{print $1}')"
+          [[ "$actual_cli" == "$EXPECTED_CLI_CHECKSUM" ]]
+
+          CLI_ARCHIVE="$cli_archive" python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import tarfile
+          import urllib.error
+          import urllib.request
+
+          archive = pathlib.Path(os.environ["CLI_ARCHIVE"])
+          root = "trop-cli-0.2.0"
+          with tarfile.open(archive, mode="r:gz") as package:
+              names = set(package.getnames())
+              info = json.load(package.extractfile(f"{root}/.cargo_vcs_info.json"))
+              assert info["git"]["sha1"] == os.environ["SOURCE_SHA"], info
+              assert info["git"].get("dirty", False) is False, info
+              for license_name in ("LICENSE-APACHE", "LICENSE-MIT"):
+                  packaged = package.extractfile(f"{root}/{license_name}").read()
+                  assert packaged == pathlib.Path(license_name).read_bytes()
+              assert f"{root}/tests/installed_sec1.rs" in names
+
+          def request_json(url):
+              request = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": os.environ["CRATES_IO_USER_AGENT"]},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      return response.status, json.load(response)
+              except urllib.error.HTTPError as error:
+                  return error.code, None
+
+          status, body = request_json(
+              "https://crates.io/api/v1/crates/trop/0.2.0"
+          )
+          assert status == 200, status
+          assert body["version"]["checksum"] == os.environ["EXPECTED_LIBRARY_CHECKSUM"]
+          assert body["version"]["yanked"] is False
+          status, _ = request_json(
+              "https://crates.io/api/v1/crates/trop-cli/0.2.0"
+          )
+          assert status == 404, status
+          PY
+
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+
+      - name: Exchange Trusted Publishing credentials before the CLI command
+        id: auth-cli
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish the verified CLI
+        id: publish-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-cli.outputs.token }}
+        run: |
+          set -euo pipefail
+          # This fresh token has the same matching-publisher scope as the
+          # earlier token; only this static command receives it in its env.
+          cargo publish --locked --no-verify --registry crates-io -p trop-cli
+
+      - name: Wait for and verify the public CLI
+        env:
+          CRATE_NAME: trop-cli
+          EXPECTED_CHECKSUM: ${{ inputs.expected_cli_checksum }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+
+          crate = os.environ["CRATE_NAME"]
+          expected = os.environ["EXPECTED_CHECKSUM"]
+          user_agent = os.environ["CRATES_IO_USER_AGENT"]
+          deadline = time.monotonic() + 600
+
+          def get_text(url):
+              remaining = deadline - time.monotonic()
+              if remaining <= 0:
+                  raise SystemExit(f"timed out waiting for {crate} 0.2.0")
+              request = urllib.request.Request(url, headers={"User-Agent": user_agent})
+              try:
+                  with urllib.request.urlopen(
+                      request,
+                      timeout=max(1, min(10, remaining)),
+                  ) as response:
+                      return response.status, response.read().decode("utf-8")
+              except urllib.error.HTTPError as error:
+                  return error.code, ""
+
+          verified = False
+          attempt = 0
+          while time.monotonic() < deadline:
+              attempt += 1
+              api_status, api_text = get_text(
+                  f"https://crates.io/api/v1/crates/{crate}/0.2.0"
+              )
+              index_status, index_text = get_text(
+                  f"https://index.crates.io/tr/op/{crate}"
+              )
+              if api_status not in (200, 404):
+                  raise SystemExit(f"unexpected API status {api_status}")
+              if index_status != 200:
+                  raise SystemExit(f"unexpected sparse-index status {index_status}")
+
+              version = json.loads(api_text)["version"] if api_status == 200 else None
+              if version is not None and (
+                  version["checksum"] != expected or version["yanked"] is not False
+              ):
+                  raise SystemExit(f"immutable API mismatch: {version}")
+              if version is not None:
+                  if version["license"] != "Apache-2.0 OR MIT":
+                      raise SystemExit(f"unexpected public license: {version['license']}")
+                  if version["repository"] != "https://github.com/plx/trop":
+                      raise SystemExit(
+                          f"unexpected public repository: {version['repository']}"
+                      )
+                  provenance = version["trustpub_data"]
+                  if version["published_by"] is not None or provenance is None:
+                      raise SystemExit(
+                          f"release was not attributed to Trusted Publishing: {version}"
+                      )
+                  expected_provenance = {
+                      "provider": "github",
+                      "repository": os.environ["EXPECTED_REPOSITORY"],
+                      "run_id": os.environ["PUBLICATION_RUN_ID"],
+                      "sha": os.environ["SOURCE_SHA"],
+                  }
+                  if any(
+                      provenance.get(key) != value
+                      for key, value in expected_provenance.items()
+                  ):
+                      raise SystemExit(
+                          f"unexpected Trusted Publishing provenance: {provenance}"
+                      )
+              entries = [
+                  json.loads(line) for line in index_text.splitlines() if line.strip()
+              ]
+              matching = [entry for entry in entries if entry["vers"] == "0.2.0"]
+              if matching and (
+                  len(matching) != 1
+                  or matching[0]["cksum"] != expected
+                  or matching[0]["yanked"] is not False
+              ):
+                  raise SystemExit(f"immutable sparse mismatch: {matching}")
+              if version is not None and len(matching) == 1:
+                  print(f"verified {crate} 0.2.0 checksum {expected}")
+                  verified = True
+                  break
+              remaining = deadline - time.monotonic()
+              if remaining > 0:
+                  time.sleep(min(5, remaining))
+          if not verified:
+              raise SystemExit(f"{crate} did not become available within 600 seconds")
+          PY
+
+      - name: Verify public metadata, ownership, and dependency binding
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          expected = {
+              "trop": os.environ["EXPECTED_LIBRARY_CHECKSUM"],
+              "trop-cli": os.environ["EXPECTED_CLI_CHECKSUM"],
+          }
+          user_agent = os.environ["CRATES_IO_USER_AGENT"]
+
+          def get_json(url):
+              request = urllib.request.Request(url, headers={"User-Agent": user_agent})
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  assert response.status == 200, (url, response.status)
+                  return json.load(response)
+
+          for crate, checksum in expected.items():
+              crate_record = get_json(
+                  f"https://crates.io/api/v1/crates/{crate}"
+              )["crate"]
+              assert crate_record["trustpub_only"] is True
+              assert crate_record["repository"] == "https://github.com/plx/trop"
+
+              version = get_json(
+                  f"https://crates.io/api/v1/crates/{crate}/0.2.0"
+              )["version"]
+              assert version["num"] == "0.2.0"
+              assert version["checksum"] == checksum
+              assert version["yanked"] is False
+              assert version["license"] == "Apache-2.0 OR MIT"
+              assert version["repository"] == "https://github.com/plx/trop"
+              assert version["published_by"] is None
+              provenance = version["trustpub_data"]
+              assert provenance is not None
+              assert provenance["provider"] == "github"
+              assert provenance["repository"] == os.environ["EXPECTED_REPOSITORY"]
+              assert provenance["run_id"] == os.environ["PUBLICATION_RUN_ID"]
+              assert provenance["sha"] == os.environ["SOURCE_SHA"]
+
+              owners = get_json(
+                  f"https://crates.io/api/v1/crates/{crate}/owners"
+              )["users"]
+              assert [(owner["id"], owner["login"]) for owner in owners] == [
+                  (347210, "plx")
+              ]
+
+          dependencies = get_json(
+              "https://crates.io/api/v1/crates/trop-cli/0.2.0/dependencies"
+          )["dependencies"]
+          matching = [
+              dependency
+              for dependency in dependencies
+              if dependency["crate_id"] == "trop" and dependency["kind"] == "normal"
+          ]
+          assert len(matching) == 1, matching
+          assert matching[0]["req"] == "^0.2.0", matching[0]["req"]
+          PY
+
+      - name: Record completed crate publication
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          {
+            echo
+            echo "### Crate publication completed"
+            echo
+            echo "- Source: \`$SOURCE_SHA\`"
+            echo "- \`trop 0.2.0\`: \`$EXPECTED_LIBRARY_CHECKSUM\`"
+            echo "- \`trop-cli 0.2.0\`: \`$EXPECTED_CLI_CHECKSUM\`"
+            echo "- Trusted Publishing provenance: verified"
+            echo
+            echo "Clean public installation and SEC-1 verification run next in a job"
+            echo "that cannot request an OIDC publication token."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record terminal public state even after an ambiguous failure
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          LIBRARY_PUBLISH_OUTCOME: ${{ steps.publish-library.outcome }}
+          CLI_PUBLISH_OUTCOME: ${{ steps.publish-cli.outcome }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+
+          expected = {
+              "trop": os.environ["EXPECTED_LIBRARY_CHECKSUM"],
+              "trop-cli": os.environ["EXPECTED_CLI_CHECKSUM"],
+          }
+          outcomes = {
+              "trop": os.environ.get("LIBRARY_PUBLISH_OUTCOME") or "skipped",
+              "trop-cli": os.environ.get("CLI_PUBLISH_OUTCOME") or "skipped",
+          }
+          user_agent = os.environ["CRATES_IO_USER_AGENT"]
+          deadline = time.monotonic() + 120
+
+          def get_text(url):
+              request = urllib.request.Request(url, headers={"User-Agent": user_agent})
+              try:
+                  with urllib.request.urlopen(request, timeout=10) as response:
+                      return response.status, response.read().decode("utf-8")
+              except urllib.error.HTTPError as error:
+                  return error.code, ""
+              except Exception as error:
+                  return 0, f"{type(error).__name__}: {error}"
+
+          observations = {}
+          pending = {
+              crate for crate, outcome in outcomes.items()
+              if outcome in ("success", "failure")
+          }
+          while True:
+              for crate in expected:
+                  api_status, api_text = get_text(
+                      f"https://crates.io/api/v1/crates/{crate}/0.2.0"
+                  )
+                  index_status, index_text = get_text(
+                      f"https://index.crates.io/tr/op/{crate}"
+                  )
+                  version = None
+                  api_error = ""
+                  if api_status == 200:
+                      try:
+                          version = json.loads(api_text)["version"]
+                      except Exception as error:
+                          api_error = f"{type(error).__name__}: {error}"
+                  elif api_status != 404:
+                      api_error = api_text or f"HTTP {api_status}"
+                  matching = []
+                  index_error = ""
+                  if index_status == 200:
+                      try:
+                          matching = [
+                              entry
+                              for line in index_text.splitlines()
+                              if line.strip()
+                              for entry in [json.loads(line)]
+                              if entry["vers"] == "0.2.0"
+                          ]
+                      except Exception as error:
+                          index_error = f"{type(error).__name__}: {error}"
+                  else:
+                      index_error = index_text or f"HTTP {index_status}"
+                  observations[crate] = {
+                      "api_status": api_status,
+                      "api_error": api_error,
+                      "version": version,
+                      "index_status": index_status,
+                      "index_error": index_error,
+                      "matching": matching,
+                  }
+
+              complete = {
+                  crate
+                  for crate in pending
+                  if observations[crate]["version"] is not None
+                  and len(observations[crate]["matching"]) == 1
+              }
+              pending -= complete
+              if not pending or time.monotonic() >= deadline:
+                  break
+              time.sleep(min(5, max(0, deadline - time.monotonic())))
+
+          lines = [
+              "",
+              "### Terminal crates.io state probe",
+              "",
+              f"- Source: `{os.environ['SOURCE_SHA']}`",
+          ]
+          for crate, checksum in expected.items():
+              observation = observations[crate]
+              lines.append(f"- `{crate}` publish command: {outcomes[crate]}")
+              version = observation["version"]
+              if version is None:
+                  lines.append(
+                      f"  - API: absent/unverified "
+                      f"(HTTP {observation['api_status']})"
+                  )
+              else:
+                  provenance = version.get("trustpub_data") or {}
+                  lines.append(
+                      "  - API: "
+                      f"checksum `{version.get('checksum')}`, "
+                      f"yanked `{version.get('yanked')}`, "
+                      f"expected checksum `{checksum}`"
+                  )
+                  lines.append(
+                      "  - provenance: "
+                      f"`{provenance.get('repository')}` "
+                      f"run `{provenance.get('run_id')}` "
+                      f"SHA `{provenance.get('sha')}`"
+                  )
+              matching = observation["matching"]
+              if len(matching) == 1:
+                  lines.append(
+                      "  - sparse index: "
+                      f"checksum `{matching[0].get('cksum')}`, "
+                      f"yanked `{matching[0].get('yanked')}`"
+                  )
+              else:
+                  lines.append(
+                      "  - sparse index: "
+                      f"{len(matching)} matching entries "
+                      f"(HTTP {observation['index_status']})"
+                  )
+              if observation["api_error"]:
+                  lines.append(f"  - API probe error: `{observation['api_error']}`")
+              if observation["index_error"]:
+                  lines.append(
+                      f"  - sparse-index probe error: "
+                      f"`{observation['index_error']}`"
+                  )
+          lines.extend([
+              "",
+              "This read-only probe does not publish, retry, yank, or announce anything.",
+          ])
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines) + "\n")
+          PY
+
+  verify:
+    name: Verify the clean public installation without publication credentials
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Fail closed unless the dispatch matches the approved identity
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$EVENT_REF" == "refs/heads/main" ]]
+          [[ "$REPOSITORY" == "$EXPECTED_REPOSITORY" ]]
+          [[ "$REPOSITORY_ID" == "$EXPECTED_REPOSITORY_ID" ]]
+          [[ "$ACTOR" == "$EXPECTED_ACTOR" ]]
+          [[ "$ACTOR_ID" == "$EXPECTED_ACTOR_ID" ]]
+          [[ "$WORKFLOW_REF" == "$EXPECTED_WORKFLOW_REF" ]]
+          [[ "$RUN_ATTEMPT" == "1" ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EVENT_SHA" == "$SOURCE_SHA" ]]
+          [[ "$WORKFLOW_SHA" == "$SOURCE_SHA" ]]
+          [[ "$EXPECTED_LIBRARY_CHECKSUM" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_CLI_CHECKSUM" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CONFIRMATION" == "PUBLISH trop and trop-cli 0.2.0 from $SOURCE_SHA" ]]
+
+      - name: Checkout the exact approved commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Establish isolated, exact verification state
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          [[ "$(git rev-parse --verify "HEAD^{commit}")" == "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          export CARGO_HOME="$RUNNER_TEMP/verify-cargo-home"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/verify-cargo-target"
+          export RUSTUP_TOOLCHAIN=1.95.0
+          mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
+          {
+            echo "CARGO_HOME=$CARGO_HOME"
+            echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+            echo "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN"
+          } >> "$GITHUB_ENV"
+          rustup toolchain install 1.95.0 --profile minimal
+          cargo --version | grep -E '^cargo 1\.95\.0 '
+          rustc --version | grep -E '^rustc 1\.95\.0 '
+
+      - name: Install the public CLI from clean Cargo state
+        id: install
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/installed-trop"
+          install_home="$RUNNER_TEMP/install-cargo-home"
+          install_target="$RUNNER_TEMP/install-cargo-target"
+          mkdir -p "$install_root" "$install_home" "$install_target"
+          CARGO_HOME="$install_home" \
+          CARGO_TARGET_DIR="$install_target" \
+            cargo install \
+              --locked \
+              --root "$install_root" \
+              --registry crates-io \
+              --version 0.2.0 \
+              trop-cli
+          binary="$install_root/bin/trop"
+          [[ -x "$binary" ]]
+          [[ "$("$binary" --version)" == "trop 0.2.0" ]]
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+          echo "binary_checksum=$(sha256sum "$binary" | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Run SEC-1 against the clean public installation
+        env:
+          TROP_SEC1_BINARY: ${{ steps.install.outputs.binary }}
+          TROP_SEC1_EXPECTED_VERSION: "0.2.0"
+        run: |
+          set -euo pipefail
+          cargo test \
+            --locked \
+            -p trop-cli \
+            --test installed_sec1 \
+            installed_binary_sec1_contract \
+            -- \
+            --exact \
+            --ignored
+
+      - name: Uninstall the public CLI from the isolated root
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/installed-trop"
+          install_home="$RUNNER_TEMP/install-cargo-home"
+          binary="$install_root/bin/trop"
+          [[ -x "$binary" ]]
+          CARGO_HOME="$install_home" \
+            cargo uninstall --root "$install_root" trop-cli
+          [[ ! -e "$binary" ]]
+
+      - name: Record completed publication state
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          {
+            echo
+            echo "### Public release verification"
+            echo
+            echo "- Source: \`$SOURCE_SHA\`"
+            echo "- \`trop 0.2.0\`: \`$EXPECTED_LIBRARY_CHECKSUM\`"
+            echo "- \`trop-cli 0.2.0\`: \`$EXPECTED_CLI_CHECKSUM\`"
+            echo "- Installed binary: \`${{ steps.install.outputs.binary_checksum }}\`"
+            echo "- Clean public install: passed"
+            echo "- Installed-binary SEC-1 suite: passed"
+            echo "- Isolated uninstall smoke: passed"
+            echo
+            echo "This workflow does not publish an advisory and does not yank any crate."
+          } >> "$GITHUB_STEP_SUMMARY"

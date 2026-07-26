@@ -40,9 +40,9 @@ ignore-build-dependencies = false
 ignore-dev-dependencies = false
 ignore-transitive-dependencies = false
 
-# Per-crate license clarifications — none required at present. If a crate
-# ships a non-standard LICENSE file or its Cargo.toml license metadata is
-# ambiguous, add a [<crate-name>] section here. Example:
+# Per-crate license clarifications. If a crate ships a non-standard LICENSE
+# file or its Cargo.toml license metadata is ambiguous, add a [<crate-name>]
+# section here. Example:
 #   [<crate>]
 #   accepted = ["MIT"]
 #   [[<crate>.clarify]]
@@ -50,3 +50,14 @@ ignore-transitive-dependencies = false
 #   [[<crate>.clarify.git]]
 #   path = "LICENSE-MIT"
 #   checksum = "..."
+
+# miniz_oxide ships both LICENSE and LICENSE-MIT.md with equivalent MIT text
+# but different blank-line formatting. Explicitly select the dedicated file so
+# cargo-about output is byte-for-byte stable across filesystem implementations.
+[miniz_oxide.clarify]
+license = "MIT"
+
+[[miniz_oxide.clarify.files]]
+path = "LICENSE-MIT.md"
+checksum = "799e9ca9d179295ef372f25d3769cdda7d25bb2668add6a6a1e22d1e4c678b8d"
+license = "MIT"
