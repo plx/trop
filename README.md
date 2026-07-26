@@ -1,6 +1,6 @@
 # trop
 
-[![CI](https://github.com/prb/trop/actions/workflows/ci.yml/badge.svg)](https://github.com/prb/trop/actions/workflows/ci.yml)
+[![CI](https://github.com/plx/trop/actions/workflows/ci.yml/badge.svg)](https://github.com/plx/trop/actions/workflows/ci.yml)
 
 > **Note:** GitHub only renders a status badge after the referenced workflow has produced at least one run. If the badge above
 > shows "no status" or a gray placeholder, trigger the workflow manually via the "Run workflow" button or push a commit to
@@ -118,7 +118,7 @@ cargo install trop-cli
 ### From source
 
 ```bash
-git clone https://github.com/prb/trop
+git clone https://github.com/plx/trop
 cd trop
 cargo install --path trop-cli
 ```

@@ -73,6 +73,37 @@ impl TestEnv {
         cmd
     }
 
+    /// Get a command builder for an explicitly selected external `trop`
+    /// binary.
+    ///
+    /// Unlike [`Self::command`], this never resolves a Cargo-built test binary.
+    /// Release-package tests use it to prove that they exercised the exact
+    /// installed artifact supplied by the caller.
+    pub fn command_for_binary(&self, binary_path: &Path) -> Command {
+        let mut cmd = Command::new(binary_path);
+        cmd.env("TROP_DATA_DIR", &self.data_dir)
+            .arg("--data-dir")
+            .arg(&self.data_dir);
+        cmd
+    }
+
+    /// Count all rows in this test environment's reservation database.
+    pub fn reservation_count(&self) -> i64 {
+        let database_path = self.data_dir.join("trop.db");
+        if !database_path.exists() {
+            return 0;
+        }
+
+        let connection = rusqlite::Connection::open_with_flags(
+            database_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("Failed to open test database");
+        connection
+            .query_row("SELECT COUNT(*) FROM reservations", [], |row| row.get(0))
+            .expect("Failed to count reservations")
+    }
+
     /// Get the temp path.
     pub fn path(&self) -> &Path {
         &self.temp_path

@@ -2,6 +2,23 @@
 
 This is the core library crate for `trop`, a port reservation management tool. It provides the fundamental types and logic for managing ephemeral port allocations in a directory-aware, idempotent manner.
 
+## Security upgrade from 0.1.0
+
+Version 0.1.0 does not safely validate every environment-variable identifier
+generated at shell export and dotenv output boundaries. The fix is versioned
+as 0.2.0. Once that version is available from your registry, depend on it
+explicitly:
+
+```toml
+[dependencies]
+trop = "0.2.0"
+```
+
+The fix changes `ShellType::format_export` to return `trop::Result<String>` so
+invalid identifiers can fail closed. This is a source-breaking change from
+0.1.0. Yanking 0.1.0 does not update existing lockfiles; consumers must update
+their dependency resolution explicitly.
+
 ## Overview
 
 The `trop` library provides types for:
@@ -198,7 +215,12 @@ Key dependencies:
 
 ## License
 
-MIT
+`trop` is dual-licensed under either:
+
+- [Apache License, Version 2.0](LICENSE-APACHE), or
+- [MIT License](LICENSE-MIT),
+
+at your option.
 
 ## Contributing
 

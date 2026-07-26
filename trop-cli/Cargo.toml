@@ -1,11 +1,11 @@
 [package]
 name = "trop-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["trop contributors"]
 license = "Apache-2.0 OR MIT"
 description = "CLI tool for managing ephemeral port reservations"
-repository = "https://github.com/prb/trop"
+repository = "https://github.com/plx/trop"
 
 [[bin]]
 name = "trop"
@@ -13,7 +13,7 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-trop = { version = "0.1.0", path = "../trop" }
+trop = { version = "0.2.0", path = "../trop" }
 clap = { workspace = true, features = ["derive", "env"] }
 clap_complete = "4.5"
 serde = { workspace = true }
