@@ -5,9 +5,8 @@ This is the core library crate for `trop`, a port reservation management tool. I
 ## Security upgrade from 0.1.0
 
 Version 0.1.0 does not safely validate every environment-variable identifier
-generated at shell export and dotenv output boundaries. The fix is versioned
-as 0.2.0. Once that version is available from your registry, depend on it
-explicitly:
+generated at shell export and dotenv output boundaries. Version 0.2.0 is
+published with the fix; depend on it explicitly:
 
 ```toml
 [dependencies]
@@ -16,8 +15,10 @@ trop = "0.2.0"
 
 The fix changes `ShellType::format_export` to return `trop::Result<String>` so
 invalid identifiers can fail closed. This is a source-breaking change from
-0.1.0. Yanking 0.1.0 does not update existing lockfiles; consumers must update
-their dependency resolution explicitly.
+0.1.0. Version 0.1.0 is yanked, but yanking does not update existing lockfiles;
+consumers must update their dependency resolution explicitly. See
+[GHSA-h2jc-jr86-m5vq](https://github.com/plx/trop/security/advisories/GHSA-h2jc-jr86-m5vq)
+for affected usage and remediation.
 
 ## Overview
 
