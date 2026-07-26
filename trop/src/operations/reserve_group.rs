@@ -339,9 +339,7 @@ impl ReserveGroupPlan {
 
             services.push(ServiceAllocationRequest {
                 tag: tag.clone(),
-                offset: service_def
-                    .offset
-                    .or_else(|| service_def.preferred.is_none().then_some(0)),
+                offset: Some(service_def.offset.unwrap_or(0)),
                 preferred,
             });
         }
@@ -672,6 +670,11 @@ ports:
         assert_eq!(
             request.services[0].preferred,
             Some(Port::try_from(8080).unwrap())
+        );
+        assert_eq!(
+            request.services[0].offset,
+            Some(0),
+            "A preferred service still receives the specified default offset"
         );
     }
 

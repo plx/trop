@@ -103,9 +103,11 @@ ports:
 reservations:
   services:
     web:
+      offset: 0
       preferred: 9000
       env: WEB_PORT
     api:
+      offset: 1
       preferred: 9001
       env: API_PORT
 "#;
@@ -133,6 +135,7 @@ reservations:
       offset: 1
       env: API_PORT
     admin:
+      offset: 2
       preferred: 9000
       env: ADMIN_PORT
 "#;
@@ -2768,6 +2771,123 @@ fn test_group_idempotency_covers_allocation_shapes_and_entrypoints() {
             reservation_count(&env),
             expected_services,
             "{case_name} group must retain exactly one row per service"
+        );
+    }
+}
+
+/// Both group entrypoints accept full-domain preferred ports and reserve them
+/// before selecting the lowest complete fallback pattern.
+#[test]
+fn test_group_commands_accept_outside_range_preferred_and_avoid_internal_collisions() {
+    for kind in GroupCommandKind::ALL {
+        let env = TestEnv::new();
+        let project_dir = env.create_dir(kind.name());
+        let config_path = project_dir.join("trop.yaml");
+        fs::write(
+            &config_path,
+            r#"
+ports:
+  min: 5000
+  max: 5100
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    external:
+      offset: 3
+      preferred: 65535
+    admin:
+      offset: 2
+      preferred: 5000
+    web:
+      offset: 0
+    api:
+      offset: 1
+"#,
+        )
+        .expect("Failed to write preferred-port regression config");
+
+        let output = run_json_group_command(&env, &project_dir, &config_path, kind);
+        assert!(
+            output.status.success(),
+            "{} preferred-port allocation failed: {}",
+            kind.name(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mapping: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("Group output should be JSON");
+        assert_eq!(mapping["external"], 65535);
+        assert_eq!(mapping["admin"], 5000);
+        assert_eq!(mapping["web"], 5001);
+        assert_eq!(mapping["api"], 5002);
+        assert_eq!(reservation_count(&env), 4);
+    }
+}
+
+/// A database-reserved preference uses the service's offset fallback through
+/// both command entrypoints, including the configuration default of zero.
+#[test]
+fn test_group_commands_reserved_preferred_uses_offset_fallback() {
+    for kind in GroupCommandKind::ALL {
+        let env = TestEnv::new();
+        let blocker_dir = env.create_dir("blocker");
+        let blocker = env
+            .command()
+            .arg("reserve")
+            .arg("--path")
+            .arg(&blocker_dir)
+            .arg("--port")
+            .arg("5050")
+            .arg("--min")
+            .arg("5050")
+            .arg("--max")
+            .arg("5050")
+            .arg("--skip-occupancy-check")
+            .arg("--allow-unrelated-path")
+            .output()
+            .expect("Failed to reserve preferred-port blocker");
+        assert!(
+            blocker.status.success(),
+            "Failed to reserve preferred-port blocker: {}",
+            String::from_utf8_lossy(&blocker.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&blocker.stdout).trim(), "5050");
+
+        let project_dir = env.create_dir(kind.name());
+        let config_path = project_dir.join("trop.yaml");
+        fs::write(
+            &config_path,
+            r#"
+ports:
+  min: 5000
+  max: 5100
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      preferred: 5050
+    api:
+      offset: 1
+"#,
+        )
+        .expect("Failed to write preferred-fallback regression config");
+
+        let output = run_json_group_command(&env, &project_dir, &config_path, kind);
+        assert!(
+            output.status.success(),
+            "{} preferred fallback failed: {}",
+            kind.name(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mapping: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("Group output should be JSON");
+        assert_eq!(mapping["web"], 5000);
+        assert_eq!(mapping["api"], 5001);
+        assert_eq!(
+            reservation_count(&env),
+            3,
+            "The blocker and complete fallback group should coexist"
         );
     }
 }

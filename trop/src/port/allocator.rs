@@ -358,8 +358,31 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         conn: &Connection,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<PortAvailability> {
-        // Check if in range
-        if !self.range.contains(port) {
+        self.port_availability(port, conn, occupancy_config, true)
+    }
+
+    /// Check a preferred port against reservations, exclusions, and operating
+    /// system occupancy without applying the ordinary scan-range boundary.
+    ///
+    /// Preferred ports use the full valid [`Port`] domain. Only fallback scans
+    /// are constrained by [`Self::range`].
+    pub(super) fn is_preferred_port_available(
+        &self,
+        port: Port,
+        conn: &Connection,
+        occupancy_config: &OccupancyCheckConfig,
+    ) -> Result<PortAvailability> {
+        self.port_availability(port, conn, occupancy_config, false)
+    }
+
+    fn port_availability(
+        &self,
+        port: Port,
+        conn: &Connection,
+        occupancy_config: &OccupancyCheckConfig,
+        require_in_range: bool,
+    ) -> Result<PortAvailability> {
+        if require_in_range && !self.range.contains(port) {
             return Ok(PortAvailability::Excluded);
         }
 
@@ -401,6 +424,18 @@ pub(super) enum PortAvailability {
     Excluded,
     /// Port is occupied on the system.
     Occupied,
+}
+
+impl PortAvailability {
+    /// Return the public reason for an unavailable port.
+    pub(super) const fn unavailable_reason(self) -> Option<PortUnavailableReason> {
+        match self {
+            Self::Available => None,
+            Self::Reserved => Some(PortUnavailableReason::Reserved),
+            Self::Excluded => Some(PortUnavailableReason::Excluded),
+            Self::Occupied => Some(PortUnavailableReason::Occupied),
+        }
+    }
 }
 
 /// Helper to create an allocator from configuration.

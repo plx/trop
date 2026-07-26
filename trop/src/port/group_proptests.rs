@@ -134,16 +134,11 @@ mod tests {
                     );
                 }
                 Err(_) => {
-                    // Failure: no reservations should exist
-                    // Note: Current implementation may leave partial reservations
-                    // due to lack of bulk transaction support. This is a known
-                    // limitation documented in the code.
-                    // For now, we check that either all or none exist.
+                    // Failure: the savepoint must roll back every reservation.
                     prop_assert!(
-                        group_reservations.is_empty() || group_reservations.len() == num_services,
-                        "Partial allocation detected: {} of {} services have reservations",
-                        group_reservations.len(),
-                        num_services
+                        group_reservations.is_empty(),
+                        "Failed allocation left {} partial reservations",
+                        group_reservations.len()
                     );
                 }
             }
@@ -761,7 +756,51 @@ mod tests {
     }
 
     // ============================================================================
-    // PROPERTY 10: BASE PORT CORRECTNESS
+    // PROPERTY 10: PREFERRED BOUNDARY PORTS ARE RANGE-INDEPENDENT
+    // ============================================================================
+    // Preferred ports use the full valid port domain. Only scanned fallback
+    // bases are constrained by the configured scan range.
+
+    proptest! {
+        #[test]
+        fn prop_group_allocation_accepts_free_boundary_preferred_ports(
+            preferred in prop_oneof![Just(1u16), Just(65535u16)],
+            scan_min in 5000u16..=6000u16,
+        ) {
+            let range = PortRange::new(
+                Port::try_from(scan_min).unwrap(),
+                Port::try_from(scan_min + 100).unwrap(),
+            ).unwrap();
+            let db = create_test_database();
+            let checker = MockOccupancyChecker::new(HashSet::new());
+            let allocator = PortAllocator::new(checker, ExclusionManager::empty(), range);
+            let preferred = Port::try_from(preferred).unwrap();
+            let request = GroupAllocationRequest {
+                base_path: PathBuf::from("/test/preferred-boundary"),
+                project: None,
+                task: None,
+                services: vec![ServiceAllocationRequest {
+                    tag: "boundary".to_string(),
+                    offset: None,
+                    preferred: Some(preferred),
+                }],
+            };
+
+            let result = allocator
+                .allocate_group(
+                    db.connection(),
+                    &request,
+                    &OccupancyCheckConfig::default(),
+                )
+                .expect("A free boundary preferred port should allocate");
+
+            prop_assert_eq!(result.allocations["boundary"], preferred);
+            prop_assert_eq!(result.base_port, None);
+        }
+    }
+
+    // ============================================================================
+    // PROPERTY 11: BASE PORT CORRECTNESS
     // ============================================================================
     // Mathematical property: Base port represents first offset service
     //
