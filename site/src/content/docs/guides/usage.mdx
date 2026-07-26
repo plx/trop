@@ -58,8 +58,16 @@ trop autoreserve --format human
 trop autoreserve --format json
 ```
 
-For trop releases through 0.1.0, do not evaluate, source, or load `export` or
-`dotenv` output, including output from `autoreserve` or `reserve-group`. Those
-releases do not safely validate every generated variable name. Until a hardened
-release is published, review the human or JSON output and manually set only the
-environment variables you trust.
+Version 0.1.0 does not safely validate every generated variable name in
+`export` or `dotenv` output from `autoreserve` and `reserve-group`. Both 0.1.0
+crates are yanked, but yanking does not remove installed binaries or update
+existing locked dependency resolutions. Upgrade the CLI explicitly:
+
+```bash
+cargo install trop-cli --version 0.2.0 --locked --force
+```
+
+Version 0.2.0 rejects invalid identifiers. See
+[the GitHub security advisory](https://github.com/plx/trop/security/advisories/GHSA-h2jc-jr86-m5vq)
+for affected usage and remediation. Until upgraded, use human or JSON output,
+inspect the result, and set only trusted variables manually.

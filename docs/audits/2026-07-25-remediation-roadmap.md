@@ -28,6 +28,8 @@ understandable from a checkout, in review, and across agent context compaction.
   [Post-remediation production-readiness audit](post-remediation-production-readiness-audit.md)
 - Remediation execution goal:
   [Production-readiness remediation goal](production-readiness-remediation-goal.md)
+- Early security-release evidence:
+  [trop 0.2.0 emergency security-release evidence](2026-07-26-security-release-0.2.0-evidence.md)
 - Lifecycle setup:
   [PR #152 — Record the approved production-readiness release lifecycle](https://github.com/plx/trop/pull/152)
 
