@@ -121,6 +121,12 @@ from the canonical absolute working directory and walks its real parents,
 stopping at the nearest directory containing `trop.yaml` or
 `trop.local.yaml`.
 
+Group commands retain the resolved configuration filename for diagnostics, but
+reservation identity is inferred from that file's containing directory and is
+always canonicalized. Consequently, bare, relative, absolute, and
+symbolic-link directory routes to the same group configuration share one
+absolute stored path.
+
 ### Projects and Tasks
 
 `trop` reservations are *keyed* by a path and optional tag, but support two additional metadata fields:

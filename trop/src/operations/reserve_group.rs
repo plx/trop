@@ -3,13 +3,15 @@
 //! This module implements group reservation planning, which reserves multiple
 //! related ports based on a configuration file.
 
-use std::path::PathBuf;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 use crate::config::{Config, ConfigLoader, ConfigValidator, EffectiveConfig};
 use crate::error::{Error, Result};
 use crate::port::group::{GroupAllocationRequest, ServiceAllocationRequest};
 use crate::port::occupancy::OccupancyCheckConfig;
-use crate::Port;
+use crate::{PathResolver, Port};
 use rusqlite::Connection;
 
 use super::plan::{OperationPlan, PlanAction};
@@ -109,7 +111,47 @@ impl ReserveGroupOptions {
 pub struct ReserveGroupPlan {
     options: ReserveGroupOptions,
     config: Config,
-    base_path: PathBuf,
+    config_path: PathBuf,
+    reservation_path: PathBuf,
+}
+
+struct GroupConfigPaths {
+    source: PathBuf,
+    reservation_identity: PathBuf,
+}
+
+impl GroupConfigPaths {
+    fn resolve(config_path: &Path) -> Result<Self> {
+        let resolver = PathResolver::new().with_nonexistent_warning(false);
+        let source = resolver.resolve_explicit(config_path)?.into_path_buf();
+        let metadata = fs::metadata(&source).map_err(|error| match error.kind() {
+            ErrorKind::NotFound => Error::PathNotFound {
+                path: source.clone(),
+            },
+            ErrorKind::PermissionDenied => Error::PermissionDenied {
+                path: source.clone(),
+            },
+            _ => Error::Io(error),
+        })?;
+
+        if !metadata.is_file() {
+            return Err(Error::InvalidPath {
+                path: source,
+                reason: "Configuration path is not a file".to_string(),
+            });
+        }
+
+        let parent = source.parent().ok_or_else(|| Error::InvalidPath {
+            path: source.clone(),
+            reason: "Configuration file has no parent directory".to_string(),
+        })?;
+        let reservation_identity = resolver.resolve_implicit(parent)?.into_path_buf();
+
+        Ok(Self {
+            source,
+            reservation_identity,
+        })
+    }
 }
 
 impl ReserveGroupPlan {
@@ -120,6 +162,8 @@ impl ReserveGroupPlan {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The config source does not exist or is not a regular file
+    /// - The config source's containing directory cannot be canonicalized
     /// - The config file cannot be read or parsed
     /// - The config file does not contain a reservation group
     /// - The reservation group is invalid
@@ -134,9 +178,9 @@ impl ReserveGroupPlan {
     /// let planner = ReserveGroupPlan::new(options).unwrap();
     /// ```
     pub fn new(options: ReserveGroupOptions) -> Result<Self> {
-        // Load the configuration file
-        let config = ConfigLoader::load_file(&options.config_path)?;
-        Self::from_config(options, config)
+        let paths = GroupConfigPaths::resolve(&options.config_path)?;
+        let config = ConfigLoader::load_file(&paths.source)?;
+        Self::from_resolved_config(options, config, paths)
     }
 
     /// Create a group plan from an already resolved effective configuration.
@@ -146,31 +190,38 @@ impl ReserveGroupPlan {
     ///
     /// # Errors
     ///
-    /// Returns an error if the effective configuration or group base path is
-    /// invalid.
+    /// Returns an error if the config source does not resolve to a regular
+    /// file, its containing directory cannot be canonicalized, or the
+    /// effective group configuration is invalid.
     pub fn from_effective(options: ReserveGroupOptions, config: &EffectiveConfig) -> Result<Self> {
         Self::from_config(options, config.config().clone())
     }
 
     /// Creates a plan from an already parsed configuration snapshot.
     pub(super) fn from_config(options: ReserveGroupOptions, config: Config) -> Result<Self> {
-        ConfigValidator::validate(&config, true)?;
+        let paths = GroupConfigPaths::resolve(&options.config_path)?;
+        Self::from_resolved_config(options, config, paths)
+    }
 
-        // Get the base path (parent directory of the config file)
-        let base_path = options
-            .config_path
-            .parent()
-            .ok_or_else(|| Error::InvalidPath {
-                path: options.config_path.clone(),
-                reason: "Config file has no parent directory".to_string(),
-            })?
-            .to_path_buf();
+    fn from_resolved_config(
+        options: ReserveGroupOptions,
+        config: Config,
+        paths: GroupConfigPaths,
+    ) -> Result<Self> {
+        ConfigValidator::validate(&config, true)?;
 
         Ok(Self {
             options,
             config,
-            base_path,
+            config_path: paths.source,
+            reservation_path: paths.reservation_identity,
         })
+    }
+
+    /// Returns the resolved source-file path used by this planner.
+    #[must_use]
+    pub const fn config_path(&self) -> &PathBuf {
+        &self.config_path
     }
 
     /// Returns the exact validated configuration snapshot used by this planner.
@@ -245,7 +296,7 @@ impl ReserveGroupPlan {
         let mut plan = OperationPlan::new(format!(
             "Reserve group of {} services from {}",
             reservation_group.services.len(),
-            self.options.config_path.display()
+            self.config_path.display()
         ));
 
         let occupancy_config = self.occupancy_config();
@@ -280,7 +331,7 @@ impl ReserveGroupPlan {
         }
 
         Ok(GroupAllocationRequest {
-            base_path: self.base_path.clone(),
+            base_path: self.reservation_path.clone(),
             project: self.config.project.clone(),
             task: self.options.task.clone(),
             services,

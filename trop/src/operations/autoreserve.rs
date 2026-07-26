@@ -5,9 +5,7 @@
 
 use std::path::PathBuf;
 
-use crate::config::{
-    Config, ConfigField, ConfigFileKind, ConfigLoader, ConfigValidator, EffectiveConfig,
-};
+use crate::config::{Config, ConfigField, ConfigFileKind, ConfigLoader, EffectiveConfig};
 use crate::error::{Error, Result};
 use rusqlite::Connection;
 
@@ -100,6 +98,17 @@ impl AutoreserveOptions {
         self.allow_task_change = allow;
         self
     }
+
+    fn into_reserve_group_options(self, config_path: PathBuf) -> ReserveGroupOptions {
+        ReserveGroupOptions {
+            config_path,
+            task: self.task,
+            force: self.force,
+            allow_unrelated_path: self.allow_unrelated_path,
+            allow_project_change: self.allow_project_change,
+            allow_task_change: self.allow_task_change,
+        }
+    }
 }
 
 /// An autoreserve plan generator.
@@ -107,9 +116,7 @@ impl AutoreserveOptions {
 /// This struct is responsible for discovering a configuration file and
 /// delegating to `ReserveGroupPlan` for actual reservation planning.
 pub struct AutoreservePlan {
-    options: AutoreserveOptions,
-    discovered_config_path: PathBuf,
-    config: Config,
+    reserve_group: ReserveGroupPlan,
 }
 
 impl AutoreservePlan {
@@ -157,13 +164,11 @@ impl AutoreservePlan {
                 path: options.start_dir.clone(),
                 reason: "Failed to determine config path".to_string(),
             })?;
-        ConfigValidator::validate(&selected_config.config, true)?;
+        let reserve_group_options = options.into_reserve_group_options(selected_config.path);
+        let reserve_group =
+            ReserveGroupPlan::from_config(reserve_group_options, selected_config.config)?;
 
-        Ok(Self {
-            options,
-            discovered_config_path: selected_config.path,
-            config: selected_config.config,
-        })
+        Ok(Self { reserve_group })
     }
 
     /// Create an autoreserve plan from one resolved effective configuration.
@@ -192,12 +197,10 @@ impl AutoreservePlan {
             })?
             .to_path_buf();
 
-        ConfigValidator::validate(config.config(), true)?;
-        Ok(Self {
-            options,
-            discovered_config_path,
-            config: config.config().clone(),
-        })
+        let reserve_group_options = options.into_reserve_group_options(discovered_config_path);
+        let reserve_group = ReserveGroupPlan::from_effective(reserve_group_options, config)?;
+
+        Ok(Self { reserve_group })
     }
 
     /// Builds an operation plan for this autoreserve request.
@@ -224,32 +227,19 @@ impl AutoreservePlan {
     /// let plan = planner.build_plan(db.connection()).unwrap();
     /// ```
     pub fn build_plan(&self, conn: &Connection) -> Result<OperationPlan> {
-        // Build options for ReserveGroupPlan
-        let reserve_group_options = ReserveGroupOptions {
-            config_path: self.discovered_config_path.clone(),
-            task: self.options.task.clone(),
-            force: self.options.force,
-            allow_unrelated_path: self.options.allow_unrelated_path,
-            allow_project_change: self.options.allow_project_change,
-            allow_task_change: self.options.allow_task_change,
-        };
-
-        // Delegate to ReserveGroupPlan
-        let reserve_group_plan =
-            ReserveGroupPlan::from_config(reserve_group_options, self.config.clone())?;
-        reserve_group_plan.build_plan(conn)
+        self.reserve_group.build_plan(conn)
     }
 
     /// Returns the discovered configuration file path.
     #[must_use]
     pub fn discovered_config_path(&self) -> &PathBuf {
-        &self.discovered_config_path
+        self.reserve_group.config_path()
     }
 
     /// Returns the exact validated configuration snapshot used by this planner.
     #[must_use]
     pub const fn config(&self) -> &Config {
-        &self.config
+        self.reserve_group.config()
     }
 }
 
@@ -305,7 +295,7 @@ reservations:
 
         assert!(plan.is_ok());
         let plan = plan.unwrap();
-        assert!(plan.discovered_config_path.ends_with("trop.yaml"));
+        assert!(plan.discovered_config_path().ends_with("trop.yaml"));
     }
 
     #[test]
@@ -366,7 +356,7 @@ reservations:
         let plan = AutoreservePlan::new(options).unwrap();
 
         // Should prefer trop.local.yaml (higher precedence)
-        assert!(plan.discovered_config_path.ends_with("trop.local.yaml"));
+        assert!(plan.discovered_config_path().ends_with("trop.local.yaml"));
     }
 
     #[test]
@@ -408,7 +398,7 @@ reservations:
         let options = AutoreserveOptions::new(child_dir);
         let plan = AutoreservePlan::new(options).unwrap();
 
-        assert!(plan.discovered_config_path.ends_with("trop.yaml"));
+        assert!(plan.discovered_config_path().ends_with("trop.yaml"));
     }
 
     #[test]
