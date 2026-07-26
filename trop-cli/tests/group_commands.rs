@@ -31,6 +31,7 @@ use std::thread;
 // ============================================================================
 
 type CollisionCase<'a> = (&'a str, &'a [(&'a str, Option<&'a str>)]);
+type ReservationMetadataRow = (String, u16, Option<String>, Option<String>, i64, i64);
 
 /// Create a minimal valid trop.yaml configuration for testing.
 ///
@@ -342,6 +343,34 @@ fn reservation_rows(env: &TestEnv) -> Vec<(String, u16, i64, i64)> {
         .expect("Failed to query reservations")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("Failed to decode reservations")
+}
+
+fn reservation_metadata_rows(env: &TestEnv) -> Vec<ReservationMetadataRow> {
+    let connection = rusqlite::Connection::open(env.data_dir.join("trop.db"))
+        .expect("Failed to open test database");
+    let mut statement = connection
+        .prepare(
+            "SELECT tag, port, project, task, created_at, last_used_at
+             FROM reservations
+             WHERE tag IS NOT NULL
+             ORDER BY tag",
+        )
+        .expect("Failed to prepare reservation metadata query");
+
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .expect("Failed to query reservation metadata")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("Failed to decode reservation metadata")
 }
 
 fn run_concurrent_group_processes(
@@ -1318,9 +1347,8 @@ fn test_reserve_group_dry_run_quiet() {
 
 /// Test reserve-group with --force flag.
 ///
-/// The --force flag overrides all safety checks. This test verifies that
-/// --force allows the operation to proceed even when it would normally be
-/// rejected due to path validation or sticky field protections.
+/// Force authorizes path, metadata, and complete shape replacement while
+/// leaving allocation-integrity checks in place.
 #[test]
 fn test_reserve_group_with_force() {
     let env = TestEnv::new();
@@ -1336,15 +1364,58 @@ fn test_reserve_group_with_force() {
         .assert()
         .success();
 
-    // Second reservation with different task should work with --force
+    let connection = rusqlite::Connection::open(env.data_dir.join("trop.db"))
+        .expect("Failed to open test database");
+    connection
+        .execute(
+            "UPDATE reservations SET created_at = 123, last_used_at = 1",
+            [],
+        )
+        .expect("Failed to make timestamps deterministic");
+    drop(connection);
+
+    fs::write(
+        &config_path,
+        r#"
+project: replacement-project
+ports:
+  min: 5000
+  max: 9000
+occupancy_check:
+  skip: true
+reservations:
+  base: 8000
+  services:
+    web:
+      offset: 0
+    db:
+      offset: 1
+    api:
+      offset: 2
+"#,
+    )
+    .expect("Failed to write replacement group");
+
     env.command()
         .arg("reserve-group")
         .arg(&config_path)
         .arg("--task")
-        .arg("different-task")
+        .arg("replacement-task")
         .arg("--force")
         .assert()
         .success();
+
+    let rows = reservation_metadata_rows(&env);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+        ["api", "db", "web"]
+    );
+    assert!(rows.iter().all(|row| {
+        row.2.as_deref() == Some("replacement-project")
+            && row.3.as_deref() == Some("replacement-task")
+            && row.4 != 123
+    }));
 }
 
 /// Test reserve-group with --allow-unrelated-path flag.
@@ -1358,7 +1429,25 @@ fn test_reserve_group_with_allow_unrelated_path() {
     let config_path = env.path().join("trop.yaml");
     create_test_config(&config_path, "test-project");
 
-    // Should succeed with --allow-unrelated-path
+    env.command()
+        .arg("reserve-group")
+        .arg(&config_path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("path relationship violation"));
+    env.command()
+        .arg("reserve-group")
+        .arg(&config_path)
+        .arg("--allow-project-change")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("path relationship violation"));
+    assert_eq!(
+        reservation_count(&env),
+        0,
+        "Narrow metadata permission must not bypass path safety"
+    );
+
     env.command()
         .arg("reserve-group")
         .arg(&config_path)
@@ -1367,11 +1456,34 @@ fn test_reserve_group_with_allow_unrelated_path() {
         .success();
 }
 
+/// Same, ancestor, and descendant config-parent relationships are accepted
+/// without any override.
+#[test]
+fn test_reserve_group_allows_related_invocation_paths() {
+    let env = TestEnv::new();
+    let project_dir = env.create_dir("project");
+    let child_dir = project_dir.join("child");
+    fs::create_dir_all(&child_dir).expect("Failed to create child directory");
+    let config_path = project_dir.join("trop.yaml");
+    create_test_config(&config_path, "test-project");
+
+    for current_dir in [&project_dir, &child_dir, env.path()] {
+        env.command()
+            .arg("reserve-group")
+            .arg(&config_path)
+            .arg("--format")
+            .arg("json")
+            .current_dir(current_dir)
+            .assert()
+            .success();
+    }
+    assert_eq!(reservation_count(&env), 2);
+}
+
 /// Test reserve-group with --allow-project-change flag.
 ///
-/// Group sticky-field authorization and persistence are covered by the
-/// dedicated group-safety work. This test currently verifies that the flag is
-/// accepted while compatible group reuse keeps the reservation set complete.
+/// Project changes fail atomically by default and persist on every row only
+/// with the project-specific permission.
 #[test]
 fn test_reserve_group_with_allow_project_change() {
     let env = TestEnv::new();
@@ -1386,19 +1498,28 @@ fn test_reserve_group_with_allow_project_change() {
         .arg("--allow-unrelated-path")
         .assert()
         .success();
+    let connection = rusqlite::Connection::open(env.data_dir.join("trop.db"))
+        .expect("Failed to open test database");
+    connection
+        .execute(
+            "UPDATE reservations SET created_at = 123, last_used_at = 1",
+            [],
+        )
+        .expect("Failed to make timestamps deterministic");
+    drop(connection);
+    let before = reservation_metadata_rows(&env);
 
-    // Change config to different project
     create_test_config(&config_path, "different-project");
 
-    // Sticky-field enforcement is intentionally handled separately.
     env.command()
         .arg("reserve-group")
         .arg(&config_path)
         .arg("--allow-unrelated-path")
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("sticky field 'project'"));
+    assert_eq!(reservation_metadata_rows(&env), before);
 
-    // With --allow-project-change flag (also succeeds)
     env.command()
         .arg("reserve-group")
         .arg(&config_path)
@@ -1406,12 +1527,21 @@ fn test_reserve_group_with_allow_project_change() {
         .arg("--allow-unrelated-path")
         .assert()
         .success();
+
+    let after = reservation_metadata_rows(&env);
+    assert_eq!(after.len(), 2);
+    assert!(after.iter().all(|row| {
+        row.2.as_deref() == Some("different-project")
+            && row.3.is_none()
+            && row.4 == 123
+            && row.5 > 1
+    }));
 }
 
 /// Test reserve-group with --allow-task-change flag.
 ///
-/// Group sticky-field authorization and persistence are handled separately;
-/// this test verifies the flag remains accepted during compatible reuse.
+/// Task changes fail atomically by default and persist on every row only with
+/// the task-specific permission.
 #[test]
 fn test_reserve_group_with_allow_task_change() {
     let env = TestEnv::new();
@@ -1428,8 +1558,17 @@ fn test_reserve_group_with_allow_task_change() {
         .arg("--allow-unrelated-path")
         .assert()
         .success();
+    let connection = rusqlite::Connection::open(env.data_dir.join("trop.db"))
+        .expect("Failed to open test database");
+    connection
+        .execute(
+            "UPDATE reservations SET created_at = 123, last_used_at = 1",
+            [],
+        )
+        .expect("Failed to make timestamps deterministic");
+    drop(connection);
+    let before = reservation_metadata_rows(&env);
 
-    // Sticky-field enforcement is intentionally handled separately.
     env.command()
         .arg("reserve-group")
         .arg(&config_path)
@@ -1437,18 +1576,28 @@ fn test_reserve_group_with_allow_task_change() {
         .arg("task-2")
         .arg("--allow-unrelated-path")
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("sticky field 'task'"));
+    assert_eq!(reservation_metadata_rows(&env), before);
 
-    // With --allow-task-change also succeeds
     env.command()
         .arg("reserve-group")
         .arg(&config_path)
         .arg("--task")
-        .arg("task-3")
+        .arg("task-2")
         .arg("--allow-task-change")
         .arg("--allow-unrelated-path")
         .assert()
         .success();
+
+    let after = reservation_metadata_rows(&env);
+    assert_eq!(after.len(), 2);
+    assert!(after.iter().all(|row| {
+        row.2.as_deref() == Some("test-project")
+            && row.3.as_deref() == Some("task-2")
+            && row.4 == 123
+            && row.5 > 1
+    }));
 }
 
 /// Test reserve-group with --allow-change flag (combined permission).
@@ -1483,6 +1632,78 @@ fn test_reserve_group_with_allow_change() {
         .arg("--allow-unrelated-path")
         .assert()
         .success();
+
+    let rows = reservation_metadata_rows(&env);
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| {
+        row.2.as_deref() == Some("project-2") && row.3.as_deref() == Some("task-2")
+    }));
+}
+
+/// Project configuration can supply the same narrow path and combined metadata
+/// permissions as explicit flags.
+#[test]
+fn test_reserve_group_uses_configured_change_permissions() {
+    let env = TestEnv::new();
+    let config_dir = env.create_dir("project");
+    let config_path = config_dir.join("trop.yaml");
+    fs::write(
+        &config_path,
+        r#"
+project: project-1
+allow_unrelated_path: true
+ports:
+  min: 5000
+  max: 9000
+occupancy_check:
+  skip: true
+reservations:
+  base: 8000
+  services:
+    web:
+      offset: 0
+"#,
+    )
+    .expect("Failed to write initial configured-permission fixture");
+    env.command()
+        .arg("reserve-group")
+        .arg(&config_path)
+        .arg("--task")
+        .arg("task-1")
+        .assert()
+        .success();
+
+    fs::write(
+        &config_path,
+        r#"
+project: project-2
+allow_unrelated_path: true
+allow_change: true
+ports:
+  min: 5000
+  max: 9000
+occupancy_check:
+  skip: true
+reservations:
+  base: 8000
+  services:
+    web:
+      offset: 0
+"#,
+    )
+    .expect("Failed to write changed configured-permission fixture");
+    env.command()
+        .arg("reserve-group")
+        .arg(&config_path)
+        .arg("--task")
+        .arg("task-2")
+        .assert()
+        .success();
+
+    let rows = reservation_metadata_rows(&env);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].2.as_deref(), Some("project-2"));
+    assert_eq!(rows[0].3.as_deref(), Some("task-2"));
 }
 
 // ============================================================================
@@ -1880,9 +2101,8 @@ fn test_autoreserve_dry_run() {
 
 /// Test autoreserve with override flags.
 ///
-/// Autoreserve should support the same override flags as reserve-group
-/// (--force, --allow-unrelated-path, etc.). This test verifies that flags
-/// are properly passed through after discovery.
+/// Autoreserve applies the same metadata and force policy after discovery,
+/// including environment-derived narrow permissions.
 #[test]
 fn test_autoreserve_with_override_flags() {
     let env = TestEnv::new();
@@ -1893,20 +2113,63 @@ fn test_autoreserve_with_override_flags() {
     // First reservation
     env.command()
         .arg("autoreserve")
-        .arg("--allow-unrelated-path")
+        .arg("--task")
+        .arg("original-task")
         .current_dir(&project_dir)
         .assert()
         .success();
 
-    // Second with different task - should work with --force
+    create_test_config(&config_path, "changed-project");
     env.command()
         .arg("autoreserve")
         .arg("--task")
-        .arg("different-task")
+        .arg("changed-task")
+        .current_dir(&project_dir)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("sticky field"));
+
+    env.command()
+        .arg("autoreserve")
+        .arg("--task")
+        .arg("changed-task")
+        .env("TROP_ALLOW_CHANGE", "true")
+        .current_dir(&project_dir)
+        .assert()
+        .success();
+    let metadata = reservation_metadata_rows(&env);
+    assert!(metadata.iter().all(|row| {
+        row.2.as_deref() == Some("changed-project") && row.3.as_deref() == Some("changed-task")
+    }));
+
+    fs::write(
+        &config_path,
+        r#"
+project: changed-project
+ports:
+  min: 5000
+  max: 9000
+occupancy_check:
+  skip: true
+reservations:
+  base: 8000
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 1
+    admin:
+      offset: 2
+"#,
+    )
+    .expect("Failed to write changed autoreserve shape");
+    env.command()
+        .arg("autoreserve")
         .arg("--force")
         .current_dir(&project_dir)
         .assert()
         .success();
+    assert_eq!(reservation_metadata_rows(&env).len(), 3);
 }
 
 // ============================================================================

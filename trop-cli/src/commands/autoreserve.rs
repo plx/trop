@@ -16,7 +16,7 @@ use super::reserve_group::OutputFormatArg;
 #[derive(Args)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AutoreserveCommand {
-    /// Task identifier
+    /// Task identifier; omission preserves an existing value (clearing unsupported)
     #[arg(long, env = "TROP_TASK")]
     pub task: Option<String>,
 
@@ -28,23 +28,26 @@ pub struct AutoreserveCommand {
     #[arg(long)]
     pub shell: Option<String>,
 
-    /// Force operation (overrides all protections)
+    /// Allow unrelated paths, metadata changes, and atomic shape replacement
+    ///
+    /// This does not bypass exclusions, OS occupancy, invalid configuration,
+    /// exhaustion, or another reservation key's port ownership.
     #[arg(long)]
     pub force: bool,
 
-    /// Allow operations on unrelated paths
+    /// Allow an unrelated config parent without changing other protections
     #[arg(long)]
     pub allow_unrelated_path: bool,
 
-    /// Allow changing the project field
+    /// Allow changing only the project field
     #[arg(long)]
     pub allow_project_change: bool,
 
-    /// Allow changing the task field
+    /// Allow changing only the task field
     #[arg(long)]
     pub allow_task_change: bool,
 
-    /// Allow changing project or task fields
+    /// Allow changing project and task fields, but not paths or group shape
     #[arg(long)]
     pub allow_change: bool,
 

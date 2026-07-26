@@ -8,8 +8,11 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, ConfigLoader, ConfigValidator, EffectiveConfig};
+use crate::database::Database;
 use crate::error::{Error, Result};
-use crate::port::group::{GroupAllocationRequest, ServiceAllocationRequest};
+use crate::port::group::{
+    GroupAllocationRequest, GroupReconciliationPolicy, ServiceAllocationRequest,
+};
 use crate::port::occupancy::OccupancyCheckConfig;
 use crate::{PathResolver, Port};
 use rusqlite::Connection;
@@ -29,16 +32,17 @@ pub struct ReserveGroupOptions {
     /// Optional task identifier (sticky field).
     pub task: Option<String>,
 
-    /// Force flag - overrides all protections.
+    /// Authorize unrelated paths, both sticky fields, and atomic replacement
+    /// of an incompatible group shape. Allocation integrity checks remain.
     pub force: bool,
 
-    /// Allow operations on unrelated paths.
+    /// Allow operations on unrelated paths without changing other protections.
     pub allow_unrelated_path: bool,
 
-    /// Allow changing the project field.
+    /// Allow changing only the project field.
     pub allow_project_change: bool,
 
-    /// Allow changing the task field.
+    /// Allow changing only the task field.
     pub allow_task_change: bool,
 }
 
@@ -289,6 +293,13 @@ impl ReserveGroupPlan {
             });
         }
 
+        // Apply the same invocation-path guard as a single reservation. Force
+        // is the broad override; the narrow path flag authorizes only this
+        // relationship check.
+        if !self.options.force && !self.options.allow_unrelated_path {
+            Database::validate_path_relationship(&self.reservation_path, false)?;
+        }
+
         // Convert the reservation group to a GroupAllocationRequest
         let request = self.build_group_request(reservation_group)?;
 
@@ -304,6 +315,11 @@ impl ReserveGroupPlan {
 
         plan = plan.add_action(PlanAction::AllocateGroup {
             request,
+            policy: GroupReconciliationPolicy {
+                allow_project_change: self.options.allow_project_change,
+                allow_task_change: self.options.allow_task_change,
+                force: self.options.force,
+            },
             full_config,
             occupancy_config,
         });
@@ -467,7 +483,10 @@ reservations:
       env: SNAPSHOT_PORT
 ",
         );
-        let planner = ReserveGroupPlan::new(ReserveGroupOptions::new(config_path.clone())).unwrap();
+        let planner = ReserveGroupPlan::new(
+            ReserveGroupOptions::new(config_path.clone()).with_allow_unrelated_path(true),
+        )
+        .unwrap();
 
         fs::write(&config_path, "this: [is not valid yaml").unwrap();
 
@@ -505,7 +524,7 @@ ports:
         let config_path = create_test_config_file(&temp_dir, config_content);
         let db = create_test_database();
 
-        let options = ReserveGroupOptions::new(config_path);
+        let options = ReserveGroupOptions::new(config_path).with_allow_unrelated_path(true);
         let plan = ReserveGroupPlan::new(options).unwrap();
         let result = plan.build_plan(db.connection());
 
@@ -536,7 +555,7 @@ reservations:
         let config_path = create_test_config_file(&temp_dir, config_content);
         let db = create_test_database();
 
-        let options = ReserveGroupOptions::new(config_path);
+        let options = ReserveGroupOptions::new(config_path).with_allow_unrelated_path(true);
         let planner = ReserveGroupPlan::new(options).unwrap();
         let plan = planner.build_plan(db.connection()).unwrap();
 

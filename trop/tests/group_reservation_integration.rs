@@ -44,7 +44,9 @@ fn create_config_file(dir: &std::path::Path, name: &str, content: &str) -> PathB
 }
 
 fn execute_group(db: &Database, config_path: &Path) -> trop::Result<HashMap<String, Port>> {
-    let planner = ReserveGroupPlan::new(ReserveGroupOptions::new(config_path.to_path_buf()))?;
+    let planner = ReserveGroupPlan::new(
+        ReserveGroupOptions::new(config_path.to_path_buf()).with_allow_unrelated_path(true),
+    )?;
     let plan = planner.build_plan(db.connection())?;
     let mut executor = PlanExecutor::new(db.connection());
     executor
@@ -54,6 +56,30 @@ fn execute_group(db: &Database, config_path: &Path) -> trop::Result<HashMap<Stri
             attempted: 0,
             reason: "group execution returned no mapping".to_string(),
         })
+}
+
+fn execute_group_with_options(
+    db: &Database,
+    options: ReserveGroupOptions,
+) -> trop::Result<HashMap<String, Port>> {
+    let planner = ReserveGroupPlan::new(options)?;
+    let plan = planner.build_plan(db.connection())?;
+    let mut executor = PlanExecutor::new(db.connection());
+    executor
+        .execute(&plan)?
+        .allocated_ports
+        .ok_or_else(|| Error::GroupAllocationFailed {
+            attempted: 0,
+            reason: "group execution returned no mapping".to_string(),
+        })
+}
+
+fn test_group_options(config_path: PathBuf) -> ReserveGroupOptions {
+    ReserveGroupOptions::new(config_path).with_allow_unrelated_path(true)
+}
+
+fn test_autoreserve_options(start_dir: PathBuf) -> AutoreserveOptions {
+    AutoreserveOptions::new(start_dir).with_allow_unrelated_path(true)
 }
 
 /// Creates a simple group reservation configuration with offset-based services.
@@ -195,7 +221,7 @@ fn test_successful_group_reservation_with_offsets() {
     let db = create_test_database();
 
     // Build and execute the reservation plan
-    let options = ReserveGroupOptions::new(config_path.clone());
+    let options = test_group_options(config_path.clone());
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
     let plan = planner
         .build_plan(db.connection())
@@ -290,7 +316,7 @@ fn test_group_plan_canonicalizes_config_parent_before_building_keys() {
     let spelled_config_path = detour.join("..").join("trop.yaml");
     let db = create_test_database();
 
-    let planner = ReserveGroupPlan::new(ReserveGroupOptions::new(spelled_config_path))
+    let planner = ReserveGroupPlan::new(test_group_options(spelled_config_path))
         .expect("Should resolve group config");
     assert_eq!(
         planner.config_path(),
@@ -330,7 +356,7 @@ fn test_group_planner_rejects_config_source_that_is_no_longer_a_file() {
     fs::create_dir(&config_path).expect("Should replace config with directory");
 
     let result =
-        ReserveGroupPlan::from_effective(ReserveGroupOptions::new(config_path.clone()), &effective);
+        ReserveGroupPlan::from_effective(test_group_options(config_path.clone()), &effective);
     assert!(
         matches!(
             result,
@@ -476,6 +502,688 @@ reservations:
     assert_incompatible_group_is_unchanged(initial_preferred, changed_preferred);
 }
 
+/// Group metadata is sticky on every row, and a narrow allow flag updates only
+/// its own field while preserving keys, ports, and creation timestamps.
+#[test]
+fn test_group_metadata_changes_require_matching_permissions_and_persist() {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(
+        temp_dir.path(),
+        "trop.yaml",
+        r#"
+project: original-project
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 1
+"#,
+    );
+    let db = create_test_database();
+
+    execute_group_with_options(
+        &db,
+        ReserveGroupOptions::new(config_path.clone())
+            .with_task(Some("original-task".to_string()))
+            .with_allow_unrelated_path(true),
+    )
+    .expect("Initial group should allocate");
+    db.connection()
+        .execute(
+            "UPDATE reservations SET created_at = 123, last_used_at = 1",
+            [],
+        )
+        .expect("Should make timestamps deterministic");
+    let before =
+        Database::list_all_reservations(db.connection()).expect("Should snapshot original group");
+
+    create_config_file(
+        temp_dir.path(),
+        "trop.yaml",
+        r#"
+project: changed-project
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 1
+"#,
+    );
+
+    let unauthorized = execute_group_with_options(
+        &db,
+        ReserveGroupOptions::new(config_path.clone())
+            .with_task(Some("changed-task".to_string()))
+            .with_allow_unrelated_path(true),
+    )
+    .expect_err("Changing sticky metadata without permission must fail");
+    assert!(matches!(unauthorized, Error::StickyFieldChange { .. }));
+    assert_eq!(
+        Database::list_all_reservations(db.connection()).expect("Should reload original group"),
+        before,
+        "Unauthorized metadata changes must not mutate any row or timestamp"
+    );
+
+    let project_only = execute_group_with_options(
+        &db,
+        ReserveGroupOptions::new(config_path.clone())
+            .with_task(Some("changed-task".to_string()))
+            .with_allow_unrelated_path(true)
+            .with_allow_project_change(true),
+    )
+    .expect_err("Project permission must not authorize a task change");
+    assert!(matches!(project_only, Error::StickyFieldChange { ref field, .. } if field == "task"));
+    assert_eq!(
+        Database::list_all_reservations(db.connection()).expect("Should reload original group"),
+        before,
+        "A rejected narrow override must leave the whole group unchanged"
+    );
+
+    let mapping = execute_group_with_options(
+        &db,
+        ReserveGroupOptions::new(config_path)
+            .with_task(Some("changed-task".to_string()))
+            .with_allow_unrelated_path(true)
+            .with_allow_project_change(true)
+            .with_allow_task_change(true),
+    )
+    .expect("Both matching permissions should authorize the metadata update");
+
+    let after =
+        Database::list_all_reservations(db.connection()).expect("Should reload updated group");
+    assert_eq!(after.len(), before.len());
+    for reservation in &after {
+        let original = before
+            .iter()
+            .find(|candidate| candidate.key() == reservation.key())
+            .expect("Every updated row should retain its key");
+        assert_eq!(reservation.port(), original.port());
+        assert_eq!(
+            mapping[reservation.key().tag.as_deref().unwrap()],
+            original.port()
+        );
+        assert_eq!(reservation.project(), Some("changed-project"));
+        assert_eq!(reservation.task(), Some("changed-task"));
+        assert_eq!(reservation.created_at(), original.created_at());
+        assert!(reservation.last_used_at() > original.last_used_at());
+    }
+}
+
+/// Omitted metadata means "keep the stored value"; group configuration does
+/// not expose an explicit clearing syntax.
+#[test]
+fn test_group_omitted_metadata_preserves_existing_values() {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(
+        temp_dir.path(),
+        "trop.yaml",
+        r#"
+project: retained-project
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+"#,
+    );
+    let db = create_test_database();
+
+    execute_group_with_options(
+        &db,
+        ReserveGroupOptions::new(config_path.clone())
+            .with_task(Some("retained-task".to_string()))
+            .with_allow_unrelated_path(true),
+    )
+    .expect("Initial group should allocate");
+
+    create_config_file(
+        temp_dir.path(),
+        "trop.yaml",
+        r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+"#,
+    );
+    execute_group(&db, &config_path).expect("Omitted metadata should reuse the group");
+
+    let rows = Database::list_all_reservations(db.connection()).expect("Should load group");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].project(), Some("retained-project"));
+    assert_eq!(rows[0].task(), Some("retained-task"));
+}
+
+/// Empty metadata is invalid rather than an implicit clearing request.
+#[test]
+fn test_group_rejects_implicit_metadata_clearing_without_mutation() {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(1));
+    let db = create_test_database();
+    execute_group_with_options(
+        &db,
+        test_group_options(config_path.clone()).with_task(Some("retained-task".to_string())),
+    )
+    .expect("Initial group should allocate");
+    let before =
+        Database::list_all_reservations(db.connection()).expect("Should snapshot original group");
+
+    create_config_file(
+        temp_dir.path(),
+        "trop.yaml",
+        r#"
+project: "   "
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    service0:
+      offset: 0
+"#,
+    );
+    let project_error = execute_group_with_options(&db, test_group_options(config_path.clone()))
+        .expect_err("Whitespace project must not clear stored metadata");
+    assert!(matches!(project_error, Error::Validation { .. }));
+    assert_eq!(
+        Database::list_all_reservations(db.connection()).expect("Should reload original group"),
+        before
+    );
+
+    create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(1));
+    let task_error = execute_group_with_options(
+        &db,
+        test_group_options(config_path).with_task(Some("   ".to_string())),
+    )
+    .expect_err("Whitespace task must not clear stored metadata");
+    assert!(matches!(task_error, Error::Validation { .. }));
+    assert_eq!(
+        Database::list_all_reservations(db.connection()).expect("Should reload original group"),
+        before
+    );
+}
+
+/// The config parent is subject to the same current-directory relationship
+/// guard as a single reservation.
+#[test]
+fn test_group_unrelated_path_requires_override() {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(1));
+    let db = create_test_database();
+
+    let planner = ReserveGroupPlan::new(ReserveGroupOptions::new(config_path.clone()))
+        .expect("Config should load");
+    let error = planner
+        .build_plan(db.connection())
+        .expect_err("An unrelated group path should be rejected by default");
+    assert!(matches!(error, Error::PathRelationshipViolation { .. }));
+    assert!(
+        Database::list_all_reservations(db.connection())
+            .expect("Should inspect database")
+            .is_empty(),
+        "Path rejection must happen before mutation"
+    );
+
+    execute_group_with_options(
+        &db,
+        ReserveGroupOptions::new(config_path).with_allow_unrelated_path(true),
+    )
+    .expect("The path-specific override should authorize the same request");
+}
+
+/// Force is the sole shape-change authorization and atomically replaces a
+/// partial or incompatible exact-path tagged group.
+#[test]
+fn test_force_atomically_replaces_changed_group_shape() {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(
+        temp_dir.path(),
+        "trop.yaml",
+        r#"
+project: retained-project
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 1
+"#,
+    );
+    let db = create_test_database();
+    execute_group_with_options(
+        &db,
+        ReserveGroupOptions::new(config_path.clone())
+            .with_task(Some("retained-task".to_string()))
+            .with_allow_unrelated_path(true),
+    )
+    .expect("Initial group should allocate");
+    let before =
+        Database::list_all_reservations(db.connection()).expect("Should snapshot initial group");
+
+    create_config_file(
+        temp_dir.path(),
+        "trop.yaml",
+        r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 2
+    db:
+      offset: 1
+"#,
+    );
+
+    let narrow_error = execute_group_with_options(
+        &db,
+        ReserveGroupOptions::new(config_path.clone())
+            .with_allow_unrelated_path(true)
+            .with_allow_project_change(true)
+            .with_allow_task_change(true),
+    )
+    .expect_err("Metadata permissions must not authorize shape replacement");
+    assert!(matches!(narrow_error, Error::ReservationConflict { .. }));
+    assert_eq!(
+        Database::list_all_reservations(db.connection()).expect("Should reload initial group"),
+        before
+    );
+
+    let mapping =
+        execute_group_with_options(&db, ReserveGroupOptions::new(config_path).with_force(true))
+            .expect("Force should authorize one atomic shape replacement");
+    assert_eq!(mapping.len(), 3);
+    assert_eq!(mapping["api"].value(), mapping["web"].value() + 2);
+    assert_eq!(mapping["db"].value(), mapping["web"].value() + 1);
+
+    let after =
+        Database::list_all_reservations(db.connection()).expect("Should load replacement group");
+    assert_eq!(after.len(), 3);
+    assert!(after.iter().all(|row| {
+        row.project() == Some("retained-project") && row.task() == Some("retained-task")
+    }));
+}
+
+/// A late metadata write failure rolls back earlier member updates.
+#[test]
+fn test_group_metadata_update_rolls_back_on_late_failure() {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(2));
+    let db = create_test_database();
+    execute_group_with_options(
+        &db,
+        test_group_options(config_path.clone()).with_task(Some("original-task".to_string())),
+    )
+    .expect("Initial group should allocate");
+    db.connection()
+        .execute(
+            "UPDATE reservations SET created_at = 123, last_used_at = 1",
+            [],
+        )
+        .expect("Should make timestamps deterministic");
+    db.connection()
+        .execute_batch(
+            r"
+            CREATE TRIGGER fail_second_metadata_update
+            BEFORE UPDATE ON reservations
+            WHEN OLD.tag = 'service1'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced late metadata update failure');
+            END;
+            ",
+        )
+        .expect("Should install failure trigger");
+    let before =
+        Database::list_all_reservations(db.connection()).expect("Should snapshot original group");
+
+    let error = execute_group_with_options(
+        &db,
+        test_group_options(config_path)
+            .with_task(Some("changed-task".to_string()))
+            .with_allow_task_change(true),
+    )
+    .expect_err("Injected late metadata failure should abort reconciliation");
+    assert!(
+        matches!(error, Error::Database(_)),
+        "The injected SQLite failure should remain typed: {error}"
+    );
+    assert_eq!(
+        Database::list_all_reservations(db.connection()).expect("Should reload original group"),
+        before,
+        "Every earlier metadata/timestamp update must roll back"
+    );
+}
+
+/// Forced replacement deletes and inserts inside one savepoint, so a late
+/// insert failure restores the complete original group.
+#[test]
+fn test_forced_shape_replacement_rolls_back_on_late_insert_failure() {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(2));
+    let db = create_test_database();
+    execute_group(&db, &config_path).expect("Initial group should allocate");
+    db.connection()
+        .execute(
+            "UPDATE reservations SET created_at = 123, last_used_at = 1",
+            [],
+        )
+        .expect("Should make timestamps deterministic");
+    db.connection()
+        .execute_batch(
+            r"
+            CREATE TRIGGER fail_late_replacement_insert
+            BEFORE INSERT ON reservations
+            WHEN NEW.tag = 'service2'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced late replacement insert failure');
+            END;
+            ",
+        )
+        .expect("Should install failure trigger");
+    let before =
+        Database::list_all_reservations(db.connection()).expect("Should snapshot original group");
+
+    create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(3));
+    let error =
+        execute_group_with_options(&db, ReserveGroupOptions::new(config_path).with_force(true))
+            .expect_err("Injected late replacement failure should abort reconciliation");
+    assert!(
+        matches!(error, Error::Database(_)),
+        "The injected SQLite failure should remain typed: {error}"
+    );
+    assert_eq!(
+        Database::list_all_reservations(db.connection()).expect("Should reload original group"),
+        before,
+        "Forced replacement failure must restore every original row byte-for-byte"
+    );
+}
+
+/// Force repairs partial state and supports removals and preferred-map changes,
+/// while ordinary reconciliation continues to reject those shapes.
+#[test]
+fn test_force_reconciles_removed_preferred_and_partial_shapes() {
+    let removed_initial = r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 1
+"#;
+    let removed_changed = r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+"#;
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(temp_dir.path(), "trop.yaml", removed_initial);
+    let db = create_test_database();
+    execute_group(&db, &config_path).expect("Initial removal fixture should allocate");
+    create_config_file(temp_dir.path(), "trop.yaml", removed_changed);
+    let removed = execute_group_with_options(
+        &db,
+        ReserveGroupOptions::new(config_path.clone()).with_force(true),
+    )
+    .expect("Force should authorize service removal");
+    assert_eq!(removed.len(), 1);
+    assert!(removed.contains_key("web"));
+    assert_eq!(
+        Database::list_all_reservations(db.connection())
+            .expect("Should load removed shape")
+            .len(),
+        1
+    );
+
+    create_config_file(temp_dir.path(), "trop.yaml", &preferred_only_config());
+    execute_group_with_options(
+        &db,
+        ReserveGroupOptions::new(config_path.clone()).with_force(true),
+    )
+    .expect("Force should replace offset services with preferred services");
+    let changed_preferred = r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      preferred: 5011
+    api:
+      preferred: 5021
+"#;
+    create_config_file(temp_dir.path(), "trop.yaml", changed_preferred);
+    let preferred = execute_group_with_options(
+        &db,
+        ReserveGroupOptions::new(config_path.clone()).with_force(true),
+    )
+    .expect("Force should authorize preferred-map replacement");
+    assert_eq!(preferred["web"], Port::try_from(5011).unwrap());
+    assert_eq!(preferred["api"], Port::try_from(5021).unwrap());
+
+    db.connection()
+        .execute("DELETE FROM reservations WHERE tag = 'api'", [])
+        .expect("Should inject partial state");
+    let repaired =
+        execute_group_with_options(&db, ReserveGroupOptions::new(config_path).with_force(true))
+            .expect("Force should replace a partial group");
+    assert_eq!(repaired.len(), 2);
+    assert_eq!(
+        Database::list_all_reservations(db.connection())
+            .expect("Should load repaired group")
+            .len(),
+        2
+    );
+}
+
+/// Force makes the old group's own ports available for reallocation but does
+/// not bypass another key's ownership or configured exclusions.
+#[test]
+fn test_force_shape_change_keeps_external_port_guards() {
+    let temp_dir = create_temp_dir();
+    let initial = r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 1
+"#;
+    let config_path = create_config_file(temp_dir.path(), "trop.yaml", initial);
+    let db = create_test_database();
+    execute_group(&db, &config_path).expect("Initial group should allocate");
+
+    let external = Reservation::builder(
+        ReservationKey::new(
+            temp_dir.path().join("external"),
+            Some("external".to_string()),
+        )
+        .expect("Should build external key"),
+        Port::try_from(5002).unwrap(),
+    )
+    .build()
+    .expect("Should build external reservation");
+    Database::create_reservation_simple(db.connection(), &external)
+        .expect("Should seed external port owner");
+
+    let changed = r#"
+ports:
+  min: 5000
+  max: 7000
+excluded_ports:
+  - 5003
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 1
+    db:
+      offset: 2
+"#;
+    create_config_file(temp_dir.path(), "trop.yaml", changed);
+    let mapping =
+        execute_group_with_options(&db, ReserveGroupOptions::new(config_path).with_force(true))
+            .expect("Force should find a complete guarded replacement pattern");
+
+    assert_eq!(mapping["web"], Port::try_from(5004).unwrap());
+    assert_eq!(mapping["api"], Port::try_from(5005).unwrap());
+    assert_eq!(mapping["db"], Port::try_from(5006).unwrap());
+    assert!(
+        Database::list_all_reservations(db.connection())
+            .expect("Should list final state")
+            .iter()
+            .any(|row| row.key() == external.key() && row.port() == external.port()),
+        "Forced replacement must preserve the unrelated port owner"
+    );
+}
+
+/// Omitted metadata can be inherited during replacement only when the stored
+/// group agrees; explicit forced values can normalize inconsistent legacy rows.
+#[test]
+fn test_forced_shape_change_requires_unanimous_omitted_metadata() {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(2));
+    let db = create_test_database();
+    execute_group_with_options(
+        &db,
+        test_group_options(config_path.clone()).with_task(Some("original-task".to_string())),
+    )
+    .expect("Initial group should allocate");
+    db.connection()
+        .execute(
+            "UPDATE reservations
+             SET project = CASE tag
+                 WHEN 'service0' THEN 'project-a'
+                 ELSE 'project-b'
+             END,
+             task = CASE tag
+                 WHEN 'service0' THEN 'task-a'
+                 ELSE 'task-b'
+             END",
+            [],
+        )
+        .expect("Should inject inconsistent legacy metadata");
+    let before =
+        Database::list_all_reservations(db.connection()).expect("Should snapshot legacy group");
+
+    create_config_file(
+        temp_dir.path(),
+        "trop.yaml",
+        r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    service0:
+      offset: 0
+    service1:
+      offset: 1
+    service2:
+      offset: 2
+"#,
+    );
+    let error = execute_group_with_options(
+        &db,
+        ReserveGroupOptions::new(config_path.clone()).with_force(true),
+    )
+    .expect_err("Force must not invent omitted metadata from inconsistent rows");
+    assert!(matches!(error, Error::ReservationConflict { .. }));
+    assert_eq!(
+        Database::list_all_reservations(db.connection()).expect("Should reload legacy group"),
+        before
+    );
+
+    create_config_file(
+        temp_dir.path(),
+        "trop.yaml",
+        r#"
+project: normalized-project
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    service0:
+      offset: 0
+    service1:
+      offset: 1
+    service2:
+      offset: 2
+"#,
+    );
+    execute_group_with_options(
+        &db,
+        ReserveGroupOptions::new(config_path)
+            .with_task(Some("normalized-task".to_string()))
+            .with_force(true),
+    )
+    .expect("Explicit forced metadata should normalize the replacement");
+    let after =
+        Database::list_all_reservations(db.connection()).expect("Should load normalized group");
+    assert_eq!(after.len(), 3);
+    assert!(after.iter().all(|row| {
+        row.project() == Some("normalized-project") && row.task() == Some("normalized-task")
+    }));
+}
+
 /// Missing rows are treated as a partial-group conflict, not repaired into a
 /// mixture of old and new allocations.
 #[test]
@@ -585,7 +1293,7 @@ fn test_mixed_offset_and_preferred_ports() {
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &mixed_allocation_config());
     let db = create_test_database();
 
-    let options = ReserveGroupOptions::new(config_path);
+    let options = test_group_options(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
     let plan = planner
         .build_plan(db.connection())
@@ -654,7 +1362,7 @@ fn test_group_reservation_preferred_ports_only() {
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &preferred_only_config());
     let db = create_test_database();
 
-    let options = ReserveGroupOptions::new(config_path);
+    let options = test_group_options(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
     let plan = planner
         .build_plan(db.connection())
@@ -690,7 +1398,7 @@ fn test_group_reservation_honors_base_port() {
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &base_port_config());
     let db = create_test_database();
 
-    let options = ReserveGroupOptions::new(config_path);
+    let options = test_group_options(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
     let plan = planner
         .build_plan(db.connection())
@@ -721,7 +1429,7 @@ fn test_group_reservation_with_project_and_task() {
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(2));
     let db = create_test_database();
 
-    let options = ReserveGroupOptions::new(config_path).with_task(Some("development".to_string()));
+    let options = test_group_options(config_path).with_task(Some("development".to_string()));
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
     let plan = planner
         .build_plan(db.connection())
@@ -771,7 +1479,7 @@ fn test_database_state_after_group_reservation() {
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(2));
     let db = create_test_database();
 
-    let options = ReserveGroupOptions::new(config_path).with_task(Some("test-task".to_string()));
+    let options = test_group_options(config_path).with_task(Some("test-task".to_string()));
     let planner = ReserveGroupPlan::new(options).expect("Failed to create plan");
     let plan = planner
         .build_plan(db.connection())
@@ -834,7 +1542,7 @@ fn test_allocated_ports_not_reused() {
     let db = create_test_database();
 
     // Allocate first group
-    let options1 = ReserveGroupOptions::new(config1_path);
+    let options1 = test_group_options(config1_path);
     let planner1 = ReserveGroupPlan::new(options1).expect("Failed to create plan");
     let plan1 = planner1
         .build_plan(db.connection())
@@ -844,7 +1552,7 @@ fn test_allocated_ports_not_reused() {
     let ports1 = result1.allocated_ports.expect("Should have ports");
 
     // Allocate second group
-    let options2 = ReserveGroupOptions::new(config2_path);
+    let options2 = test_group_options(config2_path);
     let planner2 = ReserveGroupPlan::new(options2).expect("Failed to create plan");
     let plan2 = planner2
         .build_plan(db.connection())
@@ -889,7 +1597,7 @@ fn test_autoreserve_discovers_config_in_current_dir() {
     create_config_file(temp_dir.path(), "trop.yaml", &minimal_config());
     let db = create_test_database();
 
-    let options = AutoreserveOptions::new(temp_dir.path().to_path_buf());
+    let options = test_autoreserve_options(temp_dir.path().to_path_buf());
     let planner = AutoreservePlan::new(options).expect("Should discover config");
     let plan = planner
         .build_plan(db.connection())
@@ -923,7 +1631,7 @@ fn test_autoreserve_discovers_config_from_parent() {
     create_config_file(temp_dir.path(), "trop.yaml", &minimal_config());
     let db = create_test_database();
 
-    let options = AutoreserveOptions::new(child_dir.clone());
+    let options = test_autoreserve_options(child_dir.clone());
     let planner = AutoreservePlan::new(options).expect("Should discover config");
     let canonical_parent = temp_dir
         .path()
@@ -997,7 +1705,7 @@ reservations:
     create_config_file(temp_dir.path(), "trop.local.yaml", local_config);
 
     let db = create_test_database();
-    let options = AutoreserveOptions::new(temp_dir.path().to_path_buf());
+    let options = test_autoreserve_options(temp_dir.path().to_path_buf());
     let planner = AutoreservePlan::new(options).expect("Should discover config");
 
     // Verify local config was discovered
@@ -1109,7 +1817,7 @@ fn test_allow_project_change_flag() {
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(1));
     let db = create_test_database();
 
-    let options = ReserveGroupOptions::new(config_path).with_allow_project_change(true);
+    let options = test_group_options(config_path).with_allow_project_change(true);
     let planner = ReserveGroupPlan::new(options).expect("Should create plan");
     let plan = planner
         .build_plan(db.connection())
@@ -1135,7 +1843,7 @@ fn test_allow_task_change_flag() {
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(1));
     let db = create_test_database();
 
-    let options = ReserveGroupOptions::new(config_path)
+    let options = test_group_options(config_path)
         .with_task(Some("task1".to_string()))
         .with_allow_task_change(true);
     let planner = ReserveGroupPlan::new(options).expect("Should create plan");
@@ -1201,7 +1909,7 @@ ports:
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", config_content);
     let db = create_test_database();
 
-    let options = ReserveGroupOptions::new(config_path);
+    let options = test_group_options(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
     let result = planner.build_plan(db.connection());
 
@@ -1237,7 +1945,7 @@ reservations:
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", config_content);
     let db = create_test_database();
 
-    let options = ReserveGroupOptions::new(config_path);
+    let options = test_group_options(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
     let result = planner.build_plan(db.connection());
 
@@ -1276,7 +1984,7 @@ reservations:
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", config_content);
     let db = create_test_database();
 
-    let options = ReserveGroupOptions::new(config_path);
+    let options = test_group_options(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
     let plan = planner
         .build_plan(db.connection())
@@ -1328,7 +2036,7 @@ reservations:
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", config_content);
     let db = create_test_database();
 
-    let options = ReserveGroupOptions::new(config_path);
+    let options = test_group_options(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
     let plan = planner
         .build_plan(db.connection())
@@ -1379,7 +2087,7 @@ reservations:
       offset: 0
 "#;
     let first_path = create_config_file(temp_dir.path(), "first.yaml", first_config);
-    let first_options = ReserveGroupOptions::new(first_path);
+    let first_options = test_group_options(first_path);
     let first_planner = ReserveGroupPlan::new(first_options).expect("Should create planner");
     let first_plan = first_planner
         .build_plan(db.connection())
@@ -1406,7 +2114,7 @@ reservations:
         occupied_port.value()
     );
     let second_path = create_config_file(temp_dir.path(), "second.yaml", &second_config);
-    let second_options = ReserveGroupOptions::new(second_path);
+    let second_options = test_group_options(second_path);
     let second_planner = ReserveGroupPlan::new(second_options).expect("Should create planner");
     let second_plan = second_planner
         .build_plan(db.connection())
@@ -1476,7 +2184,7 @@ reservations:
       preferred: 5100
 "#;
     let blocking_path = create_config_file(blocking_dir.path(), "trop.yaml", blocking_config);
-    let blocking_options = ReserveGroupOptions::new(blocking_path);
+    let blocking_options = test_group_options(blocking_path);
     let blocking_planner = ReserveGroupPlan::new(blocking_options).expect("Should create planner");
     let blocking_plan = blocking_planner
         .build_plan(db.connection())
@@ -1487,7 +2195,7 @@ reservations:
         .expect("Blocking allocation should succeed");
 
     // Now try to allocate the pattern - should fail
-    let options = ReserveGroupOptions::new(config_path);
+    let options = test_group_options(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
     let plan = planner
         .build_plan(db.connection())
@@ -1528,7 +2236,7 @@ fn test_dry_run_no_database_changes() {
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(2));
     let db = create_test_database();
 
-    let options = ReserveGroupOptions::new(config_path);
+    let options = test_group_options(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
     let plan = planner
         .build_plan(db.connection())
@@ -1586,7 +2294,7 @@ reservations:
     let config_path = create_config_file(temp_dir.path(), "trop.yaml", config_content);
     let db = create_test_database();
 
-    let options = ReserveGroupOptions::new(config_path);
+    let options = test_group_options(config_path);
     let planner = ReserveGroupPlan::new(options).expect("Should create planner");
     let plan = planner
         .build_plan(db.connection())
@@ -1650,7 +2358,7 @@ reservations:
         );
         let config_path = create_config_file(temp_dir.path(), "trop.yaml", &config_content);
 
-        let options = ReserveGroupOptions::new(config_path);
+        let options = test_group_options(config_path);
         let planner = ReserveGroupPlan::new(options).expect("Should create planner");
         let plan = planner
             .build_plan(db.connection())
