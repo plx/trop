@@ -27,6 +27,10 @@ target
 # Runtime lock file created by the Claude Code harness
 .claude/scheduled_tasks.lock
 
+# Python bytecode created by maintainer scripts and their tests
+__pycache__/
+*.py[cod]
+
 # Astro/Starlight site output and local dependencies
 /site/node_modules/
 /site/dist/

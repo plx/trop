@@ -1,15 +1,25 @@
 # Justfile for trop development
 # See: https://github.com/casey/just
 
-TROP_CONCURRENCY_TEST_THREADS:=env("TROP_CONCURRENCY_TEST_THREADS", "4")
+set positional-arguments
+
+TROP_CONCURRENCY_TEST_THREADS := env("TROP_CONCURRENCY_TEST_THREADS", "4")
 
 # Default recipe to display help
 default:
     @just --list
 
-# Run all tests
+# Run all Rust tests
 test:
     cargo test
+
+# Print the next production-readiness issue URL, completion, or waiting state
+get-next-production-readiness-issue *args:
+    @python3 scripts/get_next_production_readiness_issue.py "$@"
+
+# Test the production-readiness work selector
+test-production-readiness-selector:
+    python3 -m unittest discover -s scripts/tests -p "test_*.py"
 
 # Run config integration tests
 test-config:
@@ -39,8 +49,8 @@ build:
 build-release:
     cargo build --release
 
-# Run all checks (fmt, clippy, tests)
-check: fmt-check clippy test
+# Run all checks (Rust format, Clippy, Rust tests, and selector tests)
+check: fmt-check clippy test test-production-readiness-selector
 
 # Pre-flight checks for PR submission (minimal output)
 preflight-pr:
@@ -84,6 +94,14 @@ preflight-pr:
     fi
     echo "✓ Tests passed"
 
+    # Production-readiness selector check
+    if ! just test-production-readiness-selector &>/dev/null; then
+        echo "✗ Production-readiness selector tests failed"
+        just test-production-readiness-selector
+        exit 1
+    fi
+    echo "✓ Production-readiness selector tests passed"
+
     echo ""
     echo "All pre-flight checks passed!"
 
@@ -101,7 +119,7 @@ bench:
 
 # Build and run the CLI tool
 run *ARGS:
-    cargo run --bin trop-cli -- {{ARGS}}
+    cargo run --bin trop-cli -- {{ ARGS }}
 
 # CI: build all (debug)
 ci-build-all-debug:
@@ -140,6 +158,10 @@ ci-run-tests: ci-run-tests-debug ci-run-tests-release
 ci-check-format:
     cargo fmt --all -- --check
 
+# CI: test the production-readiness work selector
+ci-test-production-readiness-selector:
+    python3 -m unittest discover -s scripts/tests -p "test_*.py" -v
+
 # CI: check documentation
 ci-check-docs:
     cargo doc --all --no-deps
@@ -157,11 +179,11 @@ ci-run-doc-tests: ci-run-doc-tests-debug ci-run-doc-tests-release
 
 # CI: run concurrent tests (debug)
 ci-run-concurrency-tests-debug threads=TROP_CONCURRENCY_TEST_THREADS:
-    cargo test concurrent -- --test-threads={{threads}} --nocapture
+    cargo test concurrent -- --test-threads={{ threads }} --nocapture
 
 # CI: run concurrent tests (release)
 ci-run-concurrency-tests-release threads=TROP_CONCURRENCY_TEST_THREADS:
-    cargo test --release concurrent -- --test-threads={{threads}} --nocapture
+    cargo test --release concurrent -- --test-threads={{ threads }} --nocapture
 
 # CI: run concurrent tests (debug and release)
 ci-run-concurrency-tests threads=TROP_CONCURRENCY_TEST_THREADS: (ci-run-concurrency-tests-debug threads) (ci-run-concurrency-tests-release threads)

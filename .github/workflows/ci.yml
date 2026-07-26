@@ -30,6 +30,24 @@ jobs:
       - name: Verify navigation guide
         run: agentic-navigation-guide verify
 
+  issue-selector:
+    name: Production-readiness issue selector
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Just
+        uses: extractions/setup-just@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Run selector tests
+        run: just ci-test-production-readiness-selector
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
@@ -159,7 +177,7 @@ jobs:
 
   test:
     name: Test (${{ matrix.profile }}) on ${{ matrix.os }}
-    needs: [build, fmt, clippy, docs, navigation-guide, licenses]
+    needs: [build, fmt, clippy, docs, issue-selector, navigation-guide, licenses]
     runs-on: ${{ matrix.os }}
 
     strategy:
