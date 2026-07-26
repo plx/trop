@@ -246,6 +246,15 @@ class Selection:
         return json.dumps(payload, sort_keys=True)
 
 
+@dataclass(frozen=True)
+class SelectionSnapshot:
+    """One complete, normalized scheduling snapshot from live GitHub state."""
+
+    default_branch: str
+    issues: tuple[WorkIssue, ...]
+    selection: Selection
+
+
 CommandRunner = Callable[[Sequence[str]], str]
 
 
@@ -894,7 +903,7 @@ def fetch_selection_snapshot(
     leaf_label: str,
     gate_label: str,
     excluded_numbers: frozenset[int],
-) -> Selection:
+) -> SelectionSnapshot:
     """Fetch and validate one complete scheduling snapshot."""
     default_branch, raw_issues = client.fetch_work_universe(repository, universe_label)
     raw_work_members = (
@@ -914,18 +923,27 @@ def fetch_selection_snapshot(
         repository=repository,
         default_branch=default_branch,
     )
-    issues = normalize_work_issues(
-        raw_issues,
-        repository=repository,
-        work_label=work_label,
-        leaf_label=leaf_label,
-        gate_label=gate_label,
-        closing_pull_requests=closing_pull_requests,
+    issues = tuple(
+        sorted(
+            normalize_work_issues(
+                raw_issues,
+                repository=repository,
+                work_label=work_label,
+                leaf_label=leaf_label,
+                gate_label=gate_label,
+                closing_pull_requests=closing_pull_requests,
+            ),
+            key=lambda issue: issue.number,
+        )
     )
-    return select_next(
-        issues,
-        work_label=work_label,
-        excluded_numbers=excluded_numbers,
+    return SelectionSnapshot(
+        default_branch=default_branch,
+        issues=issues,
+        selection=select_next(
+            issues,
+            work_label=work_label,
+            excluded_numbers=excluded_numbers,
+        ),
     )
 
 
@@ -948,7 +966,7 @@ def get_selection(
     the process.  A waiting result is informational and returns immediately.
     """
     resolved_repository = client.resolve_repository(repository)
-    previous: Selection | None = None
+    previous: SelectionSnapshot | None = None
 
     for _snapshot_number in range(4):
         current = fetch_selection_snapshot(
@@ -960,10 +978,11 @@ def get_selection(
             gate_label=gate_label,
             excluded_numbers=excluded_numbers,
         )
-        if current.status is SelectionStatus.WAITING:
-            return current
+        result = current.selection
+        if result.status is SelectionStatus.WAITING:
+            return result
         if previous == current:
-            return current
+            return result
         previous = current
 
     raise WorkflowError("GitHub issue state did not stabilize during selection; rerun")
