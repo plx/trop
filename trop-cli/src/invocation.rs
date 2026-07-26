@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use trop::config::{Config, ConfigBuilder, ConfigField, ConfigFileKind, EffectiveConfig};
-use trop::{Database, DatabaseConfig};
+use trop::{Database, DatabaseConfig, PathResolver};
 
 /// Configuration-file discovery profile for a command.
 #[derive(Debug, Clone)]
@@ -70,6 +70,8 @@ pub struct InvocationContext {
     global: GlobalOptions,
     data_dir: Option<PathBuf>,
     effective: Option<EffectiveConfig>,
+    path_resolver: PathResolver,
+    working_dir: PathBuf,
 }
 
 impl InvocationContext {
@@ -81,9 +83,14 @@ impl InvocationContext {
             data_dir_override,
         } = request;
         let data_dir = data_dir_override.or_else(|| global.data_dir.clone());
-        let working_dir = std::env::current_dir().map_err(CliError::Io)?;
+        let path_resolver = PathResolver::new();
+        let process_working_dir = std::env::current_dir().map_err(CliError::Io)?;
+        let working_dir = path_resolver
+            .resolve_implicit(&process_working_dir)
+            .map_err(CliError::from)?
+            .into_path_buf();
         let mut builder = ConfigBuilder::new()
-            .with_working_dir(working_dir)
+            .with_working_dir(&working_dir)
             .with_cli_config_fields(command_line.config, command_line.fields);
         if let Some(data_dir) = &data_dir {
             builder = builder.with_data_dir(data_dir);
@@ -114,6 +121,8 @@ impl InvocationContext {
             global,
             data_dir,
             effective,
+            path_resolver,
+            working_dir,
         })
     }
 
@@ -132,6 +141,39 @@ impl InvocationContext {
     /// The effective value model consumed by existing library operations.
     pub(crate) fn config(&self) -> Result<&Config, CliError> {
         Ok(self.effective()?.config())
+    }
+
+    /// Resolve a reservation path according to how the caller supplied it.
+    ///
+    /// Explicit CLI/environment values are normalized without following
+    /// symlinks. An absent value selects the already-canonicalized invocation
+    /// working directory.
+    pub(crate) fn resolve_path(&self, path: Option<&Path>) -> Result<PathBuf, CliError> {
+        match path {
+            Some(path) => self.resolve_explicit_path(path),
+            None => Ok(self.working_dir.clone()),
+        }
+    }
+
+    /// Normalize an explicitly supplied path without following symlinks.
+    pub(crate) fn resolve_explicit_path(&self, path: &Path) -> Result<PathBuf, CliError> {
+        self.path_resolver
+            .resolve_explicit(path)
+            .map(trop::path::ResolvedPath::into_path_buf)
+            .map_err(CliError::from)
+    }
+
+    /// Canonicalize a path regardless of its provenance.
+    pub(crate) fn resolve_canonical_path(&self, path: &Path) -> Result<PathBuf, CliError> {
+        self.path_resolver
+            .resolve_canonical(path)
+            .map(trop::path::ResolvedPath::into_path_buf)
+            .map_err(CliError::from)
+    }
+
+    /// The canonical working directory selected once for this invocation.
+    pub(crate) fn working_dir(&self) -> &Path {
+        &self.working_dir
     }
 
     /// Open the database using the effective autoinit and timeout settings.

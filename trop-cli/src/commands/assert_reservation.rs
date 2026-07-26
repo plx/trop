@@ -2,7 +2,6 @@
 
 use crate::error::CliError;
 use crate::invocation::InvocationContext;
-use crate::utils::{normalize_path, resolve_path};
 use clap::Args;
 use std::path::PathBuf;
 use trop::{Database, ReservationKey};
@@ -26,16 +25,14 @@ pub struct AssertReservationCommand {
 impl AssertReservationCommand {
     pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
         let global = context.global();
-        // 1. Resolve path using existing utilities
-        let path = resolve_path(self.path)?;
-        let normalized = normalize_path(&path)?;
+        // 1. Resolve the path through the invocation-wide provenance policy.
+        let path = context.resolve_path(self.path.as_deref())?;
 
         // 2. Open database (read-only)
         let db = context.open_database()?;
 
         // 3. Build reservation key and query
-        let key =
-            ReservationKey::new(normalized, self.tag).map_err(|e| CliError::Library(e.into()))?;
+        let key = ReservationKey::new(path, self.tag).map_err(|e| CliError::Library(e.into()))?;
 
         let reservation =
             Database::get_reservation(db.connection(), &key).map_err(CliError::from)?;

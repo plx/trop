@@ -2186,7 +2186,9 @@ ports:
   min: 6100
   max: 6200
 ",
-    );
+    )
+    .canonicalize()
+    .unwrap();
     let cli = Config {
         ports: Some(PortConfig {
             min: 5000,
@@ -2241,12 +2243,16 @@ fn test_effective_config_tracks_complete_precedence() {
 
     let user_path = create_temp_config(&data_dir, "config.yaml", "maximum_lock_wait_seconds: 6\n");
     let project_path =
-        create_temp_config(&project_dir, "trop.yaml", "maximum_lock_wait_seconds: 7\n");
+        create_temp_config(&project_dir, "trop.yaml", "maximum_lock_wait_seconds: 7\n")
+            .canonicalize()
+            .unwrap();
     let local_path = create_temp_config(
         &project_dir,
         "trop.local.yaml",
         "maximum_lock_wait_seconds: 8\n",
-    );
+    )
+    .canonicalize()
+    .unwrap();
     let _environment = EnvGuard::new("TROP_BUSY_TIMEOUT", "9");
 
     let cli = Config {
@@ -2306,7 +2312,9 @@ occupancy_check:
   skip_ip4: true
   skip_tcp: false
 ",
-    );
+    )
+    .canonicalize()
+    .unwrap();
 
     let cli = Config {
         ports: Some(PortConfig {

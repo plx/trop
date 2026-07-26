@@ -133,7 +133,7 @@ impl ReservationKey {
     ///
     /// Returns an error if:
     /// - Path normalization fails
-    /// - Path canonicalization fails (for existing paths)
+    /// - Path canonicalization fails, including when the inferred path does not exist
     /// - The tag is provided but is empty after trimming whitespace
     ///
     /// # Examples
@@ -678,12 +678,11 @@ mod tests {
 
     #[test]
     fn test_with_implicit_path_normalizes() {
-        // Test with a relative path
-        let key = ReservationKey::with_implicit_path(Path::new("./test"), None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let key = ReservationKey::with_implicit_path(dir.path(), None).unwrap();
 
-        // Should be normalized to absolute
         assert!(key.path.is_absolute());
-        // Note: May or may not start with cwd depending on canonicalization
+        assert_eq!(key.path, dir.path().canonicalize().unwrap());
     }
 
     #[cfg(unix)]
@@ -734,9 +733,8 @@ mod tests {
 
     #[test]
     fn test_with_implicit_path_with_tag() {
-        let key =
-            ReservationKey::with_implicit_path(Path::new("/test/path"), Some("web".to_string()))
-                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let key = ReservationKey::with_implicit_path(dir.path(), Some("web".to_string())).unwrap();
         assert_eq!(key.tag, Some("web".to_string()));
     }
 

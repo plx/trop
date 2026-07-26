@@ -1,7 +1,7 @@
 //! Command to show the resolved path for a reservation.
 
 use crate::error::CliError;
-use crate::utils::{normalize_path, resolve_path, GlobalOptions};
+use crate::invocation::InvocationContext;
 use clap::Args;
 use std::path::PathBuf;
 
@@ -18,15 +18,15 @@ pub struct ShowPathCommand {
 }
 
 impl ShowPathCommand {
-    pub fn execute(self, _global: &GlobalOptions) -> Result<(), CliError> {
-        // Get path using existing resolution logic
-        let path = resolve_path(self.path)?;
-
-        // Normalize or canonicalize as requested
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
         let resolved = if self.canonicalize {
-            path.canonicalize().map_err(CliError::from)?
+            let path = self
+                .path
+                .as_deref()
+                .unwrap_or_else(|| context.working_dir());
+            context.resolve_canonical_path(path)?
         } else {
-            normalize_path(&path)?
+            context.resolve_path(self.path.as_deref())?
         };
 
         println!("{}", resolved.display());

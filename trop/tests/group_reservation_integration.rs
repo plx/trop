@@ -589,12 +589,16 @@ fn test_autoreserve_discovers_config_from_parent() {
 
     let options = AutoreserveOptions::new(child_dir.clone());
     let planner = AutoreservePlan::new(options).expect("Should discover config");
+    let canonical_parent = temp_dir
+        .path()
+        .canonicalize()
+        .expect("Should canonicalize config parent");
 
     // Verify discovered config path is in parent directory
     assert!(
         planner
             .discovered_config_path()
-            .starts_with(temp_dir.path()),
+            .starts_with(&canonical_parent),
         "Discovered config should be in parent directory"
     );
 
@@ -611,7 +615,7 @@ fn test_autoreserve_discovers_config_from_parent() {
     for reservation in &all_reservations {
         assert_eq!(
             reservation.key().path,
-            temp_dir.path(),
+            canonical_parent,
             "Reservation path should be config parent directory, not discovery start dir"
         );
     }

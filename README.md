@@ -101,6 +101,26 @@ Version 0.2.0 rejects invalid identifiers. See
 for affected usage and remediation. Until upgraded, use human or JSON output,
 inspect the result, and set only trusted variables manually.
 
+### Path identity
+
+`trop` stores reservation paths as lexically normalized absolute paths. An
+explicit path from `--path` or `TROP_PATH` keeps the spelling supplied by the
+user and does not follow symbolic links. The explicit target does not need to
+exist when it is resolved, although an individual command may impose its own
+existence checks.
+
+When no path is supplied, `trop` infers the path from the current working
+directory and canonicalizes it. This makes physical and symbolic-link routes to
+the same working directory share one reservation identity. If that inferred
+path cannot be canonicalized, the command reports an error instead of storing
+an unstable identity. `trop show-path --canonicalize` also forces
+canonicalization, so its target must exist.
+
+Project configuration discovery follows the same inferred-path rule: it starts
+from the canonical absolute working directory and walks its real parents,
+stopping at the nearest directory containing `trop.yaml` or
+`trop.local.yaml`.
+
 ### Projects and Tasks
 
 `trop` reservations are *keyed* by a path and optional tag, but support two additional metadata fields:

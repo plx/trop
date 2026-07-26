@@ -5,7 +5,6 @@
 
 use crate::error::CliError;
 use crate::invocation::InvocationContext;
-use crate::utils::resolve_path;
 use clap::Args;
 use std::path::PathBuf;
 use trop::{Database, PlanExecutor, ReleaseOptions, ReleasePlan, ReservationKey};
@@ -43,7 +42,7 @@ impl ReleaseCommand {
     pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
         let global = context.global();
         // 1. Resolve path
-        let path = resolve_path(self.path)?;
+        let path = context.resolve_path(self.path.as_deref())?;
 
         // 2. Validate option combinations
         if self.tag.is_some() && self.untagged_only {

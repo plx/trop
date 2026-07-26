@@ -13,8 +13,10 @@ use crate::path::{canonicalize, normalize};
 ///
 /// The `PathResolver` applies different processing based on how a path was
 /// provided:
-/// - **Explicit paths** (CLI args, env vars): Normalized only
-/// - **Implicit paths** (CWD, inferred): Normalized and canonicalized
+/// - **Explicit paths** (CLI args, env vars): Normalized only; the target need
+///   not exist
+/// - **Implicit paths** (CWD, inferred): Normalized and canonicalized; failure
+///   to canonicalize is an error
 ///
 /// # Examples
 ///
@@ -30,11 +32,11 @@ use crate::path::{canonicalize, normalize};
 ///
 /// // Implicit paths are normalized and canonicalized
 /// let implicit = resolver.resolve_implicit(Path::new(".")).unwrap();
-/// assert!(implicit.was_canonicalized() || !Path::new(".").exists());
+/// assert!(implicit.was_canonicalized());
 /// ```
 #[derive(Debug, Clone)]
 pub struct PathResolver {
-    /// Whether to warn on non-existent paths.
+    /// Whether to warn before rejecting a non-existent inferred path.
     warn_on_nonexistent: bool,
     /// Maximum symlink depth for safe canonicalization.
     max_symlink_depth: usize,
@@ -66,8 +68,8 @@ impl PathResolver {
 
     /// Configure whether to warn on non-existent paths.
     ///
-    /// When enabled, the resolver will print a warning to stderr if it
-    /// encounters a non-existent path during implicit resolution.
+    /// When enabled, the resolver prints a warning to stderr before returning
+    /// the canonicalization error for a non-existent implicit path.
     ///
     /// # Examples
     ///
@@ -144,11 +146,13 @@ impl PathResolver {
                 match canonicalize::canonicalize(&normalized) {
                     Ok(canonical) => (canonical, true),
                     Err(e) if e.is_not_found() => {
-                        // Path doesn't exist - use normalized version
                         if self.warn_on_nonexistent {
-                            eprintln!("Warning: Path does not exist: {}", normalized.display());
+                            eprintln!(
+                                "Warning: Cannot canonicalize inferred path because it does not exist: {}",
+                                normalized.display()
+                            );
                         }
-                        (normalized.clone(), false)
+                        return Err(e);
                     }
                     Err(e) => return Err(e),
                 }
@@ -305,19 +309,15 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_implicit_nonexistent() {
+    fn test_resolve_implicit_nonexistent_is_an_error() {
         let resolver = PathResolver::new().with_nonexistent_warning(false);
         let path = Path::new("/nonexistent/path/xyz");
-        let result = resolver.resolve_implicit(path).unwrap();
+        let result = resolver.resolve_implicit(path);
 
-        // Should be normalized
-        assert!(result.path().is_absolute());
-
-        // Should NOT be canonicalized (path doesn't exist)
-        assert!(!result.was_canonicalized());
-
-        // Should have implicit provenance
-        assert_eq!(result.provenance(), PathProvenance::Implicit);
+        assert!(
+            matches!(result, Err(crate::Error::PathNotFound { .. })),
+            "inferred paths must fail closed when canonicalization is impossible"
+        );
     }
 
     #[test]

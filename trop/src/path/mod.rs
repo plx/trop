@@ -25,11 +25,12 @@
 //!
 //! - **Explicit** (`PathProvenance::Explicit`): Paths explicitly provided via
 //!   CLI arguments or environment variables. These are normalized but NOT
-//!   canonicalized, preserving symlinks.
+//!   canonicalized, preserving symlinks and permitting nonexistent targets.
 //!
 //! - **Implicit** (`PathProvenance::Implicit`): Paths inferred from context
 //!   like the current working directory. These are both normalized AND
-//!   canonicalized for consistency.
+//!   canonicalized for consistency; resolution fails if canonicalization is
+//!   impossible.
 //!
 //! # Examples
 //!
@@ -45,7 +46,7 @@
 //!
 //! // Implicit paths follow symlinks
 //! let implicit = resolver.resolve_implicit(Path::new(".")).unwrap();
-//! // will be canonicalized if the path exists
+//! assert!(implicit.was_canonicalized());
 //! ```
 //!
 //! # Path Relationships

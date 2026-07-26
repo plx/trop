@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::TestEnv;
+use common::{create_directory_symlink, parse_port, TestEnv};
 use serde_json::Value;
 
 // ============================================================================
@@ -396,6 +396,75 @@ fn test_list_filter_by_path() {
     assert!(filtered.contains(&port_parent.to_string()));
     assert!(filtered.contains(&port_child.to_string()));
     assert!(!filtered.contains(&port_sibling.to_string()));
+}
+
+/// Path filters are canonicalized so a symlink alias finds an implicitly
+/// reserved physical path.
+#[test]
+fn test_list_filter_path_canonicalizes_symlink() {
+    let env = TestEnv::new();
+    let physical = env.create_dir("physical");
+    let logical = env.path().join("logical");
+    if !create_directory_symlink(&physical, &logical) {
+        return;
+    }
+
+    let reserve_output = env
+        .command()
+        .arg("reserve")
+        .arg("--allow-unrelated-path")
+        .current_dir(&physical)
+        .output()
+        .expect("Failed to reserve implicit physical path");
+    assert!(reserve_output.status.success());
+    let port = parse_port(
+        std::str::from_utf8(&reserve_output.stdout).expect("Invalid reserve output encoding"),
+    );
+
+    let list_output = env
+        .command()
+        .arg("list")
+        .arg("--format")
+        .arg("json")
+        .arg("--filter-path")
+        .arg(&logical)
+        .output()
+        .expect("Failed to filter reservations through symlink");
+    assert!(list_output.status.success());
+    let rows: Value =
+        serde_json::from_slice(&list_output.stdout).expect("Invalid JSON list output");
+
+    assert_eq!(rows.as_array().map(Vec::len), Some(1));
+    assert_eq!(rows[0]["port"].as_u64(), Some(u64::from(port)));
+    assert_eq!(
+        rows[0]["path"].as_str(),
+        physical.canonicalize().unwrap().to_str()
+    );
+}
+
+/// Nonexistent explicit identities still support a lexical path filter when
+/// canonical comparison is impossible.
+#[test]
+fn test_list_filter_path_preserves_nonexistent_identity() {
+    let env = TestEnv::new();
+    let nonexistent = env.path().join("future-project");
+    let port = env.reserve_simple(&nonexistent);
+
+    let output = env
+        .command()
+        .arg("list")
+        .arg("--format")
+        .arg("json")
+        .arg("--filter-path")
+        .arg(&nonexistent)
+        .output()
+        .expect("Failed to filter nonexistent explicit identity");
+    assert!(output.status.success());
+    let rows: Value = serde_json::from_slice(&output.stdout).expect("Invalid JSON list output");
+
+    assert_eq!(rows.as_array().map(Vec::len), Some(1));
+    assert_eq!(rows[0]["port"].as_u64(), Some(u64::from(port)));
+    assert_eq!(rows[0]["path"].as_str(), nonexistent.to_str());
 }
 
 /// Test combining multiple filters.
