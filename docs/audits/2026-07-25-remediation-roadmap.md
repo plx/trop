@@ -28,6 +28,8 @@ understandable from a checkout, in review, and across agent context compaction.
   [Post-remediation production-readiness audit](post-remediation-production-readiness-audit.md)
 - Remediation execution goal:
   [Production-readiness remediation goal](production-readiness-remediation-goal.md)
+- Lifecycle setup:
+  [PR #152 — Record the approved production-readiness release lifecycle](https://github.com/plx/trop/pull/152)
 
 At creation time the program contained 55 issues, 54 native parent
 relationships, and 74 native blocked-by relationships. The initial automatic
@@ -43,8 +45,10 @@ leaf under #88, with one blocker edge from #147 to #88. Its fixing
 full-snapshot comparison before lifecycle setup. The interim graph contained
 56 issues, 55 parent relationships, and 123 blocker edges.
 
-The approved lifecycle adds gates #149-#151 and replaces the unsafe direct
-audit-to-program jump. The current post-setup graph contains exactly:
+The approved lifecycle, installed with
+[PR #152](https://github.com/plx/trop/pull/152), adds gates #149-#151 and
+replaces the unsafe direct audit-to-program jump. The current post-setup graph
+contains exactly:
 
 - 59 workflow issues;
 - 48 leaves, #90-#136 plus #147;

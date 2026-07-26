@@ -178,8 +178,9 @@ Before selecting the first remediation issue:
    checkpoint, parent, and native blockers. Require exactly 59 workflow issues,
    48 leaves, 11 gates, 58 native parent relationships, and 132 native blocker
    edges. Do not replace these equality checks with lower bounds.
-   Confirm the dedicated lifecycle-setup PR from branch
-   `agent/production-readiness-lifecycle-setup` targeted `main`, received
+   Confirm dedicated lifecycle-setup
+   [PR #152](https://github.com/plx/trop/pull/152), from branch
+   `agent/production-readiness-lifecycle-setup`, targeted `main`, received
    independent review with no unresolved blocker, and, while open, exposed
    `closingIssuesReferences: []` whether draft or ready. It must merge without
    a workflow closing keyword. After merge and GitHub indexing, rerun selector
@@ -240,16 +241,26 @@ with the canonical audit and workflow labels. That taxonomy is a reviewed
 implementation detail aligned with existing release work; do not misstate it
 as a separately quoted maintainer preference.
 
-The dedicated setup PR is the PR opened from
-`agent/production-readiness-lifecycle-setup`; this record deliberately does not
-invent a PR number before GitHub assigns one. Before merge it must target
+The dedicated setup is
+[PR #152](https://github.com/plx/trop/pull/152), opened from
+`agent/production-readiness-lifecycle-setup`. Before merge it must target
 `main`, be open as either draft or ready for review, and expose exactly
 `closingIssuesReferences: []`. After merge and GitHub indexing, confirm there
 are no placeholders in the issue bodies or committed runbooks, reverify
 `closingIssuesReferences: []`, and revalidate all labels, parents, blockers,
 removals, counts, and selector results.
 
-If PR #138 or the dedicated lifecycle-setup PR is not merged, GitHub
+During its suspended Phase 2 activation on 2026-07-25, the setup reverified
+the 56-issue / 48-leaf / 8-gate / 55-parent / 123-blocker baseline, installed
+all nine rendered issue bodies with zero placeholders, added all three parents
+and 11 replacement blocker edges, and observed the conservative
+59 / 48 / 11 / 58 / 134 intermediate graph. Only then did it remove
+the #135 -> #136 and #137 -> #83 edges. The resulting live graph was
+cycle-free, matched 59 / 48 / 11 / 58 / 132 exactly, retained
+`closingIssuesReferences: []` on PR #152, and produced a stable selector result
+for #90.
+
+If PR #138 or lifecycle-setup PR #152 is not merged, GitHub
 authentication is unavailable, the selector fails closed, or the approved
 topology is not exact, report that condition and wait. Do not substitute a
 handwritten issue order or silently narrow the terminal outcome.
