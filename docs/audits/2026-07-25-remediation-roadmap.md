@@ -2,9 +2,9 @@
 
 This document is the durable index for the GitHub work created from the
 [July 2026 pre-release due-diligence audit](2026-07-25-pre-release-due-diligence.md).
-It records the issue taxonomy, epic hierarchy, stable ticket keys, and intended
-dependency order as they existed when the audit-remediation program was
-created.
+It records the issue taxonomy, epic hierarchy, stable ticket keys, historical
+creation baseline, and current dependency order after the approved release
+lifecycle was added.
 
 GitHub's native sub-issue and blocked-by relationships are authoritative for
 live planning. This file exists so that the intended structure remains
@@ -16,23 +16,49 @@ understandable from a checkout, in review, and across agent context compaction.
   [Production readiness / v0.2.0](https://github.com/plx/trop/milestone/2)
 - Top-level epic:
   [#83 — Production readiness stabilization for trop v0.2.0](https://github.com/plx/trop/issues/83)
-- Final gate:
+- Pre-audit candidate gate:
+  [#149 — Freeze and verify the immutable comprehensive release candidate](https://github.com/plx/trop/issues/149)
+- Independent audit gate:
   [#137 — Execute the independent post-remediation production-readiness audit](https://github.com/plx/trop/issues/137)
+- Post-audit publication gate:
+  [#150 — Publish and verify the independently approved comprehensive release](https://github.com/plx/trop/issues/150)
+- Post-release distribution gate:
+  [#151 — Verify the public release through the supported custom tap](https://github.com/plx/trop/issues/151)
 - Audit runbook:
   [Post-remediation production-readiness audit](post-remediation-production-readiness-audit.md)
 - Remediation execution goal:
   [Production-readiness remediation goal](production-readiness-remediation-goal.md)
+- Lifecycle setup:
+  [PR #152 — Record the approved production-readiness release lifecycle](https://github.com/plx/trop/pull/152)
 
 At creation time the program contained 55 issues, 54 native parent
-relationships, and 74 native blocked-by relationships. An API-level graph check
-found no missing parent, missing label axis, missing milestone, or dependency
-cycle.
+relationships, and 74 native blocked-by relationships. The initial automatic
+work-selection setup added 48 landed-only gate relationships: each component
+epic was blocked by all of its actionable sub-issues, and the top-level epic
+was blocked directly by the final audit. That creation-era graph therefore had
+122 blocker edges. An API-level graph check found no missing parent, label
+axis, milestone, or dependency cycle.
 
-The automatic work-selection setup later added 48 landed-only gate
-relationships: each component epic is blocked by all of its actionable
-sub-issues, and the top-level epic is blocked by the final audit. The live
-graph therefore has 122 native blocked-by relationships: 74 implementation
-prerequisites plus 48 gate prerequisites. See the
+Selector defect [#147](https://github.com/plx/trop/issues/147) was added as one
+leaf under #88, with one blocker edge from #147 to #88. Its fixing
+[PR #148](https://github.com/plx/trop/pull/148) corrected the selector's
+full-snapshot comparison before lifecycle setup. The interim graph contained
+56 issues, 55 parent relationships, and 123 blocker edges.
+
+The approved lifecycle, installed with
+[PR #152](https://github.com/plx/trop/pull/152), adds gates #149-#151 and
+replaces the unsafe direct audit-to-program jump. The current post-setup graph
+contains exactly:
+
+- 59 workflow issues;
+- 48 leaves, #90-#136 plus #147;
+- 11 gates, #83-#89, #137, and #149-#151;
+- 58 native parent relationships; and
+- 132 native blocker edges.
+
+The blocker total adds six prerequisites to #149, makes #149 a blocker of #89,
+and adds #137 -> #150 -> #151. Replacing #135 -> #136 with #149 -> #136 and
+replacing #137 -> #83 with #151 -> #83 are count-neutral rewires. See the
 [production-readiness work-selection guide](production-readiness-work-selection.md)
 for the operational contract.
 
@@ -61,12 +87,12 @@ Cross-cutting labels have separate meanings:
 
 Three additional labels support fail-closed automatic scheduling:
 
-- `workflow:production-readiness`: all 55 issues in the canonical audit
+- `workflow:production-readiness`: all 59 issues in the canonical audit
   universe;
-- `workflow:production-readiness-leaf`: the 47 independently actionable
-  issues, #90-#136; and
-- `workflow:production-readiness-gate`: the eight aggregate gates, #83-#89
-  and #137.
+- `workflow:production-readiness-leaf`: the 48 independently actionable
+  issues, #90-#136 and #147; and
+- `workflow:production-readiness-gate`: the 11 aggregate gates, #83-#89,
+  #137, and #149-#151.
 
 The selector requires the `audit:2026-07` and
 `workflow:production-readiness` cohorts to match exactly. Every member must
@@ -84,8 +110,10 @@ new program use one priority vocabulary.
 - [#88 — Dependencies, platform policy, test rigor, and performance](https://github.com/plx/trop/issues/88)
 - [#89 — Packaging, publishing, and distribution](https://github.com/plx/trop/issues/89)
 
-Each actionable ticket is a native sub-issue of exactly one component epic.
-The component epics and final audit are native sub-issues of #83.
+Each actionable ticket is a native sub-issue of exactly one component epic,
+and #147 belongs to #88. The component epics, final audit #137, publication
+gate #150, and distribution gate #151 are native sub-issues of #83. Candidate
+gate #149 is a native sub-issue of #89.
 
 ## Ticket catalog
 
@@ -153,6 +181,7 @@ The component epics and final audit are native sub-issues of #83.
 | `TEST-1` | [#127 — Repair property CI and add race/fault/invariant infrastructure](https://github.com/plx/trop/issues/127) | P1 | None |
 | `PERF-1` | [#128 — Establish performance, contention, load, and soak budgets](https://github.com/plx/trop/issues/128) | P2 | #95, #103, #109, #127 |
 | `API-1` | [#129 — Review and deliberately define the public API surface](https://github.com/plx/trop/issues/129) | P2 | #116, #126 |
+| `SELECTOR-1` | [#147 — Compare complete normalized snapshots before production-readiness selection](https://github.com/plx/trop/issues/147) | P2 | None |
 
 ### Packaging, publishing, and distribution
 
@@ -164,13 +193,75 @@ The component epics and final audit are native sub-issues of #83.
 | `PKG-4` | [#133 — Generate complete manpages from the real CLI and install them](https://github.com/plx/trop/issues/133) | P1 | #123, #129 |
 | `PKG-5` | [#134 — Add package, installed-binary, docs.rs, and reproducibility gates](https://github.com/plx/trop/issues/134) | P1 | #126, #130, #131, #132, #133 |
 | `RELENG-1` | [#135 — Create a trusted, immutable, verifiable release pipeline](https://github.com/plx/trop/issues/135) | P1 | #125, #126, #134 |
-| `BREW-1` | [#136 — Publish and test a custom Homebrew tap formula](https://github.com/plx/trop/issues/136) | P2 | #135 |
+| `BREW-1` | [#136 — Publish and test a custom Homebrew tap formula](https://github.com/plx/trop/issues/136) | P2 | #149 |
+
+### Release lifecycle gates
+
+| Key | Issue | Priority | Native parent | Native blockers |
+| --- | --- | --- | --- | --- |
+| `CANDIDATE-1` | [#149 — Freeze and verify the immutable comprehensive release candidate](https://github.com/plx/trop/issues/149) | P1 | #89 | #84-#88, #135 |
+| `PUBLISH-1` | [#150 — Publish and verify the independently approved comprehensive release](https://github.com/plx/trop/issues/150) | P1 | #83 | #137 |
+| `DIST-1` | [#151 — Verify the public release through the supported custom tap](https://github.com/plx/trop/issues/151) | P1 | #83 | #150 |
+
+All three are `P1` gates carrying `type:release`, `domain:release`,
+`component:release-engineering`, `release-blocker`, `audit:2026-07`,
+`workflow:production-readiness`, and
+`workflow:production-readiness-gate`.
+
+Candidate gate #149 is also a blocker of #89 and #136. Final audit #137 remains
+a child of #83 and is blocked by component gates #84-#89. Top-level program
+epic #83 is blocked only by #151; the former direct #137 -> #83 edge no longer
+exists.
+
+## Approved immutable-candidate lifecycle
+
+Issue #135 constructs the trusted release mechanism and proves it with saved
+artifacts, non-publishing rehearsals, tamper tests, and rollback exercises. It
+does not publish the comprehensive crates, create the final public candidate,
+or perform production-channel post-publish smoke tests.
+
+After component gates #84-#88 and #135 close, #149 reconciles the freshness of
+their evidence and freezes one exact commit, comprehensive version, immutable
+tag, package set, and target artifacts. The default approved mechanism is a
+public GitHub prerelease containing the exact downloadable artifacts,
+checksums, verifiable signatures, SBOM, provenance, and identity manifest.
+Comprehensive crates.io publication is withheld. Candidate-contained metadata
+and status text must remain truthful before and after `GO`; promotion may not
+change source, version, tag, lockfile, package contents, target artifacts,
+checksums, signatures, SBOM, or provenance. Creating the public tag and
+prerelease remains an explicit approval checkpoint for that exact identity;
+selector readiness alone is not authorization.
+
+Issue #136 then consumes that exact prerelease artifact and checksum through
+the custom tap. It may not rebuild, retag, or substitute an artifact. After
+issue #136 and every other #89 blocker close, #89 can perform its aggregate
+acceptance. Audit #137 evaluates the same immutable candidate, including the
+tap, and exercises crate publication through the required local registry or
+staging path without comprehensive production publication.
+
+Only an exact-candidate `GO` from #137 unlocks #150. Immediately before the
+irreversible action, #150 requires fresh maintainer approval, then publishes
+the library crate followed by the CLI crate, promotes the already-audited
+prerelease without replacing its tag or assets, and performs real public
+registry and GitHub Release smoke tests. Gate #151 then updates and verifies
+the custom tap against that exact public release. Program epic #83 remains an
+evidence-only final summary.
+
+A `CONDITIONAL NO-GO`, `NO-GO`, or candidate-affecting defect permanently
+abandons that candidate's version and tag. Never move the tag, replace its
+assets, or reuse its `GO`. Preserve and mark the failed evidence honestly,
+select a new publishable version, reopen every invalidated component,
+candidate, tap, packaging, and audit gate, freeze a new candidate, and repeat
+the affected evidence and independent audit. The same rule applies if a
+candidate-affecting change becomes necessary after `GO`.
 
 ## Dependency-ordered burn-down
 
-The following waves are a topological layering of the native dependency graph.
-Issues within a wave can be worked in parallel. Priority still applies within a
-wave, especially the immediate `SEC-1` public-safety work.
+The following waves are a topological layering of the implementation-leaf
+portion of the native dependency graph. Issues within a wave can be worked in
+parallel. Priority still applies within a wave, especially the immediate
+`SEC-1` public-safety work. Closed selector repair #147 remains listed because
+it is part of the durable 48-leaf cohort.
 
 ### Wave 0: independent foundations
 
@@ -183,6 +274,7 @@ wave, especially the immediate `SEC-1` public-safety work.
 - #116 `PLAN-1`
 - #124 `DEP-1`
 - #127 `TEST-1`
+- #147 `SELECTOR-1`
 
 ### Wave 1: first consumers of the foundations
 
@@ -224,7 +316,7 @@ wave, especially the immediate `SEC-1` public-safety work.
 - #132 `PKG-3`
 - #133 `PKG-4`
 
-### Wave 4: full behavior and candidate validation
+### Wave 4: full behavior and package validation
 
 - #96 `GRP-3`
 - #97 `GRP-4`
@@ -232,22 +324,35 @@ wave, especially the immediate `SEC-1` public-safety work.
 - #128 `PERF-1`
 - #134 `PKG-5`
 
-### Wave 5: release automation
+### Wave 5: non-publishing release automation
 
 - #135 `RELENG-1`
 
-### Wave 6: distribution rehearsal
+### Landed-only gate sequence
 
-- #136 `BREW-1`
+After the implementation-leaf waves:
 
-### Final gate
+1. component gates #84-#88 execute when all of their own leaf blockers,
+   including #147 for #88, are actually closed;
+2. #149 `CANDIDATE-1` waits for #84-#88 and #135, then freezes the public
+   prerelease candidate;
+3. #136 `BREW-1` validates the custom tap against that exact candidate;
+4. #89 waits for #149 and every packaging leaf #130-#136, then performs its
+   aggregate acceptance;
+5. #137 `AUDIT-1` waits for all component gates #84-#89 and audits the exact
+   candidate;
+6. #150 `PUBLISH-1` waits for the exact-candidate `GO` that closes #137;
+7. #151 `DIST-1` waits for #150 and verifies the exact public release through
+   the supported tap; and
+8. #83 waits for #151 and closes only through its evidence-only program
+   summary.
 
-The selector offers each component epic #84-#89 only after all of its native
-leaf blockers are actually closed. Execute the epic's aggregate acceptance
-criteria before closing it. Then execute #137 exactly as written in the
+The selector offers a gate only after all of its native blockers are actually
+closed; an open closing PR is insufficient. Execute #137 exactly as written in
+the
 [post-remediation audit runbook](post-remediation-production-readiness-audit.md).
-After #137 closes, #83 becomes the last selectable gate. A `GO` decision is not
-implied by reaching any of these points.
+Neither reaching #149 nor closing #137 authorizes irreversible publication;
+the explicit checkpoints in #149 and #150 still apply.
 
 ## Ticket execution standard
 
