@@ -20,11 +20,14 @@ mod common;
 use common::TestEnv;
 use predicates::prelude::*;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Output;
 
 // ============================================================================
 // Test Helpers
 // ============================================================================
+
+type CollisionCase<'a> = (&'a str, &'a [(&'a str, Option<&'a str>)]);
 
 /// Create a minimal valid trop.yaml configuration for testing.
 ///
@@ -101,6 +104,191 @@ reservations:
 
     fs::write(path, config).expect("Failed to write test config");
     config.to_string()
+}
+
+/// Create a group config without hand-interpolating untrusted YAML keys.
+///
+/// JSON is a valid YAML subset, so serializing the fixture this way keeps
+/// whitespace, control characters, quoting, and expansion syntax inert.
+fn create_identifier_config(path: &Path, services: &[(&str, Option<&str>)]) {
+    let services = services
+        .iter()
+        .enumerate()
+        .map(|(offset, (tag, env))| {
+            let mut definition = serde_json::Map::new();
+            definition.insert("offset".to_string(), serde_json::json!(offset));
+            if let Some(env) = env {
+                definition.insert("env".to_string(), serde_json::json!(env));
+            }
+            (tag.to_string(), serde_json::Value::Object(definition))
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    let config = serde_json::json!({
+        "project": "identifier-test",
+        "ports": {
+            "min": 5000,
+            "max": 9000
+        },
+        "reservations": {
+            "base": 8200,
+            "services": services
+        }
+    });
+
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&config).expect("Failed to serialize test config"),
+    )
+    .expect("Failed to write test config");
+}
+
+#[derive(Clone, Copy)]
+enum GroupCommandKind {
+    ReserveGroup,
+    Autoreserve,
+}
+
+impl GroupCommandKind {
+    const ALL: [Self; 2] = [Self::ReserveGroup, Self::Autoreserve];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ReserveGroup => "reserve-group",
+            Self::Autoreserve => "autoreserve",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OutputBoundary {
+    name: &'static str,
+    format: &'static str,
+    shell: Option<&'static str>,
+}
+
+const OUTPUT_BOUNDARIES: [OutputBoundary; 5] = [
+    OutputBoundary {
+        name: "bash",
+        format: "export",
+        shell: Some("bash"),
+    },
+    OutputBoundary {
+        name: "zsh",
+        format: "export",
+        shell: Some("zsh"),
+    },
+    OutputBoundary {
+        name: "fish",
+        format: "export",
+        shell: Some("fish"),
+    },
+    OutputBoundary {
+        name: "powershell",
+        format: "export",
+        shell: Some("powershell"),
+    },
+    OutputBoundary {
+        name: "dotenv",
+        format: "dotenv",
+        shell: None,
+    },
+];
+
+fn run_group_command(
+    env: &TestEnv,
+    project_dir: &Path,
+    config_path: &Path,
+    kind: GroupCommandKind,
+    boundary: OutputBoundary,
+) -> Output {
+    let mut command = env.command();
+
+    match kind {
+        GroupCommandKind::ReserveGroup => {
+            command.arg("reserve-group").arg(config_path);
+        }
+        GroupCommandKind::Autoreserve => {
+            command.arg("autoreserve").current_dir(project_dir);
+        }
+    }
+
+    command.arg("--format").arg(boundary.format);
+    if let Some(shell) = boundary.shell {
+        command.arg("--shell").arg(shell);
+    }
+    command
+        .arg("--allow-unrelated-path")
+        .output()
+        .expect("Failed to run group command")
+}
+
+fn reservation_count(env: &TestEnv) -> i64 {
+    let database_path = env.data_dir.join("trop.db");
+    if !database_path.exists() {
+        return 0;
+    }
+
+    let connection = rusqlite::Connection::open_with_flags(
+        database_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("Failed to open test database");
+    connection
+        .query_row("SELECT COUNT(*) FROM reservations", [], |row| row.get(0))
+        .expect("Failed to count reservations")
+}
+
+fn looks_like_dotenv_assignment(line: &str) -> bool {
+    let Some((name, _value)) = line.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+fn assert_group_failure_is_closed(
+    env: &TestEnv,
+    output: &Output,
+    case_name: &str,
+    expected_error: &str,
+) {
+    assert!(
+        !output.status.success(),
+        "{case_name} should fail, stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout, b"",
+        "{case_name} must not emit partial or complete generated output"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("Error: ") && stderr.contains(expected_error),
+        "{case_name} should return a typed error, stderr: {stderr}"
+    );
+    for line in stderr.lines() {
+        let line = line.trim_start();
+        assert!(
+            !line.starts_with("export ")
+                && !line.starts_with("set -x ")
+                && !line.starts_with("$env:")
+                && !looks_like_dotenv_assignment(line),
+            "{case_name} leaked a generated line to stderr: {line:?}"
+        );
+    }
+
+    assert_eq!(
+        reservation_count(env),
+        0,
+        "{case_name} must roll back every reservation"
+    );
 }
 
 /// Create a nested directory structure for testing autoreserve discovery.
@@ -480,6 +668,69 @@ fn test_reserve_group_export_format_powershell() {
     );
 }
 
+/// Both group entry points support explicit Zsh output while resolving a valid
+/// implicit name and a valid configured mapping from the same config snapshot.
+#[test]
+fn test_group_commands_export_format_zsh_with_mapped_and_derived_names() {
+    for kind in GroupCommandKind::ALL {
+        let env = TestEnv::new();
+        let project_dir = env.create_dir("project");
+        let config_path = project_dir.join("trop.yaml");
+        create_identifier_config(
+            &config_path,
+            &[
+                ("api-v2", None),
+                ("service\nexport ATTACK=1\u{1b}[31m", Some("WEB_PORT")),
+            ],
+        );
+
+        let zsh = OUTPUT_BOUNDARIES[1];
+        let output = run_group_command(&env, &project_dir, &config_path, kind, zsh);
+        assert!(
+            output.status.success(),
+            "{} should produce Zsh output, stderr: {}",
+            kind.name(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("Invalid UTF-8");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.starts_with("export API_V2=")),
+            "{} should derive API_V2 safely: {stdout}",
+            kind.name()
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.starts_with("export WEB_PORT=")),
+            "{} should honor the explicit WEB_PORT mapping: {stdout}",
+            kind.name()
+        );
+
+        let stderr = String::from_utf8(output.stderr).expect("Invalid UTF-8");
+        assert!(
+            !stderr.contains('\u{1b}')
+                && !stderr.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with("export ")
+                        || line.starts_with("set -x ")
+                        || line.starts_with("$env:")
+                        || looks_like_dotenv_assignment(line)
+                }),
+            "{} must not echo hostile tags as executable-looking diagnostics: {stderr:?}",
+            kind.name()
+        );
+        assert_eq!(
+            reservation_count(&env),
+            2,
+            "{} should persist both successful reservations",
+            kind.name()
+        );
+    }
+}
+
 // ============================================================================
 // reserve-group: Quiet and Verbose Modes
 // ============================================================================
@@ -488,7 +739,7 @@ fn test_reserve_group_export_format_powershell() {
 ///
 /// Quiet mode should suppress status messages on stderr while still outputting
 /// the formatted allocations on stdout. This is important for scripting where
-/// you want clean output: `eval $(trop reserve-group config.yaml --quiet)`
+/// stdout must contain only the selected machine-readable format.
 #[test]
 fn test_reserve_group_quiet_mode() {
     let env = TestEnv::new();
@@ -565,8 +816,8 @@ fn test_reserve_group_verbose_mode() {
 /// Test stdout/stderr separation is maintained across all formats.
 ///
 /// This is a critical property: formatted allocations always go to stdout,
-/// status messages always go to stderr. This enables shell integration like
-/// `eval $(trop reserve-group config.yaml)` to work correctly.
+/// while status messages always go to stderr. Consumers can therefore parse or
+/// inspect the requested output without mixing it with diagnostics.
 #[test]
 fn test_reserve_group_stdout_stderr_separation() {
     let env = TestEnv::new();
@@ -1439,27 +1690,160 @@ fn test_autoreserve_from_root_directory() {
         );
 }
 
-/// Test reserve-group with invalid shell type.
-///
-/// When --shell is specified with an unsupported value, the command should
-/// fail with an error listing valid shell types.
+/// Invalid shell selection fails before either group entry point can mutate the
+/// database or write generated output.
 #[test]
-fn test_reserve_group_invalid_shell_type() {
-    let env = TestEnv::new();
-    let config_dir = env.create_dir("project");
-    let config_path = config_dir.join("trop.yaml");
-    create_test_config(&config_path, "test-project");
+fn test_group_commands_invalid_shell_type_fails_without_mutation() {
+    let invalid_shell = OutputBoundary {
+        name: "invalid-shell",
+        format: "export",
+        shell: Some("invalid-shell"),
+    };
 
-    env.command()
-        .arg("reserve-group")
-        .arg(&config_path)
-        .arg("--format")
-        .arg("export")
-        .arg("--shell")
-        .arg("invalid-shell")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("shell").or(predicate::str::contains("invalid")));
+    for kind in GroupCommandKind::ALL {
+        let env = TestEnv::new();
+        let project_dir = env.create_dir("project");
+        let config_path = project_dir.join("trop.yaml");
+        create_test_config(&config_path, "test-project");
+
+        let output = run_group_command(&env, &project_dir, &config_path, kind, invalid_shell);
+        assert_group_failure_is_closed(
+            &env,
+            &output,
+            &format!("{} invalid shell", kind.name()),
+            "validation error",
+        );
+    }
+}
+
+/// A mixed group whose invalid tag sorts last must fail atomically at every
+/// shell and dotenv renderer boundary for both CLI entry points.
+#[test]
+fn test_group_commands_fail_closed_at_every_identifier_output_boundary() {
+    for kind in GroupCommandKind::ALL {
+        for boundary in OUTPUT_BOUNDARIES {
+            let env = TestEnv::new();
+            let project_dir = env.create_dir("project");
+            let config_path = project_dir.join("trop.yaml");
+            create_identifier_config(
+                &config_path,
+                &[("aaa-valid", None), ("zzz;printf-not-run", None)],
+            );
+
+            let output = run_group_command(&env, &project_dir, &config_path, kind, boundary);
+            assert_group_failure_is_closed(
+                &env,
+                &output,
+                &format!("{} {} mixed identifiers", kind.name(), boundary.name),
+                "validation error",
+            );
+        }
+    }
+}
+
+/// Hostile tag text remains inert test data. Each class is rejected by both
+/// group commands, with no generated stdout, executable-looking stderr line,
+/// or persisted reservation.
+#[test]
+fn test_group_commands_reject_adversarial_unmapped_identifiers() {
+    let overlong = "a".repeat(256);
+    let fixtures = [
+        ("whitespace", "web port"),
+        ("control character", "web\tport"),
+        ("newline line forging", "web\nexport ATTACK=1"),
+        ("CRLF line forging", "web\r\nset -x ATTACK 1"),
+        ("shell separators", "web;|&<>port"),
+        ("quotes and backticks", "web'\"`port"),
+        ("shell expansions", "web$(no-op)${NO_OP}"),
+        ("leading digit", "9web"),
+        ("Unicode", "wéb端口"),
+        ("overlong", overlong.as_str()),
+    ];
+
+    for (fixture_index, (fixture_name, tag)) in fixtures.into_iter().enumerate() {
+        for (command_index, kind) in GroupCommandKind::ALL.into_iter().enumerate() {
+            let env = TestEnv::new();
+            let project_dir = env.create_dir("project");
+            let config_path = project_dir.join("trop.yaml");
+            create_identifier_config(&config_path, &[(tag, None)]);
+
+            let boundary =
+                OUTPUT_BOUNDARIES[(fixture_index + command_index) % OUTPUT_BOUNDARIES.len()];
+            let output = run_group_command(&env, &project_dir, &config_path, kind, boundary);
+            assert_group_failure_is_closed(
+                &env,
+                &output,
+                &format!(
+                    "{} {} identifier at {} boundary",
+                    kind.name(),
+                    fixture_name,
+                    boundary.name
+                ),
+                "validation error",
+            );
+        }
+    }
+}
+
+/// Explicit mappings are validated independently of otherwise safe tags.
+#[test]
+fn test_group_commands_reject_invalid_explicit_mapping() {
+    for (index, kind) in GroupCommandKind::ALL.into_iter().enumerate() {
+        let env = TestEnv::new();
+        let project_dir = env.create_dir("project");
+        let config_path = project_dir.join("trop.yaml");
+        create_identifier_config(&config_path, &[("web", Some("9WEB PORT"))]);
+
+        let boundary = OUTPUT_BOUNDARIES[index];
+        let output = run_group_command(&env, &project_dir, &config_path, kind, boundary);
+        assert_group_failure_is_closed(
+            &env,
+            &output,
+            &format!("{} invalid explicit mapping", kind.name()),
+            "validation error",
+        );
+    }
+}
+
+/// Resolved identifiers must remain unique whether they are both derived, one
+/// is explicit, or their explicit spellings differ only by ASCII case.
+#[test]
+fn test_group_commands_reject_resolved_identifier_collisions() {
+    let collision_cases: [CollisionCase<'_>; 3] = [
+        (
+            "derived/derived",
+            &[("api-server", None), ("api_server", None)],
+        ),
+        (
+            "explicit/derived",
+            &[("api-server", None), ("mapped", Some("API_SERVER"))],
+        ),
+        (
+            "case-insensitive",
+            &[
+                ("uppercase", Some("WEB_PORT")),
+                ("lowercase", Some("web_port")),
+            ],
+        ),
+    ];
+
+    for (case_index, (collision_name, services)) in collision_cases.into_iter().enumerate() {
+        for kind in GroupCommandKind::ALL {
+            let env = TestEnv::new();
+            let project_dir = env.create_dir("project");
+            let config_path = project_dir.join("trop.yaml");
+            create_identifier_config(&config_path, services);
+
+            let boundary = OUTPUT_BOUNDARIES[case_index + 2];
+            let output = run_group_command(&env, &project_dir, &config_path, kind, boundary);
+            assert_group_failure_is_closed(
+                &env,
+                &output,
+                &format!("{} {collision_name} collision", kind.name()),
+                "validation error",
+            );
+        }
+    }
 }
 
 // ============================================================================

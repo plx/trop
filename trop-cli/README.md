@@ -132,6 +132,14 @@ reservations:
       env: API_PORT
 ```
 
+Every reservation service must resolve to a portable `export`/`dotenv`
+identifier, regardless of the selected output format. Explicit `env` names must
+be at most 255 bytes and match `[A-Za-z_][A-Za-z0-9_]*`. Without an explicit
+mapping, trop derives a name only from ASCII service tags by converting ASCII
+letters to uppercase and replacing `-` with `_`. Any other tag requires an
+explicit valid `env` name, and resolved names must be unique when compared
+without ASCII case.
+
 See the [implementation specification](../reference/ImplementationSpecification.md) for complete configuration details.
 
 ## Environment Variables

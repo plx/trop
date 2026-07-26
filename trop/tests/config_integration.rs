@@ -999,9 +999,10 @@ fn test_validation_reservation_duplicate_preferred() {
 /// Test validation of environment variable names in reservation groups.
 ///
 /// Env var names must:
-/// - Start with a letter
-/// - Contain only alphanumeric chars and underscore
-/// - Be unique within the group
+/// - Start with an ASCII letter or underscore
+/// - Contain only ASCII letters, digits, and underscores
+/// - Be at most 255 bytes
+/// - Be unique within the group under ASCII-case-insensitive comparison
 #[test]
 fn test_validation_reservation_env_var_names() {
     // Invalid: starts with number
@@ -1097,6 +1098,171 @@ fn test_validation_reservation_env_var_names() {
             .build();
 
         assert!(result.is_err());
+    }
+}
+
+/// Test the exact portable grammar and byte limit through the full config builder.
+#[test]
+fn test_validation_reservation_env_var_name_boundaries() {
+    for env_name in ["_PRIVATE_PORT".to_string(), format!("A{}", "_".repeat(254))] {
+        let services = std::collections::HashMap::from([(
+            "web".to_string(),
+            ServiceDefinition {
+                offset: Some(0),
+                preferred: None,
+                env: Some(env_name),
+            },
+        )]);
+        let config = Config {
+            reservations: Some(ReservationGroup {
+                base: Some(5000),
+                services,
+            }),
+            ..Default::default()
+        };
+
+        assert!(ConfigBuilder::new()
+            .skip_files()
+            .skip_env()
+            .with_config(config)
+            .build()
+            .is_ok());
+    }
+
+    for invalid_name in ["PORT_CAFÉ".to_string(), format!("A{}", "_".repeat(255))] {
+        let services = std::collections::HashMap::from([(
+            "web".to_string(),
+            ServiceDefinition {
+                offset: Some(0),
+                preferred: None,
+                env: Some(invalid_name.clone()),
+            },
+        )]);
+        let config = Config {
+            reservations: Some(ReservationGroup {
+                base: Some(5000),
+                services,
+            }),
+            ..Default::default()
+        };
+
+        let error = ConfigBuilder::new()
+            .skip_files()
+            .skip_env()
+            .with_config(config)
+            .build()
+            .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(!diagnostic.contains(&invalid_name));
+        assert!(!diagnostic.contains('\n'));
+        assert!(!diagnostic.contains('\r'));
+    }
+}
+
+/// Test that broad service tags require an explicit portable mapping when
+/// ASCII-only derivation cannot produce a valid environment-variable name.
+#[test]
+fn test_validation_reservation_nonconvertible_tags_require_explicit_mapping() {
+    for tag in [
+        "api server",
+        "api;export ATTACK=1",
+        "api$(command)",
+        "api\nexport ATTACK=1",
+        "123-api",
+        "api.café",
+        "ß",
+    ] {
+        let services = std::collections::HashMap::from([(
+            tag.to_string(),
+            ServiceDefinition {
+                offset: Some(0),
+                preferred: None,
+                env: None,
+            },
+        )]);
+        let config = Config {
+            reservations: Some(ReservationGroup {
+                base: Some(5000),
+                services,
+            }),
+            ..Default::default()
+        };
+
+        let error = ConfigBuilder::new()
+            .skip_files()
+            .skip_env()
+            .with_config(config)
+            .build()
+            .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(!diagnostic.contains(tag));
+        assert!(!diagnostic.contains('\n'));
+        assert!(!diagnostic.contains('\r'));
+    }
+
+    let services = std::collections::HashMap::from([(
+        "api\nexport ATTACK=1".to_string(),
+        ServiceDefinition {
+            offset: Some(0),
+            preferred: None,
+            env: Some("_SAFE_API_PORT".to_string()),
+        },
+    )]);
+    let config = Config {
+        reservations: Some(ReservationGroup {
+            base: Some(5000),
+            services,
+        }),
+        ..Default::default()
+    };
+
+    assert!(ConfigBuilder::new()
+        .skip_files()
+        .skip_env()
+        .with_config(config)
+        .build()
+        .is_ok());
+}
+
+/// Test every resolved-name collision mode through the full config builder.
+#[test]
+fn test_validation_reservation_resolved_env_var_collisions() {
+    let collision_sets = [
+        [("web-server", None), ("web_server", None)],
+        [("web", Some("api")), ("api", None)],
+        [("web", Some("PORT")), ("api", Some("port"))],
+    ];
+
+    for collision_set in collision_sets {
+        let services = collision_set
+            .into_iter()
+            .enumerate()
+            .map(|(offset, (tag, env))| {
+                (
+                    tag.to_string(),
+                    ServiceDefinition {
+                        offset: Some(u16::try_from(offset).unwrap()),
+                        preferred: None,
+                        env: env.map(str::to_string),
+                    },
+                )
+            })
+            .collect();
+        let config = Config {
+            reservations: Some(ReservationGroup {
+                base: Some(5000),
+                services,
+            }),
+            ..Default::default()
+        };
+
+        let error = ConfigBuilder::new()
+            .skip_files()
+            .skip_env()
+            .with_config(config)
+            .build()
+            .unwrap_err();
+        assert!(matches!(error, Error::Validation { .. }));
     }
 }
 

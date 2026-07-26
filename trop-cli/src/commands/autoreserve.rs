@@ -7,7 +7,6 @@ use crate::error::CliError;
 use crate::utils::{format_allocations, load_configuration, open_database, GlobalOptions};
 use clap::Args;
 use std::env;
-use trop::config::ConfigLoader;
 use trop::operations::{AutoreserveOptions, AutoreservePlan};
 use trop::PlanExecutor;
 
@@ -93,55 +92,45 @@ impl AutoreserveCommand {
             return Ok(());
         }
 
-        // 5. Load configuration and open database
+        // 5. Validate the selected output format before opening a transaction.
+        let output_format = self.format.to_output_format(self.shell.as_deref())?;
+
+        // 6. Load configuration and open database
         let config = load_configuration(global)?;
         let mut db = open_database(global, &config)?;
 
-        // 6. Begin transaction
+        // 7. Begin transaction
         let tx = db.begin_transaction().map_err(CliError::from)?;
 
-        // 7. Build plan (inside transaction)
+        // 8. Build plan (inside transaction)
         let plan = planner.build_plan(&tx).map_err(CliError::from)?;
 
-        // 8. Execute plan (inside transaction)
+        // 9. Execute plan (inside transaction)
         let mut executor = PlanExecutor::new(&tx);
         let result = executor.execute(&plan).map_err(CliError::from)?;
 
-        // 9. Commit transaction
+        // 10. Extract and completely format the result before committing.
+        let allocated_ports = result.allocated_ports.ok_or_else(|| {
+            CliError::InvalidArguments("No ports were allocated - this is unexpected".to_string())
+        })?;
+        let formatted_output =
+            format_allocations(&output_format, &allocated_ports, planner.config())?;
+
+        // 11. Commit only after every fallible output step has succeeded.
         tx.commit()
             .map_err(trop::Error::from)
             .map_err(CliError::from)?;
 
-        // 8. Extract allocated ports
-        let allocated_ports = result.allocated_ports.ok_or_else(|| {
-            CliError::InvalidArguments("No ports were allocated - this is unexpected".to_string())
-        })?;
-
-        // 9. Format output based on selected format
-        let output_format = self.format.to_output_format(self.shell.as_deref())?;
-
-        let output_config = ConfigLoader::load_file(discovered_config).map_err(CliError::from)?;
-        let formatted_output =
-            format_allocations(&output_format, &allocated_ports, &output_config)?;
-
-        // 10. Print to stdout (machine-readable)
+        // 12. Print the retained output exactly once after a successful commit.
         println!("{formatted_output}");
 
-        // 11. Print status to stderr (human-readable, unless quiet)
+        // 13. Print status to stderr (human-readable, unless quiet)
         if !global.quiet {
-            eprintln!("Discovered config: {}", discovered_config.display());
-            eprintln!(
-                "Reserved {} ports for services: {}",
-                allocated_ports.len(),
-                allocated_ports
-                    .keys()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            eprintln!("Discovered config: {discovered_config:?}");
+            eprintln!("Reserved {} ports.", allocated_ports.len());
         }
 
-        // 12. Print warnings to stderr if any
+        // 14. Print warnings to stderr if any
         if !global.quiet && !result.warnings.is_empty() {
             for warning in &result.warnings {
                 eprintln!("Warning: {warning}");

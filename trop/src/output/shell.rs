@@ -2,6 +2,7 @@
 
 use std::env;
 
+use crate::identifier::EnvironmentVariableName;
 use crate::Result;
 
 /// Supported shell types for export formatting.
@@ -88,24 +89,41 @@ impl ShellType {
     /// # Arguments
     ///
     /// * `var` - Environment variable name
-    /// * `value` - Value to assign (will be quoted appropriately)
+    /// * `value` - Caller-supplied shell-safe value. Group formatters pass only
+    ///   decimal port numbers.
     ///
     /// # Examples
     ///
     /// ```
     /// use trop::output::ShellType;
     ///
-    /// assert_eq!(ShellType::Bash.format_export("PORT", "5000"), "export PORT=5000");
-    /// assert_eq!(ShellType::Fish.format_export("PORT", "5000"), "set -x PORT 5000");
-    /// assert_eq!(ShellType::PowerShell.format_export("PORT", "5000"), "$env:PORT=\"5000\"");
+    /// assert_eq!(
+    ///     ShellType::Bash.format_export("PORT", "5000").unwrap(),
+    ///     "export PORT=5000"
+    /// );
+    /// assert_eq!(
+    ///     ShellType::Fish.format_export("PORT", "5000").unwrap(),
+    ///     "set -x PORT 5000"
+    /// );
+    /// assert_eq!(
+    ///     ShellType::PowerShell.format_export("PORT", "5000").unwrap(),
+    ///     "$env:PORT=\"5000\""
+    /// );
     /// ```
-    #[must_use]
-    pub fn format_export(&self, var: &str, value: &str) -> String {
-        match self {
-            Self::Bash | Self::Zsh => format!("export {var}={value}"),
-            Self::Fish => format!("set -x {var} {value}"),
-            Self::PowerShell => format!("$env:{var}=\"{value}\""),
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation error when `var` is not a portable
+    /// environment-variable identifier.
+    pub fn format_export(&self, var: &str, value: &str) -> Result<String> {
+        let variable_name = EnvironmentVariableName::parse(var)?;
+        let variable_name = variable_name.as_str();
+
+        Ok(match self {
+            Self::Bash | Self::Zsh => format!("export {variable_name}={value}"),
+            Self::Fish => format!("set -x {variable_name} {value}"),
+            Self::PowerShell => format!("$env:{variable_name}=\"{value}\""),
+        })
     }
 }
 
@@ -136,9 +154,12 @@ mod tests {
     #[test]
     fn test_format_export_bash() {
         let shell = ShellType::Bash;
-        assert_eq!(shell.format_export("PORT", "5000"), "export PORT=5000");
         assert_eq!(
-            shell.format_export("WEB_PORT", "8080"),
+            shell.format_export("PORT", "5000").unwrap(),
+            "export PORT=5000"
+        );
+        assert_eq!(
+            shell.format_export("WEB_PORT", "8080").unwrap(),
             "export WEB_PORT=8080"
         );
     }
@@ -146,15 +167,21 @@ mod tests {
     #[test]
     fn test_format_export_zsh() {
         let shell = ShellType::Zsh;
-        assert_eq!(shell.format_export("PORT", "5000"), "export PORT=5000");
+        assert_eq!(
+            shell.format_export("PORT", "5000").unwrap(),
+            "export PORT=5000"
+        );
     }
 
     #[test]
     fn test_format_export_fish() {
         let shell = ShellType::Fish;
-        assert_eq!(shell.format_export("PORT", "5000"), "set -x PORT 5000");
         assert_eq!(
-            shell.format_export("WEB_PORT", "8080"),
+            shell.format_export("PORT", "5000").unwrap(),
+            "set -x PORT 5000"
+        );
+        assert_eq!(
+            shell.format_export("WEB_PORT", "8080").unwrap(),
             "set -x WEB_PORT 8080"
         );
     }
@@ -162,11 +189,49 @@ mod tests {
     #[test]
     fn test_format_export_powershell() {
         let shell = ShellType::PowerShell;
-        assert_eq!(shell.format_export("PORT", "5000"), "$env:PORT=\"5000\"");
         assert_eq!(
-            shell.format_export("WEB_PORT", "8080"),
+            shell.format_export("PORT", "5000").unwrap(),
+            "$env:PORT=\"5000\""
+        );
+        assert_eq!(
+            shell.format_export("WEB_PORT", "8080").unwrap(),
             "$env:WEB_PORT=\"8080\""
         );
+    }
+
+    #[test]
+    fn test_format_export_rejects_invalid_identifiers_for_every_shell() {
+        let shells = [
+            ShellType::Bash,
+            ShellType::Zsh,
+            ShellType::Fish,
+            ShellType::PowerShell,
+        ];
+        let invalid_names = [
+            "1PORT",
+            "WEB-PORT",
+            "WEB PORT",
+            "PORT; export ATTACK=1",
+            "PORT\nexport ATTACK=1",
+            "PORT$(command)",
+            "PORT`command`",
+            "PORT_CAFÉ",
+        ];
+
+        for shell in shells {
+            for variable_name in invalid_names {
+                let error = shell.format_export(variable_name, "5000").unwrap_err();
+                let diagnostic = error.to_string();
+                assert!(!diagnostic.contains(variable_name));
+                assert!(!diagnostic.contains('\n'));
+                assert!(!diagnostic.contains('\r'));
+                assert!(!diagnostic.lines().any(|line| {
+                    line.starts_with("export ")
+                        || line.starts_with("set -x ")
+                        || line.starts_with("$env:")
+                }));
+            }
+        }
     }
 
     #[test]
@@ -335,31 +400,35 @@ mod tests {
     fn test_format_export_various_inputs() {
         // Test with different variable names
         assert_eq!(
-            ShellType::Bash.format_export("PORT", "8080"),
+            ShellType::Bash.format_export("PORT", "8080").unwrap(),
             "export PORT=8080"
         );
         assert_eq!(
-            ShellType::Bash.format_export("WEB_SERVER_PORT", "3000"),
+            ShellType::Bash
+                .format_export("WEB_SERVER_PORT", "3000")
+                .unwrap(),
             "export WEB_SERVER_PORT=3000"
         );
         assert_eq!(
-            ShellType::Bash.format_export("API_V2_PORT", "9000"),
+            ShellType::Bash
+                .format_export("API_V2_PORT", "9000")
+                .unwrap(),
             "export API_V2_PORT=9000"
         );
 
         // Test with boundary port values
         assert_eq!(
-            ShellType::Bash.format_export("MIN_PORT", "1"),
+            ShellType::Bash.format_export("MIN_PORT", "1").unwrap(),
             "export MIN_PORT=1"
         );
         assert_eq!(
-            ShellType::Bash.format_export("MAX_PORT", "65535"),
+            ShellType::Bash.format_export("MAX_PORT", "65535").unwrap(),
             "export MAX_PORT=65535"
         );
 
         // Test with underscore prefix (valid but unusual)
         assert_eq!(
-            ShellType::Bash.format_export("_PRIVATE", "5000"),
+            ShellType::Bash.format_export("_PRIVATE", "5000").unwrap(),
             "export _PRIVATE=5000"
         );
     }
@@ -374,10 +443,12 @@ mod tests {
         let value = "8080";
 
         // All shells should produce non-empty output
-        let bash_export = ShellType::Bash.format_export(var_name, value);
-        let zsh_export = ShellType::Zsh.format_export(var_name, value);
-        let fish_export = ShellType::Fish.format_export(var_name, value);
-        let ps_export = ShellType::PowerShell.format_export(var_name, value);
+        let bash_export = ShellType::Bash.format_export(var_name, value).unwrap();
+        let zsh_export = ShellType::Zsh.format_export(var_name, value).unwrap();
+        let fish_export = ShellType::Fish.format_export(var_name, value).unwrap();
+        let ps_export = ShellType::PowerShell
+            .format_export(var_name, value)
+            .unwrap();
 
         assert!(!bash_export.is_empty());
         assert!(!zsh_export.is_empty());
@@ -412,10 +483,16 @@ mod tests {
     /// method should handle empty strings gracefully.
     #[test]
     fn test_format_export_empty_value() {
-        assert_eq!(ShellType::Bash.format_export("PORT", ""), "export PORT=");
-        assert_eq!(ShellType::Fish.format_export("PORT", ""), "set -x PORT ");
         assert_eq!(
-            ShellType::PowerShell.format_export("PORT", ""),
+            ShellType::Bash.format_export("PORT", "").unwrap(),
+            "export PORT="
+        );
+        assert_eq!(
+            ShellType::Fish.format_export("PORT", "").unwrap(),
+            "set -x PORT "
+        );
+        assert_eq!(
+            ShellType::PowerShell.format_export("PORT", "").unwrap(),
             "$env:PORT=\"\""
         );
     }
@@ -431,20 +508,22 @@ mod tests {
 
         // Single word (no spaces) - typical case
         assert_eq!(
-            ShellType::Bash.format_export("PORT", "8080"),
+            ShellType::Bash.format_export("PORT", "8080").unwrap(),
             "export PORT=8080"
         );
 
         // Value with leading/trailing spaces (shouldn't happen with ports)
         // The formatter doesn't trim, so spaces are preserved
         assert_eq!(
-            ShellType::Bash.format_export("PORT", " 8080 "),
+            ShellType::Bash.format_export("PORT", " 8080 ").unwrap(),
             "export PORT= 8080 "
         );
 
         // PowerShell always quotes, so spaces are properly handled
         assert_eq!(
-            ShellType::PowerShell.format_export("PORT", " 8080 "),
+            ShellType::PowerShell
+                .format_export("PORT", " 8080 ")
+                .unwrap(),
             "$env:PORT=\" 8080 \""
         );
     }
@@ -459,26 +538,28 @@ mod tests {
         let port_value = "8080";
 
         // Bash: `export VAR=value` - POSIX standard
-        let bash = ShellType::Bash.format_export(var_name, port_value);
+        let bash = ShellType::Bash.format_export(var_name, port_value).unwrap();
         assert_eq!(bash, "export WEB_PORT=8080");
         assert!(bash.starts_with("export "));
         assert!(bash.contains('='));
         assert!(!bash.contains('"')); // No quotes for simple values
 
         // Zsh: Same as bash (POSIX-compatible)
-        let zsh = ShellType::Zsh.format_export(var_name, port_value);
+        let zsh = ShellType::Zsh.format_export(var_name, port_value).unwrap();
         assert_eq!(zsh, "export WEB_PORT=8080");
         assert_eq!(bash, zsh); // Should be identical
 
         // Fish: `set -x VAR value` - Fish-specific syntax
-        let fish = ShellType::Fish.format_export(var_name, port_value);
+        let fish = ShellType::Fish.format_export(var_name, port_value).unwrap();
         assert_eq!(fish, "set -x WEB_PORT 8080");
         assert!(fish.starts_with("set -x "));
         assert!(!fish.contains('=')); // No equals sign in fish
         assert!(!fish.contains('"')); // No quotes for simple values
 
         // PowerShell: `$env:VAR="value"` - Always quotes value
-        let ps = ShellType::PowerShell.format_export(var_name, port_value);
+        let ps = ShellType::PowerShell
+            .format_export(var_name, port_value)
+            .unwrap();
         assert_eq!(ps, "$env:WEB_PORT=\"8080\"");
         assert!(ps.starts_with("$env:"));
         assert!(ps.contains("=\"")); // Always quotes values
@@ -548,13 +629,13 @@ mod tests {
         // Simulate user providing "--shell bash"
         let shell_arg = "bash";
         let shell = ShellType::from_string(shell_arg).unwrap();
-        let export = shell.format_export("PORT", "8080");
+        let export = shell.format_export("PORT", "8080").unwrap();
         assert_eq!(export, "export PORT=8080");
 
         // Simulate user providing "--shell fish"
         let shell_arg = "fish";
         let shell = ShellType::from_string(shell_arg).unwrap();
-        let export = shell.format_export("PORT", "8080");
+        let export = shell.format_export("PORT", "8080").unwrap();
         assert_eq!(export, "set -x PORT 8080");
 
         // Simulate invalid shell name
@@ -574,7 +655,7 @@ mod tests {
 
         // Should produce valid export format
         let shell = detected.unwrap();
-        let export = shell.format_export("PORT", "8080");
+        let export = shell.format_export("PORT", "8080").unwrap();
         assert!(!export.is_empty());
         assert!(export.contains("PORT"));
         assert!(export.contains("8080"));
@@ -590,13 +671,13 @@ mod tests {
         let unix_shells = vec![ShellType::Bash, ShellType::Zsh, ShellType::Fish];
 
         for shell in unix_shells {
-            let export = shell.format_export("PORT", "8080");
+            let export = shell.format_export("PORT", "8080").unwrap();
             // Unix shells shouldn't use Windows-specific syntax
             assert!(!export.contains("$env:"));
         }
 
         // Windows commonly uses PowerShell
-        let ps_export = ShellType::PowerShell.format_export("PORT", "8080");
+        let ps_export = ShellType::PowerShell.format_export("PORT", "8080").unwrap();
         // PowerShell uses its own syntax
         assert!(ps_export.contains("$env:"));
         assert!(ps_export.contains('"')); // Always quotes values

@@ -5,6 +5,7 @@
 
 use crate::config::schema::{CleanupConfig, Config, PortConfig, PortExclusion, ReservationGroup};
 use crate::error::{Error, Result};
+use crate::identifier::EnvironmentVariableName;
 use crate::port::Port;
 use std::collections::HashSet;
 
@@ -241,7 +242,7 @@ impl ConfigValidator {
 
         for (tag, service) in &group.services {
             // Validate tag
-            Self::validate_identifier(&format!("reservations.services.{tag}"), tag)?;
+            Self::validate_identifier("reservations.services.tag", tag)?;
 
             // Check offset uniqueness for services that participate in offset allocation.
             // Preferred-only services don't use the offset pattern unless an explicit
@@ -250,7 +251,7 @@ impl ConfigValidator {
                 let offset = service.offset.unwrap_or(0);
                 if offset == 0 && service.offset.is_none() && has_default_offset {
                     return Err(Error::Validation {
-                        field: format!("reservations.services.{tag}.offset"),
+                        field: "reservations.services.offset".into(),
                         message: "Only one offset-based service can omit offset (default to 0)"
                             .into(),
                     });
@@ -261,7 +262,7 @@ impl ConfigValidator {
 
                 if !seen_offsets.insert(offset) {
                     return Err(Error::Validation {
-                        field: format!("reservations.services.{tag}.offset"),
+                        field: "reservations.services.offset".into(),
                         message: format!("Duplicate offset: {offset}"),
                     });
                 }
@@ -270,28 +271,30 @@ impl ConfigValidator {
             // Check preferred port uniqueness
             if let Some(preferred) = service.preferred {
                 Port::try_from(preferred).map_err(|_| Error::Validation {
-                    field: format!("reservations.services.{tag}.preferred"),
+                    field: "reservations.services.preferred".into(),
                     message: format!("Invalid port: {preferred}"),
                 })?;
 
                 if !seen_preferred.insert(preferred) {
                     return Err(Error::Validation {
-                        field: format!("reservations.services.{tag}.preferred"),
+                        field: "reservations.services.preferred".into(),
                         message: format!("Duplicate preferred port: {preferred}"),
                     });
                 }
             }
 
-            // Check env var uniqueness and validity
-            if let Some(ref env) = service.env {
-                Self::validate_env_var_name(&format!("reservations.services.{tag}.env"), env)?;
+            // Resolve every output identifier during configuration validation.
+            // Explicit names and implicit derivations use the same shared grammar.
+            if let Some(env) = service.env.as_deref() {
+                Self::validate_env_var_name("reservations.services.env", env)?;
+            }
+            let variable_name = EnvironmentVariableName::resolve(tag, service.env.as_deref())?;
 
-                if !seen_env_vars.insert(env.clone()) {
-                    return Err(Error::Validation {
-                        field: format!("reservations.services.{tag}.env"),
-                        message: format!("Duplicate environment variable: {env}"),
-                    });
-                }
+            if !seen_env_vars.insert(variable_name.collision_key()) {
+                return Err(Error::Validation {
+                    field: "reservations.services.env".into(),
+                    message: "resolved environment-variable names must be unique when compared without ASCII case".into(),
+                });
             }
         }
 
@@ -300,38 +303,18 @@ impl ConfigValidator {
 
     /// Validate environment variable name.
     ///
-    /// Ensures the name is non-empty, contains only alphanumeric characters
-    /// and underscores, and starts with a letter.
+    /// Ensures the name is at most 255 bytes and matches the portable grammar
+    /// `[A-Za-z_][A-Za-z0-9_]*`.
     fn validate_env_var_name(field: &str, env: &str) -> Result<()> {
-        if env.is_empty() {
-            return Err(Error::Validation {
-                field: field.into(),
-                message: "Environment variable name cannot be empty".into(),
-            });
-        }
-
-        // Validate env var name (alphanumeric + underscore, starts with letter)
-        if !env.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return Err(Error::Validation {
-                field: field.into(),
-                message: "Invalid environment variable name (must be alphanumeric + underscore)"
-                    .into(),
-            });
-        }
-
-        // Safe because we already checked env.is_empty() above
-        let first_char = env
-            .chars()
-            .next()
-            .expect("environment variable name is non-empty");
-        if !first_char.is_ascii_alphabetic() {
-            return Err(Error::Validation {
-                field: field.into(),
-                message: "Environment variable must start with a letter".into(),
-            });
-        }
-
-        Ok(())
+        EnvironmentVariableName::parse(env)
+            .map(|_| ())
+            .map_err(|error| match error {
+                Error::Validation { message, .. } => Error::Validation {
+                    field: field.into(),
+                    message,
+                },
+                other => other,
+            })
     }
 }
 
@@ -496,6 +479,7 @@ mod tests {
         assert!(ConfigValidator::validate_env_var_name("test", "API_PORT").is_ok());
         assert!(ConfigValidator::validate_env_var_name("test", "web_server_port").is_ok());
         assert!(ConfigValidator::validate_env_var_name("test", "PORT123").is_ok());
+        assert!(ConfigValidator::validate_env_var_name("test", "_PRIVATE_PORT").is_ok());
     }
 
     #[test]
@@ -512,6 +496,22 @@ mod tests {
     fn test_validate_env_var_name_invalid_chars() {
         assert!(ConfigValidator::validate_env_var_name("test", "API-PORT").is_err());
         assert!(ConfigValidator::validate_env_var_name("test", "API PORT").is_err());
+        assert!(ConfigValidator::validate_env_var_name("test", "PORT_CAFÉ").is_err());
+    }
+
+    #[test]
+    fn test_validate_env_var_name_length_limit() {
+        let maximum = format!(
+            "A{}",
+            "_".repeat(crate::identifier::MAX_ENVIRONMENT_VARIABLE_NAME_LEN - 1)
+        );
+        let overlong = format!(
+            "A{}",
+            "_".repeat(crate::identifier::MAX_ENVIRONMENT_VARIABLE_NAME_LEN)
+        );
+
+        assert!(ConfigValidator::validate_env_var_name("test", &maximum).is_ok());
+        assert!(ConfigValidator::validate_env_var_name("test", &overlong).is_err());
     }
 
     #[test]
@@ -646,6 +646,140 @@ mod tests {
             },
         );
 
+        let group = ReservationGroup {
+            base: Some(5000),
+            services,
+        };
+
+        assert!(ConfigValidator::validate_reservation_group(&group).is_err());
+    }
+
+    #[test]
+    fn test_validate_reservation_group_rejects_nonconvertible_unmapped_tag() {
+        for tag in [
+            "api server",
+            "api;export ATTACK=1",
+            "api$(command)",
+            "api\nexport ATTACK=1",
+            "123-api",
+            "api.café",
+            "ß",
+        ] {
+            let services = HashMap::from([(
+                tag.to_string(),
+                ServiceDefinition {
+                    offset: Some(0),
+                    preferred: None,
+                    env: None,
+                },
+            )]);
+            let group = ReservationGroup {
+                base: Some(5000),
+                services,
+            };
+
+            let error = ConfigValidator::validate_reservation_group(&group).unwrap_err();
+            let diagnostic = error.to_string();
+            assert!(!diagnostic.contains(tag));
+            assert!(!diagnostic.contains('\n'));
+            assert!(!diagnostic.contains('\r'));
+        }
+    }
+
+    #[test]
+    fn test_validate_reservation_group_accepts_safe_mapping_for_nonconvertible_tag() {
+        let services = HashMap::from([(
+            "api\nexport ATTACK=1".to_string(),
+            ServiceDefinition {
+                offset: Some(0),
+                preferred: None,
+                env: Some("_SAFE_API_PORT".to_string()),
+            },
+        )]);
+        let group = ReservationGroup {
+            base: Some(5000),
+            services,
+        };
+
+        assert!(ConfigValidator::validate_reservation_group(&group).is_ok());
+    }
+
+    #[test]
+    fn test_validate_reservation_group_rejects_derived_collision() {
+        let services = HashMap::from([
+            (
+                "web-server".to_string(),
+                ServiceDefinition {
+                    offset: Some(0),
+                    preferred: None,
+                    env: None,
+                },
+            ),
+            (
+                "web_server".to_string(),
+                ServiceDefinition {
+                    offset: Some(1),
+                    preferred: None,
+                    env: None,
+                },
+            ),
+        ]);
+        let group = ReservationGroup {
+            base: Some(5000),
+            services,
+        };
+
+        assert!(ConfigValidator::validate_reservation_group(&group).is_err());
+    }
+
+    #[test]
+    fn test_validate_reservation_group_rejects_explicit_derived_collision() {
+        let services = HashMap::from([
+            (
+                "web".to_string(),
+                ServiceDefinition {
+                    offset: Some(0),
+                    preferred: None,
+                    env: Some("api".to_string()),
+                },
+            ),
+            (
+                "api".to_string(),
+                ServiceDefinition {
+                    offset: Some(1),
+                    preferred: None,
+                    env: None,
+                },
+            ),
+        ]);
+        let group = ReservationGroup {
+            base: Some(5000),
+            services,
+        };
+
+        assert!(ConfigValidator::validate_reservation_group(&group).is_err());
+    }
+
+    #[test]
+    fn test_validate_reservation_group_rejects_ascii_case_collision() {
+        let services = HashMap::from([
+            (
+                "web".to_string(),
+                ServiceDefinition {
+                    offset: Some(0),
+                    preferred: None,
+                    env: Some("PORT".to_string()),
+                },
+            ),
+            (
+                "api".to_string(),
+                ServiceDefinition {
+                    offset: Some(1),
+                    preferred: None,
+                    env: Some("port".to_string()),
+                },
+            ),
+        ]);
         let group = ReservationGroup {
             base: Some(5000),
             services,
@@ -1018,14 +1152,14 @@ mod property_tests {
 
     /// Property: Valid env var names should validate
     ///
-    /// Mathematical Property: For all strings s matching [a-zA-Z][a-zA-Z0-9_]*,
+    /// Mathematical Property: For all strings s matching [a-zA-Z_][a-zA-Z0-9_]*,
     /// validate_env_var_name(s) succeeds.
     ///
     /// WHY THIS MATTERS: Environment variable names must be valid shell identifiers.
     proptest! {
         #[test]
         fn prop_valid_env_var_names_accepted(
-            first_char in "[a-zA-Z]",
+            first_char in "[a-zA-Z_]",
             rest in "[a-zA-Z0-9_]{0,30}",
         ) {
             let env_var = format!("{first_char}{rest}");
@@ -1075,6 +1209,20 @@ mod property_tests {
             let env_var = format!("{prefix}{special_char}{suffix}");
             let result = ConfigValidator::validate_env_var_name("test", &env_var);
             prop_assert!(result.is_err(), "Env var '{}' with special char should fail", env_var);
+        }
+    }
+
+    /// Property: Environment-variable names longer than the documented byte
+    /// limit are rejected even when every character otherwise matches.
+    proptest! {
+        #[test]
+        fn prop_overlong_env_var_names_rejected(extra in 1usize..=64) {
+            let env_var = format!(
+                "A{}",
+                "_".repeat(crate::identifier::MAX_ENVIRONMENT_VARIABLE_NAME_LEN - 1 + extra)
+            );
+            let result = ConfigValidator::validate_env_var_name("test", &env_var);
+            prop_assert!(result.is_err(), "Overlong env var should fail");
         }
     }
 
@@ -1215,6 +1363,60 @@ mod property_tests {
 
             let result = ConfigValidator::validate_reservation_group(&group);
             prop_assert!(result.is_err(), "Duplicate env var '{}' should fail", env_name);
+        }
+    }
+
+    /// Property: Explicit environment-variable names that differ only by ASCII
+    /// case collide under the portable group policy.
+    proptest! {
+        #[test]
+        fn prop_ascii_case_env_var_collisions_rejected(env_name in "[A-Z]{1,10}") {
+            let mut services = HashMap::new();
+            services.insert("svc1".to_string(), ServiceDefinition {
+                offset: Some(0),
+                preferred: None,
+                env: Some(env_name.clone()),
+            });
+            services.insert("svc2".to_string(), ServiceDefinition {
+                offset: Some(1),
+                preferred: None,
+                env: Some(env_name.to_ascii_lowercase()),
+            });
+
+            let group = ReservationGroup {
+                base: Some(5000),
+                services,
+            };
+
+            let result = ConfigValidator::validate_reservation_group(&group);
+            prop_assert!(result.is_err(), "ASCII case variants should collide");
+        }
+    }
+
+    /// Property: Hyphen and underscore variants that derive to the same final
+    /// identifier are rejected.
+    proptest! {
+        #[test]
+        fn prop_derived_env_var_collisions_rejected(stem in "[a-z]{1,20}") {
+            let mut services = HashMap::new();
+            services.insert(format!("{stem}-service"), ServiceDefinition {
+                offset: Some(0),
+                preferred: None,
+                env: None,
+            });
+            services.insert(format!("{stem}_service"), ServiceDefinition {
+                offset: Some(1),
+                preferred: None,
+                env: None,
+            });
+
+            let group = ReservationGroup {
+                base: Some(5000),
+                services,
+            };
+
+            let result = ConfigValidator::validate_reservation_group(&group);
+            prop_assert!(result.is_err(), "Derived names should collide");
         }
     }
 

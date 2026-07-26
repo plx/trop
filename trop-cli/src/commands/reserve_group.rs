@@ -7,7 +7,6 @@ use crate::error::CliError;
 use crate::utils::{format_allocations, load_configuration, open_database, GlobalOptions};
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
-use trop::config::ConfigLoader;
 use trop::operations::{ReserveGroupOptions, ReserveGroupPlan};
 use trop::output::{OutputFormat, ShellType};
 use trop::PlanExecutor;
@@ -127,55 +126,45 @@ impl ReserveGroupCommand {
             return Ok(());
         }
 
-        // 4. Load configuration and open database
+        // 4. Validate the selected output format before opening a transaction.
+        let output_format = self.format.to_output_format(self.shell.as_deref())?;
+
+        // 5. Load configuration and open database
         let config = load_configuration(global)?;
         let mut db = open_database(global, &config)?;
 
-        // 5. Begin transaction
+        // 6. Begin transaction
         let tx = db.begin_transaction().map_err(CliError::from)?;
 
-        // 6. Build plan (inside transaction)
+        // 7. Build plan (inside transaction)
         let planner = ReserveGroupPlan::new(options).map_err(CliError::from)?;
         let plan = planner.build_plan(&tx).map_err(CliError::from)?;
 
-        // 7. Execute plan (inside transaction)
+        // 8. Execute plan (inside transaction)
         let mut executor = PlanExecutor::new(&tx);
         let result = executor.execute(&plan).map_err(CliError::from)?;
 
-        // 8. Commit transaction
+        // 9. Extract and completely format the result before committing.
+        let allocated_ports = result.allocated_ports.ok_or_else(|| {
+            CliError::InvalidArguments("No ports were allocated - this is unexpected".to_string())
+        })?;
+        let formatted_output =
+            format_allocations(&output_format, &allocated_ports, planner.config())?;
+
+        // 10. Commit only after every fallible output step has succeeded.
         tx.commit()
             .map_err(trop::Error::from)
             .map_err(CliError::from)?;
 
-        // 7. Extract allocated ports
-        let allocated_ports = result.allocated_ports.ok_or_else(|| {
-            CliError::InvalidArguments("No ports were allocated - this is unexpected".to_string())
-        })?;
-
-        // 8. Format output based on selected format
-        let output_format = self.format.to_output_format(self.shell.as_deref())?;
-
-        let output_config = ConfigLoader::load_file(&self.config_path).map_err(CliError::from)?;
-        let formatted_output =
-            format_allocations(&output_format, &allocated_ports, &output_config)?;
-
-        // 9. Print to stdout (machine-readable)
+        // 11. Print the retained output exactly once after a successful commit.
         println!("{formatted_output}");
 
-        // 10. Print status to stderr (human-readable, unless quiet)
+        // 12. Print status to stderr (human-readable, unless quiet)
         if !global.quiet {
-            eprintln!(
-                "Reserved {} ports for services: {}",
-                allocated_ports.len(),
-                allocated_ports
-                    .keys()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            eprintln!("Reserved {} ports.", allocated_ports.len());
         }
 
-        // 11. Print warnings to stderr if any
+        // 13. Print warnings to stderr if any
         if !global.quiet && !result.warnings.is_empty() {
             for warning in &result.warnings {
                 eprintln!("Warning: {warning}");
