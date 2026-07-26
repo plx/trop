@@ -15,11 +15,12 @@ use common::database::create_test_database;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
+use trop::config::ConfigBuilder;
 use trop::operations::{
     AutoreserveOptions, AutoreservePlan, ReserveGroupOptions, ReserveGroupPlan,
 };
 use trop::Database;
-use trop::{PlanExecutor, ReservationKey};
+use trop::{Error, PlanExecutor, ReservationKey};
 
 // ============================================================================
 // Test Helpers
@@ -205,11 +206,16 @@ fn test_successful_group_reservation_with_offsets() {
         "Database should contain exactly 3 reservations"
     );
 
+    let expected_path = temp_dir
+        .path()
+        .canonicalize()
+        .expect("Should canonicalize config parent");
+
     // Verify each reservation has correct attributes
     for reservation in &all_reservations {
         assert_eq!(
             reservation.key().path,
-            temp_dir.path(),
+            expected_path,
             "Reservation path should match config parent directory"
         );
         assert_eq!(
@@ -233,6 +239,82 @@ fn test_successful_group_reservation_with_offsets() {
             "Database port should match allocated port for {tag}"
         );
     }
+}
+
+/// Group keys use the canonical config parent even when an absolute config
+/// argument contains lexical parent-directory components.
+#[test]
+fn test_group_plan_canonicalizes_config_parent_before_building_keys() {
+    let temp_dir = create_temp_dir();
+    let detour = temp_dir.path().join("detour");
+    fs::create_dir(&detour).expect("Should create detour directory");
+    create_config_file(temp_dir.path(), "trop.yaml", &minimal_config());
+    let spelled_config_path = detour.join("..").join("trop.yaml");
+    let db = create_test_database();
+
+    let planner = ReserveGroupPlan::new(ReserveGroupOptions::new(spelled_config_path))
+        .expect("Should resolve group config");
+    assert_eq!(
+        planner.config_path(),
+        &temp_dir.path().join("trop.yaml"),
+        "diagnostics should retain the resolved lexical source-file path"
+    );
+    let plan = planner
+        .build_plan(db.connection())
+        .expect("Should build group plan");
+    let expected_path = temp_dir
+        .path()
+        .canonicalize()
+        .expect("Should canonicalize config parent");
+
+    match &plan.actions[0] {
+        trop::operations::PlanAction::AllocateGroup { request, .. } => {
+            assert_eq!(request.base_path, expected_path);
+            assert!(request.base_path.is_absolute());
+        }
+        action => panic!("Expected AllocateGroup action, got {action:?}"),
+    }
+}
+
+/// A parsed snapshot cannot bypass config-source file validation during group
+/// planner construction.
+#[test]
+fn test_group_planner_rejects_config_source_that_is_no_longer_a_file() {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(temp_dir.path(), "trop.yaml", &minimal_config());
+    let effective = ConfigBuilder::new()
+        .with_project_file(&config_path)
+        .skip_env()
+        .build_effective()
+        .expect("Should build effective config");
+
+    fs::remove_file(&config_path).expect("Should remove config file");
+    fs::create_dir(&config_path).expect("Should replace config with directory");
+
+    let result =
+        ReserveGroupPlan::from_effective(ReserveGroupOptions::new(config_path.clone()), &effective);
+    assert!(
+        matches!(
+            result,
+            Err(Error::InvalidPath { path, ref reason })
+                if path == config_path && reason.contains("not a file")
+        ),
+        "group planner should reject a non-file config source"
+    );
+}
+
+/// Missing config sources retain a typed path error instead of collapsing into
+/// an unstructured load failure.
+#[test]
+fn test_group_planner_reports_missing_config_source() {
+    let temp_dir = create_temp_dir();
+    let config_path = temp_dir.path().join("missing.yaml");
+
+    let result = ReserveGroupPlan::new(ReserveGroupOptions::new(config_path.clone()));
+    assert!(
+        matches!(result, Err(Error::PathNotFound { path }) if path == config_path),
+        "group planner should report the resolved missing source path"
+    );
 }
 
 /// Test group reservation with mixed offset and preferred ports.
@@ -453,9 +535,14 @@ fn test_database_state_after_group_reservation() {
 
     let allocated_ports = result.allocated_ports.expect("Should have allocated ports");
 
+    let group_path = temp_dir
+        .path()
+        .canonicalize()
+        .expect("Should canonicalize config parent");
+
     // Verify we can retrieve each reservation by its key
     for (tag, port) in &allocated_ports {
-        let key = ReservationKey::new(temp_dir.path().to_path_buf(), Some(tag.clone()))
+        let key = ReservationKey::new(group_path.clone(), Some(tag.clone()))
             .expect("Should create valid key");
 
         let reservation = Database::get_reservation(db.connection(), &key)
@@ -952,8 +1039,14 @@ reservations:
     let allocated_ports = result.allocated_ports.expect("Should allocate ports");
     assert_eq!(allocated_ports.get("web").unwrap().value(), 5000);
 
-    let key = ReservationKey::new(temp_dir.path().to_path_buf(), Some("web".to_string()))
-        .expect("Should create reservation key");
+    let key = ReservationKey::new(
+        temp_dir
+            .path()
+            .canonicalize()
+            .expect("Should canonicalize config parent"),
+        Some("web".to_string()),
+    )
+    .expect("Should create reservation key");
     let reservation = Database::get_reservation(db.connection(), &key)
         .expect("Should query reservation")
         .expect("Should create web reservation");

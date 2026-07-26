@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::TestEnv;
+use common::{create_directory_symlink, TestEnv};
 use predicates::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -378,6 +378,155 @@ fn test_reserve_group_basic_success() {
     );
 }
 
+/// Config-file argument spelling and command choice must not change the
+/// inferred reservation identity.
+#[test]
+fn test_group_config_parent_identity_is_canonical_across_entrypoints() {
+    let env = TestEnv::new();
+    let project_dir = env.create_dir("project");
+    let config_path = project_dir.join("trop.yaml");
+    let nested_dir = project_dir.join("nested");
+    fs::create_dir(&nested_dir).expect("Failed to create nested project directory");
+    create_test_config(&config_path, "test-project");
+
+    for (config_arg, working_dir) in [
+        (Path::new("trop.yaml"), project_dir.as_path()),
+        (Path::new("./trop.yaml"), project_dir.as_path()),
+        (config_path.as_path(), project_dir.as_path()),
+        (Path::new("../trop.yaml"), nested_dir.as_path()),
+    ] {
+        let output = env
+            .command()
+            .arg("reserve-group")
+            .arg(config_arg)
+            .arg("--format")
+            .arg("json")
+            .arg("--allow-unrelated-path")
+            .current_dir(working_dir)
+            .output()
+            .expect("Failed to run reserve-group");
+        assert!(
+            output.status.success(),
+            "reserve-group {config_arg:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let autoreserve = env
+        .command()
+        .arg("autoreserve")
+        .arg("--format")
+        .arg("json")
+        .arg("--allow-unrelated-path")
+        .current_dir(&nested_dir)
+        .output()
+        .expect("Failed to run autoreserve");
+    assert!(
+        autoreserve.status.success(),
+        "autoreserve failed: {}",
+        String::from_utf8_lossy(&autoreserve.stderr)
+    );
+
+    let expected_path = project_dir
+        .canonicalize()
+        .expect("Failed to canonicalize project directory");
+    let paths_before_prune = env.reservation_paths();
+    assert!(
+        paths_before_prune
+            .iter()
+            .all(|path| path.is_absolute() && path == &expected_path),
+        "every group row should use the canonical config parent: {paths_before_prune:?}"
+    );
+
+    let list_output = env
+        .command()
+        .arg("list")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to list group reservations");
+    assert!(list_output.status.success());
+    let rows: serde_json::Value =
+        serde_json::from_slice(&list_output.stdout).expect("List output should be valid JSON");
+    let row_array = rows.as_array().expect("List output should be an array");
+    assert_eq!(
+        row_array.len(),
+        paths_before_prune.len(),
+        "JSON output should contain every stored group row"
+    );
+    assert!(
+        row_array
+            .iter()
+            .all(|row| row["path"].as_str() == expected_path.to_str()),
+        "JSON output should expose only the canonical group identity: {rows}"
+    );
+
+    let count_before_prune = env.reservation_count();
+    env.command().arg("prune").assert().success();
+    assert_eq!(
+        env.reservation_count(),
+        count_before_prune,
+        "prune must preserve a live group"
+    );
+    assert_eq!(
+        env.reservation_paths(),
+        vec![expected_path.clone(), expected_path]
+    );
+}
+
+/// A config reached through a directory symlink still infers the physical
+/// containing-directory identity for both group entrypoints.
+#[test]
+fn test_group_config_parent_identity_is_canonical_through_symlink() {
+    let env = TestEnv::new();
+    let physical = env.create_dir("physical-project");
+    let logical = env.path().join("logical-project");
+    if !create_directory_symlink(&physical, &logical) {
+        return;
+    }
+
+    let physical_config = physical.join("trop.yaml");
+    create_test_config(&physical_config, "test-project");
+
+    let reserve_group = env
+        .command()
+        .arg("reserve-group")
+        .arg(logical.join("trop.yaml"))
+        .arg("--format")
+        .arg("json")
+        .arg("--allow-unrelated-path")
+        .output()
+        .expect("Failed to run reserve-group through symlink");
+    assert!(
+        reserve_group.status.success(),
+        "reserve-group through symlink failed: {}",
+        String::from_utf8_lossy(&reserve_group.stderr)
+    );
+
+    let autoreserve = env
+        .command()
+        .arg("autoreserve")
+        .arg("--format")
+        .arg("json")
+        .arg("--allow-unrelated-path")
+        .current_dir(&logical)
+        .output()
+        .expect("Failed to run autoreserve through symlink");
+    assert!(
+        autoreserve.status.success(),
+        "autoreserve through symlink failed: {}",
+        String::from_utf8_lossy(&autoreserve.stderr)
+    );
+
+    let expected_path = physical
+        .canonicalize()
+        .expect("Failed to canonicalize physical project directory");
+    assert_eq!(
+        env.reservation_paths(),
+        vec![expected_path.clone(), expected_path]
+    );
+}
+
 /// Test reserve-group with explicit config path that doesn't exist.
 ///
 /// This verifies error handling when the specified config file is not found.
@@ -395,6 +544,10 @@ fn test_reserve_group_config_not_found() {
         .stderr(
             predicate::str::contains("not found").or(predicate::str::contains("Configuration")),
         );
+    assert!(
+        !env.data_dir.join("trop.db").exists(),
+        "invalid config input must fail before opening the database"
+    );
 }
 
 /// Test reserve-group with a directory path instead of file.
@@ -412,6 +565,10 @@ fn test_reserve_group_with_directory_path() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("not a file"));
+    assert!(
+        !env.data_dir.join("trop.db").exists(),
+        "non-file config input must fail before opening the database"
+    );
 }
 
 // ============================================================================
