@@ -114,6 +114,13 @@ trop reserve-group ./trop.yaml
 trop autoreserve
 ```
 
+Both entrypoints share one idempotent group operation. Repeating either command,
+or alternating between them, preserves a complete compatible group's mapping
+and creation times while atomically refreshing every member's last-used time.
+If the stored tagged service set is partial or its ports no longer satisfy the
+configured preferred/offset shape, the command reports a reservation conflict
+and leaves the stored group unchanged.
+
 ## Configuration
 
 `trop` resolves hierarchical configuration in this order, from highest to

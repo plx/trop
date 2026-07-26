@@ -100,6 +100,13 @@ const SELECT_BY_PATH_PREFIX: &str = r"
     ORDER BY path, tag
 ";
 
+const SELECT_TAGGED_BY_EXACT_PATH: &str = r"
+    SELECT path, tag, port, project, task, created_at, last_used_at
+    FROM reservations
+    WHERE path = ? AND tag IS NOT NULL
+    ORDER BY tag
+";
+
 const SELECT_EXPIRED: &str = r"
     SELECT path, tag, port, project, task, created_at, last_used_at
     FROM reservations
@@ -518,6 +525,22 @@ impl Database {
             .filter(|reservation| reservation.key().path.starts_with(prefix))
             .collect();
 
+        Ok(reservations)
+    }
+
+    /// Returns every tagged reservation at one exact path.
+    ///
+    /// Untagged reservations and reservations below the path are deliberately
+    /// excluded. Group reconciliation uses this exact set to distinguish a
+    /// complete stored group from partial or changed service sets.
+    pub(crate) fn get_tagged_reservations_by_exact_path(
+        conn: &Connection,
+        path: &Path,
+    ) -> Result<Vec<Reservation>> {
+        let mut stmt = conn.prepare_cached(SELECT_TAGGED_BY_EXACT_PATH)?;
+        let reservations = stmt
+            .query_map([path.to_string_lossy().to_string()], row_to_reservation)?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
         Ok(reservations)
     }
 

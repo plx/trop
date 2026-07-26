@@ -12,15 +12,16 @@
 mod common;
 
 use common::database::create_test_database;
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use trop::config::ConfigBuilder;
 use trop::operations::{
     AutoreserveOptions, AutoreservePlan, ReserveGroupOptions, ReserveGroupPlan,
 };
 use trop::Database;
-use trop::{Error, PlanExecutor, ReservationKey};
+use trop::{Error, PlanExecutor, Port, Reservation, ReservationKey};
 
 // ============================================================================
 // Test Helpers
@@ -40,6 +41,19 @@ fn create_config_file(dir: &std::path::Path, name: &str, content: &str) -> PathB
     let config_path = dir.join(name);
     fs::write(&config_path, content).expect("Failed to write config file");
     config_path
+}
+
+fn execute_group(db: &Database, config_path: &Path) -> trop::Result<HashMap<String, Port>> {
+    let planner = ReserveGroupPlan::new(ReserveGroupOptions::new(config_path.to_path_buf()))?;
+    let plan = planner.build_plan(db.connection())?;
+    let mut executor = PlanExecutor::new(db.connection());
+    executor
+        .execute(&plan)?
+        .allocated_ports
+        .ok_or_else(|| Error::GroupAllocationFailed {
+            attempted: 0,
+            reason: "group execution returned no mapping".to_string(),
+        })
 }
 
 /// Creates a simple group reservation configuration with offset-based services.
@@ -132,6 +146,30 @@ reservations:
       offset: 0
 "#
     .to_string()
+}
+
+fn assert_incompatible_group_is_unchanged(initial: &str, changed: &str) {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(temp_dir.path(), "trop.yaml", initial);
+    let db = create_test_database();
+
+    execute_group(&db, &config_path).expect("Initial group should allocate");
+    let before =
+        Database::list_all_reservations(db.connection()).expect("Should snapshot reservations");
+
+    fs::write(&config_path, changed).expect("Should replace group definition");
+    let error = execute_group(&db, &config_path).expect_err("Changed group should conflict");
+    assert!(
+        matches!(error, Error::ReservationConflict { .. }),
+        "Changed group should return a typed reservation conflict, got {error}"
+    );
+
+    let after =
+        Database::list_all_reservations(db.connection()).expect("Should reload reservations");
+    assert_eq!(
+        after, before,
+        "An incompatible group request must leave every row unchanged"
+    );
 }
 
 // ============================================================================
@@ -314,6 +352,217 @@ fn test_group_planner_reports_missing_config_source() {
     assert!(
         matches!(result, Err(Error::PathNotFound { path }) if path == config_path),
         "group planner should report the resolved missing source path"
+    );
+}
+
+/// Every supported group shape reuses its complete existing mapping.
+#[test]
+fn test_repeated_group_allocation_preserves_allocation_shapes() {
+    let cases = [
+        ("offset", simple_offset_config(3), 3),
+        ("preferred", preferred_only_config(), 2),
+        ("mixed", mixed_allocation_config(), 3),
+    ];
+
+    for (case_name, config, expected_services) in cases {
+        let temp_dir = create_temp_dir();
+        let config_path = create_config_file(temp_dir.path(), "trop.yaml", &config);
+        let db = create_test_database();
+
+        let first = execute_group(&db, &config_path).expect("Initial group should allocate");
+        let second = execute_group(&db, &config_path)
+            .unwrap_or_else(|error| panic!("Repeated {case_name} group should succeed: {error}"));
+
+        assert_eq!(
+            second, first,
+            "Repeated {case_name} group must preserve every port"
+        );
+        assert_eq!(
+            Database::list_all_reservations(db.connection())
+                .expect("Should list group reservations")
+                .len(),
+            expected_services,
+            "Repeated {case_name} group must retain one row per service"
+        );
+    }
+}
+
+/// Added, removed, and reshaped services fail atomically until the explicit
+/// shape-change policy is selected.
+#[test]
+fn test_incompatible_group_shapes_fail_without_mutation() {
+    let initial_offsets = r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 1
+"#;
+    let added_service = r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 1
+    db:
+      offset: 2
+"#;
+    let removed_service = r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+"#;
+    let changed_offset = r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 2
+"#;
+    let initial_preferred = r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      preferred: 5010
+    api:
+      preferred: 5020
+"#;
+    let changed_preferred = r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      preferred: 5011
+    api:
+      preferred: 5020
+"#;
+
+    assert_incompatible_group_is_unchanged(initial_offsets, added_service);
+    assert_incompatible_group_is_unchanged(initial_offsets, removed_service);
+    assert_incompatible_group_is_unchanged(initial_offsets, changed_offset);
+    assert_incompatible_group_is_unchanged(initial_preferred, changed_preferred);
+}
+
+/// Missing rows are treated as a partial-group conflict, not repaired into a
+/// mixture of old and new allocations.
+#[test]
+fn test_partial_existing_group_fails_without_mutation() {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(temp_dir.path(), "trop.yaml", &simple_offset_config(3));
+    let db = create_test_database();
+
+    execute_group(&db, &config_path).expect("Initial group should allocate");
+    db.connection()
+        .execute("DELETE FROM reservations WHERE tag = 'service1'", [])
+        .expect("Should inject partial group state");
+    let before =
+        Database::list_all_reservations(db.connection()).expect("Should snapshot partial group");
+    assert_eq!(before.len(), 2, "Fixture should retain two of three rows");
+
+    let error = execute_group(&db, &config_path).expect_err("Partial group should conflict");
+    assert!(
+        matches!(error, Error::ReservationConflict { .. }),
+        "Partial group should return a typed reservation conflict, got {error}"
+    );
+    assert_eq!(
+        Database::list_all_reservations(db.connection()).expect("Should reload partial group"),
+        before,
+        "Partial group conflict must leave surviving rows unchanged"
+    );
+}
+
+/// Untagged same-path and tagged descendant reservations are not mistaken for
+/// group members, but their ports still block fresh allocation.
+#[test]
+fn test_group_reconciliation_ignores_other_keys_but_respects_their_ports() {
+    let temp_dir = create_temp_dir();
+    let config = r#"
+ports:
+  min: 5000
+  max: 7000
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 1
+"#;
+    let config_path = create_config_file(temp_dir.path(), "trop.yaml", config);
+    let db = create_test_database();
+    let group_path = temp_dir
+        .path()
+        .canonicalize()
+        .expect("Should canonicalize group path");
+    let untagged = Reservation::builder(
+        ReservationKey::new(group_path.clone(), None).expect("Should build untagged key"),
+        Port::try_from(5000).expect("Should build port"),
+    )
+    .build()
+    .expect("Should build untagged reservation");
+    let descendant = Reservation::builder(
+        ReservationKey::new(group_path.join("child"), Some("other-service".to_string()))
+            .expect("Should build descendant key"),
+        Port::try_from(5001).expect("Should build port"),
+    )
+    .build()
+    .expect("Should build descendant reservation");
+    Database::create_reservation_simple(db.connection(), &untagged)
+        .expect("Should seed untagged reservation");
+    Database::create_reservation_simple(db.connection(), &descendant)
+        .expect("Should seed descendant reservation");
+
+    let mapping = execute_group(&db, &config_path).expect("Fresh group should allocate");
+    assert_eq!(mapping["web"], Port::try_from(5002).unwrap());
+    assert_eq!(mapping["api"], Port::try_from(5003).unwrap());
+
+    let rows = Database::list_all_reservations(db.connection()).expect("Should list reservations");
+    assert_eq!(
+        rows.len(),
+        4,
+        "Unrelated keys and both group rows must remain"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| { row.key() == untagged.key() && row.port() == untagged.port() })
+            && rows
+                .iter()
+                .any(|row| { row.key() == descendant.key() && row.port() == descendant.port() }),
+        "Group allocation must preserve unrelated exact-path and descendant keys"
     );
 }
 

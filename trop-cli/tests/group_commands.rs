@@ -19,9 +19,12 @@ mod common;
 
 use common::{create_directory_symlink, TestEnv};
 use predicates::prelude::*;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 // ============================================================================
 // Test Helpers
@@ -59,6 +62,33 @@ reservations:
     config
 }
 
+fn create_offset_config_without_occupancy_checks(path: &Path, project_name: &str) -> String {
+    let config = format!(
+        r#"
+project: "{project_name}"
+
+ports:
+  min: 5000
+  max: 12000
+occupancy_check:
+  skip: true
+
+reservations:
+  base: 8000
+  services:
+    web:
+      offset: 0
+      env: WEB_PORT
+    api:
+      offset: 1
+      env: API_PORT
+"#
+    );
+
+    fs::write(path, &config).expect("Failed to write test config");
+    config
+}
+
 /// Create a config with preferred ports instead of offsets.
 ///
 /// This tests a different allocation strategy where services specify
@@ -77,6 +107,33 @@ reservations:
     api:
       preferred: 9001
       env: API_PORT
+"#;
+
+    fs::write(path, config).expect("Failed to write test config");
+    config.to_string()
+}
+
+/// Create a config with both offset and preferred services.
+fn create_config_with_mixed_ports(path: &Path) -> String {
+    let config = r#"
+ports:
+  min: 5000
+  max: 10000
+occupancy_check:
+  skip: true
+
+reservations:
+  base: 8000
+  services:
+    web:
+      offset: 0
+      env: WEB_PORT
+    api:
+      offset: 1
+      env: API_PORT
+    admin:
+      preferred: 9000
+      env: ADMIN_PORT
 "#;
 
     fs::write(path, config).expect("Failed to write test config");
@@ -223,6 +280,119 @@ fn run_group_command(
         .expect("Failed to run group command")
 }
 
+fn run_json_group_command(
+    env: &TestEnv,
+    project_dir: &Path,
+    config_path: &Path,
+    kind: GroupCommandKind,
+) -> Output {
+    run_group_command(
+        env,
+        project_dir,
+        config_path,
+        kind,
+        OutputBoundary {
+            name: "json",
+            format: "json",
+            shell: None,
+        },
+    )
+}
+
+fn run_json_group_dry_run(
+    env: &TestEnv,
+    project_dir: &Path,
+    config_path: &Path,
+    kind: GroupCommandKind,
+) -> Output {
+    let mut command = env.command();
+    match kind {
+        GroupCommandKind::ReserveGroup => {
+            command.arg("reserve-group").arg(config_path);
+        }
+        GroupCommandKind::Autoreserve => {
+            command.arg("autoreserve").current_dir(project_dir);
+        }
+    }
+    command
+        .arg("--format")
+        .arg("json")
+        .arg("--dry-run")
+        .arg("--allow-unrelated-path")
+        .output()
+        .expect("Failed to run group dry-run")
+}
+
+fn reservation_rows(env: &TestEnv) -> Vec<(String, u16, i64, i64)> {
+    let connection = rusqlite::Connection::open(env.data_dir.join("trop.db"))
+        .expect("Failed to open test database");
+    let mut statement = connection
+        .prepare(
+            "SELECT tag, port, created_at, last_used_at
+             FROM reservations
+             WHERE tag IS NOT NULL
+             ORDER BY tag",
+        )
+        .expect("Failed to prepare reservation query");
+
+    statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("Failed to query reservations")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("Failed to decode reservations")
+}
+
+fn run_concurrent_group_processes(
+    data_dir: &Path,
+    specs: &[(PathBuf, PathBuf, GroupCommandKind)],
+) -> Vec<Output> {
+    let binary = assert_cmd::cargo::cargo_bin!("trop").to_path_buf();
+    let barrier = Arc::new(Barrier::new(specs.len()));
+    let handles = specs
+        .iter()
+        .cloned()
+        .map(|(project_dir, config_path, kind)| {
+            let binary = binary.clone();
+            let data_dir = data_dir.to_path_buf();
+            let barrier = Arc::clone(&barrier);
+
+            thread::spawn(move || {
+                barrier.wait();
+
+                let mut command = Command::new(binary);
+                command
+                    .arg("--data-dir")
+                    .arg(data_dir)
+                    .arg("--busy-timeout")
+                    .arg("30");
+
+                match kind {
+                    GroupCommandKind::ReserveGroup => {
+                        command.arg("reserve-group").arg(config_path);
+                    }
+                    GroupCommandKind::Autoreserve => {
+                        command.arg("autoreserve").current_dir(project_dir);
+                    }
+                }
+
+                command
+                    .arg("--format")
+                    .arg("json")
+                    .arg("--allow-unrelated-path")
+                    .output()
+                    .expect("Failed to run concurrent group command")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    handles
+        .into_iter()
+        .map(|handle| handle.join().expect("Concurrent command thread panicked"))
+        .collect()
+}
+
 fn reservation_count(env: &TestEnv) -> i64 {
     let database_path = env.data_dir.join("trop.db");
     if !database_path.exists() {
@@ -273,6 +443,20 @@ fn assert_group_failure_is_closed(
         stderr.starts_with("Error: ") && stderr.contains(expected_error),
         "{case_name} should return a typed error, stderr: {stderr}"
     );
+    assert_stderr_is_inert(&stderr, case_name);
+
+    assert_eq!(
+        reservation_count(env),
+        0,
+        "{case_name} must roll back every reservation"
+    );
+}
+
+fn assert_stderr_is_inert(stderr: &str, case_name: &str) {
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "{case_name} leaked a terminal escape to stderr: {stderr:?}"
+    );
     for line in stderr.lines() {
         let line = line.trim_start();
         assert!(
@@ -283,12 +467,6 @@ fn assert_group_failure_is_closed(
             "{case_name} leaked a generated line to stderr: {line:?}"
         );
     }
-
-    assert_eq!(
-        reservation_count(env),
-        0,
-        "{case_name} must roll back every reservation"
-    );
 }
 
 /// Create a nested directory structure for testing autoreserve discovery.
@@ -1191,13 +1369,9 @@ fn test_reserve_group_with_allow_unrelated_path() {
 
 /// Test reserve-group with --allow-project-change flag.
 ///
-/// CURRENT BEHAVIOR: Group reservations don't currently enforce sticky field
-/// validation in the same way as single reservations. This test documents that
-/// reserve-group succeeds even when the project changes, since each call
-/// creates new reservations.
-///
-/// NOTE: If group idempotency is implemented, sticky field validation would
-/// become relevant and this test would need to verify that behavior.
+/// Group sticky-field authorization and persistence are covered by the
+/// dedicated group-safety work. This test currently verifies that the flag is
+/// accepted while compatible group reuse keeps the reservation set complete.
 #[test]
 fn test_reserve_group_with_allow_project_change() {
     let env = TestEnv::new();
@@ -1216,8 +1390,7 @@ fn test_reserve_group_with_allow_project_change() {
     // Change config to different project
     create_test_config(&config_path, "different-project");
 
-    // CURRENT BEHAVIOR: Succeeds without permission since new reservations are created
-    // If idempotency is implemented, this might fail without --allow-project-change
+    // Sticky-field enforcement is intentionally handled separately.
     env.command()
         .arg("reserve-group")
         .arg(&config_path)
@@ -1237,9 +1410,8 @@ fn test_reserve_group_with_allow_project_change() {
 
 /// Test reserve-group with --allow-task-change flag.
 ///
-/// CURRENT BEHAVIOR: Similar to project changes, task changes don't trigger
-/// sticky field validation failures since each group reservation creates new
-/// entries. This test documents the current non-idempotent behavior.
+/// Group sticky-field authorization and persistence are handled separately;
+/// this test verifies the flag remains accepted during compatible reuse.
 #[test]
 fn test_reserve_group_with_allow_task_change() {
     let env = TestEnv::new();
@@ -1257,7 +1429,7 @@ fn test_reserve_group_with_allow_task_change() {
         .assert()
         .success();
 
-    // CURRENT BEHAVIOR: Changing task succeeds (creates new reservations)
+    // Sticky-field enforcement is intentionally handled separately.
     env.command()
         .arg("reserve-group")
         .arg(&config_path)
@@ -2069,14 +2241,386 @@ fn test_reserve_group_without_env_mappings() {
     );
 }
 
-/// Test autoreserve repeated calls behavior.
-///
-/// CURRENT BEHAVIOR: Group reservations currently allocate new ports on each call.
-/// This test documents the existing behavior where repeated autoreserve calls
-/// create new reservations rather than reusing existing ones.
-///
-/// NOTE: This may change in the future to be idempotent (return same ports),
-/// which would be more consistent with the single-reservation behavior.
+/// Repeated reserve-group calls return the same mapping.
+#[test]
+fn test_reserve_group_idempotency() {
+    let env = TestEnv::new();
+    let project_dir = env.create_dir("project");
+    let config_path = project_dir.join("trop.yaml");
+    create_test_config(&config_path, "test-project");
+
+    let reserve_group = || {
+        env.command()
+            .arg("reserve-group")
+            .arg(&config_path)
+            .arg("--format")
+            .arg("json")
+            .arg("--allow-unrelated-path")
+            .output()
+            .expect("Failed to run reserve-group")
+    };
+
+    let output1 = reserve_group();
+    let output2 = reserve_group();
+
+    assert!(
+        output1.status.success(),
+        "first reserve-group failed: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
+    assert!(
+        output2.status.success(),
+        "second reserve-group failed: {}",
+        String::from_utf8_lossy(&output2.stderr)
+    );
+    assert_eq!(
+        output1.stdout, output2.stdout,
+        "repeated reserve-group calls must return a byte-identical mapping"
+    );
+    assert_eq!(
+        reservation_count(&env),
+        2,
+        "repeating a group must retain exactly one row per service"
+    );
+}
+
+/// Tag whitespace is normalized once for storage, reconciliation, allocation
+/// output, and explicit environment-variable lookup.
+#[test]
+fn test_group_idempotency_uses_normalized_tag_identity() {
+    let env = TestEnv::new();
+    let project_dir = env.create_dir("project");
+    let config_path = project_dir.join("trop.yaml");
+    create_identifier_config(&config_path, &[(" web ", Some("WEB_PORT"))]);
+    let dotenv = OutputBoundary {
+        name: "dotenv",
+        format: "dotenv",
+        shell: None,
+    };
+
+    let first = run_group_command(
+        &env,
+        &project_dir,
+        &config_path,
+        GroupCommandKind::ReserveGroup,
+        dotenv,
+    );
+    let second = run_group_command(
+        &env,
+        &project_dir,
+        &config_path,
+        GroupCommandKind::Autoreserve,
+        dotenv,
+    );
+
+    assert!(
+        first.status.success(),
+        "padded-tag reserve-group failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "padded-tag autoreserve failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        second.stdout, first.stdout,
+        "raw and stored tag spellings must resolve to one stable identity"
+    );
+    assert!(
+        String::from_utf8_lossy(&first.stdout).starts_with("WEB_PORT="),
+        "normalized allocations must retain the explicit env mapping: {}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+    let rows = reservation_rows(&env);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "web");
+}
+
+/// Distinct raw config keys that normalize to one reservation identity are
+/// rejected before normal and dry-run entrypoints can persist or forge output.
+#[test]
+fn test_group_commands_reject_tags_colliding_after_normalization() {
+    let hostile_tag = "service\nexport ATTACK=1\u{1b}[31m";
+    for kind in GroupCommandKind::ALL {
+        for dry_run in [false, true] {
+            let env = TestEnv::new();
+            let project_dir = env.create_dir(kind.name());
+            let config_path = project_dir.join("trop.yaml");
+            create_identifier_config(
+                &config_path,
+                &[
+                    (hostile_tag, Some("SAFE_PORT")),
+                    (&format!(" {hostile_tag} "), Some("OTHER_SAFE_PORT")),
+                ],
+            );
+
+            let output = if dry_run {
+                run_json_group_dry_run(&env, &project_dir, &config_path, kind)
+            } else {
+                run_json_group_command(&env, &project_dir, &config_path, kind)
+            };
+            let mode = if dry_run { "dry-run" } else { "normal" };
+
+            assert_group_failure_is_closed(
+                &env,
+                &output,
+                &format!("{} {mode} normalized tag collision", kind.name()),
+                "must be unique after trimming whitespace",
+            );
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains(hostile_tag),
+                "collision diagnostic must not echo the hostile tag: {:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+/// Reconciliation conflicts keep broad explicitly mapped tags out of
+/// executable-looking diagnostics and leave the incompatible group untouched.
+#[test]
+fn test_group_reconciliation_conflict_diagnostics_keep_hostile_tags_inert() {
+    let env = TestEnv::new();
+    let project_dir = env.create_dir("project");
+    let config_path = project_dir.join("trop.yaml");
+    let hostile_tag = "service\nexport ATTACK=1\u{1b}[31m";
+    create_identifier_config(
+        &config_path,
+        &[
+            ("api", Some("API_PORT")),
+            (hostile_tag, Some("SAFE_SERVICE_PORT")),
+        ],
+    );
+
+    let initial = run_json_group_command(
+        &env,
+        &project_dir,
+        &config_path,
+        GroupCommandKind::ReserveGroup,
+    );
+    assert!(
+        initial.status.success(),
+        "hostile mapped tag should allocate safely: {}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+
+    let connection = rusqlite::Connection::open(env.data_dir.join("trop.db"))
+        .expect("Failed to open test database");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE reservations SET port = port + 1 WHERE tag = ?1",
+                [hostile_tag],
+            )
+            .expect("Failed to inject an incompatible stored mapping"),
+        1
+    );
+    drop(connection);
+    let before = reservation_rows(&env);
+
+    let repeated = run_json_group_command(
+        &env,
+        &project_dir,
+        &config_path,
+        GroupCommandKind::Autoreserve,
+    );
+
+    assert!(
+        !repeated.status.success(),
+        "incompatible hostile-tag group should fail"
+    );
+    assert_eq!(
+        repeated.stdout, b"",
+        "reconciliation conflict must not emit generated output"
+    );
+    let stderr = String::from_utf8_lossy(&repeated.stderr);
+    assert!(
+        stderr.starts_with("Error: ") && stderr.contains("reservation conflict"),
+        "reconciliation should return a typed conflict: {stderr}"
+    );
+    assert_stderr_is_inert(&stderr, "hostile-tag reconciliation conflict");
+    assert!(
+        !stderr.contains(hostile_tag),
+        "reconciliation diagnostic must not echo the hostile tag: {stderr:?}"
+    );
+    assert_eq!(
+        reservation_rows(&env),
+        before,
+        "reconciliation conflict must preserve every stored row"
+    );
+}
+
+/// Offset-only, preferred-only, and mixed groups remain stable across both
+/// entrypoints.
+#[test]
+fn test_group_idempotency_covers_allocation_shapes_and_entrypoints() {
+    for case_name in ["offset", "preferred", "mixed"] {
+        let env = TestEnv::new();
+        let project_dir = env.create_dir(case_name);
+        let config_path = project_dir.join("trop.yaml");
+        let expected_services = match case_name {
+            "offset" => {
+                create_test_config(&config_path, "offset-project");
+                2
+            }
+            "preferred" => {
+                create_config_with_preferred_ports(&config_path);
+                2
+            }
+            "mixed" => {
+                create_config_with_mixed_ports(&config_path);
+                3
+            }
+            _ => unreachable!("all cases are enumerated above"),
+        };
+
+        let calls = [
+            GroupCommandKind::ReserveGroup,
+            GroupCommandKind::ReserveGroup,
+            GroupCommandKind::Autoreserve,
+            GroupCommandKind::Autoreserve,
+        ];
+        let outputs = calls
+            .into_iter()
+            .map(|kind| run_json_group_command(&env, &project_dir, &config_path, kind))
+            .collect::<Vec<_>>();
+
+        for output in &outputs {
+            assert!(
+                output.status.success(),
+                "{case_name} group call failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let expected = &outputs[0].stdout;
+        for output in outputs.iter().skip(1) {
+            assert_eq!(
+                &output.stdout, expected,
+                "{case_name} group mappings must be byte-identical across entrypoints"
+            );
+        }
+        assert_eq!(
+            reservation_count(&env),
+            expected_services,
+            "{case_name} group must retain exactly one row per service"
+        );
+    }
+}
+
+/// Compatible reuse preserves creation metadata and refreshes every member.
+#[test]
+fn test_group_idempotency_preserves_created_at_and_refreshes_last_used() {
+    let env = TestEnv::new();
+    let project_dir = env.create_dir("project");
+    let config_path = project_dir.join("trop.yaml");
+    create_test_config(&config_path, "test-project");
+
+    let first = run_json_group_command(
+        &env,
+        &project_dir,
+        &config_path,
+        GroupCommandKind::ReserveGroup,
+    );
+    assert!(
+        first.status.success(),
+        "initial group call failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let connection = rusqlite::Connection::open(env.data_dir.join("trop.db"))
+        .expect("Failed to open test database");
+    connection
+        .execute(
+            "UPDATE reservations SET created_at = 123, last_used_at = 1",
+            [],
+        )
+        .expect("Failed to age reservation timestamps");
+    drop(connection);
+
+    let second = run_json_group_command(
+        &env,
+        &project_dir,
+        &config_path,
+        GroupCommandKind::Autoreserve,
+    );
+    assert!(
+        second.status.success(),
+        "repeated group call failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        first.stdout, second.stdout,
+        "refreshing a compatible group must preserve its mapping"
+    );
+
+    let rows = reservation_rows(&env);
+    assert_eq!(rows.len(), 2);
+    for (tag, _port, created_at, last_used_at) in rows {
+        assert_eq!(
+            created_at, 123,
+            "compatible reuse must preserve {tag}'s creation timestamp"
+        );
+        assert!(
+            last_used_at > 1,
+            "compatible reuse must refresh {tag}'s last-used timestamp"
+        );
+    }
+}
+
+/// A partial stored group is rejected without filling or replacing rows.
+#[test]
+fn test_partial_group_conflict_is_atomic() {
+    let env = TestEnv::new();
+    let project_dir = env.create_dir("project");
+    let config_path = project_dir.join("trop.yaml");
+    create_test_config(&config_path, "test-project");
+
+    let initial = run_json_group_command(
+        &env,
+        &project_dir,
+        &config_path,
+        GroupCommandKind::ReserveGroup,
+    );
+    assert!(
+        initial.status.success(),
+        "initial group call failed: {}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+
+    let connection = rusqlite::Connection::open(env.data_dir.join("trop.db"))
+        .expect("Failed to open test database");
+    connection
+        .execute("DELETE FROM reservations WHERE tag = 'api'", [])
+        .expect("Failed to inject a partial group");
+    drop(connection);
+    let before = reservation_rows(&env);
+    assert_eq!(before.len(), 1, "fixture must contain one partial row");
+
+    let repeated = run_json_group_command(
+        &env,
+        &project_dir,
+        &config_path,
+        GroupCommandKind::Autoreserve,
+    );
+    assert!(
+        !repeated.status.success(),
+        "a partial group must fail instead of mixing old and new rows"
+    );
+    assert!(
+        String::from_utf8_lossy(&repeated.stderr).contains("reservation conflict"),
+        "partial group failure should identify the conflict: {}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    assert_eq!(
+        reservation_rows(&env),
+        before,
+        "a partial-group conflict must not mutate the surviving row"
+    );
+}
+
+/// Repeated autoreserve calls return the same mapping.
 #[test]
 fn test_autoreserve_idempotency() {
     let env = TestEnv::new();
@@ -2114,27 +2658,23 @@ fn test_autoreserve_idempotency() {
     let stdout2 = String::from_utf8(output2.stdout).expect("Invalid UTF-8");
     let json2: serde_json::Value = serde_json::from_str(&stdout2).expect("Should be valid JSON");
 
-    // CURRENT BEHAVIOR: Allocates different ports each time
-    // Future enhancement: Could be made idempotent
-    assert_ne!(
+    assert_eq!(
         json1, json2,
-        "Currently, repeated calls allocate new ports (not idempotent)"
+        "repeated autoreserve calls must return the same mapping"
     );
 
-    // Verify both calls successfully allocated ports
     assert!(json1.get("web").is_some());
     assert!(json1.get("api").is_some());
     assert!(json2.get("web").is_some());
     assert!(json2.get("api").is_some());
+    assert_eq!(
+        reservation_count(&env),
+        2,
+        "repeating a group must retain exactly one row per service"
+    );
 }
 
-/// Test reserve-group followed by autoreserve behavior.
-///
-/// CURRENT BEHAVIOR: Group reservations allocate new ports on each invocation,
-/// even when called via different commands (reserve-group vs autoreserve).
-/// This test documents that currently there is no idempotency across commands.
-///
-/// NOTE: Future enhancement could make this idempotent if desired.
+/// reserve-group and autoreserve share one idempotent group identity.
 #[test]
 fn test_reserve_group_then_autoreserve() {
     let env = TestEnv::new();
@@ -2172,15 +2712,163 @@ fn test_reserve_group_then_autoreserve() {
     let stdout2 = String::from_utf8(output2.stdout).expect("Invalid UTF-8");
     let json2: serde_json::Value = serde_json::from_str(&stdout2).expect("Should be valid JSON");
 
-    // CURRENT BEHAVIOR: Different commands allocate different ports
-    assert_ne!(
+    assert_eq!(
         json1, json2,
-        "Currently, different commands allocate new ports (not idempotent)"
+        "reserve-group and autoreserve must return the same mapping"
     );
 
-    // Both should have successfully allocated ports
     assert!(json1.get("web").is_some());
     assert!(json1.get("api").is_some());
     assert!(json2.get("web").is_some());
     assert!(json2.get("api").is_some());
+    assert_eq!(
+        reservation_count(&env),
+        2,
+        "alternating commands must retain exactly one row per service"
+    );
+}
+
+/// Competing processes for one new group converge on one complete mapping.
+#[test]
+fn test_concurrent_same_group_requests_converge() {
+    let env = TestEnv::new();
+    env.command().arg("init").assert().success();
+
+    let project_dir = env.create_dir("project");
+    let config_path = project_dir.join("trop.yaml");
+    create_config_with_mixed_ports(&config_path);
+
+    let mut expected_output = None;
+    for _round in 0..3 {
+        let specs = (0..6)
+            .map(|index| {
+                let kind = if index % 2 == 0 {
+                    GroupCommandKind::ReserveGroup
+                } else {
+                    GroupCommandKind::Autoreserve
+                };
+                (project_dir.clone(), config_path.clone(), kind)
+            })
+            .collect::<Vec<_>>();
+        let outputs = run_concurrent_group_processes(&env.data_dir, &specs);
+
+        for output in &outputs {
+            assert!(
+                output.status.success(),
+                "concurrent same-group request failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let round_output = outputs[0].stdout.clone();
+        for output in outputs.iter().skip(1) {
+            assert_eq!(
+                output.stdout, round_output,
+                "same-group processes must return one byte-identical mapping"
+            );
+        }
+        if let Some(expected) = &expected_output {
+            assert_eq!(
+                &round_output, expected,
+                "same-group mapping must remain stable across stress rounds"
+            );
+        } else {
+            expected_output = Some(round_output);
+        }
+
+        assert_eq!(
+            reservation_count(&env),
+            3,
+            "same-group concurrency must leave one complete three-service group"
+        );
+    }
+}
+
+/// Concurrent requests for distinct groups allocate unique complete mappings,
+/// and a second concurrent round preserves each mapping.
+#[test]
+fn test_concurrent_distinct_groups_remain_unique_and_stable() {
+    let env = TestEnv::new();
+    env.command().arg("init").assert().success();
+
+    let groups = (0..6)
+        .map(|index| {
+            let project_dir = env.create_dir(&format!("project-{index}"));
+            let config_path = project_dir.join("trop.yaml");
+            create_offset_config_without_occupancy_checks(
+                &config_path,
+                &format!("project-{index}"),
+            );
+            (project_dir, config_path)
+        })
+        .collect::<Vec<_>>();
+
+    let first_specs = groups
+        .iter()
+        .map(|(project_dir, config_path)| {
+            (
+                project_dir.clone(),
+                config_path.clone(),
+                GroupCommandKind::ReserveGroup,
+            )
+        })
+        .collect::<Vec<_>>();
+    let first_outputs = run_concurrent_group_processes(&env.data_dir, &first_specs);
+
+    let mut first_mappings = Vec::with_capacity(first_outputs.len());
+    let mut all_ports = HashSet::new();
+    for output in &first_outputs {
+        assert!(
+            output.status.success(),
+            "concurrent distinct-group request failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mapping: BTreeMap<String, u16> =
+            serde_json::from_slice(&output.stdout).expect("Group output should be JSON");
+        assert_eq!(mapping.len(), 2, "each distinct group must be complete");
+        for port in mapping.values() {
+            assert!(
+                all_ports.insert(*port),
+                "distinct groups must never share port {port}"
+            );
+        }
+        first_mappings.push(mapping);
+    }
+
+    assert_eq!(
+        reservation_count(&env),
+        12,
+        "six two-service groups must leave exactly twelve rows"
+    );
+
+    let second_specs = groups
+        .iter()
+        .map(|(project_dir, config_path)| {
+            (
+                project_dir.clone(),
+                config_path.clone(),
+                GroupCommandKind::Autoreserve,
+            )
+        })
+        .collect::<Vec<_>>();
+    let second_outputs = run_concurrent_group_processes(&env.data_dir, &second_specs);
+
+    for (index, output) in second_outputs.iter().enumerate() {
+        assert!(
+            output.status.success(),
+            "repeated concurrent distinct-group request failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mapping: BTreeMap<String, u16> =
+            serde_json::from_slice(&output.stdout).expect("Group output should be JSON");
+        assert_eq!(
+            mapping, first_mappings[index],
+            "distinct group {index} must retain its original mapping"
+        );
+    }
+    assert_eq!(
+        reservation_count(&env),
+        12,
+        "repeating distinct groups must not create or remove rows"
+    );
 }
