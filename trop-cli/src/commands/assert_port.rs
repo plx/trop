@@ -1,7 +1,7 @@
 //! Command to assert that a specific port is reserved.
 
 use crate::error::CliError;
-use crate::utils::{load_configuration, open_database, GlobalOptions};
+use crate::invocation::InvocationContext;
 use clap::Args;
 use trop::{Database, Port};
 
@@ -18,14 +18,13 @@ pub struct AssertPortCommand {
 }
 
 impl AssertPortCommand {
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
         // 1. Parse port
         let port =
             Port::try_from(self.port).map_err(|e| CliError::InvalidArguments(e.to_string()))?;
 
         // 2. Open database
-        let config = load_configuration(global)?;
-        let db = open_database(global, &config)?;
+        let db = context.open_database()?;
 
         // 3. Check if port is reserved (method already exists)
         let reserved = Database::is_port_reserved(db.connection(), port).map_err(CliError::from)?;

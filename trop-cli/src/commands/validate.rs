@@ -4,7 +4,7 @@ use crate::error::CliError;
 use crate::utils::GlobalOptions;
 use clap::Args;
 use std::path::PathBuf;
-use trop::config::{Config, ConfigValidator};
+use trop::config::{Config, ConfigFileKind, ConfigValidator, ConfigValueSource};
 
 /// Validate a trop configuration file.
 #[derive(Args)]
@@ -30,22 +30,30 @@ impl ValidateCommand {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        let is_tropfile = filename == "trop.yaml" || filename == "trop.local.yaml";
+        let kind = if filename == "config.yaml" {
+            ConfigFileKind::User
+        } else {
+            ConfigFileKind::Project
+        };
 
         // 3. Parse the file
         let contents = std::fs::read_to_string(&self.config_path)?;
         let config: Config = match serde_yaml::from_str(&contents) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Parse error: {e}");
+                eprintln!("Parse error in {}: {e}", self.config_path.display());
                 return Err(CliError::SemanticFailure(
                     "Configuration file is invalid".to_string(),
                 ));
             }
         };
 
-        // 4. Validate the configuration (ConfigValidator already exists)
-        match ConfigValidator::validate(&config, is_tropfile) {
+        // 4. Validate the document in the context of its exact source.
+        let source = ConfigValueSource::File {
+            kind,
+            path: self.config_path.clone(),
+        };
+        match ConfigValidator::validate_source(&config, &source) {
             Ok(()) => {
                 println!("Configuration is valid");
                 Ok(())

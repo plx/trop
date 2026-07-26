@@ -4,7 +4,8 @@
 //! reservations based on path and tag filters.
 
 use crate::error::CliError;
-use crate::utils::{load_configuration, open_database, resolve_path, GlobalOptions};
+use crate::invocation::InvocationContext;
+use crate::utils::resolve_path;
 use clap::Args;
 use std::path::PathBuf;
 use trop::{Database, PlanExecutor, ReleaseOptions, ReleasePlan, ReservationKey};
@@ -39,7 +40,8 @@ pub struct ReleaseCommand {
 
 impl ReleaseCommand {
     /// Execute the release command.
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
+        let global = context.global();
         // 1. Resolve path
         let path = resolve_path(self.path)?;
 
@@ -50,11 +52,8 @@ impl ReleaseCommand {
             ));
         }
 
-        // 3. Load configuration
-        let config = load_configuration(global)?;
-
-        // 4. Open database
-        let mut db = open_database(global, &config)?;
+        // 3. Open the database from the shared effective configuration.
+        let mut db = context.open_database()?;
 
         // 5. Handle recursive release or single release
         if self.recursive {

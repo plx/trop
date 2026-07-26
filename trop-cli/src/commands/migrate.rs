@@ -4,7 +4,7 @@
 //! from one path to another while preserving all metadata.
 
 use crate::error::CliError;
-use crate::utils::{load_configuration, open_database, GlobalOptions};
+use crate::invocation::InvocationContext;
 use clap::Args;
 use std::path::PathBuf;
 use trop::{execute_migrate, MigrateOptions, MigratePlan};
@@ -35,12 +35,11 @@ pub struct MigrateCommand {
 
 impl MigrateCommand {
     /// Execute the migrate command.
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
-        // 1. Load configuration
-        let config = load_configuration(global)?;
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
+        let global = context.global();
 
-        // 2. Open database
-        let mut db = open_database(global, &config)?;
+        // 1. Open database
+        let mut db = context.open_database()?;
 
         // 3. Build migrate options
         let options = MigrateOptions::new(self.from.clone(), self.to.clone())

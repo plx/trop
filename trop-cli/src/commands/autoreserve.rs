@@ -4,7 +4,8 @@
 //! discovers a config file and reserves ports for the defined group.
 
 use crate::error::CliError;
-use crate::utils::{format_allocations, load_configuration, open_database, GlobalOptions};
+use crate::invocation::InvocationContext;
+use crate::utils::format_allocations;
 use clap::Args;
 use std::env;
 use trop::operations::{AutoreserveOptions, AutoreservePlan};
@@ -33,19 +34,19 @@ pub struct AutoreserveCommand {
     pub force: bool,
 
     /// Allow operations on unrelated paths
-    #[arg(long, env = "TROP_ALLOW_UNRELATED_PATH")]
+    #[arg(long)]
     pub allow_unrelated_path: bool,
 
     /// Allow changing the project field
-    #[arg(long, env = "TROP_ALLOW_PROJECT_CHANGE")]
+    #[arg(long)]
     pub allow_project_change: bool,
 
     /// Allow changing the task field
-    #[arg(long, env = "TROP_ALLOW_TASK_CHANGE")]
+    #[arg(long)]
     pub allow_task_change: bool,
 
     /// Allow changing project or task fields
-    #[arg(long, env = "TROP_ALLOW_CHANGE")]
+    #[arg(long)]
     pub allow_change: bool,
 
     /// Perform a dry run
@@ -55,7 +56,8 @@ pub struct AutoreserveCommand {
 
 impl AutoreserveCommand {
     /// Execute the autoreserve command.
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
+        let global = context.global();
         // 1. Get current working directory as start directory
         let start_dir = env::current_dir().map_err(CliError::Io)?;
 
@@ -63,22 +65,24 @@ impl AutoreserveCommand {
         let options = AutoreserveOptions::new(start_dir.clone())
             .with_task(self.task)
             .with_force(self.force)
-            .with_allow_unrelated_path(self.allow_unrelated_path)
-            .with_allow_project_change(self.allow_project_change || self.allow_change)
-            .with_allow_task_change(self.allow_task_change || self.allow_change);
+            .with_allow_unrelated_path(context.effective()?.allow_unrelated_path())
+            .with_allow_project_change(context.effective()?.allow_project_change())
+            .with_allow_task_change(context.effective()?.allow_task_change());
 
         // 3. Discover config file
-        let planner = AutoreservePlan::new(options).map_err(|e| match &e {
-            trop::Error::InvalidPath { reason, .. }
-                if reason.contains("No trop configuration file found") =>
-            {
-                CliError::InvalidArguments(format!(
-                    "No trop configuration file found (searched from: {})",
-                    start_dir.display()
-                ))
-            }
-            _ => CliError::from(e),
-        })?;
+        let planner = AutoreservePlan::from_effective(options, context.effective()?).map_err(
+            |e| match &e {
+                trop::Error::InvalidPath { reason, .. }
+                    if reason.contains("No trop configuration file found") =>
+                {
+                    CliError::InvalidArguments(format!(
+                        "No trop configuration file found (searched from: {})",
+                        start_dir.display()
+                    ))
+                }
+                _ => CliError::from(e),
+            },
+        )?;
 
         let discovered_config = planner.discovered_config_path();
 
@@ -96,8 +100,7 @@ impl AutoreserveCommand {
         let output_format = self.format.to_output_format(self.shell.as_deref())?;
 
         // 6. Load configuration and open database
-        let config = load_configuration(global)?;
-        let mut db = open_database(global, &config)?;
+        let mut db = context.open_database()?;
 
         // 7. Begin transaction
         let tx = db.begin_transaction().map_err(CliError::from)?;

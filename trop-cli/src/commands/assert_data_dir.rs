@@ -1,10 +1,9 @@
 //! Command to assert that the data directory exists and is valid.
 
 use crate::error::CliError;
-use crate::utils::{resolve_data_dir, GlobalOptions};
+use crate::invocation::InvocationContext;
 use clap::Args;
-use std::path::{Path, PathBuf};
-use trop::{Database, DatabaseConfig};
+use std::path::PathBuf;
 
 /// Assert that the data directory exists and is valid.
 #[derive(Args)]
@@ -23,19 +22,16 @@ pub struct AssertDataDirCommand {
 }
 
 impl AssertDataDirCommand {
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
-        // 1. Resolve data directory
-        let data_dir = self
-            .data_dir
-            .or(global.data_dir.clone())
-            .unwrap_or_else(resolve_data_dir);
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
+        // 1. Use the data directory selected once for this invocation.
+        let data_dir = context.data_dir()?;
 
         // 2. Check existence
         let exists = data_dir.exists();
 
         // 3. If validating, check database integrity
         let valid = if exists && self.validate {
-            match validate_database(&data_dir) {
+            match validate_database(context) {
                 Ok(()) => true,
                 Err(_) => false,
             }
@@ -68,15 +64,9 @@ impl AssertDataDirCommand {
     }
 }
 
-fn validate_database(data_dir: &Path) -> Result<(), CliError> {
-    let db_path = data_dir.join("trop.db");
-    if !db_path.exists() {
-        return Err(CliError::InvalidArguments("Database file not found".into()));
-    }
-
-    // Open database and run integrity check
-    let config = DatabaseConfig::new(db_path);
-    let mut db = Database::open(config).map_err(CliError::from)?;
+fn validate_database(context: &InvocationContext) -> Result<(), CliError> {
+    // Open the existing database with the effective lock timeout.
+    let mut db = context.open_existing_database()?;
 
     // Run PRAGMA integrity_check
     db.verify_integrity().map_err(CliError::from)?;

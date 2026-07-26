@@ -1,9 +1,8 @@
 //! Command to add port or range to exclusion list.
 
 use crate::error::CliError;
-use crate::utils::{
-    load_configuration, open_database, resolve_config_file, resolve_data_dir, GlobalOptions,
-};
+use crate::invocation::InvocationContext;
+use crate::utils::GlobalOptions;
 use clap::Args;
 use std::path::Path;
 use trop::config::{Config, PortExclusion};
@@ -26,13 +25,13 @@ pub struct ExcludeCommand {
 }
 
 impl ExcludeCommand {
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
+        let global = context.global();
         // 1. Parse port or range
         let exclusion = self.parse_exclusion()?;
 
         // 2. Load configuration and database
-        let config = load_configuration(global)?;
-        let db = open_database(global, &config)?;
+        let db = context.open_database()?;
 
         // 3. Check if any ports are reserved (unless --force)
         if !self.force {
@@ -40,16 +39,7 @@ impl ExcludeCommand {
         }
 
         // 4. Determine target config file
-        let config_path = if self.global {
-            global
-                .data_dir
-                .as_ref()
-                .map(|d| d.join("config.yaml"))
-                .unwrap_or_else(|| resolve_data_dir().join("config.yaml"))
-        } else {
-            // Use resolve_config_file which returns project config if exists, otherwise global
-            resolve_config_file(global)?
-        };
+        let config_path = context.config_file_for_write(self.global)?;
 
         // 5. Load, modify, and save configuration
         let mut file_config = self.load_config_file(&config_path)?;

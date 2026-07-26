@@ -3,7 +3,8 @@
 //! This module provides support for TROP_* environment variables that
 //! override configuration file values.
 
-use crate::config::schema::{Config, PortExclusion};
+use crate::config::effective::ConfigField;
+use crate::config::schema::{Config, OutputFormat, PortExclusion};
 use crate::error::{Error, Result};
 use std::env;
 
@@ -30,28 +31,39 @@ impl EnvironmentConfig {
     /// Returns an error if any environment variable value is invalid
     /// (e.g., non-numeric port, invalid boolean).
     pub fn apply_overrides(config: &mut Config) -> Result<()> {
+        Self::apply_overrides_with(config, |_, _| {})
+    }
+
+    pub(crate) fn apply_overrides_with(
+        config: &mut Config,
+        mut on_field: impl FnMut(ConfigField, &'static str),
+    ) -> Result<()> {
         // TROP_PROJECT
         if let Ok(project) = env::var("TROP_PROJECT") {
             config.project = Some(project);
+            on_field(ConfigField::Project, "TROP_PROJECT");
         }
 
         // TROP_DISABLE_AUTOINIT
         if let Ok(val) = env::var("TROP_DISABLE_AUTOINIT") {
             config.disable_autoinit = Some(Self::parse_bool("TROP_DISABLE_AUTOINIT", &val)?);
+            on_field(ConfigField::DisableAutoinit, "TROP_DISABLE_AUTOINIT");
         }
 
         // TROP_DISABLE_AUTOPRUNE
         if let Ok(val) = env::var("TROP_DISABLE_AUTOPRUNE") {
             config.disable_autoprune = Some(Self::parse_bool("TROP_DISABLE_AUTOPRUNE", &val)?);
+            on_field(ConfigField::DisableAutoprune, "TROP_DISABLE_AUTOPRUNE");
         }
 
         // TROP_DISABLE_AUTOEXPIRE
         if let Ok(val) = env::var("TROP_DISABLE_AUTOEXPIRE") {
             config.disable_autoexpire = Some(Self::parse_bool("TROP_DISABLE_AUTOEXPIRE", &val)?);
+            on_field(ConfigField::DisableAutoexpire, "TROP_DISABLE_AUTOEXPIRE");
         }
 
         // Port range from TROP_PORT_MIN, TROP_PORT_MAX, and TROP_PORT_MAX_OFFSET
-        Self::apply_port_overrides(config)?;
+        Self::apply_port_overrides(config, &mut on_field)?;
 
         // TROP_EXCLUDED_PORTS (comma-separated)
         if let Ok(excluded) = env::var("TROP_EXCLUDED_PORTS") {
@@ -60,6 +72,7 @@ impl EnvironmentConfig {
                 Some(existing) => existing.extend(exclusions),
                 None => config.excluded_ports = Some(exclusions),
             }
+            on_field(ConfigField::ExcludedPorts, "TROP_EXCLUDED_PORTS");
         }
 
         // TROP_EXPIRE_AFTER_DAYS
@@ -71,44 +84,79 @@ impl EnvironmentConfig {
 
             let cleanup = config.cleanup.get_or_insert_with(Default::default);
             cleanup.expire_after_days = Some(days);
+            on_field(
+                ConfigField::CleanupExpireAfterDays,
+                "TROP_EXPIRE_AFTER_DAYS",
+            );
         }
 
-        // TROP_MAXIMUM_LOCK_WAIT_SECONDS
-        if let Ok(seconds) = env::var("TROP_MAXIMUM_LOCK_WAIT_SECONDS") {
+        // Canonical TROP_BUSY_TIMEOUT wins over its historical library alias.
+        if let Some((seconds, variable)) =
+            Self::read_with_alias("TROP_BUSY_TIMEOUT", &["TROP_MAXIMUM_LOCK_WAIT_SECONDS"])
+        {
             config.maximum_lock_wait_seconds =
                 Some(seconds.parse().map_err(|_| Error::Validation {
-                    field: "TROP_MAXIMUM_LOCK_WAIT_SECONDS".into(),
+                    field: variable.into(),
                     message: "Must be a positive integer".into(),
                 })?);
+            on_field(ConfigField::MaximumLockWaitSeconds, variable);
+        }
+
+        if let Ok(format) = env::var("TROP_OUTPUT_FORMAT") {
+            config.output_format = Some(match format.to_ascii_lowercase().as_str() {
+                "table" => OutputFormat::Table,
+                "json" => OutputFormat::Json,
+                "csv" => OutputFormat::Csv,
+                "tsv" => OutputFormat::Tsv,
+                _ => {
+                    return Err(Error::Validation {
+                        field: "TROP_OUTPUT_FORMAT".into(),
+                        message: format!(
+                            "Invalid output format: '{format}' (expected table/json/csv/tsv)"
+                        ),
+                    });
+                }
+            });
+            on_field(ConfigField::OutputFormat, "TROP_OUTPUT_FORMAT");
         }
 
         // Permission flags
         if let Ok(val) = env::var("TROP_ALLOW_UNRELATED_PATH") {
             config.allow_unrelated_path =
                 Some(Self::parse_bool("TROP_ALLOW_UNRELATED_PATH", &val)?);
+            on_field(ConfigField::AllowUnrelatedPath, "TROP_ALLOW_UNRELATED_PATH");
         }
 
-        if let Ok(val) = env::var("TROP_ALLOW_CHANGE_PROJECT") {
-            config.allow_change_project =
-                Some(Self::parse_bool("TROP_ALLOW_CHANGE_PROJECT", &val)?);
+        if let Some((val, variable)) =
+            Self::read_with_alias("TROP_ALLOW_PROJECT_CHANGE", &["TROP_ALLOW_CHANGE_PROJECT"])
+        {
+            config.allow_change_project = Some(Self::parse_bool(variable, &val)?);
+            on_field(ConfigField::AllowChangeProject, variable);
         }
 
-        if let Ok(val) = env::var("TROP_ALLOW_CHANGE_TASK") {
-            config.allow_change_task = Some(Self::parse_bool("TROP_ALLOW_CHANGE_TASK", &val)?);
+        if let Some((val, variable)) =
+            Self::read_with_alias("TROP_ALLOW_TASK_CHANGE", &["TROP_ALLOW_CHANGE_TASK"])
+        {
+            config.allow_change_task = Some(Self::parse_bool(variable, &val)?);
+            on_field(ConfigField::AllowChangeTask, variable);
         }
 
         if let Ok(val) = env::var("TROP_ALLOW_CHANGE") {
             config.allow_change = Some(Self::parse_bool("TROP_ALLOW_CHANGE", &val)?);
+            on_field(ConfigField::AllowChange, "TROP_ALLOW_CHANGE");
         }
 
         // Occupancy check flags
-        Self::apply_occupancy_overrides(config)?;
+        Self::apply_occupancy_overrides(config, &mut on_field)?;
 
         Ok(())
     }
 
     /// Apply port-related environment variable overrides.
-    fn apply_port_overrides(config: &mut Config) -> Result<()> {
+    fn apply_port_overrides(
+        config: &mut Config,
+        on_field: &mut impl FnMut(ConfigField, &'static str),
+    ) -> Result<()> {
         let mut port_config = config.ports.clone().unwrap_or_default();
         let mut modified = false;
 
@@ -118,6 +166,7 @@ impl EnvironmentConfig {
                 message: "Invalid port number".into(),
             })?;
             modified = true;
+            on_field(ConfigField::PortsMin, "TROP_PORT_MIN");
         }
 
         if let Ok(max) = env::var("TROP_PORT_MAX") {
@@ -127,6 +176,8 @@ impl EnvironmentConfig {
             })?);
             port_config.max_offset = None;
             modified = true;
+            on_field(ConfigField::PortsMax, "TROP_PORT_MAX");
+            on_field(ConfigField::PortsMaxOffset, "TROP_PORT_MAX");
         }
 
         if let Ok(max_offset) = env::var("TROP_PORT_MAX_OFFSET") {
@@ -136,6 +187,8 @@ impl EnvironmentConfig {
             })?);
             port_config.max = None;
             modified = true;
+            on_field(ConfigField::PortsMaxOffset, "TROP_PORT_MAX_OFFSET");
+            on_field(ConfigField::PortsMax, "TROP_PORT_MAX_OFFSET");
         }
 
         if modified {
@@ -146,39 +199,51 @@ impl EnvironmentConfig {
     }
 
     /// Apply occupancy check environment variable overrides.
-    fn apply_occupancy_overrides(config: &mut Config) -> Result<()> {
+    fn apply_occupancy_overrides(
+        config: &mut Config,
+        on_field: &mut impl FnMut(ConfigField, &'static str),
+    ) -> Result<()> {
         let mut occupancy = config.occupancy_check.clone().unwrap_or_default();
         let mut modified = false;
 
         if let Ok(val) = env::var("TROP_SKIP_OCCUPANCY_CHECK") {
             occupancy.skip = Some(Self::parse_bool("TROP_SKIP_OCCUPANCY_CHECK", &val)?);
             modified = true;
+            on_field(ConfigField::OccupancySkip, "TROP_SKIP_OCCUPANCY_CHECK");
         }
 
         if let Ok(val) = env::var("TROP_SKIP_IPV4") {
             occupancy.skip_ip4 = Some(Self::parse_bool("TROP_SKIP_IPV4", &val)?);
             modified = true;
+            on_field(ConfigField::OccupancySkipIp4, "TROP_SKIP_IPV4");
         }
 
         if let Ok(val) = env::var("TROP_SKIP_IPV6") {
             occupancy.skip_ip6 = Some(Self::parse_bool("TROP_SKIP_IPV6", &val)?);
             modified = true;
+            on_field(ConfigField::OccupancySkipIp6, "TROP_SKIP_IPV6");
         }
 
         if let Ok(val) = env::var("TROP_SKIP_TCP") {
             occupancy.skip_tcp = Some(Self::parse_bool("TROP_SKIP_TCP", &val)?);
             modified = true;
+            on_field(ConfigField::OccupancySkipTcp, "TROP_SKIP_TCP");
         }
 
         if let Ok(val) = env::var("TROP_SKIP_UDP") {
             occupancy.skip_udp = Some(Self::parse_bool("TROP_SKIP_UDP", &val)?);
             modified = true;
+            on_field(ConfigField::OccupancySkipUdp, "TROP_SKIP_UDP");
         }
 
         if let Ok(val) = env::var("TROP_CHECK_ALL_INTERFACES") {
             occupancy.check_all_interfaces =
                 Some(Self::parse_bool("TROP_CHECK_ALL_INTERFACES", &val)?);
             modified = true;
+            on_field(
+                ConfigField::OccupancyCheckAllInterfaces,
+                "TROP_CHECK_ALL_INTERFACES",
+            );
         }
 
         if modified {
@@ -186,6 +251,19 @@ impl EnvironmentConfig {
         }
 
         Ok(())
+    }
+
+    fn read_with_alias(
+        canonical: &'static str,
+        aliases: &[&'static str],
+    ) -> Option<(String, &'static str)> {
+        if let Ok(value) = env::var(canonical) {
+            return Some((value, canonical));
+        }
+
+        aliases
+            .iter()
+            .find_map(|alias| env::var(alias).ok().map(|value| (value, *alias)))
     }
 
     /// Parse a boolean value from a string.

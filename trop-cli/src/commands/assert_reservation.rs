@@ -1,9 +1,8 @@
 //! Command to assert that a reservation exists for a specific path/tag combination.
 
 use crate::error::CliError;
-use crate::utils::{
-    load_configuration, normalize_path, open_database, resolve_path, GlobalOptions,
-};
+use crate::invocation::InvocationContext;
+use crate::utils::{normalize_path, resolve_path};
 use clap::Args;
 use std::path::PathBuf;
 use trop::{Database, ReservationKey};
@@ -25,14 +24,14 @@ pub struct AssertReservationCommand {
 }
 
 impl AssertReservationCommand {
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
+        let global = context.global();
         // 1. Resolve path using existing utilities
         let path = resolve_path(self.path)?;
         let normalized = normalize_path(&path)?;
 
         // 2. Open database (read-only)
-        let config = load_configuration(global)?;
-        let db = open_database(global, &config)?;
+        let db = context.open_database()?;
 
         // 3. Build reservation key and query
         let key =

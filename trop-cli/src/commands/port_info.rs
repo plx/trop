@@ -1,7 +1,8 @@
 //! Command to display information about a specific port.
 
 use crate::error::CliError;
-use crate::utils::{format_timestamp, load_configuration, open_database, GlobalOptions};
+use crate::invocation::InvocationContext;
+use crate::utils::format_timestamp;
 use clap::Args;
 use trop::port::occupancy::{OccupancyCheckConfig, PortOccupancyChecker, SystemOccupancyChecker};
 use trop::{Database, Port};
@@ -19,14 +20,13 @@ pub struct PortInfoCommand {
 }
 
 impl PortInfoCommand {
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
         // 1. Parse port
         let port =
             Port::try_from(self.port).map_err(|e| CliError::InvalidArguments(e.to_string()))?;
 
         // 2. Open database and query
-        let config = load_configuration(global)?;
-        let db = open_database(global, &config)?;
+        let db = context.open_database()?;
 
         // 3. Find reservation for this port
         let reservation =
@@ -61,7 +61,12 @@ impl PortInfoCommand {
             println!("Occupancy status:");
 
             let checker = SystemOccupancyChecker;
-            let check_config = OccupancyCheckConfig::default();
+            let check_config = context
+                .config()?
+                .occupancy_check
+                .as_ref()
+                .map(OccupancyCheckConfig::from)
+                .unwrap_or_default();
 
             match checker.is_occupied(port, &check_config) {
                 Ok(occupied) => {

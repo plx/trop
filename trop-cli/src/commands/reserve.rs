@@ -4,10 +4,10 @@
 //! for a directory with optional metadata and constraints.
 
 use crate::error::CliError;
-use crate::utils::{load_configuration, open_database, resolve_path, GlobalOptions};
+use crate::invocation::InvocationContext;
+use crate::utils::resolve_path;
 use clap::Args;
 use std::path::PathBuf;
-use trop::config::{PortConfig, DEFAULT_MIN_PORT};
 use trop::{PlanExecutor, Port, ReservationKey, ReserveOptions, ReservePlan};
 
 /// Reserve a port for a directory.
@@ -23,7 +23,7 @@ pub struct ReserveCommand {
     pub tag: Option<String>,
 
     /// Project identifier
-    #[arg(long, value_name = "PROJECT", env = "TROP_PROJECT")]
+    #[arg(long, value_name = "PROJECT")]
     pub project: Option<String>,
 
     /// Task identifier
@@ -35,11 +35,11 @@ pub struct ReserveCommand {
     pub port: Option<String>,
 
     /// Minimum acceptable port
-    #[arg(long, value_name = "MIN", env = "TROP_PORT_MIN")]
+    #[arg(long, value_name = "MIN")]
     pub min: Option<String>,
 
     /// Maximum acceptable port
-    #[arg(long, value_name = "MAX", env = "TROP_PORT_MAX")]
+    #[arg(long, value_name = "MAX")]
     pub max: Option<String>,
 
     /// Overwrite existing reservation
@@ -59,27 +59,27 @@ pub struct ReserveCommand {
     pub force: bool,
 
     /// Allow operations on unrelated paths
-    #[arg(long, env = "TROP_ALLOW_UNRELATED_PATH")]
+    #[arg(long)]
     pub allow_unrelated_path: bool,
 
     /// Allow changing the project field
-    #[arg(long, env = "TROP_ALLOW_PROJECT_CHANGE")]
+    #[arg(long)]
     pub allow_project_change: bool,
 
     /// Allow changing the task field
-    #[arg(long, env = "TROP_ALLOW_TASK_CHANGE")]
+    #[arg(long)]
     pub allow_task_change: bool,
 
     /// Allow changing project or task fields
-    #[arg(long, env = "TROP_ALLOW_CHANGE")]
+    #[arg(long)]
     pub allow_change: bool,
 
     /// Disable automatic pruning
-    #[arg(long, env = "TROP_DISABLE_AUTOPRUNE")]
+    #[arg(long)]
     pub disable_autoprune: bool,
 
     /// Disable automatic expiration
-    #[arg(long, env = "TROP_DISABLE_AUTOEXPIRE")]
+    #[arg(long)]
     pub disable_autoexpire: bool,
 
     /// Disable all automatic cleanup
@@ -117,7 +117,8 @@ pub struct ReserveCommand {
 
 impl ReserveCommand {
     /// Execute the reserve command.
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
+        let global = context.global();
         // 1. Resolve path (use CWD if not specified, canonicalize if implicit)
         let path = resolve_path(self.path)?;
 
@@ -125,8 +126,9 @@ impl ReserveCommand {
         let key = ReservationKey::new(path, self.tag)
             .map_err(|e| CliError::InvalidArguments(e.to_string()))?;
 
-        // 3. Load configuration
-        let config = load_configuration(global)?;
+        // 3. Consume the configuration snapshot resolved before dispatch.
+        let effective = context.effective()?;
+        let config = effective.config();
 
         // 4. Parse and validate port arguments
         let port = self
@@ -138,79 +140,18 @@ impl ReserveCommand {
             .transpose()
             .map_err(|e| CliError::InvalidArguments(e.to_string()))?;
 
-        let min = self.min.as_deref().map(parse_port_string).transpose()?;
-
-        let max = self.max.as_deref().map(parse_port_string).transpose()?;
-
-        // 5. Validate port range (min <= max)
-        if let (Some(min_val), Some(max_val)) = (min, max) {
-            if min_val > max_val {
-                return Err(CliError::InvalidArguments(format!(
-                    "Invalid port range: min ({min_val}) must be less than or equal to max ({max_val})"
-                )));
-            }
-        }
-
-        // 6. Modify config for port range if min/max specified
-        let mut config = config;
-        if min.is_some() || max.is_some() {
-            // Override config port range with CLI arguments
-            let mut port_config = config.ports.clone().unwrap_or(PortConfig {
-                min: DEFAULT_MIN_PORT,
-                max: Some(trop::config::DEFAULT_MAX_PORT),
-                max_offset: None,
-            });
-            if let Some(min) = min {
-                port_config.min = min;
-            }
-            if let Some(max) = max {
-                port_config.max = Some(max);
-                port_config.max_offset = None;
-            }
-            config.ports = Some(port_config);
-        }
-
-        if self.skip_occupancy_check
-            || self.skip_tcp
-            || self.skip_udp
-            || self.skip_ipv4
-            || self.skip_ipv6
-            || self.check_all_interfaces
-        {
-            let mut occupancy = config.occupancy_check.clone().unwrap_or_default();
-            if self.skip_occupancy_check {
-                occupancy.skip = Some(true);
-            }
-            if self.skip_tcp {
-                occupancy.skip_tcp = Some(true);
-            }
-            if self.skip_udp {
-                occupancy.skip_udp = Some(true);
-            }
-            if self.skip_ipv4 {
-                occupancy.skip_ip4 = Some(true);
-            }
-            if self.skip_ipv6 {
-                occupancy.skip_ip6 = Some(true);
-            }
-            if self.check_all_interfaces {
-                occupancy.check_all_interfaces = Some(true);
-            }
-            config.occupancy_check = Some(occupancy);
-        }
-
         // 7. Build library ReserveOptions
         let options = ReserveOptions::new(key, port)
-            .with_project(self.project)
+            .with_project(effective.project().map(ToOwned::to_owned))
             .with_task(self.task)
             .with_ignore_occupied(self.ignore_occupied)
             .with_ignore_exclusions(self.ignore_exclusions)
             .with_force(self.force)
-            .with_allow_unrelated_path(self.allow_unrelated_path)
-            .with_allow_project_change(self.allow_project_change || self.allow_change)
-            .with_allow_task_change(self.allow_task_change || self.allow_change)
-            .with_disable_autoprune(self.disable_autoprune || self.disable_autoclean)
-            .with_disable_autoexpire(self.disable_autoexpire || self.disable_autoclean);
+            .with_allow_unrelated_path(effective.allow_unrelated_path())
+            .with_allow_project_change(effective.allow_project_change())
+            .with_allow_task_change(effective.allow_task_change())
+            .with_disable_autoprune(effective.disable_autoprune())
+            .with_disable_autoexpire(effective.disable_autoexpire());
 
         // 8. Handle dry-run mode
         if self.dry_run {
@@ -223,13 +164,13 @@ impl ReserveCommand {
         }
 
         // 8. Open database
-        let mut db = open_database(global, &config)?;
+        let mut db = context.open_database()?;
 
         // 9. Begin transaction - wraps entire operation (planning + execution)
         let tx = db.begin_transaction().map_err(CliError::from)?;
 
         // 10. Build plan (inside transaction - sees consistent view)
-        let plan = ReservePlan::new(options, &config)
+        let plan = ReservePlan::new(options, config)
             .build_plan(&tx)
             .map_err(CliError::from)?;
 
@@ -262,7 +203,7 @@ impl ReserveCommand {
 ///
 /// Returns an error if the string cannot be parsed as a number or if the number
 /// is outside the valid port range.
-fn parse_port_string(s: &str) -> Result<u16, CliError> {
+pub(crate) fn parse_port_string(s: &str) -> Result<u16, CliError> {
     // Try to parse as u32 first to detect values > 65535
     let parsed = s.parse::<u32>().map_err(|_| {
         CliError::InvalidArguments(format!("Invalid port number: '{s}' is not a valid number"))

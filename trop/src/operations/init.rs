@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::{Database, DatabaseConfig};
@@ -19,6 +20,8 @@ pub struct InitOptions {
     pub overwrite: bool,
     /// Create a default configuration file.
     pub create_config: bool,
+    /// Maximum time to wait for `SQLite` lock acquisition.
+    pub busy_timeout: Duration,
 }
 
 impl InitOptions {
@@ -29,6 +32,7 @@ impl InitOptions {
             data_dir,
             overwrite: false,
             create_config: false,
+            busy_timeout: Duration::from_secs(5),
         }
     }
 
@@ -43,6 +47,13 @@ impl InitOptions {
     #[must_use]
     pub fn with_create_config(mut self, create_config: bool) -> Self {
         self.create_config = create_config;
+        self
+    }
+
+    /// Sets the maximum time to wait for `SQLite` lock acquisition.
+    #[must_use]
+    pub const fn with_busy_timeout(mut self, busy_timeout: Duration) -> Self {
+        self.busy_timeout = busy_timeout;
         self
     }
 }
@@ -146,7 +157,7 @@ pub fn init_database(options: &InitOptions) -> Result<InitResult> {
     }
 
     // 5. Initialize database (this will create schema)
-    let db_config = DatabaseConfig::new(&db_path);
+    let db_config = DatabaseConfig::new(&db_path).with_busy_timeout(options.busy_timeout);
     let mut _db = Database::open(db_config)?;
     result.database_created = true;
 
@@ -168,6 +179,14 @@ pub fn init_database(options: &InitOptions) -> Result<InitResult> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_init_options_busy_timeout_override() {
+        let options =
+            InitOptions::new(PathBuf::from("/tmp/trop")).with_busy_timeout(Duration::from_secs(17));
+
+        assert_eq!(options.busy_timeout, Duration::from_secs(17));
+    }
 
     #[test]
     fn test_init_fresh_directory() {

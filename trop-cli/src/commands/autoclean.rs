@@ -4,9 +4,8 @@
 //! prune and expire operations.
 
 use crate::error::CliError;
-use crate::utils::{load_configuration, open_database, GlobalOptions};
+use crate::invocation::InvocationContext;
 use clap::Args;
-use trop::config::CleanupConfig;
 use trop::operations::CleanupOperations;
 
 /// Combined cleanup (prune + expire).
@@ -23,29 +22,16 @@ pub struct AutocleanCommand {
 
 impl AutocleanCommand {
     /// Execute the autoclean command.
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
-        // Load configuration
-        let config = load_configuration(global)?;
-
-        // Build cleanup config with overrides
-        let cleanup_config = if let Some(days) = self.days {
-            CleanupConfig {
-                expire_after_days: Some(days),
-            }
-        } else if let Some(ref cleanup) = config.cleanup {
-            cleanup.clone()
-        } else {
-            CleanupConfig {
-                expire_after_days: None,
-            }
-        };
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
+        let global = context.global();
+        let cleanup_config = context.effective()?.cleanup().clone();
 
         if self.dry_run && !global.quiet {
             eprintln!("[DRY RUN] Performing combined cleanup...");
         }
 
         // Open database
-        let mut db = open_database(global, &config)?;
+        let mut db = context.open_database()?;
 
         // Perform combined cleanup
         let result = CleanupOperations::autoclean(&mut db, &cleanup_config, self.dry_run)

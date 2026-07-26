@@ -4,10 +4,8 @@
 //! reservations in various formats (table, JSON, CSV, TSV).
 
 use crate::error::CliError;
-use crate::utils::{
-    format_timestamp, load_configuration, normalize_path, open_database, shorten_path,
-    GlobalOptions,
-};
+use crate::invocation::InvocationContext;
+use crate::utils::{format_timestamp, normalize_path, shorten_path};
 use clap::{Args, ValueEnum};
 use std::io::Write;
 use std::path::PathBuf;
@@ -28,14 +26,8 @@ const COLUMN_HEADERS: [&str; 7] = [
 #[derive(Args)]
 pub struct ListCommand {
     /// Output format
-    #[arg(
-        long,
-        value_enum,
-        default_value = "table",
-        env = "TROP_OUTPUT_FORMAT",
-        ignore_case = true
-    )]
-    pub format: OutputFormat,
+    #[arg(long, value_enum, ignore_case = true)]
+    pub format: Option<OutputFormat>,
 
     /// Filter by project
     #[arg(long, value_name = "PROJECT")]
@@ -70,12 +62,16 @@ pub enum OutputFormat {
 
 impl ListCommand {
     /// Execute the list command.
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
-        // 1. Load configuration
-        let config = load_configuration(global)?;
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
+        let format = match context.effective()?.output_format() {
+            trop::config::OutputFormat::Table => OutputFormat::Table,
+            trop::config::OutputFormat::Json => OutputFormat::Json,
+            trop::config::OutputFormat::Csv => OutputFormat::Csv,
+            trop::config::OutputFormat::Tsv => OutputFormat::Tsv,
+        };
 
         // 2. Open database (read-only access is fine)
-        let db = open_database(global, &config)?;
+        let db = context.open_database()?;
 
         // 3. Query reservations
         let mut reservations =
@@ -96,7 +92,7 @@ impl ListCommand {
         }
 
         // 5. Format and output to stdout
-        match self.format {
+        match format {
             OutputFormat::Table => format_as_table(&reservations, self.show_full_paths)?,
             OutputFormat::Json => format_as_json(&reservations)?,
             OutputFormat::Csv => format_as_csv(&reservations)?,

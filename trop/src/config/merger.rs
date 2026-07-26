@@ -5,6 +5,7 @@
 
 use crate::config::loader::ConfigSource;
 use crate::config::schema::{CleanupConfig, Config, PortConfig};
+use crate::config::ConfigField;
 
 /// Merges configuration sources according to precedence rules.
 ///
@@ -50,45 +51,63 @@ impl ConfigMerger {
     /// - Occupancy config: atomic replacement
     /// - Reservation groups: complete replacement
     pub fn merge_into(target: &mut Config, source: &Config) {
+        Self::merge_into_observed(target, source, |_| {});
+    }
+
+    pub(crate) fn merge_into_observed(
+        target: &mut Config,
+        source: &Config,
+        mut on_field: impl FnMut(ConfigField),
+    ) {
         // Simple fields - source overwrites if Some
         if source.project.is_some() {
             target.project.clone_from(&source.project);
+            on_field(ConfigField::Project);
         }
 
         if source.disable_autoinit.is_some() {
             target.disable_autoinit = source.disable_autoinit;
+            on_field(ConfigField::DisableAutoinit);
         }
 
         if source.disable_autoprune.is_some() {
             target.disable_autoprune = source.disable_autoprune;
+            on_field(ConfigField::DisableAutoprune);
         }
 
         if source.disable_autoexpire.is_some() {
             target.disable_autoexpire = source.disable_autoexpire;
+            on_field(ConfigField::DisableAutoexpire);
         }
 
         if source.allow_unrelated_path.is_some() {
             target.allow_unrelated_path = source.allow_unrelated_path;
+            on_field(ConfigField::AllowUnrelatedPath);
         }
 
         if source.allow_change_project.is_some() {
             target.allow_change_project = source.allow_change_project;
+            on_field(ConfigField::AllowChangeProject);
         }
 
         if source.allow_change_task.is_some() {
             target.allow_change_task = source.allow_change_task;
+            on_field(ConfigField::AllowChangeTask);
         }
 
         if source.allow_change.is_some() {
             target.allow_change = source.allow_change;
+            on_field(ConfigField::AllowChange);
         }
 
         if source.maximum_lock_wait_seconds.is_some() {
             target.maximum_lock_wait_seconds = source.maximum_lock_wait_seconds;
+            on_field(ConfigField::MaximumLockWaitSeconds);
         }
 
         if source.output_format.is_some() {
             target.output_format = source.output_format;
+            on_field(ConfigField::OutputFormat);
         }
 
         // Merge ports config
@@ -97,6 +116,13 @@ impl ConfigMerger {
                 Some(target_ports) => Self::merge_port_config(target_ports, source_ports),
                 None => source_ports.clone(),
             });
+            on_field(ConfigField::PortsMin);
+            if source_ports.max.is_some() || source_ports.max_offset.is_some() {
+                // Selecting either upper-bound representation also clears the
+                // mutually exclusive representation.
+                on_field(ConfigField::PortsMax);
+                on_field(ConfigField::PortsMaxOffset);
+            }
         }
 
         // Merge excluded_ports (union of all exclusions)
@@ -109,6 +135,7 @@ impl ConfigMerger {
                     target.excluded_ports.clone_from(&source.excluded_ports);
                 }
             }
+            on_field(ConfigField::ExcludedPorts);
         }
 
         // Merge cleanup config
@@ -117,16 +144,26 @@ impl ConfigMerger {
                 Some(target_cleanup) => Self::merge_cleanup(target_cleanup, source_cleanup),
                 None => source_cleanup.clone(),
             });
+            if source_cleanup.expire_after_days.is_some() {
+                on_field(ConfigField::CleanupExpireAfterDays);
+            }
         }
 
         // Occupancy config - full replacement (not field-by-field)
         if source.occupancy_check.is_some() {
             target.occupancy_check.clone_from(&source.occupancy_check);
+            on_field(ConfigField::OccupancySkip);
+            on_field(ConfigField::OccupancySkipIp4);
+            on_field(ConfigField::OccupancySkipIp6);
+            on_field(ConfigField::OccupancySkipTcp);
+            on_field(ConfigField::OccupancySkipUdp);
+            on_field(ConfigField::OccupancyCheckAllInterfaces);
         }
 
         // Reservation groups - don't merge, only replace
         if source.reservations.is_some() {
             target.reservations.clone_from(&source.reservations);
+            on_field(ConfigField::Reservations);
         }
     }
 

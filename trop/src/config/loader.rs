@@ -80,6 +80,35 @@ impl ConfigLoader {
         Ok(sources)
     }
 
+    pub(crate) fn load_with_project_file(
+        project_file: &Path,
+        data_dir: Option<&Path>,
+    ) -> Result<Vec<ConfigSource>> {
+        let mut sources = Vec::new();
+
+        if let Some(user_config) = Self::load_user_config(data_dir)? {
+            sources.push(user_config);
+        }
+
+        let precedence = if project_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "trop.local.yaml")
+        {
+            3
+        } else {
+            2
+        };
+
+        sources.push(ConfigSource {
+            path: project_file.to_path_buf(),
+            precedence,
+            config: Self::load_file(project_file)?,
+        });
+        sources.sort_by_key(|source| source.precedence);
+        Ok(sources)
+    }
+
     /// Load user configuration file.
     ///
     /// If `data_dir` is provided, loads from `{data_dir}/config.yaml`.

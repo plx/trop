@@ -4,6 +4,7 @@
 //! ensuring that values are valid and consistent.
 
 use crate::config::schema::{CleanupConfig, Config, PortConfig, PortExclusion, ReservationGroup};
+use crate::config::{ConfigFileKind, ConfigValueSource};
 use crate::error::{Error, Result};
 use crate::identifier::EnvironmentVariableName;
 use crate::port::Port;
@@ -22,6 +23,44 @@ use std::collections::HashSet;
 pub struct ConfigValidator;
 
 impl ConfigValidator {
+    /// Validate a configuration document in the context of its source.
+    ///
+    /// In addition to ordinary value validation, this rejects project-only
+    /// fields from user-wide `config.yaml` files and annotates validation
+    /// errors with the originating file or environment variable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source-annotated validation error when the document is invalid
+    /// for its source or contains an invalid value.
+    pub fn validate_source(config: &Config, source: &ConfigValueSource) -> Result<()> {
+        let is_user_file = matches!(
+            source,
+            ConfigValueSource::File {
+                kind: ConfigFileKind::User,
+                ..
+            }
+        );
+
+        if is_user_file && config.project.is_some() {
+            return Err(Self::source_error(
+                "project",
+                "project is only valid in trop.yaml/trop.local.yaml, not user config.yaml",
+                source,
+            ));
+        }
+
+        if is_user_file && config.reservations.is_some() {
+            return Err(Self::source_error(
+                "reservations",
+                "reservations are only valid in trop.yaml/trop.local.yaml, not user config.yaml",
+                source,
+            ));
+        }
+
+        Self::validate(config, !is_user_file).map_err(|error| Self::annotate(error, source))
+    }
+
     /// Validate a complete configuration.
     ///
     /// # Arguments
@@ -77,6 +116,31 @@ impl ConfigValidator {
         }
 
         Ok(())
+    }
+
+    fn source_error(field: &str, message: &str, source: &ConfigValueSource) -> Error {
+        let source = Self::source_name(source);
+        Error::Validation {
+            field: format!("{field} ({source})"),
+            message: message.to_string(),
+        }
+    }
+
+    pub(crate) fn annotate(error: Error, source: &ConfigValueSource) -> Error {
+        match error {
+            Error::Validation { field, message } => Self::source_error(&field, &message, source),
+            other => other,
+        }
+    }
+
+    fn source_name(source: &ConfigValueSource) -> String {
+        match source {
+            ConfigValueSource::BuiltIn => "<built-in defaults>".to_string(),
+            ConfigValueSource::File { path, .. } => path.display().to_string(),
+            ConfigValueSource::Environment { variable } => (*variable).to_string(),
+            ConfigValueSource::CommandLine => "<command line>".to_string(),
+            ConfigValueSource::Programmatic => "<programmatic override>".to_string(),
+        }
     }
 
     /// Validate string identifiers (project, task, tags).

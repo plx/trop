@@ -11,12 +11,13 @@
 //! Configuration is merged from multiple sources with the following precedence
 //! (highest to lowest):
 //!
-//! 1. Programmatic overrides (via `ConfigBuilder::with_config`)
-//! 2. Environment variables (TROP_*)
-//! 3. Private project config (`trop.local.yaml`)
-//! 4. Project config (`trop.yaml`)
-//! 5. User config (`~/.trop/config.yaml`)
-//! 6. Built-in defaults
+//! 1. Command-line overrides (via `ConfigBuilder::with_cli_config`)
+//! 2. Programmatic overrides (via `ConfigBuilder::with_config`)
+//! 3. Environment variables (TROP_*)
+//! 4. Private project config (`trop.local.yaml`)
+//! 5. Project config (`trop.yaml`)
+//! 6. User config (`~/.trop/config.yaml`)
+//! 7. Built-in defaults
 //!
 //! # Examples
 //!
@@ -72,6 +73,7 @@
 //! ```
 
 pub mod builder;
+pub mod effective;
 pub mod environment;
 pub mod loader;
 pub mod merger;
@@ -83,6 +85,10 @@ mod proptests;
 
 // Re-export key types at module root
 pub use builder::ConfigBuilder;
+pub use effective::{
+    ConfigField, ConfigFileKind, ConfigValueSource, EffectiveConfig, FieldProvenance,
+    LoadedConfigFile,
+};
 pub use environment::EnvironmentConfig;
 pub use loader::{ConfigLoader, ConfigSource};
 pub use merger::ConfigMerger;
