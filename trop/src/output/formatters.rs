@@ -1,6 +1,6 @@
 //! Output formatter implementations.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::identifier::EnvironmentVariableName;
 use crate::{Error, Port, Result};
@@ -117,8 +117,9 @@ pub struct JsonFormatter;
 
 impl OutputFormatter for JsonFormatter {
     fn format(&self, allocations: &HashMap<String, Port>) -> Result<String> {
-        // Convert Port values to u16 for JSON
-        let json_map: HashMap<String, u16> = allocations
+        // Sort service tags so identical mappings are byte-stable across
+        // processes with independently randomized HashMap iteration order.
+        let json_map: BTreeMap<String, u16> = allocations
             .iter()
             .map(|(k, v)| (k.clone(), v.value()))
             .collect();
@@ -616,6 +617,21 @@ mod tests {
         let parsed: HashMap<String, u16> = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed.get("web"), Some(&5000));
         assert_eq!(parsed.get("api"), Some(&5001));
+    }
+
+    #[test]
+    fn test_json_formatter_sorts_service_tags() {
+        let allocations = HashMap::from([
+            ("zebra".to_string(), Port::try_from(8080).unwrap()),
+            ("apple".to_string(), Port::try_from(8081).unwrap()),
+            ("mango".to_string(), Port::try_from(8082).unwrap()),
+        ]);
+        let output = JsonFormatter.format(&allocations).unwrap();
+
+        assert_eq!(
+            output,
+            "{\n  \"apple\": 8081,\n  \"mango\": 8082,\n  \"zebra\": 8080\n}"
+        );
     }
 
     /// Test JSON formatter with various allocation scenarios.

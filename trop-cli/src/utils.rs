@@ -78,7 +78,7 @@ pub fn format_allocations(
                 service
                     .env
                     .as_ref()
-                    .map(|env_name| (tag.clone(), env_name.clone()))
+                    .map(|env_name| (tag.trim().to_string(), env_name.clone()))
             })
             .collect::<HashMap<String, String>>()
     });

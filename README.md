@@ -87,6 +87,14 @@ trop autoreserve --format human
 trop autoreserve --format json
 ```
 
+Compatible group requests are idempotent: repeated `reserve-group`,
+`autoreserve`, or alternating invocations return the same service-to-port
+mapping, preserve creation timestamps, and refresh each service's last-used
+time in one transaction. A stored group is compatible when its complete tagged
+service set matches the configuration and its ports still satisfy the requested
+preferred/offset shape. Partial groups and changed service shapes fail without
+modifying any group row.
+
 Version 0.1.0 does not safely validate every generated variable name in
 `export` or `dotenv` output from `autoreserve` and `reserve-group`. Both 0.1.0
 crates are yanked, but yanking does not remove installed binaries or update

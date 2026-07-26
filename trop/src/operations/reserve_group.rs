@@ -247,9 +247,9 @@ impl ReserveGroupPlan {
     /// # Note on `_db` parameter
     ///
     /// The `_db` parameter is kept for API consistency with other plan types
-    /// (`ReservePlan`, `ReleasePlan`). Group allocation happens during execution
-    /// (not during planning), so the database isn't needed at plan-building time.
-    /// This matches the signature expected by the operations system.
+    /// (`ReservePlan`, `ReleasePlan`). Group reconciliation and allocation
+    /// happen during execution, inside the caller's transaction, so the
+    /// database is not inspected while building this plan.
     ///
     /// # Errors
     ///
@@ -330,12 +330,13 @@ impl ReserveGroupPlan {
             });
         }
 
-        Ok(GroupAllocationRequest {
+        GroupAllocationRequest {
             base_path: self.reservation_path.clone(),
             project: self.config.project.clone(),
             task: self.options.task.clone(),
             services,
-        })
+        }
+        .normalized()
     }
 
     /// Returns configuration adjusted so `reservations.base` is the group scan start.

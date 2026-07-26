@@ -59,6 +59,46 @@ pub struct GroupAllocationRequest {
     pub services: Vec<ServiceAllocationRequest>,
 }
 
+impl GroupAllocationRequest {
+    /// Return a validated request whose service tags use their reservation-key
+    /// identity. `ReservationKey` trims tags before storage, so group matching
+    /// and duplicate detection must use that same spelling before any write.
+    pub(crate) fn normalized(&self) -> Result<Self> {
+        if self.services.is_empty() {
+            return Err(Error::Validation {
+                field: "services".into(),
+                message: "Group allocation requires at least one service".into(),
+            });
+        }
+
+        let mut normalized = self.clone();
+        let mut seen_tags = std::collections::HashSet::new();
+        for service in &mut normalized.services {
+            service.tag = service.tag.trim().to_string();
+            if service.tag.is_empty() {
+                return Err(Error::Validation {
+                    field: "services".into(),
+                    message: "Service tags must not be empty or whitespace-only".into(),
+                });
+            }
+            if !seen_tags.insert(service.tag.clone()) {
+                return Err(Error::Validation {
+                    field: "services".into(),
+                    message: "Duplicate service tag after normalization".into(),
+                });
+            }
+            if service.preferred.is_none() && service.offset.is_none() {
+                return Err(Error::Validation {
+                    field: "services".into(),
+                    message: "Every service without a preferred port must have an offset".into(),
+                });
+            }
+        }
+
+        Ok(normalized)
+    }
+}
+
 /// Individual service in a group allocation request.
 ///
 /// Each service has a tag (identifier), an optional offset from the base port,
@@ -127,10 +167,11 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     /// Allocate a group of related ports atomically.
     ///
     /// This method implements group allocation with the following semantics:
-    /// 1. Separate services into those with preferred ports and those with offsets
-    /// 2. For offset-based services, find a base port where all offsets are available
-    /// 3. Create reservations for all services inside one savepoint
-    /// 4. Roll back the whole group if any insert fails
+    /// 1. Load tagged rows at the exact group path
+    /// 2. Reuse and refresh a complete shape-compatible group
+    /// 3. Allocate a fresh complete group only when no tagged rows exist
+    /// 4. Reject partial or incompatible groups without mutation
+    /// 5. Roll back the whole refresh/allocation if any write fails
     ///
     /// # Errors
     ///
@@ -139,12 +180,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     /// - No base port can be found for the offset pattern
     /// - Database operations fail
     /// - Preferred ports are unavailable
-    ///
-    /// # Panics
-    ///
-    /// Does not panic. The code uses `unwrap()` on `service.preferred` at line 253,
-    /// but this is safe because `preferred_services` is filtered to only contain
-    /// services where `preferred.is_some()`.
+    /// - Existing tagged rows form a partial or incompatible group
     ///
     /// # Examples
     ///
@@ -197,48 +233,182 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         request: &GroupAllocationRequest,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<GroupAllocationResult> {
-        // Validate request
-        if request.services.is_empty() {
-            return Err(Error::Validation {
-                field: "services".into(),
-                message: "Group allocation requires at least one service".into(),
-            });
+        let request = request.normalized()?;
+
+        // The CLI opens an IMMEDIATE outer transaction before execution. This
+        // savepoint keeps reconciliation/allocation atomic for library callers
+        // too, and rolls timestamp refreshes or inserts back as one unit.
+        Database::with_savepoint(conn, "trop_allocate_group", |conn| {
+            let existing =
+                Database::get_tagged_reservations_by_exact_path(conn, &request.base_path)?;
+
+            if existing.is_empty() {
+                return self.allocate_fresh_group(conn, &request, occupancy_config);
+            }
+
+            let result = self.compatible_existing_group(&request, &existing)?;
+            for reservation in &existing {
+                if !Database::update_last_used_simple(conn, reservation.key())? {
+                    return Err(Self::group_conflict(
+                        &request,
+                        "a stored service disappeared while refreshing the group",
+                    ));
+                }
+            }
+
+            Ok(result)
+        })
+    }
+
+    fn compatible_existing_group(
+        &self,
+        request: &GroupAllocationRequest,
+        existing: &[Reservation],
+    ) -> Result<GroupAllocationResult> {
+        let existing_by_tag = Self::index_existing_group(request, existing)?;
+        let mut allocations = HashMap::with_capacity(request.services.len());
+        let mut base_port = None;
+        let mut services = request.services.iter().collect::<Vec<_>>();
+        services.sort_unstable_by(|left, right| left.tag.cmp(&right.tag));
+
+        for service in services {
+            let reservation = existing_by_tag
+                .get(service.tag.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    Self::group_conflict(request, "stored group is missing a requested service")
+                })?;
+            let port = reservation.port();
+
+            if let Some(preferred) = service.preferred {
+                if port != preferred {
+                    return Err(Self::group_conflict(
+                        request,
+                        format!("stored port {port} does not match preferred port {preferred}"),
+                    ));
+                }
+            } else {
+                let offset = service.offset.ok_or_else(|| Error::Validation {
+                    field: "services".into(),
+                    message: "An offset-based service is missing its offset".into(),
+                })?;
+                let candidate = self.compatible_offset_base(request, port, offset)?;
+
+                match base_port {
+                    Some(base) if base != candidate => {
+                        return Err(Self::group_conflict(
+                            request,
+                            format!(
+                                "stored offset mappings imply different bases \
+                                 ({candidate} and {base})"
+                            ),
+                        ));
+                    }
+                    None => base_port = Some(candidate),
+                    Some(_) => {}
+                }
+            }
+
+            allocations.insert(service.tag.clone(), port);
         }
 
-        // Check for duplicate tags
-        let mut seen_tags = std::collections::HashSet::new();
-        for service in &request.services {
-            if !seen_tags.insert(&service.tag) {
-                return Err(Error::Validation {
-                    field: "services".into(),
-                    message: format!("Duplicate service tag: {}", service.tag),
-                });
+        Ok(GroupAllocationResult {
+            allocations,
+            base_port,
+        })
+    }
+
+    fn index_existing_group<'a>(
+        request: &GroupAllocationRequest,
+        existing: &'a [Reservation],
+    ) -> Result<HashMap<&'a str, &'a Reservation>> {
+        let mut existing_by_tag = HashMap::with_capacity(existing.len());
+        for reservation in existing {
+            let Some(tag) = reservation.key().tag.as_deref() else {
+                return Err(Self::group_conflict(
+                    request,
+                    "stored group unexpectedly contains an untagged reservation",
+                ));
+            };
+            if existing_by_tag.insert(tag, reservation).is_some() {
+                return Err(Self::group_conflict(
+                    request,
+                    "stored group contains duplicate service tags",
+                ));
             }
         }
 
-        // Separate services into those with preferred ports and those with offsets
+        let mut requested_tags = request
+            .services
+            .iter()
+            .map(|service| service.tag.as_str())
+            .collect::<Vec<_>>();
+        requested_tags.sort_unstable();
+        let mut existing_tags = existing_by_tag.keys().copied().collect::<Vec<_>>();
+        existing_tags.sort_unstable();
+
+        if requested_tags != existing_tags {
+            return Err(Self::group_conflict(
+                request,
+                "requested service set does not match stored service set",
+            ));
+        }
+
+        Ok(existing_by_tag)
+    }
+
+    fn compatible_offset_base(
+        &self,
+        request: &GroupAllocationRequest,
+        port: Port,
+        offset: u16,
+    ) -> Result<Port> {
+        let candidate_value = port.value().checked_sub(offset).ok_or_else(|| {
+            Self::group_conflict(
+                request,
+                format!("stored port {port} cannot satisfy requested offset {offset}"),
+            )
+        })?;
+        let candidate = Port::try_from(candidate_value).map_err(|_| {
+            Self::group_conflict(
+                request,
+                format!("stored port {port} implies invalid base {candidate_value}"),
+            )
+        })?;
+
+        if !self.range().contains(candidate) || !self.range().contains(port) {
+            return Err(Self::group_conflict(
+                request,
+                "a stored service mapping is outside the current scan range",
+            ));
+        }
+
+        Ok(candidate)
+    }
+
+    fn group_conflict(request: &GroupAllocationRequest, reason: impl Into<String>) -> Error {
+        Error::ReservationConflict {
+            details: format!(
+                "existing group at {} is incompatible: {}",
+                request.base_path.display(),
+                reason.into()
+            ),
+        }
+    }
+
+    fn allocate_fresh_group(
+        &self,
+        conn: &rusqlite::Connection,
+        request: &GroupAllocationRequest,
+        occupancy_config: &OccupancyCheckConfig,
+    ) -> Result<GroupAllocationResult> {
         let (preferred_services, offset_services): (Vec<_>, Vec<_>) =
             request.services.iter().partition(|s| s.preferred.is_some());
 
-        // Determine the base port
         let base_port = if offset_services.is_empty() {
             None
         } else {
-            // Extract offset pattern using two-phase validation:
-            // 1. First, filter_map extracts only services with Some(offset)
-            // 2. Later, we validate that the pattern is non-empty
-            // This allows us to provide a specific error message if all services
-            // without preferred ports are also missing offsets.
             let pattern: Vec<u16> = offset_services.iter().filter_map(|s| s.offset).collect();
-
-            if pattern.is_empty() {
-                return Err(Error::Validation {
-                    field: "services".into(),
-                    message: "Services without preferred ports must have offsets".into(),
-                });
-            }
-
-            // Find a base port where all offsets are available
             let base = self
                 .find_pattern_match(&pattern, conn, occupancy_config)?
                 .ok_or_else(|| Error::GroupAllocationFailed {
@@ -249,16 +419,16 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
             Some(base)
         };
 
-        // Build allocation map
         let mut allocations = HashMap::new();
         let mut reservations_to_create = Vec::new();
 
-        // Allocate preferred ports
         for service in &preferred_services {
-            let port = service.preferred.unwrap(); // Safe because we filtered for Some
+            let port = service.preferred.ok_or_else(|| Error::Validation {
+                field: "services".into(),
+                message: "A preferred-port service is missing its preferred port".into(),
+            })?;
             let key = ReservationKey::new(request.base_path.clone(), Some(service.tag.clone()))?;
 
-            // Check if port is available
             let options = AllocationOptions {
                 preferred: Some(port),
                 ignore_occupied: false,
@@ -266,9 +436,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
             };
 
             match self.allocate_single(conn, &options, occupancy_config)? {
-                crate::port::allocator::AllocationResult::Allocated(_) => {
-                    // Good, port is available
-                }
+                crate::port::allocator::AllocationResult::Allocated(_) => {}
                 crate::port::allocator::AllocationResult::PreferredUnavailable { port, reason } => {
                     return Err(Error::PreferredPortUnavailable { port, reason });
                 }
@@ -282,7 +450,6 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
 
             allocations.insert(service.tag.clone(), port);
 
-            // Prepare reservation
             let reservation = Reservation::builder(key, port)
                 .project(request.project.clone())
                 .task(request.task.clone())
@@ -290,12 +457,11 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
             reservations_to_create.push(reservation);
         }
 
-        // Allocate offset-based ports
         if let Some(base) = base_port {
             for service in &offset_services {
                 let offset = service.offset.ok_or_else(|| Error::Validation {
                     field: "services".into(),
-                    message: format!("Service {} missing offset", service.tag),
+                    message: "An offset-based service is missing its offset".into(),
                 })?;
 
                 let port = base.checked_add(offset).ok_or_else(|| Error::Validation {
@@ -308,7 +474,6 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
 
                 allocations.insert(service.tag.clone(), port);
 
-                // Prepare reservation
                 let reservation = Reservation::builder(key, port)
                     .project(request.project.clone())
                     .task(request.task.clone())
@@ -317,14 +482,9 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
             }
         }
 
-        // Create all reservations atomically. This covers races where another
-        // process claims a port after availability was checked but before insert.
-        Database::with_savepoint(conn, "trop_allocate_group", |conn| {
-            for reservation in &reservations_to_create {
-                Database::create_reservation_simple(conn, reservation)?;
-            }
-            Ok(())
-        })?;
+        for reservation in &reservations_to_create {
+            Database::create_reservation_simple(conn, reservation)?;
+        }
 
         Ok(GroupAllocationResult {
             allocations,
@@ -451,9 +611,21 @@ mod tests {
     }
 
     #[test]
-    fn test_group_allocation_rolls_back_if_insert_conflicts() {
+    fn test_group_allocation_rolls_back_if_late_insert_fails() {
         let db = create_test_database();
         let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
+        db.connection()
+            .execute_batch(
+                r"
+                CREATE TRIGGER fail_api_insert
+                BEFORE INSERT ON reservations
+                WHEN NEW.tag = 'api'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced late group insert failure');
+                END;
+                ",
+            )
+            .unwrap();
 
         let request = GroupAllocationRequest {
             base_path: PathBuf::from("/test/project"),
@@ -468,7 +640,7 @@ mod tests {
                 ServiceAllocationRequest {
                     tag: "api".to_string(),
                     offset: None,
-                    preferred: Some(Port::try_from(5000).unwrap()),
+                    preferred: Some(Port::try_from(5001).unwrap()),
                 },
             ],
         };
@@ -651,6 +823,86 @@ mod tests {
             }
             _ => panic!("Expected validation error"),
         }
+    }
+
+    #[test]
+    fn test_group_allocation_normalizes_tags_before_reuse() {
+        let db = create_test_database();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
+        let request = GroupAllocationRequest {
+            base_path: PathBuf::from("/test/project"),
+            project: Some("test".to_string()),
+            task: None,
+            services: vec![ServiceAllocationRequest {
+                tag: " web ".to_string(),
+                offset: Some(0),
+                preferred: None,
+            }],
+        };
+        let config = OccupancyCheckConfig::default();
+
+        let first = allocator
+            .allocate_group(db.connection(), &request, &config)
+            .expect("Padded tag should allocate");
+        let second = allocator
+            .allocate_group(db.connection(), &request, &config)
+            .expect("The same padded tag should reuse its normalized key");
+
+        assert_eq!(second, first);
+        assert_eq!(
+            first.allocations,
+            HashMap::from([("web".to_string(), Port::try_from(5000).unwrap())])
+        );
+        let reservations = Database::list_all_reservations(db.connection()).unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].key().tag.as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn test_group_allocation_rejects_tags_colliding_after_normalization() {
+        let db = create_test_database();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
+        let request = GroupAllocationRequest {
+            base_path: PathBuf::from("/test/project"),
+            project: Some("test".to_string()),
+            task: None,
+            services: vec![
+                ServiceAllocationRequest {
+                    tag: "web".to_string(),
+                    offset: Some(0),
+                    preferred: None,
+                },
+                ServiceAllocationRequest {
+                    tag: " web ".to_string(),
+                    offset: Some(1),
+                    preferred: None,
+                },
+            ],
+        };
+        let config = OccupancyCheckConfig::default();
+
+        let error = allocator
+            .allocate_group(db.connection(), &request, &config)
+            .expect_err("Tags with the same normalized identity must conflict");
+
+        assert!(
+            matches!(
+                error,
+                Error::Validation {
+                    ref field,
+                    ref message
+                }
+                    if field == "services"
+                        && message.contains("Duplicate service tag")
+            ),
+            "Expected a normalized duplicate-tag validation error, got {error}"
+        );
+        assert!(
+            Database::list_all_reservations(db.connection())
+                .unwrap()
+                .is_empty(),
+            "Normalized duplicate tags must fail before any row is written"
+        );
     }
 
     #[test]

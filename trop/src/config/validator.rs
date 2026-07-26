@@ -302,11 +302,18 @@ impl ConfigValidator {
         let mut seen_offsets = HashSet::new();
         let mut seen_preferred = HashSet::new();
         let mut seen_env_vars = HashSet::new();
+        let mut seen_tags = HashSet::new();
         let mut has_default_offset = false;
 
         for (tag, service) in &group.services {
             // Validate tag
             Self::validate_identifier("reservations.services.tag", tag)?;
+            if !seen_tags.insert(tag.trim()) {
+                return Err(Error::Validation {
+                    field: "reservations.services.tag".into(),
+                    message: "Service tags must be unique after trimming whitespace".into(),
+                });
+            }
 
             // Check offset uniqueness for services that participate in offset allocation.
             // Preferred-only services don't use the offset pattern unless an explicit
@@ -766,6 +773,43 @@ mod tests {
         };
 
         assert!(ConfigValidator::validate_reservation_group(&group).is_ok());
+    }
+
+    #[test]
+    fn test_validate_reservation_group_rejects_normalized_tag_collision_without_echoing_input() {
+        let hostile_tag = "api\nexport ATTACK=1\u{1b}[31m";
+        let services = HashMap::from([
+            (
+                hostile_tag.to_string(),
+                ServiceDefinition {
+                    offset: Some(0),
+                    preferred: None,
+                    env: Some("_SAFE_API_PORT".to_string()),
+                },
+            ),
+            (
+                format!(" {hostile_tag} "),
+                ServiceDefinition {
+                    offset: Some(1),
+                    preferred: None,
+                    env: Some("_OTHER_SAFE_API_PORT".to_string()),
+                },
+            ),
+        ]);
+        let group = ReservationGroup {
+            base: Some(5000),
+            services,
+        };
+
+        let error = ConfigValidator::validate_reservation_group(&group)
+            .expect_err("Trim-equivalent tags must be rejected");
+        let diagnostic = error.to_string();
+
+        assert!(diagnostic.contains("must be unique after trimming whitespace"));
+        assert!(!diagnostic.contains(hostile_tag));
+        assert!(!diagnostic.contains('\n'));
+        assert!(!diagnostic.contains('\r'));
+        assert!(!diagnostic.contains('\u{1b}'));
     }
 
     #[test]
