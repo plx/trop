@@ -121,6 +121,20 @@ If the stored tagged service set is partial or its ports no longer satisfy the
 configured preferred/offset shape, the command reports a reservation conflict
 and leaves the stored group unchanged.
 
+Project and task values are sticky on every group member. Omitted values
+preserve stored metadata; clearing is not supported. Use
+`--allow-project-change`, `--allow-task-change`, or `--allow-change` for only
+those metadata changes. By default, the config parent must be the invocation
+directory, an ancestor, or a descendant; `--allow-unrelated-path` bypasses only
+that relationship check.
+
+`--force` authorizes the path and both metadata changes plus one atomic
+replacement of an incompatible exact-path tagged group. Replacement resets the
+new set's creation times and can change its mapping, but it never removes
+same-path untagged or descendant reservations. Force does not bypass exclusions,
+OS occupancy, invalid configuration, exhaustion, or another reservation key's
+port. Any replacement failure restores the original group.
+
 ## Configuration
 
 `trop` resolves hierarchical configuration in this order, from highest to

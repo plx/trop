@@ -95,6 +95,22 @@ service set matches the configuration and its ports still satisfy the requested
 preferred/offset shape. Partial groups and changed service shapes fail without
 modifying any group row.
 
+Group metadata and paths use the same safety model as single reservations.
+Explicit project or task changes require `--allow-project-change`,
+`--allow-task-change`, their combined `--allow-change` form, or `--force`;
+omitting either value preserves the stored value because there is no metadata
+clearing interface. The group path must be the current directory, an ancestor,
+or a descendant unless `--allow-unrelated-path` or `--force` is supplied.
+Narrow flags authorize only their named check.
+
+For groups, `--force` combines the path and metadata permissions with
+authorization to replace an incompatible exact-path tagged group atomically.
+Replacement may choose a new mapping, resets creation times for the replacement
+set, and leaves same-path untagged reservations and descendant reservations
+alone. It does not bypass invalid configuration, exclusions, operating-system
+occupancy, range exhaustion, or another reservation key's ownership of a port.
+If replacement fails, the original exact-path tagged state is restored.
+
 Version 0.1.0 does not safely validate every generated variable name in
 `export` or `dotenv` output from `autoreserve` and `reserve-group`. Both 0.1.0
 crates are yanked, but yanking does not remove installed binaries or update

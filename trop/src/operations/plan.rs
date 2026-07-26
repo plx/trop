@@ -3,7 +3,7 @@
 //! This module defines the plan structures that describe what actions
 //! will be taken during an operation, without actually performing them.
 
-use crate::port::group::GroupAllocationRequest;
+use crate::port::group::{GroupAllocationRequest, GroupReconciliationPolicy};
 use crate::port::occupancy::OccupancyCheckConfig;
 use crate::{Reservation, ReservationKey};
 
@@ -41,6 +41,8 @@ pub enum PlanAction {
     AllocateGroup {
         /// The group allocation request.
         request: GroupAllocationRequest,
+        /// Safety permissions governing reconciliation with stored rows.
+        policy: GroupReconciliationPolicy,
         /// Full configuration (needed for port allocation).
         full_config: crate::config::Config,
         /// Occupancy check configuration.

@@ -219,11 +219,17 @@ impl<'conn> PlanExecutor<'conn> {
             }
             PlanAction::AllocateGroup {
                 request,
+                policy,
                 full_config,
                 occupancy_config,
             } => {
                 let allocator = allocator_from_config(full_config)?;
-                let result = allocator.allocate_group(self.conn, request, occupancy_config)?;
+                let result = allocator.allocate_group_with_policy(
+                    self.conn,
+                    request,
+                    occupancy_config,
+                    *policy,
+                )?;
                 Ok(Some(result.allocations))
             }
         }

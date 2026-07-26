@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use crate::database::Database;
 use crate::error::Error;
@@ -72,6 +73,8 @@ impl GroupAllocationRequest {
         }
 
         let mut normalized = self.clone();
+        normalized.project = Self::normalize_metadata("project", normalized.project.as_deref())?;
+        normalized.task = Self::normalize_metadata("task", normalized.task.as_deref())?;
         let mut seen_tags = std::collections::HashSet::new();
         for service in &mut normalized.services {
             service.tag = service.tag.trim().to_string();
@@ -97,6 +100,38 @@ impl GroupAllocationRequest {
 
         Ok(normalized)
     }
+
+    fn normalize_metadata(field: &str, value: Option<&str>) -> Result<Option<String>> {
+        value
+            .map(str::trim)
+            .map(|value| {
+                if value.is_empty() {
+                    Err(Error::Validation {
+                        field: field.to_string(),
+                        message: "Cannot be empty or only whitespace".to_string(),
+                    })
+                } else {
+                    Ok(value.to_string())
+                }
+            })
+            .transpose()
+    }
+}
+
+/// Safety policy for reconciling an existing reservation group.
+///
+/// Field-specific permissions authorize only their named metadata update.
+/// `force` additionally authorizes both metadata fields and one atomic
+/// replacement of an incompatible group shape. It deliberately does not relax
+/// database uniqueness, exclusion, or operating-system occupancy checks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroupReconciliationPolicy {
+    /// Authorize project metadata changes.
+    pub allow_project_change: bool,
+    /// Authorize task metadata changes.
+    pub allow_task_change: bool,
+    /// Authorize every group safety override, including shape replacement.
+    pub force: bool,
 }
 
 /// Individual service in a group allocation request.
@@ -163,15 +198,39 @@ pub struct GroupAllocationResult {
     pub base_port: Option<Port>,
 }
 
+#[derive(Debug, Clone)]
+struct GroupMetadataUpdate {
+    key: ReservationKey,
+    project: Option<String>,
+    task: Option<String>,
+}
+
+enum GroupReconciliation {
+    AllocateFresh(GroupAllocationRequest),
+    Refresh {
+        result: GroupAllocationResult,
+        metadata: Vec<GroupMetadataUpdate>,
+    },
+    Replace {
+        request: GroupAllocationRequest,
+        existing_keys: Vec<ReservationKey>,
+    },
+}
+
 impl<C: PortOccupancyChecker> PortAllocator<C> {
     /// Allocate a group of related ports atomically.
     ///
     /// This method implements group allocation with the following semantics:
     /// 1. Load tagged rows at the exact group path
-    /// 2. Reuse and refresh a complete shape-compatible group
-    /// 3. Allocate a fresh complete group only when no tagged rows exist
-    /// 4. Reject partial or incompatible groups without mutation
-    /// 5. Roll back the whole refresh/allocation if any write fails
+    /// 2. Validate every sticky metadata change before writing
+    /// 3. Reuse and atomically refresh a complete shape-compatible group
+    /// 4. Preserve stored metadata when the request omits it
+    /// 5. Allocate a fresh complete group only when no tagged rows exist
+    /// 6. Reject partial or incompatible groups without mutation
+    /// 7. Roll back the whole refresh/allocation if any write fails
+    ///
+    /// This compatibility entrypoint uses the default reconciliation policy,
+    /// so it never authorizes sticky changes or shape replacement.
     ///
     /// # Errors
     ///
@@ -233,6 +292,26 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         request: &GroupAllocationRequest,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<GroupAllocationResult> {
+        self.allocate_group_with_policy(
+            conn,
+            request,
+            occupancy_config,
+            GroupReconciliationPolicy::default(),
+        )
+    }
+
+    /// Allocate or reconcile a group under an explicit safety policy.
+    ///
+    /// The existing exact-path tagged rows are classified before any write.
+    /// The resulting refresh, fresh allocation, or forced replacement is then
+    /// executed inside one savepoint.
+    pub(crate) fn allocate_group_with_policy(
+        &self,
+        conn: &rusqlite::Connection,
+        request: &GroupAllocationRequest,
+        occupancy_config: &OccupancyCheckConfig,
+        policy: GroupReconciliationPolicy,
+    ) -> Result<GroupAllocationResult> {
         let request = request.normalized()?;
 
         // The CLI opens an IMMEDIATE outer transaction before execution. This
@@ -241,23 +320,189 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         Database::with_savepoint(conn, "trop_allocate_group", |conn| {
             let existing =
                 Database::get_tagged_reservations_by_exact_path(conn, &request.base_path)?;
-
-            if existing.is_empty() {
-                return self.allocate_fresh_group(conn, &request, occupancy_config);
-            }
-
-            let result = self.compatible_existing_group(&request, &existing)?;
-            for reservation in &existing {
-                if !Database::update_last_used_simple(conn, reservation.key())? {
-                    return Err(Self::group_conflict(
-                        &request,
-                        "a stored service disappeared while refreshing the group",
-                    ));
-                }
-            }
-
-            Ok(result)
+            let reconciliation = self.plan_reconciliation(&request, &existing, policy)?;
+            self.execute_reconciliation(conn, reconciliation, occupancy_config)
         })
+    }
+
+    fn plan_reconciliation(
+        &self,
+        request: &GroupAllocationRequest,
+        existing: &[Reservation],
+        policy: GroupReconciliationPolicy,
+    ) -> Result<GroupReconciliation> {
+        if existing.is_empty() {
+            return Ok(GroupReconciliation::AllocateFresh(request.clone()));
+        }
+
+        match self.compatible_existing_group(request, existing) {
+            Ok(result) => {
+                let metadata = Self::plan_metadata_refresh(request, existing, policy)?;
+                Ok(GroupReconciliation::Refresh { result, metadata })
+            }
+            Err(Error::ReservationConflict { .. }) if policy.force => {
+                let request = Self::replacement_request(request, existing)?;
+                let existing_keys = existing
+                    .iter()
+                    .map(|reservation| reservation.key().clone())
+                    .collect();
+                Ok(GroupReconciliation::Replace {
+                    request,
+                    existing_keys,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn execute_reconciliation(
+        &self,
+        conn: &rusqlite::Connection,
+        reconciliation: GroupReconciliation,
+        occupancy_config: &OccupancyCheckConfig,
+    ) -> Result<GroupAllocationResult> {
+        match reconciliation {
+            GroupReconciliation::AllocateFresh(request) => {
+                self.allocate_fresh_group(conn, &request, occupancy_config)
+            }
+            GroupReconciliation::Refresh { result, metadata } => {
+                let refreshed_at = SystemTime::now();
+                for update in metadata {
+                    if !Database::update_metadata_and_last_used_simple(
+                        conn,
+                        &update.key,
+                        update.project.as_deref(),
+                        update.task.as_deref(),
+                        refreshed_at,
+                    )? {
+                        return Err(Self::group_conflict_at_path(
+                            &update.key.path,
+                            "a stored service disappeared while refreshing the group",
+                        ));
+                    }
+                }
+                Ok(result)
+            }
+            GroupReconciliation::Replace {
+                request,
+                existing_keys,
+            } => {
+                for key in existing_keys {
+                    if !Database::delete_reservation_simple(conn, &key)? {
+                        return Err(Self::group_conflict(
+                            &request,
+                            "a stored service disappeared while replacing the group",
+                        ));
+                    }
+                }
+                self.allocate_fresh_group(conn, &request, occupancy_config)
+            }
+        }
+    }
+
+    fn plan_metadata_refresh(
+        request: &GroupAllocationRequest,
+        existing: &[Reservation],
+        policy: GroupReconciliationPolicy,
+    ) -> Result<Vec<GroupMetadataUpdate>> {
+        existing
+            .iter()
+            .map(|reservation| {
+                let project = Self::reconciled_metadata_field(
+                    request,
+                    "project",
+                    request.project.as_deref(),
+                    reservation.project(),
+                    policy.force || policy.allow_project_change,
+                )?;
+                let task = Self::reconciled_metadata_field(
+                    request,
+                    "task",
+                    request.task.as_deref(),
+                    reservation.task(),
+                    policy.force || policy.allow_task_change,
+                )?;
+
+                Ok(GroupMetadataUpdate {
+                    key: reservation.key().clone(),
+                    project,
+                    task,
+                })
+            })
+            .collect()
+    }
+
+    fn reconciled_metadata_field(
+        request: &GroupAllocationRequest,
+        field: &str,
+        requested: Option<&str>,
+        existing: Option<&str>,
+        allowed: bool,
+    ) -> Result<Option<String>> {
+        let Some(requested) = requested else {
+            return Ok(existing.map(str::to_string));
+        };
+
+        if Some(requested) != existing && !allowed {
+            let permission = match field {
+                "project" => "--allow-project-change",
+                "task" => "--allow-task-change",
+                _ => "--force",
+            };
+            return Err(Error::StickyFieldChange {
+                field: field.to_string(),
+                details: format!(
+                    "Cannot change group {field} from {existing:?} to {requested:?} \
+                     without --force or {permission} (group at {})",
+                    request.base_path.display()
+                ),
+            });
+        }
+
+        Ok(Some(requested.to_string()))
+    }
+
+    fn replacement_request(
+        request: &GroupAllocationRequest,
+        existing: &[Reservation],
+    ) -> Result<GroupAllocationRequest> {
+        let mut replacement = request.clone();
+        if replacement.project.is_none() {
+            replacement.project = Self::uniform_existing_metadata(
+                request,
+                existing,
+                "project",
+                Reservation::project,
+            )?;
+        }
+        if replacement.task.is_none() {
+            replacement.task =
+                Self::uniform_existing_metadata(request, existing, "task", Reservation::task)?;
+        }
+        Ok(replacement)
+    }
+
+    fn uniform_existing_metadata(
+        request: &GroupAllocationRequest,
+        existing: &[Reservation],
+        field: &str,
+        get: fn(&Reservation) -> Option<&str>,
+    ) -> Result<Option<String>> {
+        let first = existing.first().and_then(get);
+        if existing
+            .iter()
+            .skip(1)
+            .any(|reservation| get(reservation) != first)
+        {
+            return Err(Self::group_conflict(
+                request,
+                format!(
+                    "stored rows disagree on {field}; provide an explicit value \
+                     when forcing a shape replacement"
+                ),
+            ));
+        }
+        Ok(first.map(str::to_string))
     }
 
     fn compatible_existing_group(
@@ -387,10 +632,14 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     }
 
     fn group_conflict(request: &GroupAllocationRequest, reason: impl Into<String>) -> Error {
+        Self::group_conflict_at_path(&request.base_path, reason)
+    }
+
+    fn group_conflict_at_path(path: &std::path::Path, reason: impl Into<String>) -> Error {
         Error::ReservationConflict {
             details: format!(
                 "existing group at {} is incompatible: {}",
-                request.base_path.display(),
+                path.display(),
                 reason.into()
             ),
         }
@@ -734,6 +983,71 @@ mod tests {
         let web_port = result.allocations.get("web").unwrap();
         // Should skip 5000 and 5001, allocate starting from 5002
         assert_eq!(web_port.value(), 5002);
+    }
+
+    #[test]
+    fn test_forced_shape_replacement_does_not_bypass_occupancy() {
+        let db = create_test_database();
+        let initial_allocator = create_test_allocator(HashSet::new(), 5000, 5100);
+        let initial = GroupAllocationRequest {
+            base_path: PathBuf::from("/test/project"),
+            project: None,
+            task: None,
+            services: vec![
+                ServiceAllocationRequest {
+                    tag: "web".to_string(),
+                    offset: Some(0),
+                    preferred: None,
+                },
+                ServiceAllocationRequest {
+                    tag: "api".to_string(),
+                    offset: Some(1),
+                    preferred: None,
+                },
+            ],
+        };
+        let occupancy_config = OccupancyCheckConfig::default();
+        initial_allocator
+            .allocate_group(db.connection(), &initial, &occupancy_config)
+            .expect("Initial group should allocate");
+
+        let occupied = HashSet::from([Port::try_from(5002).unwrap()]);
+        let replacement_allocator = create_test_allocator(occupied, 5000, 5100);
+        let replacement = GroupAllocationRequest {
+            services: vec![
+                ServiceAllocationRequest {
+                    tag: "web".to_string(),
+                    offset: Some(0),
+                    preferred: None,
+                },
+                ServiceAllocationRequest {
+                    tag: "api".to_string(),
+                    offset: Some(1),
+                    preferred: None,
+                },
+                ServiceAllocationRequest {
+                    tag: "db".to_string(),
+                    offset: Some(2),
+                    preferred: None,
+                },
+            ],
+            ..initial
+        };
+        let result = replacement_allocator
+            .allocate_group_with_policy(
+                db.connection(),
+                &replacement,
+                &occupancy_config,
+                GroupReconciliationPolicy {
+                    force: true,
+                    ..GroupReconciliationPolicy::default()
+                },
+            )
+            .expect("Force should scan past the occupied replacement pattern");
+
+        assert_eq!(result.allocations["web"], Port::try_from(5003).unwrap());
+        assert_eq!(result.allocations["api"], Port::try_from(5004).unwrap());
+        assert_eq!(result.allocations["db"], Port::try_from(5005).unwrap());
     }
 
     #[test]

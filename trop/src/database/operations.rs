@@ -80,6 +80,12 @@ const UPDATE_LAST_USED: &str = r"
     WHERE path = ? AND tag IS ?
 ";
 
+const UPDATE_METADATA_AND_LAST_USED: &str = r"
+    UPDATE reservations
+    SET project = ?, task = ?, last_used_at = ?
+    WHERE path = ? AND tag IS ?
+";
+
 const LIST_RESERVATIONS: &str = r"
     SELECT path, tag, port, project, task, created_at, last_used_at
     FROM reservations
@@ -406,6 +412,23 @@ impl Database {
         let rows_affected = conn.execute(
             UPDATE_LAST_USED,
             params![now, key.path_as_string(), key.tag],
+        )?;
+        Ok(rows_affected > 0)
+    }
+
+    /// Atomically updates sticky metadata and the last-used timestamp for one
+    /// reservation without changing its key, port, or creation timestamp.
+    pub(crate) fn update_metadata_and_last_used_simple(
+        conn: &Connection,
+        key: &ReservationKey,
+        project: Option<&str>,
+        task: Option<&str>,
+        last_used_at: SystemTime,
+    ) -> Result<bool> {
+        let last_used_at = systemtime_to_unix_secs(last_used_at)?;
+        let rows_affected = conn.execute(
+            UPDATE_METADATA_AND_LAST_USED,
+            params![project, task, last_used_at, key.path_as_string(), key.tag],
         )?;
         Ok(rows_affected > 0)
     }
