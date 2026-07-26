@@ -64,10 +64,10 @@ requires it to contain exactly the same issues as
 
 | Label | Population | Meaning |
 | --- | ---: | --- |
-| `audit:2026-07` | 55 | Canonical audit universe |
-| `workflow:production-readiness` | 55 | Membership in automatic selection |
-| `workflow:production-readiness-leaf` | 47 | Actionable remediation |
-| `workflow:production-readiness-gate` | 8 | Component, audit, or program gate |
+| `audit:2026-07` | 59 | Canonical audit universe |
+| `workflow:production-readiness` | 59 | Membership in automatic selection |
+| `workflow:production-readiness-leaf` | 48 | Actionable remediation |
+| `workflow:production-readiness-gate` | 11 | Component or lifecycle gate |
 
 Every member must carry exactly one leaf/gate label and exactly one recognized
 `P0`, `P1`, `P2`, or `P3` label. A missing universe or membership label,
@@ -143,6 +143,17 @@ revalidates:
 - the repository default branch; and
 - all open PR closing relationships.
 
+The selector originally merged in
+[PR #138](https://github.com/plx/trop/pull/138) compared only the projected
+selection, so changes outside the winner could escape this check. Defect
+[#147](https://github.com/plx/trop/issues/147), fixed by
+[PR #148](https://github.com/plx/trop/pull/148), made the guarantee literal.
+Each fetch now retains one immutable value containing the default branch, every
+deterministically ordered normalized workflow issue, all normalized blocker
+and closing-PR relationships, and the projected selection. Selected and
+complete results require equality of that entire value, not merely the winner
+and aggregate counts.
+
 This prevents a reopened blocker or disappearing prerequisite PR from slipping
 through a selected-issue-only freshness check. It narrows, but cannot eliminate,
 the interval between the last GitHub query and the caller acting. If a returned
@@ -179,16 +190,36 @@ until every blocker issue is actually closed. A stacked PR must name its
 prerequisites and remain blocked from merge until it can be safely rebased or
 retargeted.
 
-## Epic and audit gates
+## Epic and release-lifecycle gates
 
 The live graph uses landed-only gate edges:
 
 ```text
-47 leaf issues
-  -> component epics #84-#89
-  -> final audit #137
-  -> program epic #83
+#90-#91                 -> #84
+#92-#104                -> #85
+#105-#116               -> #86
+#117-#123               -> #87
+#124-#129 and #147      -> #88
+
+#84-#88 and #135        -> #149 CANDIDATE-1
+#149                    -> #136 and #89
+#130-#136               -> #89
+
+#84-#89                 -> #137 AUDIT-1
+#137                    -> #150 PUBLISH-1
+#150                    -> #151 DIST-1
+#151                    -> #83
 ```
+
+An arrow means the issue on the right is natively blocked by the issue or
+range on the left. Candidate gate #149 is a native child of #89. Publication
+gate #150 and distribution gate #151 are native children of #83, as is #137.
+Leaf #147 is a native child of #88. Parentage is retained for hierarchy and
+does not replace any blocker edge.
+
+The current post-setup census is 59 workflow issues. There are 48 leaves
+(#90-#136 plus #147) and 11 gates (#83-#89, #137, and #149-#151). The graph
+has 58 native parent relationships and 132 native blocker edges.
 
 Each gate remains unavailable until every native blocker is closed. Once
 selected, its agent performs the aggregate acceptance or audit procedure and
@@ -198,6 +229,37 @@ blockers finish.
 
 If all leaves have closing PRs but remain open, their component gates remain
 blocked and the selector reports waiting rather than complete.
+
+Issue #135 builds and rehearses the release mechanism without publishing the
+comprehensive crates or creating the final public candidate. After #84-#88 and
+issue #135 actually close, #149 reconciles component-evidence freshness and
+freezes one exact commit, version, immutable tag, package set, and artifact
+set. The approved default is a public GitHub prerelease with checksums,
+verifiable signatures, SBOM, provenance, and an identity manifest while
+comprehensive crates.io publication remains withheld. Creating that public
+immutable tag and prerelease remains an explicit approval checkpoint; gate
+readiness is not authorization.
+
+Issue #136 must consume that exact candidate artifact and checksum; it may not
+rebuild, retag, or substitute another artifact. Gate #89 remains blocked by
+both #149 and every packaging leaf #130-#136. Audit #137 then evaluates the
+same candidate and tap after all six component gates close.
+
+Only an exact-candidate `GO` that closes #137 makes #150 selectable. Gate #150
+still requires explicit approval immediately before irreversible publication.
+It publishes the library crate followed by the CLI crate, promotes the
+already-audited prerelease, and performs real public-channel smoke tests
+without changing source, version, tag, lockfile, package contents, artifacts,
+checksums, signatures, SBOM, or provenance. Gate #151 verifies that exact
+public release through the supported custom tap before #83 records the
+evidence-only program summary.
+
+A `CONDITIONAL NO-GO`, `NO-GO`, or candidate-affecting defect permanently
+abandons that candidate's version and tag. The tag must not move, its assets
+must not be replaced, and its `GO` must not be reused. Preserve and mark the
+failed evidence, choose a new publishable version, reopen every invalidated
+component, candidate, tap, packaging, and audit gate, and repeat the affected
+evidence and independent audit.
 
 ## Maintaining the workflow universe
 
@@ -214,6 +276,12 @@ contract. Before moving acceptance work out of an existing issue:
 A body link or sub-issue relationship alone is insufficient: neither is a
 selector scheduling input, and either could let a gate advance while deferred
 work remains invisible.
+
+Immediately after this lifecycle setup, a complete graph check must reproduce
+the 59-member / 48-leaf / 11-gate / 58-parent / 132-blocker census and every
+edge shown above. Future tickets may change those totals only when their
+labels, parent, prerequisites, affected gate edges, documentation, and
+validation are updated together.
 
 ## Alternate-label validation
 
@@ -247,10 +315,11 @@ delete the branches, and delete temporary labels after validation. Closed
 fixture objects are unavoidable GitHub history but must leave no active work or
 production scheduling metadata behind.
 
-### Recorded live smoke test
+### Recorded historical live smoke test
 
-The alternate-label test was executed against `plx/trop` on 2026-07-25. It
-used three leaf fixtures
+This is creation-time evidence for the original selector topology, not the
+current production census. The alternate-label test was executed against
+`plx/trop` on 2026-07-25. It used three leaf fixtures
 [#139](https://github.com/plx/trop/issues/139),
 [#140](https://github.com/plx/trop/issues/140), and
 [#141](https://github.com/plx/trop/issues/141), plus gate
@@ -275,6 +344,9 @@ Cleanup then closed PRs #143-#146 without merge; closed issues #139-#142 as
 completed; removed every fixture label and native dependency; and deleted all
 four `test/selector-guangzhou-20260725-*` branches. A verification query found
 no open fixture issue or PR, no temporary label or branch, and no remaining
-fixture dependency. The production cohort remained 55 members, 47 leaves,
-eight gates, and 122 dependencies, and the production selector still returned
-issue #90.
+fixture dependency. At that historical point, the production cohort remained
+55 members, 47 leaves, eight gates, and 122 dependencies, and the production
+selector still returned issue #90. Those figures intentionally preserve the
+smoke-test record; they do not describe the current post-#147 and
+post-lifecycle graph, whose census is 59 members, 48 leaves, 11 gates,
+58 parents, and 132 blocker edges.

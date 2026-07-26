@@ -31,28 +31,39 @@ end to end as an ordered sequence of small, reviewable pull requests:
   [#84](https://github.com/plx/trop/issues/84) through
   [#89](https://github.com/plx/trop/issues/89) only after their work has
   landed;
-- complete a dedicated pre-audit candidate-artifact gate and
+- complete candidate-artifact gate
+  [#149](https://github.com/plx/trop/issues/149) and
   [#136](https://github.com/plx/trop/issues/136) so the final audit receives one
   immutable candidate and a tap that consumes it;
 - complete the independent production-readiness audit in
   [#137](https://github.com/plx/trop/issues/137) only when its evidence permits
   an explicit `GO`; and
-- complete dedicated post-audit publication and post-release custom-tap gates
-  before closing final program gate #83.
+- complete publication gate
+  [#150](https://github.com/plx/trop/issues/150) and distribution gate
+  [#151](https://github.com/plx/trop/issues/151) before closing final program
+  gate #83.
 
-The live program initially contains 55 issues: 47 actionable leaves,
+The program initially contained 55 issues: 47 actionable leaves,
 component gates #84-#89, independent audit gate #137, and program gate #83.
-Those counts are context, not a frozen limit. Live labels and GitHub native
+Those figures are the historical pre-selector-fix, pre-lifecycle-setup
+baseline. They are context, not a frozen limit; live labels and GitHub native
 relationships remain authoritative as findings are added or split.
 
 The initial 55-issue graph does **not** contain dedicated pre-audit
 candidate-artifact, post-audit publication, or post-release distribution
 gates. It also orders #136 only behind #135, which could let custom-tap work
 begin while unrelated candidate-affecting remediation is still landing. The
-preconditions below require an explicit maintainer decision and graph
-completion before ordinary remediation begins. Do not let the original graph's
-apparent terminal state end this goal before the full required outcome is
-represented and complete.
+setup record below preserves the explicit maintainer decision, and the
+preconditions require graph completion before ordinary remediation begins. Do
+not let the original graph's apparent terminal state end this goal before the
+full required outcome is represented and complete.
+
+The approved post-setup topology is exactly 59 workflow issues, 48 leaves,
+11 gates, 58 native parent relationships, and 132 native blocker edges.
+Selector fix [#147](https://github.com/plx/trop/issues/147), implemented by
+[PR #148](https://github.com/plx/trop/pull/148), accounts for the additional
+leaf in that topology. Issues #149, #150, and #151 implement the three release
+gates.
 
 The static site in `site/`, its landing page, and `trop-design-system/` remain
 outside the audit scope except where a selected ticket explicitly concerns a
@@ -139,55 +150,54 @@ Before selecting the first remediation issue:
    creation, the expected baseline was 55 members, 47 leaves, eight gates, and
    122 blocker edges. Do not repair labels or native relationships merely to
    obtain a preferred first issue.
-8. Resolve the known release-lifecycle and graph gap. The initial graph jumps
-   directly from #137 to #83 and leaves #136 ordered only behind #135. Obtain an
-   explicit maintainer decision, then update the issue contracts and native
-   graph so that:
+8. Verify the approved release-lifecycle setup. The historical graph jumped
+   directly from #137 to #83 and left #136 ordered only behind #135. The live
+   issue contracts and native graph must instead establish that:
    - #135 governs pipeline construction plus non-publishing and
-     prerelease/staging rehearsal; its requirement for real production-channel
-     post-publish smoke is moved to the post-audit publication gate;
-   - one dedicated candidate-artifact gate is a native child and blocker of
-     #89, is blocked by component gates #84-#88 and #135, and freezes the exact
-     candidate only after the component-evidence freshness reconciliation;
+     local-registry, staging, and disposable-remote rehearsal; real
+     production-channel publication and post-publish smoke belong to #150;
+   - #147 is a native child of and blocker of #88;
+   - #149 is a native child of #89, is blocked by #84-#88 and #135, blocks #136
+     and #89, and freezes the exact candidate only after component-evidence
+     freshness reconciliation;
    - #136 remains the custom-tap ticket, is blocked by the candidate-artifact
-     gate, and consumes that exact candidate rather than creating a different
-     release artifact;
-   - one dedicated publication gate is blocked by #137;
-   - one dedicated post-release distribution gate is blocked by the
-     publication gate;
-   - the original direct #137-to-#83 blocker is replaced by the full chain, and
-     #83 is blocked by the post-release distribution gate;
-   - the publication and distribution gates are native children of #83;
+     gate #149, and consumes that exact candidate rather than creating a
+     different release artifact;
+   - #136 remains a native blocker of #89;
+   - #150 and #151 are native children of #83;
+   - the authoritative terminal chain is #137 -> #150 -> #151 -> #83;
+   - #83 is blocked only by #151 in the approved lifecycle;
+   - the obsolete direct blocker edges #135 -> #136 and #137 -> #83 are absent;
    - all three new gates carry the milestone, canonical/workflow labels,
      exactly one gate label, exactly one priority, and applicable reporting
      labels; and
    - the roadmap, work-selection counts, issue bodies, and native relationships
      record the same lifecycle.
-   Each new issue must be self-contained: state its problem, required procedure,
+   Each new issue must remain self-contained: problem, required procedure,
    evidence and tests, validation, acceptance criteria, irreversible-action
-   checkpoint, parent, and native blockers. The post-setup graph should contain
-   at least 58 workflow issues and 11 gates; derive and test the exact counts
-   and blocker-edge total from the approved graph rather than hard-coding these
-   lower bounds as the selector contract.
-   Preserve that decision in one dedicated, independently reviewed setup PR
-   with no workflow closing keyword. Apply the matching GitHub issue and graph
-   metadata, merge the setup PR, and rerun selector validation before entering
-   the ordinary one-issue loop.
-9. Record a candidate-artifact lifecycle that lets #137 inspect the exact final
+   checkpoint, parent, and native blockers. Require exactly 59 workflow issues,
+   48 leaves, 11 gates, 58 native parent relationships, and 132 native blocker
+   edges. Do not replace these equality checks with lower bounds.
+   Confirm the dedicated lifecycle-setup PR from branch
+   `agent/production-readiness-lifecycle-setup` targeted `main`, received
+   independent review with no unresolved blocker, and, while open, exposed
+   `closingIssuesReferences: []` whether draft or ready. It must merge without
+   a workflow closing keyword. After merge and GitHub indexing, rerun selector
+   validation and verify the exact topology before entering the ordinary
+   one-issue loop.
+9. Verify the candidate-artifact lifecycle lets #137 inspect the exact final
    version, tag, release artifacts, provenance, and custom-tap formula without
    prematurely publishing the comprehensive crates or claiming stable support.
-   The default lifecycle is a public GitHub prerelease for the exact final
-   commit, version, and immutable tag, with comprehensive crates publication
-   withheld. The post-`GO` promotion must not change source, version, tag,
-   lockfile, package contents, binary artifacts, checksums, signatures, SBOM, or
-   provenance. An alternative is acceptable only if the issue contracts and
-   final-audit runbook are explicitly updated and the mechanism supplies every
-   mandatory unauthenticated artifact check.
+   The approved lifecycle is a public GitHub prerelease for the exact final
+   commit, version, and never-moved tag, with both comprehensive production
+   crates withheld. The post-`GO` promotion must not change source, version,
+   tag, lockfile, package contents, binary artifacts, checksums, signatures,
+   SBOM, provenance, README, changelog, or Cargo metadata.
 10. Align #135 and the final-audit runbook on mandatory release evidence.
     Every target artifact requires a checksum, SBOM, provenance, and verifiable
-    signature. If maintainers intend a different release contract, resolve and
-    document that conflict before remediation rather than allowing #135 to
-    close under criteria that make #137's `GO` impossible.
+    signature. Any proposed different release contract requires a separately
+    approved and reviewed lifecycle change before remediation; do not allow
+    #135 to close under criteria that make #137's `GO` impossible.
 11. Extend #130's version and status decision so candidate-contained Cargo
     metadata, README text, and changelog entries are truthful both before and
     after `GO` without a source edit. Prefer a neutral statement that
@@ -195,21 +205,54 @@ Before selecting the first remediation issue:
     an independent `GO`, not a claim embedded in the pre-audit candidate. Any
     post-`GO` version bump, changelog date or status edit, README support claim,
     or package-metadata change is candidate-affecting and requires a new
-    candidate and audit.
-12. Record failed-candidate semantics. Under the default public-prerelease
+    #149 candidate and audit.
+12. Enforce failed-candidate semantics. Under the approved public-prerelease
     lifecycle, a `CONDITIONAL NO-GO` or `NO-GO` permanently abandons that
     version and tag; never move the tag or replace its assets. Select a new
     publishable version, freeze new artifacts, rerun affected component
-    evidence and tap validation, and perform a fresh audit. A private or
-    disposable staging alternative does not satisfy the current audit's
-    unauthenticated release-page checks unless the audit runbook and gate
-    contracts are explicitly revised before work begins and the displaced live
-    checks are assigned to a post-publication gate.
+    evidence and tap validation, and perform a fresh audit. Private or
+    disposable rehearsal does not substitute for #149's public prerelease or
+    the audit's unauthenticated release-page checks.
 
-If PR #138 is not merged, GitHub authentication is unavailable, or the selector
-fails closed, or the lifecycle decision is unavailable, report that condition
-and wait. Do not substitute a handwritten issue order or silently narrow the
-terminal outcome.
+### Approved lifecycle setup record
+
+On 2026-07-25, after reviewing the complete release-lifecycle proposal, the
+maintainer explicitly replied `Approved`. That approval selected the default
+public-prerelease lifecycle, the reviewed three-gate contracts now represented
+by #149, #150, and #151, and the exact graph transformation below. It does not
+authorize any later irreversible candidate, publication, advisory, yank, or
+external-tap action; each still requires its own checkpoint.
+
+Selector issue #147 and PR #148 first changed the historical topology from
+55 issues, 47 leaves, eight gates, 54 native parent relationships, and
+122 blocker edges to 56 issues, 48 leaves, eight gates, 55 native parent
+relationships, and 123 blocker edges. The approved lifecycle then adds three
+gates and native children: #149, #150, and #151. From the post-#147 baseline,
+the 11 lifecycle blocker additions are the six edges into #149 from component
+gates #84-#88 and issue #135; the two outgoing edges from #149 to #136 and #89;
+and the three edges in the #137 -> #150 -> #151 -> #83 chain. Removing the
+obsolete #135 -> #136 and #137 -> #83 edges produces 59 issues, 48 leaves,
+11 gates, 58 native parent relationships, and 132 blocker edges.
+
+The setup applies `P1`, `type:release`, `domain:release`,
+`component:release-engineering`, and `release-blocker` to each new gate, along
+with the canonical audit and workflow labels. That taxonomy is a reviewed
+implementation detail aligned with existing release work; do not misstate it
+as a separately quoted maintainer preference.
+
+The dedicated setup PR is the PR opened from
+`agent/production-readiness-lifecycle-setup`; this record deliberately does not
+invent a PR number before GitHub assigns one. Before merge it must target
+`main`, be open as either draft or ready for review, and expose exactly
+`closingIssuesReferences: []`. After merge and GitHub indexing, confirm there
+are no placeholders in the issue bodies or committed runbooks, reverify
+`closingIssuesReferences: []`, and revalidate all labels, parents, blockers,
+removals, counts, and selector results.
+
+If PR #138 or the dedicated lifecycle-setup PR is not merged, GitHub
+authentication is unavailable, the selector fails closed, or the approved
+topology is not exact, report that condition and wait. Do not substitute a
+handwritten issue order or silently narrow the terminal outcome.
 
 ## Required guidance
 
@@ -310,7 +353,7 @@ the issue must later close again through a new dedicated PR.
 ## Pull-request stack contract
 
 The program is a sequence of small, default-branch-targeted ancestry stacks,
-not one giant PR and not a 47-leaf global branch chain. Git ancestry may stack
+not one giant PR and not a 48-leaf global branch chain. Git ancestry may stack
 on a predecessor head; the GitHub PR base may not.
 
 ### Starting a branch
@@ -448,15 +491,14 @@ If implementation reveals a separate defect:
   exactly one `P0`-`P3` priority, and applicable reporting labels;
 - add it as a native child of the correct component gate and make that gate
   natively depend on it;
-- if it can affect a frozen candidate, make the candidate-artifact gate depend
-  on it directly whenever the component path does not already order it,
+- if it can affect a frozen candidate, make #149 depend on it directly whenever
+  the component path does not already order it,
   especially for a new #89 child that cannot make #89 block its own child
   without a cycle;
 - reopen any already-closed gate whose evidence it invalidates; and
-- if a candidate has already been frozen, reopen the candidate-artifact gate,
-  #136, and #89, abandon the old candidate when its immutable identity cannot
-  remain valid, and block #137 or publication until the replacement evidence
-  closes;
+- if a candidate has already been frozen, reopen #149, #136, and #89, abandon
+  the old candidate when its immutable identity cannot remain valid, and block
+  #137 and #150 until the replacement evidence closes;
 - rerun the selector after the current ticket reaches a stable PR boundary.
 
 Do not hide substantive audit findings inside an unrelated PR.
@@ -543,9 +585,9 @@ Closes #<selected-issue>
 <None, or explicit limitations and follow-up issue links>
 ```
 
-Except for #91, #136, #137, and the dedicated candidate-artifact, publication,
-and distribution gates described below, the initial PR body must contain
-exactly one GitHub closing keyword for exactly the selected workflow issue.
+Except for the staged workflows in #91, #136, #137, #149, #150, and #151, the
+initial PR body must contain exactly one GitHub closing keyword for exactly the
+selected workflow issue.
 
 Preparatory, audit-in-progress, publication, or external PRs for those staged
 workflows use only non-closing references. Remain on the selected workflow
@@ -731,10 +773,9 @@ candidate commit:
 5. reopen and re-close any gate whose retained evidence no longer attests the
    prospective candidate.
 
-After the candidate-artifact gate and #136 close, complete #89 and repeat the
-freshness check before starting #137. At that point all six component gates
-must attest the exact candidate handed to #137, not merely a historically green
-intermediate commit.
+After #149 and #136 close, complete #89 and repeat the freshness check before
+starting #137. At that point all six component gates must attest the exact
+candidate handed to #137, not merely a historically green intermediate commit.
 
 ### Early fixed security release #91
 
@@ -799,22 +840,21 @@ candidate as a stable, production-supported release. Closing #135 proves that
 the mechanism exists and has passed non-publishing rehearsal; it does not by
 itself freeze the final candidate.
 
-The lifecycle decision in the preconditions must first align #135's issue body:
-pre-`GO` evidence covers the exact-version prerelease/staging path, while real
-crates.io and final GitHub post-publish smoke belongs to the dedicated
-post-audit publication gate. Do not close #135 against a contradictory
-acceptance criterion.
+The approved lifecycle aligns #135's issue body so pre-`GO` evidence covers
+non-publishing local-registry, staging, and disposable-remote rehearsal, while
+real crates.io publication and final GitHub post-publish smoke belong to #150.
+Do not close #135 against a contradictory acceptance criterion.
 
 Use non-publishing rehearsal modes, protected test environments, saved
 artifacts, tamper tests, and tabletop rollback exercises. Any real credential,
 OIDC trust, tag protection, release environment, signing, or repository-setting
 change requires owner verification and the decision checkpoint above.
 
-### Dedicated pre-audit candidate-artifact gate
+### Candidate-artifact gate #149
 
-Use the candidate-artifact gate added during preconditions. It is selectable
-only after #84-#88, #135, every direct candidate-affecting blocker, and the
-freshness reconciliation are closed. A merely covered PR is insufficient.
+Issue #149 is selectable only after #84-#88, #135, every direct
+candidate-affecting blocker, and the freshness reconciliation are closed. A
+merely covered PR is insufficient.
 
 Freeze one exact commit using the comprehensive version and status contract
 approved under #130. Under the lifecycle reviewed in #135, produce the final
@@ -838,15 +878,21 @@ withdrawn or failed without deleting its evidence, abandon that version and
 tag, and obtain the required version decision before producing a successor.
 
 After the candidate is available and independently downloadable evidence
-passes, create a dedicated in-repository evidence PR with the sole closing
-reference for this gate. Its retained evidence identifies the exact candidate
-that #136 and #137 must consume.
+passes for every release asset, checksum, signature, SBOM, and provenance
+object, create a dedicated in-repository evidence PR with the sole closing
+reference for #149. Its retained evidence identifies the exact candidate
+consumed by #136 and #137.
+
+Every #149 preparatory, candidate-build, or candidate-publication PR uses only
+`Refs #149`, contains no workflow closing keyword, and must expose
+`closingIssuesReferences: []` after indexing. Creating the tag, prerelease, or
+assets does not itself close or cover #149.
 
 ### Custom tap #136
 
-Issue #136 is selectable only after the candidate-artifact gate closes. It
-supplies custom-tap evidence for that exact immutable candidate; it must not
-build, retag, or substitute another release artifact.
+Issue #136 is selectable only after #149 closes. It supplies custom-tap
+evidence for that exact immutable candidate; it must not build, retag, or
+substitute another release artifact.
 
 Confirm the tap repository, owner, credentials, and support model before
 writing outside `plx/trop`. At this document's creation `plx/homebrew-tap` did
@@ -858,11 +904,11 @@ Complete and merge the external PR and run its macOS and Linuxbrew validation
 first. Then create a dedicated in-repository evidence/documentation PR targeting
 `main` with the sole `Closes #136`.
 
-If tap work exposes a candidate-affecting defect, reopen the candidate-artifact
-gate and #136, keep or reopen #89, abandon the immutable candidate as required,
-and do not let #137 begin. If the approved mechanism cannot expose audit-ready
-artifacts and a working tap without changing the candidate during post-`GO`
-promotion, stop and correct the #135 lifecycle and native graph. Do not accept a
+If tap work exposes a candidate-affecting defect, reopen #149 and #136, keep or
+reopen #89, abandon the immutable candidate as required, and do not let #137
+begin. If the approved mechanism cannot expose audit-ready artifacts and a
+working tap without changing the candidate during post-`GO` promotion, stop
+and correct the #135 lifecycle and native graph. Do not accept a
 security-hotfix artifact as a substitute for the comprehensive candidate
 audited by #137. Homebrew/core submission remains outside scope.
 
@@ -875,16 +921,18 @@ author its own verdict.
 
 Follow every applicable section of
 `post-remediation-production-readiness-audit.md`. An audit PR opened before its
-verdict is final uses only `Refs #137`. Add `Closes #137` to the dedicated
-report PR only after the committed signed-off report states exactly `GO` for
-release and contains or links all required evidence.
+verdict is final uses only `Refs #137`, contains no workflow closing keyword,
+and must expose `closingIssuesReferences: []` after GitHub indexing. Add
+`Closes #137` to the dedicated report PR only after the committed signed-off
+report states exactly `GO` for release and contains or links all required
+evidence.
 
-Audit the exact candidate frozen by the candidate-artifact gate and consumed by
-issue #136. Its public prerelease artifacts, version/tag, checksums, signatures,
-SBOM, provenance, and custom-tap formula must be the ones evaluated by the
-runbook. Exercise crate publication order and installation through the required
-disposable local registry or staging environment; comprehensive production
-registry publication remains pending until the post-audit publication gate.
+Audit the exact candidate frozen by #149 and consumed by #136. Its public
+prerelease artifacts, version/tag, checksums, signatures, SBOM, provenance,
+and custom-tap formula must be the ones evaluated by the runbook. Exercise
+crate publication order and installation through the required disposable local
+registry or staging environment; comprehensive production registry
+publication remains pending until #150.
 
 If a mandatory audit criterion cannot be demonstrated before production
 publication under the approved lifecycle, do not waive it or declare `GO`.
@@ -893,33 +941,37 @@ the affected evidence.
 
 A `CONDITIONAL NO-GO` or `NO-GO` verdict must not close #137. New substantive
 defects receive separate workflow issues and fixes; do not repair them in the
-audit PR. Such a report PR must never acquire a closing keyword. For every
-candidate-affecting finding, reopen the candidate-artifact gate, #136, #89, and
-each affected component gate; abandon the old immutable version/tag; land the
-fix; obtain a new version decision as needed; build and tap-test a new
-candidate; re-close the invalidated evidence gates; and run a fresh audit.
+audit PR. Such a report PR must never acquire a closing keyword and must expose
+`closingIssuesReferences: []`. Every non-`GO` verdict permanently abandons the
+old immutable version and tag, even when the cause is an evidence or platform
+gap. Mark its public prerelease honestly as failed or withdrawn without moving
+or deleting its tag or replacing or deleting its assets. Reopen the #149
+candidate gate, issues #136 and #89, and each affected component gate; land the
+fix or evidence work; obtain a successor #130 version decision as needed; build
+and tap-test a new candidate; re-close the invalidated evidence gates; and run
+a fresh independent audit.
 
 Only `GO` for the exact immutable candidate may produce a merge that closes
 issue #137.
 
-Every candidate-affecting preparation must land before the candidate-artifact
-gate freezes its subject. This includes source, tests, manifests, lockfiles,
-versions, release workflows, package inputs, and release controls. The audit
-report may be committed afterward as evidence while continuing to identify the
-exact earlier candidate commit.
+Every candidate-affecting preparation must land before #149 freezes its
+subject. This includes source, tests, manifests, lockfiles, versions, release
+workflows, package inputs, and release controls. The audit report may be
+committed afterward as evidence while continuing to identify the exact earlier
+candidate commit.
 
 After #137 closes, no candidate-affecting change may land before comprehensive
-publication. If one becomes necessary, stop the release; reopen #137, the
-candidate-artifact gate, #136, #89, and every affected component gate; abandon
-the old version/tag; land and validate the new work; obtain a new version
-decision as needed; freeze and tap-test a new candidate; and run a fresh
-independent audit. The old `GO` must not authorize a changed candidate.
+publication in #150. If one becomes necessary, stop the release and reopen
+all of #137, #149, #136, #89, and every affected component gate. Abandon the
+old version/tag, land and validate the new work, obtain a new version decision
+as needed, freeze and tap-test a new candidate, and run a fresh independent
+audit. The old `GO` must not authorize a changed candidate.
 
-### Dedicated post-audit publication gate
+### Publication gate #150
 
-Use the dedicated gate added during preconditions. It is selectable only after
-issue #137 closes with `GO`. Its preparatory or publication-in-progress PRs use
-only non-closing references to that gate.
+Issue #150 is selectable only after #137 closes with `GO`. Its preparatory or
+publication-in-progress PRs use only `Refs #150`, contain no workflow closing
+keyword, and must expose `closingIssuesReferences: []` after indexing.
 
 Immediately before irreversible publication, present the user with:
 
@@ -944,53 +996,64 @@ After approval:
    release assets and exact normalized file-manifest/content digests for
    registry packages whose transport archive must be regenerated; never invent
    an equivalence rule after `GO`;
-2. publish `trop`, wait for registry availability, then publish `trop-cli`;
-3. under the default lifecycle, promote the already-audited public prerelease
-   without replacing its tag or artifacts; under an approved alternative,
-   perform only the exact transition recorded before the audit;
-4. verify public crate downloads, artifact hashes, provenance, release
-   contents, and clean installed behavior;
-5. verify the tag, release, crates, CLI version, changelog, checksums, and
-   provenance all identify the same source and version; and
+2. use the protected crates.io Trusted Publishing workflow approved under #135
+   to publish `trop`, wait for registry and index availability, then publish
+   `trop-cli`;
+3. promote the already-audited public prerelease without replacing its tag or
+   artifacts;
+4. verify public crate downloads, normalized package identity, target-artifact
+   hashes, checksums, signatures, SBOMs, provenance, release contents, and
+   clean installed behavior;
+5. verify the tag, release, crates, CLI version, changelog, checksums,
+   signatures, SBOMs, and provenance all identify the same source and version;
+   and
 6. create a dedicated in-repository publication-evidence PR with the sole
-   closing reference for this gate.
+   closing reference for #150.
 
 If the registry or release process exposes a defect requiring any
 candidate-affecting change, do not patch forward under the old `GO`. Reopen
-issue #137, the candidate-artifact gate, #136, #89, and every affected
-component gate; abandon the old version/tag; land the fix; obtain a new version
-decision as needed; reproduce the full candidate and tap evidence; and perform
-a new audit.
+issue #137, #149, #136, #89, and every affected component gate; abandon the old
+version/tag; land the fix; obtain a new version decision as needed; reproduce
+the full candidate and tap evidence; and perform a new audit.
 
 If publication partially succeeds—for example, the library crate is public but
 the CLI crate, release promotion, or verification fails—stop immediately,
 preserve the exact registry and release state, and invoke the approved
 incident/rollback plan only with fresh user direction. Do not silently publish
-a new version, replace an artifact, yank a crate, or advance the distribution
-gate.
+a new version, replace an artifact, yank a crate, or advance #151.
 
-### Dedicated post-release distribution gate
+### Distribution gate #151
 
-Use the distribution gate added during preconditions. It is selectable only
-after the publication gate actually closes.
+Issue #151 is selectable only after #150 actually closes.
 
 Confirm external-repository authority again. Update the custom tap, if needed,
 so its formula and checksum consume the exact public release. The external PR
-uses only a full non-closing reference to this gate. Then rerun install, test,
-upgrade, reinstall, and uninstall checks on every claimed Homebrew platform.
+uses only the full non-closing reference `Refs plx/trop#151`. Then rerun
+install, test, upgrade, reinstall, and uninstall checks on every claimed
+Homebrew platform.
 
 After public verification, create one dedicated in-repository
-distribution-evidence PR with the sole closing reference for this gate. An
-external PR cannot close a `plx/trop` workflow issue, and the pre-audit #136
-evidence is not a substitute for post-release verification.
+distribution-evidence PR with the sole closing reference for #151. An external
+PR cannot close a `plx/trop` workflow issue, and the pre-audit #136 evidence is
+not a substitute for post-release verification.
+
+Every external or in-repository #151 preparation or verification-in-progress
+PR contains no workflow closing keyword and must expose
+`closingIssuesReferences: []` after indexing. If the tap reveals a
+candidate-affecting defect or mismatch with the audited public identity,
+preserve the exact public state, keep #151 open, reopen #137, #149, #136, #89,
+and #150 plus every affected component gate, and follow the successor-version
+lifecycle. Only a formula error introduced solely by #151 may remain within this
+gate, and only when the #136 formula, #137 evidence, and public candidate
+identity all remain valid.
 
 ### Final program gate #83
 
-Issue #83 is last. It becomes selectable only after the post-release
-distribution gate closes. Execute its aggregate exit criteria, commit a dated
-program evidence summary under `docs/audits/` linking every live exit criterion
-to the component gates, #137, the publication gate, the distribution gate, and
-the retained release evidence, then merge one PR with the sole `Closes #83`.
+Issue #83 is last. It becomes selectable only after #151 closes. Execute its
+aggregate exit criteria, commit a dated program evidence summary under
+`docs/audits/` linking every live exit criterion to the component gates and
+issues #137, #150, and #151 plus the retained release evidence, then merge one
+PR with the sole `Closes #83`.
 
 The #83 PR must be documentation and evidence only. Any candidate-affecting
 change invalidates #137 rather than being hidden in the final summary.
@@ -1032,17 +1095,16 @@ Pause for user direction when:
   establish why;
 - a dependency, parent, gate, or closing relationship appears incorrect and
   changing it would alter program scope;
-- the required pre-audit candidate, publication, and distribution gates have
-  not been approved and encoded in the live graph;
+- #149, #150, or #151 is missing or differs from its approved issue contract or
+  native graph;
 - a required credential, platform, hardware environment, repository, real
   owner, or independent auditor is unavailable;
 - #91 reaches security publication, advisory, or yank action;
-- the candidate-artifact gate reaches public tag/prerelease creation;
+- #149 reaches public tag/prerelease creation;
 - #136 lacks confirmed authority for the tap destination;
 - #137 requires a risk acceptance, skip, or verdict judgment;
-- the dedicated post-audit gate reaches comprehensive publication;
-- the dedicated distribution gate lacks confirmed external-repository
-  authority; or
+- #150 reaches comprehensive publication;
+- #151 lacks confirmed external-repository authority; or
 - legal, licensing, security, or support claims cannot be established from
   verified evidence.
 
@@ -1054,19 +1116,25 @@ takes time, a 24-hour soak is long, or the program spans many sessions.
 Mark the goal complete only when all of the following are true:
 
 - every issue in the live `workflow:production-readiness` cohort, including
-  #83, #137, the added candidate-artifact, publication, and distribution gates,
-  and issues discovered during remediation or reassessment, is closed;
+  #83, #137, #149, #150, #151, and issues discovered during remediation or
+  reassessment, is closed;
 - every issue timeline attributes closure to its dedicated merged PR or final
   evidence PR, not a direct state change;
 - the selector returns `status: complete`, `open_count: 0`,
   `covered_count: 0`, and `ready_count: 0`;
-- no remediation PR or intentional stack remains open;
-- merged ticket branches are removed unless an explicit policy retains them;
+- no remediation, evidence, audit, publication, distribution, or setup PR and
+  no intentional stack remains open;
+- merged workflow and setup branches are removed unless an explicit policy
+  retains them;
 - all six component gates have retained, reproducible evidence;
 - #91's fixed public release, advisory, clean-install evidence, and documented
   0.1.0 yank state agree;
-- #137 records an independent `GO` for the exact comprehensive candidate that
-  was released;
+- #149 retains one exact public-prerelease candidate, #136 retains a formula
+  that consumes its exact asset and checksum, and #137 records an independent
+  `GO` for that exact candidate;
+- #150 publishes the exact audited packages and promotes the existing
+  prerelease without a candidate-affecting change, and #151 retains
+  post-release custom-tap verification;
 - both comprehensive crates, immutable tag, GitHub Release, changelog,
   checksums, SBOM, provenance, verifiable signatures, and installed
   `trop --version` agree;
@@ -1080,7 +1148,6 @@ Mark the goal complete only when all of the following are true:
   reproduce the result.
 
 Queue `complete` with covered open issues is not terminal completion. A #137
-`GO` without approved publication and post-release verification is not terminal
-completion. A published release while the distribution gate, #83, or another
-workflow issue remains open is not terminal completion. Do not mark the goal
-achieved early.
+`GO` without closed #150 and #151 is not terminal completion. A published
+release while #151, #83, or another workflow issue remains open is not terminal
+completion. Do not mark the goal achieved early.

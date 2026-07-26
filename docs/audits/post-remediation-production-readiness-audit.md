@@ -16,9 +16,11 @@ helpers in isolation.
 
 The remediation program is indexed in the
 [July 2026 remediation roadmap](2026-07-25-remediation-roadmap.md), and its
-final GitHub gate is
-[#137](https://github.com/plx/trop/issues/137). Closed tickets and a green
-milestone are prerequisites for this runbook, not substitutes for executing it.
+independent-audit gate is
+[#137](https://github.com/plx/trop/issues/137). Closed remediation tickets and
+a green milestone are prerequisites for this runbook, not substitutes for
+executing it. A `GO` at #137 is followed by #150 publication and #151
+distribution; it is neither the final program gate nor publication authority.
 
 The authoritative product contract is
 `reference/ImplementationSpecification.md`. Do not modify that file as part of
@@ -52,6 +54,52 @@ licenses, release notes, and packaging metadata are in scope.
 7. **Do not repair while auditing.** Record findings against the immutable
    revision. Fixes belong in follow-up changes and trigger re-audit.
 
+## Approved audit subject and publication boundary
+
+The maintainer-approved lifecycle is recorded in the
+[production-readiness remediation goal](production-readiness-remediation-goal.md).
+For #137, the audit subject is the single public GitHub prerelease closed by
+candidate gate [#149](https://github.com/plx/trop/issues/149): one exact final
+commit, comprehensive version, never-moved tag, identity manifest, saved Cargo
+package set, and complete target-artifact set. The auditor must download that
+public subject as an unauthenticated user. Do not create another tag or release,
+rebuild or repack a substitute, replace an asset, or audit a merely equivalent
+candidate.
+
+Comprehensive production publication is deliberately absent during #137.
+Verify through unauthenticated production crates.io and index queries that the
+exact comprehensive version is unpublished for both `trop` and `trop-cli`.
+Exercise library-first, index-wait, then CLI publication only through the
+disposable local registry or staging mechanism rehearsed by #135. Production
+credentials and production publication are outside this audit.
+
+Every target artifact in #149 must have a SHA-256 checksum, a verifiable
+signature, an SPDX or CycloneDX SBOM, and provenance tied to its exact source
+and workflow. Missing or unverifiable evidence is a failed mandatory gate.
+Download and verify each artifact and all four evidence objects without
+authentication. The custom-tap formula closed by
+[#136](https://github.com/plx/trop/issues/136) must consume the exact #149 asset
+URL and checksum; a rebuilt archive or alternate formula is not the audit
+subject.
+
+Issue #135 has already proved candidate construction and disposable-remote
+mechanics. This audit instead rehearses publication and promotion from #149's
+saved artifacts without production credentials and proves that no source,
+version, tag, lockfile, package, artifact, checksum, signature, SBOM,
+provenance, README, changelog, Cargo metadata, or candidate-contained status
+text change is required. After `GO`, any such candidate-affecting change
+invalidates the verdict.
+
+An exact `GO` closes #137 and only unlocks publication gate
+[#150](https://github.com/plx/trop/issues/150); it does not authorize
+publication. Issue #150 requires a fresh irreversible-action approval, publishes
+the saved `trop` package, waits for registry availability, publishes the saved
+`trop-cli` package, and promotes the existing prerelease without changing its
+tag or assets. Distribution gate
+[#151](https://github.com/plx/trop/issues/151) then performs post-release
+custom-tap verification. Neither gate is part of the #137 audit verdict or may
+be skipped.
+
 ## Required outputs
 
 The audit must produce an evidence directory and a signed-off report. The
@@ -63,6 +111,14 @@ report must include:
 - every command run and its exit code;
 - logs for all test, lint, audit, package, install, and load runs;
 - hashes of source and release artifacts;
+- the #149 prerelease URL, identity manifest, saved-package identities, and
+  unauthenticated download evidence;
+- proof that the exact comprehensive `trop` and `trop-cli` versions are absent
+  from production crates.io throughout the audit;
+- the #136 formula revision, exact #149 asset URL and checksum, and platform
+  results;
+- the saved-artifact publication/promotion rehearsal and its no-change
+  comparison;
 - before/after SQLite dumps for mutation scenarios;
 - platform-specific results for Linux, macOS, and Windows;
 - skipped tests and why they were skipped;
@@ -87,13 +143,21 @@ git describe --always --dirty --tags
 git submodule status --recursive
 ```
 
-The worktree must be clean, `git describe` must not say `dirty`, and the commit
-must be reachable from the proposed release tag or release branch. Record the
-output before doing anything else.
+The worktree must be clean, `git describe` must not say `dirty`, and `HEAD` must
+be the exact commit named by #149's public prerelease, never-moved tag, and
+identity manifest. Verify the tag resolves directly to that commit and has not
+been recreated or moved. Record the output before doing anything else.
 
 Confirm that the version in both crate manifests, `trop --version`, the
-changelog, tag, and proposed artifact names agree. Confirm that the lockfile is
-tracked and unchanged.
+changelog, tag, saved Cargo packages, and target artifact names agree. Confirm
+that the lockfile is tracked and unchanged, every #149 release-asset hash
+matches the identity manifest, and normalized package file-manifest/content
+digests match wherever a registry regenerates transport archives.
+
+Before executing the rest of the runbook, verify #84-#89, #149, and #136
+closed through their dedicated evidence PRs and that the component evidence is
+fresh for this exact commit. Record unauthenticated proof that the comprehensive
+version is absent for both production crates.
 
 ### 1.2 Create isolated state
 
@@ -938,7 +1002,7 @@ Review CI and release workflows:
 - installed tools are version-pinned and checksum-verified where practical;
 - workflow permissions default to read-only and are elevated per job;
 - pull-request workflows cannot access publishing/signing secrets;
-- crates.io uses Trusted Publishing or an equivalently short-lived mechanism;
+- crates.io uses the protected Trusted Publishing workflow approved under #135;
 - GitHub environments require appropriate release approval;
 - release artifacts are produced from the tagged commit, not rebuilt by hand;
 - the build records compiler, lockfile, source, and workflow provenance;
@@ -1036,10 +1100,23 @@ Build and test the packaged source in an offline clean environment after all
 dependencies have been fetched. Do not assume a workspace path dependency
 makes the independently published CLI installable.
 
-Test a registry-equivalent sequence in a disposable local registry or staging
-environment: publish/install the library version, then publish/install the CLI
-version that depends on it. Verify exact version constraints and publication
-order.
+Use the saved Cargo package outputs identified by #149 for the
+registry-equivalent test; do not replace them with a newly packed audit
+substitute. A fresh `cargo package` run may test reproducibility only when its
+normalized file-manifest/content digest is compared with the precommitted
+identity rule.
+
+In the disposable local registry or staging environment, publish/install the
+saved library version, wait for index availability, then publish/install the
+saved CLI version that depends on it. Verify exact version constraints,
+publication order, and clean independent installation without production
+credentials.
+
+Before and after that rehearsal, query production crates.io and its index as an
+unauthenticated user. Retain proof that the exact comprehensive version remains
+absent for both packages. If either production package already exists, the
+approved pre-publication boundary has been violated and the result is
+`NO-GO`; do not continue with a substituted version.
 
 ### 15.2 Install, invoke, upgrade, and uninstall
 
@@ -1083,36 +1160,60 @@ documentation.
 
 ### 15.4 Release artifacts, SBOM, and provenance
 
-For every target artifact:
+Use only the target artifacts attached to #149's public prerelease. For every
+target artifact:
 
 - unpack it and inventory every file;
 - verify executable architecture and minimum OS compatibility;
 - run install/smoke/uninstall on the target platform;
 - include README/release notes and both licenses;
-- produce SHA-256 checksums;
-- verify signatures with a public documented command;
-- generate an SPDX or CycloneDX SBOM from the exact lockfile/artifact;
-- attach build provenance tying artifact hash to commit, workflow, compiler,
+- require and verify its SHA-256 checksum;
+- require and verify its signature with a public documented command;
+- require and verify an SPDX or CycloneDX SBOM for the exact lockfile/artifact;
+- require build provenance tying artifact hash to commit, workflow, compiler,
   target, and dependency graph;
 - verify the checksum, signature, SBOM, and provenance after downloading from
   the release page as an unauthenticated user.
 
-Ensure GitHub tag, release page, crate version, artifacts, checksum file,
-Homebrew formula, changelog, and `trop --version` identify the same release.
+Use a clean unauthenticated session with no repository checkout, GitHub token,
+or cached artifact. Verify the identity manifest before executing any
+downloaded binary. A missing, inaccessible, or unverifiable checksum,
+signature, SBOM, or provenance object for any target is an automatic `NO-GO`,
+not a conditional gap.
+
+Ensure the #149 tag, prerelease, saved crate packages, target artifacts,
+checksum files, #136 Homebrew formula, changelog, and `trop --version` identify
+the same release. Verify separately that this exact version is still absent for
+both production crates.
 
 ## 16. Release rehearsal, rollback, and operational response
 
-Perform a full release rehearsal without production credentials:
+Issue #135 already rehearsed candidate construction and public-prerelease
+mechanics in a disposable remote. Do not create a new candidate tag, prerelease,
+package, target artifact, or formula during #137. Perform this full rehearsal
+without production credentials from #149's retained subject:
 
-1. create an immutable candidate tag in a disposable remote;
-2. run the release workflow;
-3. download and verify artifacts;
-4. install on every target platform;
+1. download the existing public-prerelease assets as an unauthenticated user;
+2. verify the identity manifest, hashes, signatures, SBOMs, and provenance;
+3. publish the saved `trop` package to the disposable registry, wait for index
+   availability, then publish the saved `trop-cli` package;
+4. install the saved packages and artifacts on every target platform;
 5. upgrade a copy of each prior supported database;
 6. execute the smoke and destructive-operation suites;
-7. generate the custom Homebrew formula;
-8. simulate announcement and security-advisory metadata;
-9. practice rollback.
+7. install and test the exact custom-tap formula retained by #136;
+8. simulate #150's production publication and existing-prerelease promotion
+   from saved outputs without contacting a production write endpoint;
+9. compare every candidate-affecting input and output with the #149 identity
+   manifest and require no change;
+10. simulate announcement and security-advisory metadata; and
+11. practice rollback and failed-candidate withdrawal.
+
+The simulation in step 8 must prove that #150 can publish in `trop`,
+index-wait, `trop-cli` order and promote the existing public prerelease without
+rebuilding, repacking, retagging, replacing assets, or editing source, version,
+lockfile, package contents, integrity evidence, README, changelog, Cargo
+metadata, or status text. A new disposable candidate or rebuilt substitute does
+not satisfy this rehearsal.
 
 The rollback plan must distinguish:
 
@@ -1134,8 +1235,10 @@ users whose database was migrated by a withdrawn release.
 
 ## 17. Homebrew custom-tap verification
 
-Use a custom tap before proposing Homebrew/core. The formula must consume an
-immutable release artifact with an exact SHA-256, not a branch archive.
+Audit the exact custom-tap formula whose evidence closed #136. It must consume
+the exact #149 public-prerelease asset URL and SHA-256 recorded in the identity
+manifest, not a branch archive, rebuilt archive, or substitute version. Do not
+generate or switch formulas during #137.
 
 In a clean Homebrew environment run:
 
@@ -1157,8 +1260,15 @@ formula. Verify:
 - formula test uses an isolated data directory and proves a real
   reserve/idempotency/list operation;
 - uninstall does not delete user reservations;
-- checksum/signature correspond to the published release;
+- formula URL and checksum correspond exactly to #149's public prerelease asset;
+- the artifact's signature is independently verifiable;
 - no source checkout or network access is needed at runtime.
+
+Record the formula revision, tap PR, asset URL, checksum, and results. Its
+pre-`GO` status must be honest: #136 proves candidate consumption, not stable
+publication. After #137 records `GO`, #150 must promote that existing candidate
+without changing the formula's artifact identity; #151 later owns
+post-publication tap verification.
 
 Do not treat inclusion in a custom tap as evidence that Homebrew/core's
 notability or policy requirements are met. Consider a core submission only
@@ -1192,10 +1302,30 @@ does not satisfy the gate.
 
 ## 19. Final report and go/no-go rubric
 
+### Verdict ownership and closing references
+
+Run #137 in a fresh independent session or context. The active remediation
+context may provide a factual handoff, but it must not author, review, approve,
+sign, or otherwise determine its own verdict. Use an auditor and final reviewer
+independent of the remediation sequence wherever practical.
+
+Every audit-preparation, audit-in-progress, `CONDITIONAL NO-GO`, or `NO-GO` PR
+must use only `Refs #137`, contain no workflow closing keyword, and expose
+`closingIssuesReferences: []` after GitHub indexing. It leaves #137 open. Only
+one final, dedicated, independently authored and reviewed report PR may use the
+sole `Closes #137`, and only after its committed signed-off report states
+exactly `GO` for the exact #149 candidate and contains or links every mandatory
+evidence item. That PR must target `main`, close no other workflow issue, and
+expose exactly #137 in `closingIssuesReferences` after indexing.
+
 ### Automatic no-go conditions
 
 The release is **NO-GO** if any of the following is true:
 
+- the tested commit, version, tag, prerelease, package, artifact, identity
+  manifest, or formula is not the exact subject closed by #149 and #136;
+- the exact comprehensive version of `trop` or `trop-cli` is already present on
+  production crates.io before #150;
 - any known critical or high-severity correctness/security finding remains;
 - generated shell output can contain an unvalidated identifier or statement;
 - single or group reservations are not idempotent;
@@ -1213,6 +1343,11 @@ The release is **NO-GO** if any of the following is true:
   fails its required tests;
 - release artifacts lack required licenses, checksums, signatures, SBOM, or
   provenance;
+- an unauthenticated user cannot download and verify every #149 target artifact
+  and all four required integrity objects;
+- the #136 formula does not consume the exact #149 asset URL and checksum;
+- saved-artifact rehearsal requires a candidate-affecting change or cannot
+  prove the exact #150 publication and promotion path;
 - migration/rollback from every previously published schema is unverified;
 - any required test was skipped without an approved release-scope reduction;
 - any traceability row is failed, blocked, or lacks evidence;
@@ -1221,27 +1356,64 @@ The release is **NO-GO** if any of the following is true:
 
 ### Conditional no-go
 
-The result is **CONDITIONAL NO-GO** when no automatic blocker is known but
-evidence is incomplete, a platform is unavailable, a risk exception awaits
-approval, performance budgets are undefined, or a nondeterministic result
-cannot yet be explained. This is not authorization to publish; resolve the
-condition and rerun the affected gates.
+The result is **CONDITIONAL NO-GO** only when no automatic blocker is known and
+the remaining items are bounded, non-safety evidence gaps: for example, a
+platform is temporarily unavailable, a non-safety risk exception awaits
+approval, performance budgets are undefined, or a nondeterministic non-safety
+result remains unexplained. Security, data-integrity, destructive-operation,
+candidate-identity, packaging-integrity, or other automatic no-go conditions
+cannot be conditional. Every condition must name its accountable owner, linked
+remediation or evidence action, and a dated near-term re-audit plan.
+
+`CONDITIONAL NO-GO` is not authorization to publish and does not preserve the
+candidate for a later resumed audit. Apply the abandonment procedure below and
+rerun against a successor candidate.
 
 ### Go criteria
 
 The release is **GO** only when:
 
+- every mandatory evidence item is present, and no open P0, P1, or unwaived
+  release blocker remains;
 - every specification requirement has passing independent evidence;
 - every original due-diligence defect has been reproduced as fixed and guarded
   by a regression test that fails under controlled mutation;
 - baseline, cross-platform, MSRV, security, supply-chain, migration, packaging,
   installation, Homebrew-tap, load, race, crash, and soak gates all pass;
+- the exact #149 assets and mandatory integrity evidence pass unauthenticated
+  verification, while both comprehensive production crates remain absent;
+- the exact #136 formula consumes #149's asset URL and checksum on every
+  claimed platform;
 - test runs are repeatable and free of unexplained flakes;
-- release and rollback rehearsals succeed using the exact candidate artifacts;
+- release and rollback rehearsals succeed from the exact saved candidate
+  artifacts and prove #150 requires no candidate-affecting change;
 - all findings are closed or are low-severity, explicitly risk-accepted,
   documented, and noncontractual;
 - at least one reviewer independent of the remediation work signs the evidence
   bundle and decision.
+
+### Verdict consequences
+
+Every `CONDITIONAL NO-GO` or `NO-GO` permanently abandons the audited version
+and tag, even when caused only by missing evidence or platform availability.
+Mark the public prerelease honestly as failed or withdrawn. Never move or
+delete its tag, replace or delete its assets, or reuse that version. Leave #137
+open; reopen #149, #136, #89, and every affected component gate; file and land
+the linked remediation or evidence work; and obtain a successor #130 version
+decision when needed. The next attempt requires a successor candidate, fresh
+tap evidence, reclosed affected gates, and a fresh independent audit.
+
+An exact `GO` closes only #137. It unlocks #150 but does not authorize
+production publication. Fresh explicit maintainer approval at #150 remains
+mandatory. After that gate publishes the saved packages and promotes the
+existing prerelease without a candidate-affecting change, #151 must close with
+post-release custom-tap evidence before the program may advance to #83.
+
+No candidate-affecting change may land between `GO` and #150 publication. If
+one becomes necessary, stop, invalidate the old `GO`, reopen issue #137,
+candidate gate #149, issues #136 and #89, and every affected component gate,
+permanently abandon the old version and tag, and repeat the
+successor-candidate lifecycle. A prior `GO` cannot authorize changed content.
 
 ### Required sign-off block
 
@@ -1249,7 +1421,11 @@ Include this completed block in the final report:
 
 ```text
 Audited commit:
-Proposed version/tag:
+#149 candidate URL:
+Comprehensive version/tag:
+#149 identity manifest and SHA-256:
+#136 formula revision, asset URL, and checksum:
+Production crate absence evidence:
 Audit dates:
 Auditor(s):
 Independent reviewer:
@@ -1262,6 +1438,7 @@ Cross-platform and MSRV: PASS / FAIL / INCOMPLETE
 Performance and 24-hour soak: PASS / FAIL / INCOMPLETE
 Packaging, artifacts, and custom tap: PASS / FAIL / INCOMPLETE
 Release and rollback rehearsal: PASS / FAIL / INCOMPLETE
+Saved-artifact no-change comparison: PASS / FAIL / INCOMPLETE
 Open findings by severity:
 Skipped/blocked tests:
 Risk acceptances:
