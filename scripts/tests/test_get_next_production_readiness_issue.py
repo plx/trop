@@ -80,12 +80,26 @@ def issue(
     )
 
 
+def selection_snapshot(
+    issues: list[selector.WorkIssue],
+    *,
+    default_branch: str = "main",
+) -> selector.SelectionSnapshot:
+    normalized = tuple(sorted(issues, key=lambda item: item.number))
+    return selector.SelectionSnapshot(
+        default_branch=default_branch,
+        issues=normalized,
+        selection=selector.select_next(normalized),
+    )
+
+
 def raw_issue(
     number: int,
     *,
     labels: tuple[str, ...] = (WORK_LABEL, LEAF_LABEL, "P1"),
     state: str = "OPEN",
     blockers: tuple[dict[str, object], ...] = (),
+    updated_at: str = UPDATED_AT,
 ) -> dict[str, object]:
     return {
         "id": f"I_{number}",
@@ -93,7 +107,7 @@ def raw_issue(
         "title": f"Issue {number}",
         "url": f"https://github.com/{REPOSITORY}/issues/{number}",
         "state": state,
-        "updatedAt": UPDATED_AT,
+        "updatedAt": updated_at,
         "labels": {
             "totalCount": len(labels),
             "nodes": [{"name": label} for label in labels],
@@ -544,7 +558,7 @@ class MembershipTests(unittest.TestCase):
 
 
 class FakeClient:
-    def __init__(self, snapshots: list[selector.Selection]) -> None:
+    def __init__(self, snapshots: list[selector.SelectionSnapshot]) -> None:
         self.snapshots = snapshots
         self.snapshot_calls = 0
 
@@ -552,14 +566,196 @@ class FakeClient:
         return repository or REPOSITORY
 
 
+class FullSnapshotClient:
+    def __init__(
+        self,
+        snapshots: list[tuple[str, list[dict[str, object]], list[dict[str, object]]]],
+    ) -> None:
+        self.snapshots = snapshots
+        self.snapshot_calls = 0
+
+    def resolve_repository(self, repository: str | None) -> str:
+        return repository or REPOSITORY
+
+    def fetch_work_universe(
+        self,
+        _repository: str,
+        _universe_label: str,
+    ) -> tuple[str, list[dict[str, object]]]:
+        default_branch, issues, _pull_requests = self.snapshots[self.snapshot_calls]
+        return default_branch, issues
+
+    def fetch_work_membership(
+        self,
+        _repository: str,
+        _work_label: str,
+    ) -> list[dict[str, object]]:
+        _default_branch, issues, _pull_requests = self.snapshots[self.snapshot_calls]
+        return issues
+
+    def fetch_open_pull_requests(
+        self,
+        _repository: str,
+    ) -> list[dict[str, object]]:
+        _default_branch, _issues, pull_requests = self.snapshots[self.snapshot_calls]
+        self.snapshot_calls += 1
+        return pull_requests
+
+
+class FullSnapshotStabilizationTests(unittest.TestCase):
+    def get_with_snapshots(
+        self,
+        snapshots: list[tuple[str, list[dict[str, object]], list[dict[str, object]]]],
+    ) -> tuple[selector.Selection, FullSnapshotClient]:
+        client = FullSnapshotClient(snapshots)
+        result = selector.get_selection(
+            client=client,
+            repository=REPOSITORY,
+            universe_label=UNIVERSE_LABEL,
+            work_label=WORK_LABEL,
+            leaf_label=LEAF_LABEL,
+            gate_label=GATE_LABEL,
+        )
+        return result, client
+
+    def test_default_branch_change_requires_a_new_matching_snapshot(self) -> None:
+        issues = [
+            raw_issue(10, labels=(WORK_LABEL, LEAF_LABEL, "P0")),
+            raw_issue(20),
+        ]
+
+        result, client = self.get_with_snapshots(
+            [
+                ("main", issues, []),
+                ("release", issues, []),
+                ("release", issues, []),
+            ]
+        )
+
+        self.assertEqual(result.issue, issue(10, priority=0))
+        self.assertEqual(client.snapshot_calls, 3)
+
+    def test_non_selected_issue_change_requires_a_new_matching_snapshot(
+        self,
+    ) -> None:
+        first = [
+            raw_issue(10, labels=(WORK_LABEL, LEAF_LABEL, "P0")),
+            raw_issue(20),
+        ]
+        changed = [
+            first[0],
+            raw_issue(20, updated_at="2026-07-25T12:01:00Z"),
+        ]
+
+        result, client = self.get_with_snapshots(
+            [
+                ("main", first, []),
+                ("main", changed, []),
+                ("main", changed, []),
+            ]
+        )
+
+        self.assertEqual(result.issue, issue(10, priority=0))
+        self.assertEqual(client.snapshot_calls, 3)
+
+    def test_non_selected_taxonomy_change_requires_a_new_matching_snapshot(
+        self,
+    ) -> None:
+        winner = raw_issue(10, labels=(WORK_LABEL, LEAF_LABEL, "P0"))
+        first = [winner, raw_issue(20)]
+        changed = [
+            winner,
+            raw_issue(20, labels=(WORK_LABEL, LEAF_LABEL, "P2")),
+        ]
+
+        result, client = self.get_with_snapshots(
+            [
+                ("main", first, []),
+                ("main", changed, []),
+                ("main", changed, []),
+            ]
+        )
+
+        self.assertEqual(result.issue, issue(10, priority=0))
+        self.assertEqual(client.snapshot_calls, 3)
+
+    def test_non_selected_blocker_change_requires_a_new_matching_snapshot(
+        self,
+    ) -> None:
+        winner = raw_issue(10, labels=(WORK_LABEL, LEAF_LABEL, "P0"))
+        closed = raw_issue(30, state="CLOSED")
+        first = [
+            winner,
+            raw_issue(20, blockers=(raw_blocker(30, state="CLOSED"),)),
+            closed,
+        ]
+        changed = [winner, raw_issue(20), closed]
+
+        result, client = self.get_with_snapshots(
+            [
+                ("main", first, []),
+                ("main", changed, []),
+                ("main", changed, []),
+            ]
+        )
+
+        self.assertEqual(result.issue, issue(10, priority=0))
+        self.assertEqual(client.snapshot_calls, 3)
+
+    def test_non_selected_closing_pr_change_requires_a_new_matching_snapshot(
+        self,
+    ) -> None:
+        issues = [
+            raw_issue(10, labels=(WORK_LABEL, LEAF_LABEL, "P0")),
+            raw_issue(20),
+            raw_issue(30),
+        ]
+        closes_20 = [raw_pull_request(900, issue_numbers=(20,))]
+        closes_30 = [raw_pull_request(900, issue_numbers=(30,))]
+
+        result, client = self.get_with_snapshots(
+            [
+                ("main", issues, closes_20),
+                ("main", issues, closes_30),
+                ("main", issues, closes_30),
+            ]
+        )
+
+        self.assertEqual(result.issue, issue(10, priority=0))
+        self.assertEqual(client.snapshot_calls, 3)
+
+    def test_full_snapshots_that_never_stabilize_fail_closed(self) -> None:
+        issues = [raw_issue(10, labels=(WORK_LABEL, LEAF_LABEL, "P0"))]
+        client = FullSnapshotClient(
+            [
+                ("main", issues, []),
+                ("release", issues, []),
+                ("main", issues, []),
+                ("release", issues, []),
+            ]
+        )
+
+        with self.assertRaisesRegex(selector.WorkflowError, "stabilize"):
+            selector.get_selection(
+                client=client,
+                repository=REPOSITORY,
+                universe_label=UNIVERSE_LABEL,
+                work_label=WORK_LABEL,
+                leaf_label=LEAF_LABEL,
+                gate_label=GATE_LABEL,
+            )
+
+        self.assertEqual(client.snapshot_calls, 4)
+
+
 class StabilizationTests(unittest.TestCase):
     def get_with_snapshots(
         self,
-        snapshots: list[selector.Selection],
+        snapshots: list[selector.SelectionSnapshot],
     ) -> tuple[selector.Selection, FakeClient]:
         client = FakeClient(snapshots)
 
-        def fetch(**_: object) -> selector.Selection:
+        def fetch(**_: object) -> selector.SelectionSnapshot:
             result = snapshots[client.snapshot_calls]
             client.snapshot_calls += 1
             return result
@@ -576,20 +772,20 @@ class StabilizationTests(unittest.TestCase):
         return result, client
 
     def test_selected_result_requires_two_matching_full_snapshots(self) -> None:
-        selected = selector.select_next([issue(10, priority=0)])
+        selected = selection_snapshot([issue(10, priority=0)])
 
         result, client = self.get_with_snapshots([selected, selected])
 
-        self.assertEqual(result, selected)
+        self.assertEqual(result, selected.selection)
         self.assertEqual(client.snapshot_calls, 2)
 
     def test_candidate_change_requires_two_matches_for_new_candidate(self) -> None:
-        first = selector.select_next([issue(10, priority=0)])
-        second = selector.select_next([issue(20, priority=0)])
+        first = selection_snapshot([issue(10, priority=0)])
+        second = selection_snapshot([issue(20, priority=0)])
 
         result, client = self.get_with_snapshots([first, second, second])
 
-        self.assertEqual(result, second)
+        self.assertEqual(result, second.selection)
         self.assertEqual(client.snapshot_calls, 3)
 
     def test_reopened_blocker_changes_snapshot_and_prevents_stale_selection(
@@ -600,8 +796,8 @@ class StabilizationTests(unittest.TestCase):
             priority=0,
             blockers=(blocker(10, state="CLOSED"),),
         )
-        selected = selector.select_next([formerly_ready])
-        now_blocked = selector.select_next(
+        selected = selection_snapshot([formerly_ready])
+        now_blocked = selection_snapshot(
             [replace(formerly_ready, blockers=(blocker(10, state="OPEN"),))]
         )
 
@@ -616,8 +812,8 @@ class StabilizationTests(unittest.TestCase):
             closing_pull_requests=(closing_pull_request(),),
         )
         dependent = issue(20, priority=0, blockers=(blocker(10),))
-        selected = selector.select_next([root, dependent])
-        now_root = selector.select_next(
+        selected = selection_snapshot([root, dependent])
+        now_root = selection_snapshot(
             [replace(root, closing_pull_requests=()), dependent]
         )
 
@@ -632,8 +828,8 @@ class StabilizationTests(unittest.TestCase):
             kind=selector.WorkKind.GATE,
             blockers=(blocker(10, state="CLOSED"),),
         )
-        selected = selector.select_next([formerly_ready])
-        now_blocked = selector.select_next(
+        selected = selection_snapshot([formerly_ready])
+        now_blocked = selection_snapshot(
             [replace(formerly_ready, blockers=(blocker(10, state="OPEN"),))]
         )
 
@@ -642,7 +838,7 @@ class StabilizationTests(unittest.TestCase):
         self.assertIs(result.status, selector.SelectionStatus.WAITING)
 
     def test_complete_result_requires_two_matching_full_snapshots(self) -> None:
-        complete = selector.select_next([issue(10, state="CLOSED")])
+        complete = selection_snapshot([issue(10, state="CLOSED")])
 
         result, client = self.get_with_snapshots([complete, complete])
 
@@ -650,7 +846,7 @@ class StabilizationTests(unittest.TestCase):
         self.assertEqual(client.snapshot_calls, 2)
 
     def test_waiting_result_returns_after_one_snapshot(self) -> None:
-        waiting = selector.select_next([issue(20, blockers=(blocker(10),))])
+        waiting = selection_snapshot([issue(20, blockers=(blocker(10),))])
 
         result, client = self.get_with_snapshots([waiting])
 
@@ -658,12 +854,12 @@ class StabilizationTests(unittest.TestCase):
         self.assertEqual(client.snapshot_calls, 1)
 
     def test_unstable_state_fails_closed_after_four_snapshots(self) -> None:
-        first = selector.select_next([issue(10, priority=0)])
-        second = selector.select_next([issue(20, priority=0)])
+        first = selection_snapshot([issue(10, priority=0)])
+        second = selection_snapshot([issue(20, priority=0)])
 
         client = FakeClient([first, second, first, second])
 
-        def fetch(**_: object) -> selector.Selection:
+        def fetch(**_: object) -> selector.SelectionSnapshot:
             result = client.snapshots[client.snapshot_calls]
             client.snapshot_calls += 1
             return result
