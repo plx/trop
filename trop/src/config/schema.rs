@@ -278,7 +278,12 @@ pub struct ReservationGroup {
     /// Base port for the reservation group.
     pub base: Option<u16>,
 
-    /// Map of service tags to their definitions.
+    /// Map of broad service tags to their definitions.
+    ///
+    /// When a service omits [`ServiceDefinition::env`], its tag must be ASCII
+    /// and produce a portable environment-variable name after ASCII
+    /// case conversion and replacing hyphens with underscores. Resolved names
+    /// must be unique under ASCII-case-insensitive comparison.
     pub services: HashMap<String, ServiceDefinition>,
 }
 
@@ -304,7 +309,10 @@ pub struct ServiceDefinition {
     /// Preferred absolute port number.
     pub preferred: Option<u16>,
 
-    /// Environment variable name to export.
+    /// Explicit environment-variable name to export.
+    ///
+    /// Names must be at most 255 bytes and match
+    /// `[A-Za-z_][A-Za-z0-9_]*`.
     pub env: Option<String>,
 }
 

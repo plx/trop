@@ -47,7 +47,8 @@ impl OutputFormat {
     /// # Arguments
     ///
     /// * `env_mappings` - Optional mapping from service tags to environment variable names.
-    ///   If None, service tags are converted to uppercase for variable names.
+    ///   Unmapped tags use ASCII-only uppercase/hyphen-to-underscore derivation,
+    ///   and formatting fails if the result is not portable.
     #[must_use]
     pub fn create_formatter(
         &self,

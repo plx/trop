@@ -70,11 +70,28 @@ reservations:
       env: DB_PORT
 ```
 
-With that file in place, you can then reserve all ports and inject them into the environment like so:
+Every reservation service must resolve to a portable `export`/`dotenv`
+identifier, regardless of the selected output format. Explicit `env` names must
+be at most 255 bytes and match `[A-Za-z_][A-Za-z0-9_]*`. When `env` is omitted,
+trop accepts ASCII service tags that become valid names after converting ASCII
+letters to uppercase and replacing `-` with `_`; all other tags require an
+explicit valid mapping.
+Resolved names must also be unique when compared without ASCII case.
+
+With that file in place, reserve all ports and inspect the resulting mapping by
+choosing one non-executable output format:
 
 ```bash
-eval "$(trop autoreserve)"
+trop autoreserve --format human
+# or
+trop autoreserve --format json
 ```
+
+For trop releases through 0.1.0, do not evaluate, source, or load `export` or
+`dotenv` output, including output from `autoreserve` or `reserve-group`. Those
+releases do not safely validate every generated variable name. Until a hardened
+release is published, review the human or JSON output and manually set only the
+environment variables you trust.
 
 ### Projects and Tasks
 

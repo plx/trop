@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use crate::config::ConfigLoader;
+use crate::config::{Config, ConfigLoader, ConfigValidator};
 use crate::error::{Error, Result};
 use rusqlite::Connection;
 
@@ -107,6 +107,7 @@ impl AutoreserveOptions {
 pub struct AutoreservePlan {
     options: AutoreserveOptions,
     discovered_config_path: PathBuf,
+    config: Config,
 }
 
 impl AutoreservePlan {
@@ -147,18 +148,19 @@ impl AutoreservePlan {
 
         // Use the highest precedence config (last in the sorted list)
         // ConfigLoader::discover_project_configs returns configs sorted by precedence
-        let discovered_config_path = configs
-            .iter()
+        let selected_config = configs
+            .into_iter()
             .max_by_key(|c| c.precedence)
-            .map(|c| c.path.clone())
             .ok_or_else(|| Error::InvalidPath {
                 path: options.start_dir.clone(),
                 reason: "Failed to determine config path".to_string(),
             })?;
+        ConfigValidator::validate(&selected_config.config, true)?;
 
         Ok(Self {
             options,
-            discovered_config_path,
+            discovered_config_path: selected_config.path,
+            config: selected_config.config,
         })
     }
 
@@ -197,7 +199,8 @@ impl AutoreservePlan {
         };
 
         // Delegate to ReserveGroupPlan
-        let reserve_group_plan = ReserveGroupPlan::new(reserve_group_options)?;
+        let reserve_group_plan =
+            ReserveGroupPlan::from_config(reserve_group_options, self.config.clone())?;
         reserve_group_plan.build_plan(conn)
     }
 
@@ -205,6 +208,12 @@ impl AutoreservePlan {
     #[must_use]
     pub fn discovered_config_path(&self) -> &PathBuf {
         &self.discovered_config_path
+    }
+
+    /// Returns the exact validated configuration snapshot used by this planner.
+    #[must_use]
+    pub const fn config(&self) -> &Config {
+        &self.config
     }
 }
 
@@ -261,6 +270,52 @@ reservations:
         assert!(plan.is_ok());
         let plan = plan.unwrap();
         assert!(plan.discovered_config_path.ends_with("trop.yaml"));
+    }
+
+    #[test]
+    fn test_autoreserve_config_accessor_is_creation_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("trop.yaml");
+        create_test_config_file(
+            temp_dir.path(),
+            "trop.yaml",
+            r"
+project: snapshot-project
+ports:
+  min: 5000
+  max: 7000
+reservations:
+  services:
+    web:
+      offset: 0
+      env: SNAPSHOT_PORT
+",
+        );
+        let planner =
+            AutoreservePlan::new(AutoreserveOptions::new(temp_dir.path().to_path_buf())).unwrap();
+
+        fs::write(&config_path, "this: [is not valid yaml").unwrap();
+
+        assert_eq!(
+            planner.config().project.as_deref(),
+            Some("snapshot-project")
+        );
+        assert_eq!(
+            planner
+                .config()
+                .reservations
+                .as_ref()
+                .unwrap()
+                .services
+                .get("web")
+                .unwrap()
+                .env
+                .as_deref(),
+            Some("SNAPSHOT_PORT")
+        );
+
+        let db = create_test_database();
+        assert!(planner.build_plan(db.connection()).is_ok());
     }
 
     #[test]

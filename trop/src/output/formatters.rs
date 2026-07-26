@@ -1,7 +1,8 @@
 //! Output formatter implementations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::identifier::EnvironmentVariableName;
 use crate::{Error, Port, Result};
 
 use super::{OutputFormatter, ShellType};
@@ -11,21 +12,9 @@ use super::{OutputFormatter, ShellType};
 /// Valid names must:
 /// - Start with a letter or underscore
 /// - Contain only letters, digits, and underscores
+#[cfg(test)]
 fn is_valid_env_var_name(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-
-    let mut chars = name.chars();
-    let first = chars.next().unwrap();
-
-    // First character must be letter or underscore
-    if !first.is_ascii_alphabetic() && first != '_' {
-        return false;
-    }
-
-    // Remaining characters must be alphanumeric or underscore
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    EnvironmentVariableName::parse(name).is_ok()
 }
 
 /// Converts a service tag to an environment variable name.
@@ -33,19 +22,9 @@ fn is_valid_env_var_name(name: &str) -> bool {
 /// - Converts to uppercase
 /// - Replaces hyphens with underscores
 /// - Validates the result
+#[cfg(test)]
 fn tag_to_env_var(tag: &str) -> Result<String> {
-    let var_name = tag.to_uppercase().replace('-', "_");
-
-    if !is_valid_env_var_name(&var_name) {
-        return Err(Error::Validation {
-            field: "environment_variable".to_string(),
-            message: format!(
-                "invalid environment variable name '{var_name}': must contain only alphanumeric characters and underscores, and start with a letter or underscore"
-            ),
-        });
-    }
-
-    Ok(var_name)
+    EnvironmentVariableName::derive_from_tag(tag).map(EnvironmentVariableName::into_string)
 }
 
 /// Resolve environment variable name for a service tag using optional mappings.
@@ -53,14 +32,44 @@ fn resolve_env_var_name(
     tag: &str,
     env_mappings: Option<&HashMap<String, String>>,
 ) -> Result<String> {
-    if let Some(mappings) = env_mappings {
-        Ok(mappings
-            .get(tag)
-            .cloned()
-            .unwrap_or_else(|| tag_to_env_var(tag).unwrap_or_else(|_| tag.to_uppercase())))
-    } else {
-        tag_to_env_var(tag)
+    let explicit = env_mappings
+        .and_then(|mappings| mappings.get(tag))
+        .map(String::as_str);
+    EnvironmentVariableName::resolve(tag, explicit).map(EnvironmentVariableName::into_string)
+}
+
+/// Resolves and validates an entire allocation set before any output is rendered.
+fn resolve_allocations(
+    allocations: &HashMap<String, Port>,
+    env_mappings: Option<&HashMap<String, String>>,
+) -> Result<Vec<(Port, String)>> {
+    let mut tags: Vec<_> = allocations.keys().collect();
+    tags.sort();
+
+    let mut collision_keys = HashSet::with_capacity(tags.len());
+    let mut resolved = Vec::with_capacity(tags.len());
+
+    for tag in tags {
+        let variable_name = resolve_env_var_name(tag, env_mappings)?;
+        let validated = EnvironmentVariableName::parse(&variable_name)?;
+
+        if !collision_keys.insert(validated.collision_key()) {
+            return Err(Error::Validation {
+                field: "environment_variable".to_owned(),
+                message: "resolved environment-variable names must be unique when compared without ASCII case".to_owned(),
+            });
+        }
+
+        resolved.push((allocations[tag], validated.into_string()));
     }
+
+    Ok(resolved)
+}
+
+/// Formats one dotenv assignment after revalidating the identifier boundary.
+fn format_dotenv_assignment(variable_name: &str, port: Port) -> Result<String> {
+    let validated = EnvironmentVariableName::parse(variable_name)?;
+    Ok(format!("{}={}", validated.as_str(), port.value()))
 }
 
 /// Formatter for shell-specific export statements.
@@ -76,7 +85,8 @@ impl ExportFormatter {
     ///
     /// * `shell` - The shell type to format exports for
     /// * `env_mappings` - Optional mapping from service tags to environment variable names.
-    ///   If None, tags are converted to uppercase.
+    ///   Unmapped tags use ASCII-only uppercase/hyphen-to-underscore derivation,
+    ///   and formatting fails if the result is not portable.
     #[must_use]
     pub fn new(shell: ShellType, env_mappings: Option<HashMap<String, String>>) -> Self {
         Self {
@@ -88,21 +98,13 @@ impl ExportFormatter {
 
 impl OutputFormatter for ExportFormatter {
     fn format(&self, allocations: &HashMap<String, Port>) -> Result<String> {
-        let mut exports = Vec::new();
+        let resolved = resolve_allocations(allocations, self.env_mappings.as_ref())?;
+        let mut exports = Vec::with_capacity(resolved.len());
 
-        // Sort by tag for consistent output
-        let mut tags: Vec<_> = allocations.keys().collect();
-        tags.sort();
-
-        for tag in tags {
-            let port = allocations[tag];
-
-            // Resolve environment variable name
-            let var_name = resolve_env_var_name(tag, self.env_mappings.as_ref())?;
-
+        for (port, variable_name) in resolved {
             exports.push(
                 self.shell
-                    .format_export(&var_name, &port.value().to_string()),
+                    .format_export(&variable_name, &port.value().to_string())?,
             );
         }
 
@@ -139,7 +141,8 @@ impl DotenvFormatter {
     /// # Arguments
     ///
     /// * `env_mappings` - Optional mapping from service tags to environment variable names.
-    ///   If None, tags are converted to uppercase.
+    ///   Unmapped tags use ASCII-only uppercase/hyphen-to-underscore derivation,
+    ///   and formatting fails if the result is not portable.
     #[must_use]
     pub fn new(env_mappings: Option<HashMap<String, String>>) -> Self {
         Self { env_mappings }
@@ -148,19 +151,11 @@ impl DotenvFormatter {
 
 impl OutputFormatter for DotenvFormatter {
     fn format(&self, allocations: &HashMap<String, Port>) -> Result<String> {
-        let mut lines = Vec::new();
+        let resolved = resolve_allocations(allocations, self.env_mappings.as_ref())?;
+        let mut lines = Vec::with_capacity(resolved.len());
 
-        // Sort by tag for consistent output
-        let mut tags: Vec<_> = allocations.keys().collect();
-        tags.sort();
-
-        for tag in tags {
-            let port = allocations[tag];
-
-            // Resolve environment variable name
-            let var_name = resolve_env_var_name(tag, self.env_mappings.as_ref())?;
-
-            lines.push(format!("{}={}", var_name, port.value()));
+        for (port, variable_name) in resolved {
+            lines.push(format_dotenv_assignment(&variable_name, port)?);
         }
 
         Ok(lines.join("\n"))
@@ -1111,12 +1106,12 @@ mod tests {
         assert_eq!(output1, expected);
     }
 
-    /// Test that `resolve_env_var_name` handles fallback correctly.
+    /// Test that `resolve_env_var_name` handles default derivation correctly.
     ///
     /// When a custom mapping exists but a service is not mapped,
-    /// the function should fall back to the default tag-to-env-var conversion.
+    /// the function should use validated default tag-to-env-var derivation.
     #[test]
-    fn test_resolve_env_var_name_fallback() {
+    fn test_resolve_env_var_name_default_derivation() {
         let mut mappings = HashMap::new();
         mappings.insert("web".to_string(), "WEB_PORT".to_string());
 
@@ -1124,12 +1119,200 @@ mod tests {
         let result = resolve_env_var_name("web", Some(&mappings)).unwrap();
         assert_eq!(result, "WEB_PORT");
 
-        // Service without mapping (fallback to default)
+        // Service without mapping (validated default derivation)
         let result = resolve_env_var_name("api", Some(&mappings)).unwrap();
         assert_eq!(result, "API");
 
         // No mappings provided (use default)
         let result = resolve_env_var_name("db", None).unwrap();
         assert_eq!(result, "DB");
+    }
+
+    #[test]
+    fn test_resolve_env_var_name_never_falls_back_to_raw_text() {
+        let mappings = HashMap::new();
+        let hostile_tags = [
+            "api server",
+            "api;export ATTACK=1",
+            "api$(command)",
+            "api`command`",
+            "api\nexport ATTACK=1",
+            "123-api",
+            "api.café",
+            "ß",
+            "ſ",
+        ];
+
+        for tag in hostile_tags {
+            let error = resolve_env_var_name(tag, Some(&mappings)).unwrap_err();
+            let diagnostic = error.to_string();
+            assert!(!diagnostic.contains(tag));
+            assert!(!diagnostic.contains('\n'));
+            assert!(!diagnostic.contains('\r'));
+        }
+    }
+
+    #[test]
+    fn test_explicit_mapping_is_revalidated_and_can_map_a_hostile_tag_safely() {
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "api;export ATTACK=1".to_string(),
+            "SAFE_API_PORT".to_string(),
+        );
+
+        assert_eq!(
+            resolve_env_var_name("api;export ATTACK=1", Some(&mappings)).unwrap(),
+            "SAFE_API_PORT"
+        );
+
+        mappings.insert(
+            "api;export ATTACK=1".to_string(),
+            "PORT\nexport ATTACK=1".to_string(),
+        );
+        let error = resolve_env_var_name("api;export ATTACK=1", Some(&mappings)).unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(!diagnostic.contains("PORT\nexport ATTACK=1"));
+        assert!(!diagnostic.contains('\n'));
+    }
+
+    #[test]
+    fn test_export_and_dotenv_reject_hostile_unmapped_tags_at_every_boundary() {
+        let shells = [
+            ShellType::Bash,
+            ShellType::Zsh,
+            ShellType::Fish,
+            ShellType::PowerShell,
+        ];
+        let hostile_tags = [
+            "api server",
+            "api;export ATTACK=1",
+            "api$(command)",
+            "api`command`",
+            "api\nexport ATTACK=1",
+            "123-api",
+            "api.café",
+            "ß",
+        ];
+
+        for tag in hostile_tags {
+            let mut allocations = HashMap::new();
+            allocations.insert(tag.to_string(), Port::try_from(5000).unwrap());
+
+            for shell in shells {
+                let formatter = ExportFormatter::new(shell, Some(HashMap::new()));
+                let error = formatter.format(&allocations).unwrap_err();
+                let diagnostic = error.to_string();
+                assert!(!diagnostic.contains(tag));
+                assert!(!diagnostic.contains('\n'));
+                assert!(!diagnostic.contains('\r'));
+            }
+
+            let formatter = DotenvFormatter::new(Some(HashMap::new()));
+            let error = formatter.format(&allocations).unwrap_err();
+            let diagnostic = error.to_string();
+            assert!(!diagnostic.contains(tag));
+            assert!(!diagnostic.contains('\n'));
+            assert!(!diagnostic.contains('\r'));
+        }
+    }
+
+    #[test]
+    fn test_export_and_dotenv_reject_invalid_explicit_names_at_every_boundary() {
+        let mut allocations = HashMap::new();
+        allocations.insert("api".to_string(), Port::try_from(5000).unwrap());
+
+        let invalid_names = [
+            "1PORT",
+            "API-PORT",
+            "API PORT",
+            "PORT$(command)",
+            "PORT\nexport ATTACK=1",
+            "PORT_CAFÉ",
+        ];
+
+        for invalid_name in invalid_names {
+            let mappings = HashMap::from([("api".to_string(), invalid_name.to_string())]);
+
+            for shell in [
+                ShellType::Bash,
+                ShellType::Zsh,
+                ShellType::Fish,
+                ShellType::PowerShell,
+            ] {
+                let formatter = ExportFormatter::new(shell, Some(mappings.clone()));
+                let error = formatter.format(&allocations).unwrap_err();
+                let diagnostic = error.to_string();
+                assert!(!diagnostic.contains(invalid_name));
+                assert!(!diagnostic.contains('\n'));
+            }
+
+            let formatter = DotenvFormatter::new(Some(mappings));
+            let error = formatter.format(&allocations).unwrap_err();
+            let diagnostic = error.to_string();
+            assert!(!diagnostic.contains(invalid_name));
+            assert!(!diagnostic.contains('\n'));
+        }
+    }
+
+    #[test]
+    fn test_mixed_valid_and_invalid_groups_fail_as_a_whole() {
+        let allocations = HashMap::from([
+            ("a-valid".to_string(), Port::try_from(5000).unwrap()),
+            (
+                "z;export ATTACK=1".to_string(),
+                Port::try_from(5001).unwrap(),
+            ),
+        ]);
+
+        for shell in [
+            ShellType::Bash,
+            ShellType::Zsh,
+            ShellType::Fish,
+            ShellType::PowerShell,
+        ] {
+            let formatter = ExportFormatter::new(shell, Some(HashMap::new()));
+            assert!(formatter.format(&allocations).is_err());
+        }
+
+        let formatter = DotenvFormatter::new(Some(HashMap::new()));
+        assert!(formatter.format(&allocations).is_err());
+    }
+
+    #[test]
+    fn test_resolved_environment_variable_collisions_are_rejected() {
+        let derived_collision = HashMap::from([
+            ("web-server".to_string(), Port::try_from(5000).unwrap()),
+            ("web_server".to_string(), Port::try_from(5001).unwrap()),
+        ]);
+        let formatter = ExportFormatter::new(ShellType::Bash, Some(HashMap::new()));
+        assert!(formatter.format(&derived_collision).is_err());
+
+        let mixed_collision = HashMap::from([
+            ("web".to_string(), Port::try_from(5000).unwrap()),
+            ("api".to_string(), Port::try_from(5001).unwrap()),
+        ]);
+        let mappings = HashMap::from([("web".to_string(), "api".to_string())]);
+        let formatter = DotenvFormatter::new(Some(mappings));
+        assert!(formatter.format(&mixed_collision).is_err());
+
+        let explicit_case_collision = HashMap::from([
+            ("web".to_string(), Port::try_from(5000).unwrap()),
+            ("api".to_string(), Port::try_from(5001).unwrap()),
+        ]);
+        let mappings = HashMap::from([
+            ("web".to_string(), "PORT".to_string()),
+            ("api".to_string(), "port".to_string()),
+        ]);
+        let formatter = ExportFormatter::new(ShellType::PowerShell, Some(mappings));
+        assert!(formatter.format(&explicit_case_collision).is_err());
+    }
+
+    #[test]
+    fn test_dotenv_assignment_revalidates_its_identifier_boundary() {
+        assert_eq!(
+            format_dotenv_assignment("_PRIVATE_PORT", Port::try_from(5000).unwrap()).unwrap(),
+            "_PRIVATE_PORT=5000"
+        );
+        assert!(format_dotenv_assignment("PORT\nATTACK=1", Port::try_from(5000).unwrap()).is_err());
     }
 }

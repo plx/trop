@@ -136,6 +136,11 @@ impl ReserveGroupPlan {
     pub fn new(options: ReserveGroupOptions) -> Result<Self> {
         // Load the configuration file
         let config = ConfigLoader::load_file(&options.config_path)?;
+        Self::from_config(options, config)
+    }
+
+    /// Creates a plan from an already parsed configuration snapshot.
+    pub(super) fn from_config(options: ReserveGroupOptions, config: Config) -> Result<Self> {
         ConfigValidator::validate(&config, true)?;
 
         // Get the base path (parent directory of the config file)
@@ -153,6 +158,12 @@ impl ReserveGroupPlan {
             config,
             base_path,
         })
+    }
+
+    /// Returns the exact validated configuration snapshot used by this planner.
+    #[must_use]
+    pub const fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Gets the occupancy check configuration from the overall config.
@@ -372,6 +383,49 @@ reservations:
         let plan = ReserveGroupPlan::new(options);
 
         assert!(plan.is_ok());
+    }
+
+    #[test]
+    fn test_reserve_group_config_accessor_is_creation_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = create_test_config_file(
+            &temp_dir,
+            r"
+project: snapshot-project
+ports:
+  min: 5000
+  max: 7000
+reservations:
+  services:
+    web:
+      offset: 0
+      env: SNAPSHOT_PORT
+",
+        );
+        let planner = ReserveGroupPlan::new(ReserveGroupOptions::new(config_path.clone())).unwrap();
+
+        fs::write(&config_path, "this: [is not valid yaml").unwrap();
+
+        assert_eq!(
+            planner.config().project.as_deref(),
+            Some("snapshot-project")
+        );
+        assert_eq!(
+            planner
+                .config()
+                .reservations
+                .as_ref()
+                .unwrap()
+                .services
+                .get("web")
+                .unwrap()
+                .env
+                .as_deref(),
+            Some("SNAPSHOT_PORT")
+        );
+
+        let db = create_test_database();
+        assert!(planner.build_plan(db.connection()).is_ok());
     }
 
     #[test]

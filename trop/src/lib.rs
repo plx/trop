@@ -35,6 +35,7 @@
 pub mod config;
 pub mod database;
 pub mod error;
+mod identifier;
 pub mod logging;
 pub mod operations;
 pub mod output;
