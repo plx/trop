@@ -20,6 +20,7 @@
     - 2026-07-25-pre-release-due-diligence.md # Historical baseline audit and release verdict
     - 2026-07-25-remediation-roadmap.md # GitHub epic, label, ticket, and dependency index
     - 2026-07-26-security-release-0.2.0-evidence.md # Retained SEC-2 publication, advisory, install, and yank evidence
+    - 2026-07-26-security-public-safety-gate-evidence.md # Aggregate evidence for the security and public-safety component gate
     - post-remediation-production-readiness-audit.md # Independent final-audit procedure and go/no-go rubric
     - production-readiness-remediation-goal.md # Autonomous one-issue remediation, audit, and release execution contract
     - production-readiness-work-selection.md # Live GitHub scheduling contract and selector operations
