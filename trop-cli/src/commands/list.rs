@@ -5,7 +5,7 @@
 
 use crate::error::CliError;
 use crate::invocation::InvocationContext;
-use crate::utils::{format_timestamp, normalize_path, shorten_path};
+use crate::utils::{format_timestamp, shorten_path};
 use clap::{Args, ValueEnum};
 use std::io::Write;
 use std::path::PathBuf;
@@ -87,8 +87,24 @@ impl ListCommand {
         }
 
         if let Some(ref path) = self.filter_path {
-            let normalized = normalize_path(path)?;
-            reservations.retain(|r| r.key().path.starts_with(&normalized));
+            let lexical_filter = context.resolve_explicit_path(path)?;
+            let canonical_filter = context.resolve_canonical_path(path).ok();
+            reservations.retain(|reservation| {
+                let stored_path = &reservation.key().path;
+
+                // Preserve direct matches for explicit identities, including
+                // nonexistent paths. When both paths can be canonicalized,
+                // also compare their physical identities as required by the
+                // list-filter contract.
+                stored_path.starts_with(&lexical_filter)
+                    || canonical_filter.as_ref().is_some_and(|canonical_filter| {
+                        context
+                            .resolve_canonical_path(stored_path)
+                            .is_ok_and(|canonical_path| {
+                                canonical_path.starts_with(canonical_filter)
+                            })
+                    })
+            });
         }
 
         // 5. Format and output to stdout

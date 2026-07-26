@@ -40,7 +40,7 @@
 mod common;
 
 use assert_cmd::Command;
-use common::TestEnv;
+use common::{create_directory_symlink, TestEnv};
 use predicates::prelude::*;
 use std::fs;
 use std::path::Path;
@@ -666,13 +666,56 @@ fn test_show_path_uses_cwd_by_default() {
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).expect("Invalid UTF-8");
-    let shown_path = stdout.trim();
+    let shown_path = Path::new(stdout.trim());
 
-    // Should show the test directory (or its canonical equivalent)
-    assert!(
-        shown_path.contains("test"),
-        "Should resolve to current directory: {shown_path}"
+    assert_eq!(
+        shown_path,
+        fs::canonicalize(&test_dir).expect("failed to canonicalize the implicit working directory")
     );
+}
+
+/// Inferred CWD paths are canonicalized, while explicit paths preserve the
+/// caller's symlink spelling unless `--canonicalize` is requested.
+#[test]
+fn test_show_path_preserves_explicit_and_canonicalizes_implicit_symlink_paths() {
+    let env = TestEnv::new();
+    let physical = env.create_dir("physical");
+    let logical = env.path().join("logical");
+    if !create_directory_symlink(&physical, &logical) {
+        return;
+    }
+
+    let implicit_output = env
+        .command()
+        .arg("show-path")
+        .current_dir(&logical)
+        .output()
+        .expect("Failed to resolve implicit path");
+    assert!(implicit_output.status.success());
+    let implicit = Path::new(
+        std::str::from_utf8(&implicit_output.stdout)
+            .expect("Invalid UTF-8")
+            .trim(),
+    )
+    .to_path_buf();
+
+    let explicit_output = env
+        .command()
+        .arg("show-path")
+        .arg("--path")
+        .arg(&logical)
+        .output()
+        .expect("Failed to resolve explicit path");
+    assert!(explicit_output.status.success());
+    let explicit = Path::new(
+        std::str::from_utf8(&explicit_output.stdout)
+            .expect("Invalid UTF-8")
+            .trim(),
+    )
+    .to_path_buf();
+
+    assert_eq!(implicit, fs::canonicalize(&physical).unwrap());
+    assert_eq!(explicit, logical);
 }
 
 // ============================================================================

@@ -14,7 +14,7 @@
 mod common;
 
 use assert_cmd::Command;
-use common::{parse_port, TestEnv};
+use common::{create_directory_symlink, parse_port, TestEnv};
 use predicates::prelude::*;
 
 // ============================================================================
@@ -68,9 +68,53 @@ fn test_reserve_without_path_uses_cwd() {
         .success()
         .stdout(predicate::str::is_match(r"^\d+\n$").unwrap());
 
-    // Verify the reservation was created for the test path
-    let list_output = env.list();
-    assert!(list_output.contains(test_path.to_str().unwrap()));
+    // Implicit paths use the canonical identity of the working directory.
+    assert_eq!(
+        env.reservation_paths(),
+        vec![test_path
+            .canonicalize()
+            .expect("failed to canonicalize implicit working directory")]
+    );
+}
+
+/// Implicit CWD identity must not depend on whether the directory was entered
+/// through its physical path or a directory symlink.
+#[test]
+fn test_implicit_reserve_uses_one_identity_through_symlink() {
+    let env = TestEnv::new();
+    let physical = env.create_dir("physical-project");
+    let logical = env.path().join("logical-project");
+    if !create_directory_symlink(&physical, &logical) {
+        return;
+    }
+
+    let reserve_from = |working_dir: &std::path::Path| {
+        let output = env
+            .command()
+            .arg("reserve")
+            .arg("--allow-unrelated-path")
+            .current_dir(working_dir)
+            .output()
+            .expect("Failed to run implicit reserve");
+        assert!(
+            output.status.success(),
+            "implicit reserve failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        parse_port(&String::from_utf8(output.stdout).expect("Invalid UTF-8"))
+    };
+
+    let physical_port = reserve_from(&physical);
+    let logical_port = reserve_from(&logical);
+
+    assert_eq!(logical_port, physical_port);
+    assert_eq!(env.reservation_count(), 1);
+    assert_eq!(
+        env.reservation_paths(),
+        vec![physical
+            .canonicalize()
+            .expect("failed to canonicalize physical project")]
+    );
 }
 
 /// Test reserve with service tag.
@@ -646,6 +690,27 @@ fn test_reserve_respects_trop_path_env() {
         .stdout(predicate::str::is_match(r"^\d+\n$").unwrap());
 }
 
+/// `TROP_PATH` is explicit input, so its symlink spelling remains the
+/// reservation identity.
+#[test]
+fn test_trop_path_symlink_remains_explicit() {
+    let env = TestEnv::new();
+    let physical = env.create_dir("physical-project");
+    let logical = env.path().join("logical-project");
+    if !create_directory_symlink(&physical, &logical) {
+        return;
+    }
+
+    env.command()
+        .arg("reserve")
+        .arg("--allow-unrelated-path")
+        .env("TROP_PATH", &logical)
+        .assert()
+        .success();
+
+    assert_eq!(env.reservation_paths(), vec![logical]);
+}
+
 /// Test that command-line --path overrides TROP_PATH.
 ///
 /// This verifies the precedence: CLI flags > env vars.
@@ -774,31 +839,21 @@ fn test_reserve_with_invalid_port_range() {
         .failure();
 }
 
-/// Test reserve with nonexistent path fails with appropriate error.
-///
-/// While trop generally accepts paths (they might be created later),
-/// some operations may require the path to exist.
+/// Explicit reservation paths need not exist and retain their lexical identity.
 #[test]
 fn test_reserve_with_nonexistent_path() {
     let env = TestEnv::new();
     let fake_path = env.path().join("does-not-exist");
 
-    // This might succeed or fail depending on path validation strategy
-    // Just verify it doesn't crash
-    let output = env
-        .command()
+    env.command()
         .arg("reserve")
         .arg("--path")
         .arg(&fake_path)
         .arg("--allow-unrelated-path")
-        .output()
-        .unwrap();
+        .assert()
+        .success();
 
-    // Either succeeds or fails gracefully with error message
-    if !output.status.success() {
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(!stderr.is_empty(), "Error should have a message");
-    }
+    assert_eq!(env.reservation_paths(), vec![fake_path]);
 }
 
 /// Test sticky field violation without permission flag.

@@ -726,7 +726,8 @@ impl Database {
     ///
     /// Returns an error if:
     /// - The current working directory cannot be determined
-    /// - The paths are unrelated and `allow_unrelated` is false
+    /// - The paths are unrelated both lexically and physically, and
+    ///   `allow_unrelated` is false
     ///
     /// # Examples
     ///
@@ -743,11 +744,26 @@ impl Database {
     /// ```
     pub fn validate_path_relationship(target_path: &Path, allow_unrelated: bool) -> Result<()> {
         let current_dir = env::current_dir()?;
-        let relationship = PathRelationship::between(target_path, &current_dir);
+        let lexical_relationship = PathRelationship::between(target_path, &current_dir);
+        // Preserve lexical hierarchy for explicit and nonexistent paths. When
+        // that comparison is unrelated, compare existing paths physically so
+        // canonical inferred identities remain compatible with the platform's
+        // process-CWD spelling (notably Windows verbatim prefixes).
+        let physically_related = || {
+            let canonical_target = crate::path::canonicalize::canonicalize(target_path).ok()?;
+            let canonical_current = crate::path::canonicalize::canonicalize(&current_dir).ok()?;
+            Some(
+                PathRelationship::between(&canonical_target, &canonical_current)
+                    .is_allowed_without_force(),
+            )
+        };
 
-        if !relationship.is_allowed_without_force() && !allow_unrelated {
+        if !allow_unrelated
+            && !lexical_relationship.is_allowed_without_force()
+            && !physically_related().unwrap_or(false)
+        {
             return Err(Error::PathRelationshipViolation {
-                details: relationship.description(target_path, &current_dir),
+                details: lexical_relationship.description(target_path, &current_dir),
             });
         }
 
@@ -1143,6 +1159,19 @@ mod tests {
         // Same path should be allowed
         let result = Database::validate_path_relationship(&cwd, false);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_relationship_canonical_same() {
+        let _db = create_test_database();
+        let cwd = env::current_dir().unwrap();
+        let canonical_cwd = crate::path::canonicalize::canonicalize(&cwd).unwrap();
+
+        let result = Database::validate_path_relationship(&canonical_cwd, false);
+        assert!(
+            result.is_ok(),
+            "canonical and process spellings of the current directory must be related: {result:?}"
+        );
     }
 
     #[test]

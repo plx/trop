@@ -319,7 +319,7 @@ impl Command {
             Self::AssertDataDir(command) => command.execute(context),
             Self::PortInfo(command) => command.execute(context),
             Self::ShowDataDir(command) => command.execute(context.global()),
-            Self::ShowPath(command) => command.execute(context.global()),
+            Self::ShowPath(command) => command.execute(context),
             Self::Scan(command) => command.execute(context),
             Self::Validate(command) => command.execute(context.global()),
             Self::Exclude(command) => command.execute(context),

@@ -6,10 +6,9 @@
 
 use crate::error::CliError;
 use std::collections::HashMap;
-use std::env;
 use std::path::{Path, PathBuf};
 use trop::output::OutputFormat;
-use trop::{Config, PathResolver, Port};
+use trop::{Config, Port};
 
 /// Global CLI options shared across all commands.
 #[derive(Debug, Clone)]
@@ -29,32 +28,6 @@ pub struct GlobalOptions {
 
     /// Disable automatic database initialization.
     pub disable_autoinit: bool,
-}
-
-/// Resolve a path, using CWD if not specified.
-///
-/// # Path Handling Rules
-///
-/// - Explicit paths (provided by user) are normalized but NOT canonicalized
-/// - Implicit paths (CWD) are normalized from the current directory
-///
-/// Normalization makes paths absolute and expands ~, but doesn't follow symlinks.
-/// This allows paths that don't exist yet and avoids issues with temp directories.
-pub fn resolve_path(path: Option<PathBuf>) -> Result<PathBuf, CliError> {
-    let path_to_resolve = match path {
-        Some(p) => p,
-        None => env::current_dir()?,
-    };
-
-    // Normalize to make absolute, but don't canonicalize (allows non-existent paths)
-    normalize_path(&path_to_resolve)
-}
-
-/// Normalize a path (make absolute, expand ~, etc.) without following symlinks.
-pub fn normalize_path(path: &Path) -> Result<PathBuf, CliError> {
-    let resolver = PathResolver::new();
-    let resolved = resolver.resolve_explicit(path).map_err(CliError::from)?;
-    Ok(resolved.into_path_buf())
 }
 
 /// Format a timestamp for display.

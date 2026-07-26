@@ -5,7 +5,6 @@
 
 use crate::error::CliError;
 use crate::invocation::InvocationContext;
-use crate::utils::resolve_path;
 use clap::Args;
 use std::path::PathBuf;
 use trop::{PlanExecutor, Port, ReservationKey, ReserveOptions, ReservePlan};
@@ -120,7 +119,7 @@ impl ReserveCommand {
     pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
         let global = context.global();
         // 1. Resolve path (use CWD if not specified, canonicalize if implicit)
-        let path = resolve_path(self.path)?;
+        let path = context.resolve_path(self.path.as_deref())?;
 
         // 2. Build ReservationKey
         let key = ReservationKey::new(path, self.tag)

@@ -41,8 +41,12 @@ impl MigrateCommand {
         // 1. Open database
         let mut db = context.open_database()?;
 
+        // 2. Resolve both explicitly supplied paths without following symlinks.
+        let from = context.resolve_explicit_path(&self.from)?;
+        let to = context.resolve_explicit_path(&self.to)?;
+
         // 3. Build migrate options
-        let options = MigrateOptions::new(self.from.clone(), self.to.clone())
+        let options = MigrateOptions::new(from.clone(), to.clone())
             .with_recursive(self.recursive)
             .with_force(self.force)
             .with_dry_run(self.dry_run);
@@ -54,8 +58,8 @@ impl MigrateCommand {
         // 5. Display migration plan
         if !global.quiet {
             eprintln!("Migration plan:");
-            eprintln!("  From: {}", self.from.display());
-            eprintln!("  To:   {}", self.to.display());
+            eprintln!("  From: {}", from.display());
+            eprintln!("  To:   {}", to.display());
             eprintln!(
                 "  Mode: {}",
                 if self.recursive { "recursive" } else { "exact" }

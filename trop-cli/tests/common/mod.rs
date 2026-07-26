@@ -104,6 +104,28 @@ impl TestEnv {
             .expect("Failed to count reservations")
     }
 
+    /// Return every persisted reservation path in deterministic order.
+    pub fn reservation_paths(&self) -> Vec<PathBuf> {
+        let database_path = self.data_dir.join("trop.db");
+        if !database_path.exists() {
+            return Vec::new();
+        }
+
+        let connection = rusqlite::Connection::open_with_flags(
+            database_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("Failed to open test database");
+        let mut statement = connection
+            .prepare("SELECT path FROM reservations ORDER BY path")
+            .expect("Failed to prepare reservation-path query");
+        statement
+            .query_map([], |row| row.get::<_, String>(0).map(PathBuf::from))
+            .expect("Failed to query reservation paths")
+            .collect::<rusqlite::Result<Vec<PathBuf>>>()
+            .expect("Failed to decode reservation paths")
+    }
+
     /// Get the temp path.
     pub fn path(&self) -> &Path {
         &self.temp_path
@@ -223,6 +245,29 @@ impl TestEnv {
 impl Default for TestEnv {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Create a directory symlink when the platform permits it.
+///
+/// Windows may require Developer Mode or elevated privileges. Callers should
+/// return early from the test when this helper returns `false`.
+#[allow(dead_code)]
+pub fn create_directory_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link);
+        false
     }
 }
 

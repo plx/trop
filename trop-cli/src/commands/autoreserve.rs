@@ -7,7 +7,6 @@ use crate::error::CliError;
 use crate::invocation::InvocationContext;
 use crate::utils::format_allocations;
 use clap::Args;
-use std::env;
 use trop::operations::{AutoreserveOptions, AutoreservePlan};
 use trop::PlanExecutor;
 
@@ -58,8 +57,8 @@ impl AutoreserveCommand {
     /// Execute the autoreserve command.
     pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
         let global = context.global();
-        // 1. Get current working directory as start directory
-        let start_dir = env::current_dir().map_err(CliError::Io)?;
+        // 1. Use the canonical working directory selected for this invocation.
+        let start_dir = context.working_dir().to_path_buf();
 
         // 2. Build AutoreserveOptions
         let options = AutoreserveOptions::new(start_dir.clone())

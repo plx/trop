@@ -11,7 +11,9 @@ use crate::error::{Error, Result};
 ///
 /// Path provenance determines how the path is processed:
 /// - **Explicit** paths (CLI args, env vars) are normalized but NOT canonicalized
-/// - **Implicit** paths (CWD, inferred) are normalized AND canonicalized
+///   and need not exist
+/// - **Implicit** paths (CWD, inferred) are normalized AND canonicalized and
+///   must exist
 ///
 /// # Examples
 ///

@@ -5,6 +5,7 @@
 
 use crate::config::schema::Config;
 use crate::error::{Error, Result};
+use crate::PathResolver;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -138,14 +139,20 @@ impl ConfigLoader {
 
     /// Discover project configurations by walking up directories.
     ///
+    /// The discovery root is treated as inferred context: it is normalized to
+    /// an absolute path and canonicalized before parent traversal begins.
+    ///
     /// Stops at the first directory containing either trop.yaml or trop.local.yaml.
     ///
     /// # Errors
     ///
-    /// Returns an error if any discovered file cannot be read or parsed.
+    /// Returns an error if the discovery root cannot be canonicalized or if any
+    /// discovered file cannot be read or parsed.
     pub fn discover_project_configs(start_dir: &Path) -> Result<Vec<ConfigSource>> {
         let mut configs = Vec::new();
-        let mut current = start_dir.to_path_buf();
+        let mut current = PathResolver::new()
+            .resolve_implicit(start_dir)?
+            .into_path_buf();
 
         loop {
             let mut found_any = false;
