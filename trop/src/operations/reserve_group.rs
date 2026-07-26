@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use crate::config::{Config, ConfigLoader, ConfigValidator};
+use crate::config::{Config, ConfigLoader, ConfigValidator, EffectiveConfig};
 use crate::error::{Error, Result};
 use crate::port::group::{GroupAllocationRequest, ServiceAllocationRequest};
 use crate::port::occupancy::OccupancyCheckConfig;
@@ -137,6 +137,19 @@ impl ReserveGroupPlan {
         // Load the configuration file
         let config = ConfigLoader::load_file(&options.config_path)?;
         Self::from_config(options, config)
+    }
+
+    /// Create a group plan from an already resolved effective configuration.
+    ///
+    /// The plan retains one cloned snapshot so allocation and output formatting
+    /// observe exactly the same validated values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the effective configuration or group base path is
+    /// invalid.
+    pub fn from_effective(options: ReserveGroupOptions, config: &EffectiveConfig) -> Result<Self> {
+        Self::from_config(options, config.config().clone())
     }
 
     /// Creates a plan from an already parsed configuration snapshot.

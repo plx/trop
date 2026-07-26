@@ -2,7 +2,7 @@
 
 use crate::commands::compact_exclusions::compact_exclusion_list;
 use crate::error::CliError;
-use crate::utils::{load_configuration, open_database, resolve_config_file, GlobalOptions};
+use crate::invocation::InvocationContext;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 use trop::config::{Config, PortExclusion, DEFAULT_MAX_PORT, DEFAULT_MIN_PORT};
@@ -58,23 +58,21 @@ pub enum ScanOutputFormat {
 }
 
 impl ScanCommand {
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
         // 1. Load configuration and determine port range
-        let mut config = load_configuration(global)?;
-        let range = self.determine_range(&config)?;
+        let config = context.config()?;
+        let range = self.determine_range(config)?;
 
         // 2. Open database
-        let db = open_database(global, &config)?;
+        let db = context.open_database()?;
 
         // 3. Scan for occupied ports
         let checker = SystemOccupancyChecker;
-        let check_config = OccupancyCheckConfig {
-            skip_tcp: self.skip_tcp,
-            skip_udp: self.skip_udp,
-            skip_ipv4: self.skip_ipv4,
-            skip_ipv6: self.skip_ipv6,
-            check_all_interfaces: self.check_all_interfaces,
-        };
+        let check_config = config
+            .occupancy_check
+            .as_ref()
+            .map(OccupancyCheckConfig::from)
+            .unwrap_or_default();
 
         let occupied_ports = checker
             .find_occupied_ports(&range, &check_config)
@@ -93,10 +91,10 @@ impl ScanCommand {
 
         // 6. Auto-exclude if requested
         if self.autoexclude && !unreserved_occupied.is_empty() {
-            self.add_exclusions(&mut config, &unreserved_occupied, global)?;
+            self.add_exclusions(&unreserved_occupied, context)?;
 
             if self.autocompact {
-                self.compact_exclusions(&mut config, global)?;
+                self.compact_exclusions(context)?;
             }
         }
 
@@ -107,13 +105,15 @@ impl ScanCommand {
     }
 
     fn determine_range(&self, config: &Config) -> Result<PortRange, CliError> {
-        let min = self
-            .min
-            .or(config.ports.as_ref().map(|p| p.min))
+        let min = config
+            .ports
+            .as_ref()
+            .map(|p| p.min)
             .unwrap_or(DEFAULT_MIN_PORT);
-        let max = self
-            .max
-            .or(config.ports.as_ref().and_then(|p| p.max))
+        let max = config
+            .ports
+            .as_ref()
+            .and_then(|p| p.max)
             .unwrap_or(DEFAULT_MAX_PORT);
 
         let min_port =
@@ -124,14 +124,9 @@ impl ScanCommand {
         PortRange::new(min_port, max_port).map_err(|e| CliError::Library(e.into()))
     }
 
-    fn add_exclusions(
-        &self,
-        config: &mut Config,
-        ports: &[Port],
-        global: &GlobalOptions,
-    ) -> Result<(), CliError> {
-        // Determine target config file (project or global)
-        let config_path = resolve_config_file(global)?;
+    fn add_exclusions(&self, ports: &[Port], context: &InvocationContext) -> Result<(), CliError> {
+        let config_path = context.config_file_for_write(false)?;
+        let mut config = load_raw_config(&config_path)?;
 
         // Ensure excluded_ports exists
         if config.excluded_ports.is_none() {
@@ -149,11 +144,11 @@ impl ScanCommand {
         }
 
         // Save config
-        let yaml = serde_yaml::to_string(config)
+        let yaml = serde_yaml::to_string(&config)
             .map_err(|e| CliError::Config(format!("Failed to serialize config: {e}")))?;
         std::fs::write(&config_path, yaml)?;
 
-        if !global.quiet {
+        if !context.global().quiet {
             eprintln!(
                 "Added {} exclusions to {}",
                 ports.len(),
@@ -164,11 +159,9 @@ impl ScanCommand {
         Ok(())
     }
 
-    fn compact_exclusions(
-        &self,
-        config: &mut Config,
-        global: &GlobalOptions,
-    ) -> Result<(), CliError> {
+    fn compact_exclusions(&self, context: &InvocationContext) -> Result<(), CliError> {
+        let config_path = context.config_file_for_write(false)?;
+        let mut config = load_raw_config(&config_path)?;
         if let Some(ref mut exclusions) = config.excluded_ports {
             let original_count = exclusions.len();
             let compacted = compact_exclusion_list(exclusions);
@@ -178,13 +171,11 @@ impl ScanCommand {
                 *exclusions = compacted;
 
                 // Save compacted config
-                let config_path = resolve_config_file(global)?;
-
-                let yaml = serde_yaml::to_string(config)
+                let yaml = serde_yaml::to_string(&config)
                     .map_err(|e| CliError::Config(format!("Failed to serialize config: {e}")))?;
                 std::fs::write(&config_path, yaml)?;
 
-                if !global.quiet {
+                if !context.global().quiet {
                     eprintln!("Compacted {original_count} exclusions to {new_count}");
                 }
             }
@@ -259,4 +250,13 @@ impl ScanCommand {
 
         Ok(())
     }
+}
+
+fn load_raw_config(path: &std::path::Path) -> Result<Config, CliError> {
+    if !path.exists() {
+        return Ok(Config::default());
+    }
+    let contents = std::fs::read_to_string(path)?;
+    serde_yaml::from_str(&contents)
+        .map_err(|error| CliError::Config(format!("Failed to parse config: {error}")))
 }

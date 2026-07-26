@@ -44,7 +44,10 @@ pub mod port;
 pub mod reservation;
 
 // Re-export key types at crate root for convenience
-pub use config::{Config, ConfigBuilder};
+pub use config::{
+    Config, ConfigBuilder, ConfigField, ConfigFileKind, ConfigValueSource, EffectiveConfig,
+    FieldProvenance, LoadedConfigFile,
+};
 pub use database::{Database, DatabaseConfig};
 pub use error::{Error, PortUnavailableReason, Result};
 pub use logging::{init_logger, LogLevel, Logger};

@@ -4,7 +4,7 @@
 //! all unique project identifiers from the database.
 
 use crate::error::CliError;
-use crate::utils::{load_configuration, open_database, GlobalOptions};
+use crate::invocation::InvocationContext;
 use clap::Parser;
 use std::io::Write;
 use trop::Database;
@@ -18,12 +18,9 @@ pub struct ListProjectsCommand {
 
 impl ListProjectsCommand {
     /// Execute the list-projects command.
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
-        // 1. Load configuration
-        let config = load_configuration(global)?;
-
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
         // 2. Open database (read-only access is fine)
-        let db = open_database(global, &config)?;
+        let db = context.open_database()?;
 
         // 3. Query projects
         let projects = Database::list_projects(db.connection()).map_err(CliError::from)?;

@@ -4,7 +4,8 @@
 //! ports for a group of services defined in a configuration file.
 
 use crate::error::CliError;
-use crate::utils::{format_allocations, load_configuration, open_database, GlobalOptions};
+use crate::invocation::InvocationContext;
+use crate::utils::format_allocations;
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
 use trop::operations::{ReserveGroupOptions, ReserveGroupPlan};
@@ -35,19 +36,19 @@ pub struct ReserveGroupCommand {
     pub force: bool,
 
     /// Allow operations on unrelated paths
-    #[arg(long, env = "TROP_ALLOW_UNRELATED_PATH")]
+    #[arg(long)]
     pub allow_unrelated_path: bool,
 
     /// Allow changing the project field
-    #[arg(long, env = "TROP_ALLOW_PROJECT_CHANGE")]
+    #[arg(long)]
     pub allow_project_change: bool,
 
     /// Allow changing the task field
-    #[arg(long, env = "TROP_ALLOW_TASK_CHANGE")]
+    #[arg(long)]
     pub allow_task_change: bool,
 
     /// Allow changing project or task fields
-    #[arg(long, env = "TROP_ALLOW_CHANGE")]
+    #[arg(long)]
     pub allow_change: bool,
 
     /// Perform a dry run
@@ -90,7 +91,8 @@ impl OutputFormatArg {
 
 impl ReserveGroupCommand {
     /// Execute the reserve-group command.
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
+        let global = context.global();
         // 1. Validate config file exists
         if !self.config_path.exists() {
             return Err(CliError::InvalidArguments(format!(
@@ -110,9 +112,9 @@ impl ReserveGroupCommand {
         let options = ReserveGroupOptions::new(self.config_path.clone())
             .with_task(self.task)
             .with_force(self.force)
-            .with_allow_unrelated_path(self.allow_unrelated_path)
-            .with_allow_project_change(self.allow_project_change || self.allow_change)
-            .with_allow_task_change(self.allow_task_change || self.allow_change);
+            .with_allow_unrelated_path(context.effective()?.allow_unrelated_path())
+            .with_allow_project_change(context.effective()?.allow_project_change())
+            .with_allow_task_change(context.effective()?.allow_task_change());
 
         // 3. Handle dry-run mode
         if self.dry_run {
@@ -130,14 +132,15 @@ impl ReserveGroupCommand {
         let output_format = self.format.to_output_format(self.shell.as_deref())?;
 
         // 5. Load configuration and open database
-        let config = load_configuration(global)?;
-        let mut db = open_database(global, &config)?;
+        let effective = context.effective()?;
+        let mut db = context.open_database()?;
 
         // 6. Begin transaction
         let tx = db.begin_transaction().map_err(CliError::from)?;
 
         // 7. Build plan (inside transaction)
-        let planner = ReserveGroupPlan::new(options).map_err(CliError::from)?;
+        let planner =
+            ReserveGroupPlan::from_effective(options, effective).map_err(CliError::from)?;
         let plan = planner.build_plan(&tx).map_err(CliError::from)?;
 
         // 8. Execute plan (inside transaction)

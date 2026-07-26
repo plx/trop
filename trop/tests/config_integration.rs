@@ -20,15 +20,19 @@
 //! Only environment-dependent tests run serially; other tests run in parallel.
 
 use serial_test::serial;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use trop::config::{
-    CleanupConfig, Config, ConfigBuilder, OutputFormat, PortConfig, PortExclusion,
-    ReservationGroup, ServiceDefinition,
+    CleanupConfig, Config, ConfigBuilder, ConfigField, ConfigFileKind, ConfigValueSource,
+    OccupancyConfig, OutputFormat, PortConfig, PortExclusion, ReservationGroup, ServiceDefinition,
 };
 use trop::error::Error;
+use trop::operations::{
+    AutoreserveOptions, AutoreservePlan, ReserveGroupOptions, ReserveGroupPlan,
+};
 
 // ============================================================================
 // Test Utilities
@@ -103,9 +107,12 @@ fn clear_trop_env_vars() -> Vec<EnvGuard> {
         "TROP_DISABLE_AUTOEXPIRE",
         "TROP_OUTPUT_FORMAT",
         "TROP_ALLOW_UNRELATED_PATH",
+        "TROP_ALLOW_PROJECT_CHANGE",
+        "TROP_ALLOW_TASK_CHANGE",
         "TROP_ALLOW_CHANGE_PROJECT",
         "TROP_ALLOW_CHANGE_TASK",
         "TROP_ALLOW_CHANGE",
+        "TROP_BUSY_TIMEOUT",
         "TROP_MAXIMUM_LOCK_WAIT_SECONDS",
         "TROP_SKIP_OCCUPANCY_CHECK",
         "TROP_SKIP_IPV4",
@@ -113,6 +120,7 @@ fn clear_trop_env_vars() -> Vec<EnvGuard> {
         "TROP_SKIP_TCP",
         "TROP_SKIP_UDP",
         "TROP_CHECK_ALL_INTERFACES",
+        "TROP_EXPIRE_AFTER_DAYS",
         "TROP_CLEANUP_EXPIRE_AFTER_DAYS",
     ];
 
@@ -1660,6 +1668,7 @@ disable_autoinit: false
 #[test]
 #[serial]
 fn test_end_to_end_validation_after_merge() {
+    let _guards = clear_trop_env_vars();
     let temp = TempDir::new().unwrap();
 
     // File has valid min
@@ -1680,6 +1689,10 @@ ports:
 
     // Should fail validation
     assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("TROP_PORT_MAX"),
+        "final merged error should name the winning environment source"
+    );
 }
 
 /// Test configuration with real file system structure.
@@ -1869,4 +1882,634 @@ ports:
 
         assert!(result.is_err());
     }
+}
+
+// ============================================================================
+// Category 9: Effective Configuration and Provenance Tests
+// ============================================================================
+
+const ALL_EFFECTIVE_FIELDS: &[ConfigField] = &[
+    ConfigField::Project,
+    ConfigField::DisableAutoinit,
+    ConfigField::DisableAutoprune,
+    ConfigField::DisableAutoexpire,
+    ConfigField::OutputFormat,
+    ConfigField::AllowUnrelatedPath,
+    ConfigField::AllowChangeProject,
+    ConfigField::AllowChangeTask,
+    ConfigField::AllowChange,
+    ConfigField::MaximumLockWaitSeconds,
+    ConfigField::OccupancySkip,
+    ConfigField::OccupancySkipIp4,
+    ConfigField::OccupancySkipIp6,
+    ConfigField::OccupancySkipTcp,
+    ConfigField::OccupancySkipUdp,
+    ConfigField::OccupancyCheckAllInterfaces,
+    ConfigField::PortsMin,
+    ConfigField::PortsMax,
+    ConfigField::PortsMaxOffset,
+    ConfigField::ExcludedPorts,
+    ConfigField::CleanupExpireAfterDays,
+    ConfigField::Reservations,
+];
+
+fn source_layer(source: &ConfigValueSource) -> &'static str {
+    match source {
+        ConfigValueSource::BuiltIn => "built-in",
+        ConfigValueSource::File { kind, .. } => match kind {
+            ConfigFileKind::User => "user",
+            ConfigFileKind::Project => "project",
+            ConfigFileKind::Local => "local",
+            _ => "unknown-file",
+        },
+        ConfigValueSource::Environment { .. } => "environment",
+        ConfigValueSource::CommandLine => "cli",
+        ConfigValueSource::Programmatic => "programmatic",
+        _ => "unknown",
+    }
+}
+
+/// Semantic built-in defaults retain provenance even when stored as `None`.
+#[test]
+fn test_effective_config_tracks_absent_built_in_values() {
+    let effective = ConfigBuilder::new()
+        .skip_files()
+        .skip_env()
+        .build_effective()
+        .unwrap();
+
+    for field in [
+        ConfigField::Project,
+        ConfigField::Reservations,
+        ConfigField::ExcludedPorts,
+        ConfigField::PortsMaxOffset,
+    ] {
+        assert_eq!(
+            effective.provenance(field).unwrap().winner(),
+            &ConfigValueSource::BuiltIn,
+            "missing built-in provenance for {field:?}"
+        );
+    }
+}
+
+/// Every field follows the complete documented precedence hierarchy.
+#[test]
+#[serial]
+#[allow(clippy::too_many_lines)]
+fn test_effective_config_all_fields_precedence_matrix() {
+    let _guards = clear_trop_env_vars();
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("data");
+    let project_dir = temp.path().join("project");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&project_dir).unwrap();
+
+    create_temp_config(
+        &data_dir,
+        "config.yaml",
+        r"
+disable_autoinit: true
+disable_autoprune: true
+disable_autoexpire: true
+output_format: json
+allow_unrelated_path: true
+allow_change_project: true
+allow_change_task: true
+allow_change: true
+maximum_lock_wait_seconds: 11
+ports:
+  min: 5100
+  max: 5900
+excluded_ports: [5101]
+cleanup:
+  expire_after_days: 11
+occupancy_check:
+  skip: true
+  skip_ip4: true
+  skip_ip6: true
+  skip_tcp: true
+  skip_udp: true
+  check_all_interfaces: true
+",
+    );
+    create_temp_config(
+        &project_dir,
+        "trop.yaml",
+        r"
+project: project-layer
+disable_autoinit: false
+disable_autoprune: false
+disable_autoexpire: false
+output_format: csv
+allow_unrelated_path: false
+allow_change_project: false
+allow_change_task: false
+allow_change: false
+maximum_lock_wait_seconds: 22
+ports:
+  min: 5200
+  max: 6000
+excluded_ports: [5201]
+cleanup:
+  expire_after_days: 22
+occupancy_check:
+  skip: false
+  skip_ip4: false
+  skip_ip6: false
+  skip_tcp: false
+  skip_udp: false
+  check_all_interfaces: false
+reservations:
+  services:
+    project:
+      offset: 0
+      env: PROJECT_PORT
+",
+    );
+    create_temp_config(
+        &project_dir,
+        "trop.local.yaml",
+        r"
+project: local-layer
+disable_autoinit: true
+disable_autoprune: true
+disable_autoexpire: true
+output_format: table
+allow_unrelated_path: true
+allow_change_project: true
+allow_change_task: true
+allow_change: true
+maximum_lock_wait_seconds: 33
+ports:
+  min: 5300
+  max: 6100
+excluded_ports: [5301]
+cleanup:
+  expire_after_days: 33
+occupancy_check:
+  skip: true
+  skip_ip4: true
+  skip_ip6: true
+  skip_tcp: true
+  skip_udp: true
+  check_all_interfaces: true
+reservations:
+  services:
+    local:
+      offset: 0
+      env: LOCAL_PORT
+",
+    );
+
+    let _environment = [
+        EnvGuard::new("TROP_PROJECT", "environment-layer"),
+        EnvGuard::new("TROP_DISABLE_AUTOINIT", "false"),
+        EnvGuard::new("TROP_DISABLE_AUTOPRUNE", "false"),
+        EnvGuard::new("TROP_DISABLE_AUTOEXPIRE", "false"),
+        EnvGuard::new("TROP_OUTPUT_FORMAT", "csv"),
+        EnvGuard::new("TROP_ALLOW_UNRELATED_PATH", "false"),
+        EnvGuard::new("TROP_ALLOW_PROJECT_CHANGE", "false"),
+        EnvGuard::new("TROP_ALLOW_TASK_CHANGE", "false"),
+        EnvGuard::new("TROP_ALLOW_CHANGE", "false"),
+        EnvGuard::new("TROP_BUSY_TIMEOUT", "44"),
+        EnvGuard::new("TROP_PORT_MIN", "5400"),
+        EnvGuard::new("TROP_PORT_MAX", "6200"),
+        EnvGuard::new("TROP_EXCLUDED_PORTS", "5401"),
+        EnvGuard::new("TROP_EXPIRE_AFTER_DAYS", "44"),
+        EnvGuard::new("TROP_SKIP_OCCUPANCY_CHECK", "false"),
+        EnvGuard::new("TROP_SKIP_IPV4", "false"),
+        EnvGuard::new("TROP_SKIP_IPV6", "false"),
+        EnvGuard::new("TROP_SKIP_TCP", "false"),
+        EnvGuard::new("TROP_SKIP_UDP", "false"),
+        EnvGuard::new("TROP_CHECK_ALL_INTERFACES", "false"),
+    ];
+
+    let cli = Config {
+        project: Some("cli-layer".to_string()),
+        ports: Some(PortConfig {
+            min: 6500,
+            max: Some(6900),
+            max_offset: None,
+        }),
+        excluded_ports: Some(vec![PortExclusion::Single(6501)]),
+        cleanup: Some(CleanupConfig {
+            expire_after_days: Some(55),
+        }),
+        occupancy_check: Some(OccupancyConfig {
+            skip: Some(false),
+            skip_ip4: Some(false),
+            skip_ip6: Some(false),
+            skip_tcp: Some(false),
+            skip_udp: Some(false),
+            check_all_interfaces: Some(false),
+        }),
+        reservations: Some(ReservationGroup {
+            base: Some(6500),
+            services: HashMap::from([(
+                "cli".to_string(),
+                ServiceDefinition {
+                    offset: Some(0),
+                    preferred: None,
+                    env: Some("CLI_PORT".to_string()),
+                },
+            )]),
+        }),
+        disable_autoinit: Some(false),
+        disable_autoprune: Some(false),
+        disable_autoexpire: Some(false),
+        allow_unrelated_path: Some(false),
+        allow_change_project: Some(false),
+        allow_change_task: Some(false),
+        allow_change: Some(false),
+        maximum_lock_wait_seconds: Some(55),
+        output_format: Some(OutputFormat::Tsv),
+    };
+    let effective = ConfigBuilder::new()
+        .with_data_dir(&data_dir)
+        .with_working_dir(&project_dir)
+        .with_cli_config_fields(cli, ALL_EFFECTIVE_FIELDS.iter().copied())
+        .build_effective()
+        .unwrap();
+
+    assert_eq!(effective.project(), Some("cli-layer"));
+    assert_eq!(effective.ports().min, 6500);
+    assert_eq!(effective.ports().max, Some(6900));
+    assert_eq!(effective.ports().max_offset, None);
+    assert_eq!(effective.excluded_ports().len(), 5);
+    assert_eq!(effective.cleanup().expire_after_days, Some(55));
+    assert_eq!(effective.occupancy_check().skip, Some(false));
+    assert!(effective.reservations().is_some());
+    assert!(!effective.disable_autoinit());
+    assert!(!effective.disable_autoprune());
+    assert!(!effective.disable_autoexpire());
+    assert!(!effective.allow_unrelated_path());
+    assert!(!effective.allow_project_change());
+    assert!(!effective.allow_task_change());
+    assert_eq!(effective.maximum_lock_wait_seconds(), 55);
+    assert_eq!(effective.output_format(), OutputFormat::Tsv);
+
+    for &field in ALL_EFFECTIVE_FIELDS {
+        let provenance = effective.provenance(field).unwrap();
+        assert_eq!(
+            source_layer(provenance.winner()),
+            "cli",
+            "wrong winner for {field:?}"
+        );
+
+        let actual_layers = provenance
+            .contributors()
+            .iter()
+            .map(source_layer)
+            .collect::<Vec<_>>();
+        let expected_layers: &[&str] = match field {
+            ConfigField::Project => &["built-in", "project", "local", "environment", "cli"],
+            ConfigField::Reservations => &["built-in", "project", "local", "cli"],
+            _ => &["built-in", "user", "project", "local", "environment", "cli"],
+        };
+        assert_eq!(actual_layers, expected_layers, "wrong layers for {field:?}");
+    }
+}
+
+/// An explicitly selected CLI field with `None` preserves the lower value.
+#[test]
+fn test_effective_cli_none_preserves_lower_value_and_source() {
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let project_path = create_temp_config(
+        temp.path(),
+        "trop.yaml",
+        r"
+project: lower
+output_format: json
+ports:
+  min: 6100
+  max: 6200
+",
+    );
+    let cli = Config {
+        ports: Some(PortConfig {
+            min: 5000,
+            max: None,
+            max_offset: None,
+        }),
+        ..Default::default()
+    };
+    let effective = ConfigBuilder::new()
+        .with_data_dir(data_dir)
+        .with_working_dir(temp.path())
+        .skip_env()
+        .with_cli_config_fields(
+            cli,
+            [
+                ConfigField::Project,
+                ConfigField::OutputFormat,
+                ConfigField::PortsMax,
+            ],
+        )
+        .build_effective()
+        .unwrap();
+
+    assert_eq!(effective.project(), Some("lower"));
+    assert_eq!(effective.output_format(), OutputFormat::Json);
+    assert_eq!(effective.ports().max, Some(6200));
+    for field in [
+        ConfigField::Project,
+        ConfigField::OutputFormat,
+        ConfigField::PortsMax,
+    ] {
+        assert_eq!(
+            effective.provenance(field).unwrap().winner(),
+            &ConfigValueSource::File {
+                kind: ConfigFileKind::Project,
+                path: project_path.clone(),
+            }
+        );
+    }
+}
+
+/// Every participating layer is retained in low-to-high precedence order.
+#[test]
+#[serial]
+fn test_effective_config_tracks_complete_precedence() {
+    let _guards = clear_trop_env_vars();
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("data");
+    let project_dir = temp.path().join("project");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let user_path = create_temp_config(&data_dir, "config.yaml", "maximum_lock_wait_seconds: 6\n");
+    let project_path =
+        create_temp_config(&project_dir, "trop.yaml", "maximum_lock_wait_seconds: 7\n");
+    let local_path = create_temp_config(
+        &project_dir,
+        "trop.local.yaml",
+        "maximum_lock_wait_seconds: 8\n",
+    );
+    let _environment = EnvGuard::new("TROP_BUSY_TIMEOUT", "9");
+
+    let cli = Config {
+        maximum_lock_wait_seconds: Some(10),
+        ..Default::default()
+    };
+    let effective = ConfigBuilder::new()
+        .with_data_dir(&data_dir)
+        .with_working_dir(&project_dir)
+        .with_cli_config_fields(cli, [ConfigField::MaximumLockWaitSeconds])
+        .build_effective()
+        .unwrap();
+
+    assert_eq!(effective.maximum_lock_wait_seconds(), 10);
+    let provenance = effective
+        .provenance(ConfigField::MaximumLockWaitSeconds)
+        .unwrap();
+    assert_eq!(provenance.winner(), &ConfigValueSource::CommandLine);
+    assert_eq!(
+        provenance.contributors(),
+        &[
+            ConfigValueSource::BuiltIn,
+            ConfigValueSource::File {
+                kind: ConfigFileKind::User,
+                path: user_path,
+            },
+            ConfigValueSource::File {
+                kind: ConfigFileKind::Project,
+                path: project_path,
+            },
+            ConfigValueSource::File {
+                kind: ConfigFileKind::Local,
+                path: local_path,
+            },
+            ConfigValueSource::Environment {
+                variable: "TROP_BUSY_TIMEOUT",
+            },
+            ConfigValueSource::CommandLine,
+        ]
+    );
+}
+
+/// Precise CLI leaves must not replace unrelated nested values.
+#[test]
+fn test_effective_cli_config_preserves_nested_siblings_and_provenance() {
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let project_path = create_temp_config(
+        temp.path(),
+        "trop.yaml",
+        r"
+ports:
+  min: 6100
+  max_offset: 500
+occupancy_check:
+  skip_ip4: true
+  skip_tcp: false
+",
+    );
+
+    let cli = Config {
+        ports: Some(PortConfig {
+            min: 5000,
+            max: Some(6400),
+            max_offset: None,
+        }),
+        occupancy_check: Some(OccupancyConfig {
+            skip_tcp: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let effective = ConfigBuilder::new()
+        .with_data_dir(&data_dir)
+        .with_working_dir(temp.path())
+        .skip_env()
+        .with_cli_config_fields(cli, [ConfigField::PortsMax, ConfigField::OccupancySkipTcp])
+        .build_effective()
+        .unwrap();
+
+    assert_eq!(effective.ports().min, 6100);
+    assert_eq!(effective.ports().max, Some(6400));
+    assert_eq!(effective.ports().max_offset, None);
+    assert_eq!(effective.occupancy_check().skip_ip4, Some(true));
+    assert_eq!(effective.occupancy_check().skip_tcp, Some(true));
+
+    assert_eq!(
+        effective
+            .provenance(ConfigField::PortsMin)
+            .unwrap()
+            .winner(),
+        &ConfigValueSource::File {
+            kind: ConfigFileKind::Project,
+            path: project_path.clone(),
+        }
+    );
+    assert_eq!(
+        effective
+            .provenance(ConfigField::OccupancySkipIp4)
+            .unwrap()
+            .winner(),
+        &ConfigValueSource::File {
+            kind: ConfigFileKind::Project,
+            path: project_path,
+        }
+    );
+    assert_eq!(
+        effective
+            .provenance(ConfigField::OccupancySkipTcp)
+            .unwrap()
+            .winner(),
+        &ConfigValueSource::CommandLine
+    );
+    assert_eq!(
+        effective
+            .provenance(ConfigField::PortsMaxOffset)
+            .unwrap()
+            .winner(),
+        &ConfigValueSource::CommandLine
+    );
+}
+
+/// Historical environment aliases remain accepted, while canonical names win.
+#[test]
+#[serial]
+fn test_effective_environment_canonical_names_win_over_aliases() {
+    let _guards = clear_trop_env_vars();
+    let _legacy_timeout = EnvGuard::new("TROP_MAXIMUM_LOCK_WAIT_SECONDS", "17");
+    let _legacy_project = EnvGuard::new("TROP_ALLOW_CHANGE_PROJECT", "true");
+    let _legacy_task = EnvGuard::new("TROP_ALLOW_CHANGE_TASK", "false");
+
+    let aliases = ConfigBuilder::new().skip_files().build_effective().unwrap();
+    assert_eq!(aliases.maximum_lock_wait_seconds(), 17);
+    assert!(aliases.allow_project_change());
+    assert!(!aliases.allow_task_change());
+    assert_eq!(
+        aliases
+            .provenance(ConfigField::MaximumLockWaitSeconds)
+            .unwrap()
+            .winner(),
+        &ConfigValueSource::Environment {
+            variable: "TROP_MAXIMUM_LOCK_WAIT_SECONDS",
+        }
+    );
+
+    let _canonical_timeout = EnvGuard::new("TROP_BUSY_TIMEOUT", "19");
+    let _canonical_project = EnvGuard::new("TROP_ALLOW_PROJECT_CHANGE", "false");
+    let _canonical_task = EnvGuard::new("TROP_ALLOW_TASK_CHANGE", "true");
+    let canonical = ConfigBuilder::new().skip_files().build_effective().unwrap();
+
+    assert_eq!(canonical.maximum_lock_wait_seconds(), 19);
+    assert!(!canonical.allow_project_change());
+    assert!(canonical.allow_task_change());
+    assert_eq!(
+        canonical
+            .provenance(ConfigField::MaximumLockWaitSeconds)
+            .unwrap()
+            .winner(),
+        &ConfigValueSource::Environment {
+            variable: "TROP_BUSY_TIMEOUT",
+        }
+    );
+    assert_eq!(
+        canonical
+            .provenance(ConfigField::AllowChangeProject)
+            .unwrap()
+            .winner(),
+        &ConfigValueSource::Environment {
+            variable: "TROP_ALLOW_PROJECT_CHANGE",
+        }
+    );
+    assert_eq!(
+        canonical
+            .provenance(ConfigField::AllowChangeTask)
+            .unwrap()
+            .winner(),
+        &ConfigValueSource::Environment {
+            variable: "TROP_ALLOW_TASK_CHANGE",
+        }
+    );
+}
+
+/// Project-only fields are rejected from user config with the exact source path.
+#[test]
+fn test_effective_source_validation_names_invalid_user_file() {
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("data");
+    let project_dir = temp.path().join("project");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&project_dir).unwrap();
+    let user_path = create_temp_config(&data_dir, "config.yaml", "project: forbidden\n");
+
+    let error = ConfigBuilder::new()
+        .with_data_dir(&data_dir)
+        .with_working_dir(&project_dir)
+        .skip_env()
+        .build_effective()
+        .unwrap_err();
+    let message = error.to_string();
+
+    assert!(message.contains("project"), "{message}");
+    assert!(
+        message.contains(&user_path.display().to_string()),
+        "{message}"
+    );
+}
+
+/// Effective-aware group planners share one merged snapshot and source path.
+#[test]
+fn test_effective_project_file_feeds_group_planners() {
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let project_path = create_temp_config(
+        temp.path(),
+        "chosen.yaml",
+        r"
+project: effective-group
+reservations:
+  services:
+    web:
+      offset: 0
+      env: WEB_PORT
+",
+    );
+
+    let effective = ConfigBuilder::new()
+        .with_data_dir(&data_dir)
+        .with_project_file(&project_path)
+        .skip_env()
+        .build_effective()
+        .unwrap();
+
+    assert_eq!(effective.ports().min, 5000);
+    assert_eq!(effective.ports().max, Some(7000));
+    assert_eq!(
+        effective.loaded_file(ConfigFileKind::Project),
+        Some(project_path.as_path())
+    );
+    assert_eq!(
+        effective
+            .provenance(ConfigField::Reservations)
+            .unwrap()
+            .winner(),
+        &ConfigValueSource::File {
+            kind: ConfigFileKind::Project,
+            path: project_path.clone(),
+        }
+    );
+
+    let group = ReserveGroupPlan::from_effective(
+        ReserveGroupOptions::new(project_path.clone()),
+        &effective,
+    )
+    .unwrap();
+    assert_eq!(group.config(), effective.config());
+
+    let autoreserve = AutoreservePlan::from_effective(
+        AutoreserveOptions::new(temp.path().to_path_buf()),
+        &effective,
+    )
+    .unwrap();
+    assert_eq!(autoreserve.discovered_config_path(), &project_path);
+    assert_eq!(autoreserve.config(), effective.config());
 }

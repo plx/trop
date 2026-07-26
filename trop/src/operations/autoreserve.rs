@@ -5,7 +5,9 @@
 
 use std::path::PathBuf;
 
-use crate::config::{Config, ConfigLoader, ConfigValidator};
+use crate::config::{
+    Config, ConfigField, ConfigFileKind, ConfigLoader, ConfigValidator, EffectiveConfig,
+};
 use crate::error::{Error, Result};
 use rusqlite::Connection;
 
@@ -161,6 +163,40 @@ impl AutoreservePlan {
             options,
             discovered_config_path: selected_config.path,
             config: selected_config.config,
+        })
+    }
+
+    /// Create an autoreserve plan from one resolved effective configuration.
+    ///
+    /// The reservation group's winning source identifies the discovered
+    /// project file. If no group supplied a file source, the highest-precedence
+    /// loaded project file is retained for diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no project configuration file participated in the
+    /// effective configuration or if the effective values are invalid.
+    pub fn from_effective(options: AutoreserveOptions, config: &EffectiveConfig) -> Result<Self> {
+        let reservation_file = config
+            .provenance(ConfigField::Reservations)
+            .and_then(|provenance| provenance.winner().file_path());
+        let discovered_config_path = reservation_file
+            .or_else(|| config.loaded_file(ConfigFileKind::Local))
+            .or_else(|| config.loaded_file(ConfigFileKind::Project))
+            .ok_or_else(|| Error::InvalidPath {
+                path: options.start_dir.clone(),
+                reason: format!(
+                    "No trop configuration file found searching from {}",
+                    options.start_dir.display()
+                ),
+            })?
+            .to_path_buf();
+
+        ConfigValidator::validate(config.config(), true)?;
+        Ok(Self {
+            options,
+            discovered_config_path,
+            config: config.config().clone(),
         })
     }
 

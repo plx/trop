@@ -4,7 +4,7 @@
 //! for non-existent directories.
 
 use crate::error::CliError;
-use crate::utils::{load_configuration, open_database, GlobalOptions};
+use crate::invocation::InvocationContext;
 use clap::Args;
 use trop::operations::CleanupOperations;
 
@@ -18,9 +18,8 @@ pub struct PruneCommand {
 
 impl PruneCommand {
     /// Execute the prune command.
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
-        // Load configuration for database location
-        let config = load_configuration(global)?;
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
+        let global = context.global();
 
         // Handle dry-run output
         if self.dry_run && !global.quiet {
@@ -28,7 +27,7 @@ impl PruneCommand {
         }
 
         // Open database with write access
-        let mut db = open_database(global, &config)?;
+        let mut db = context.open_database()?;
 
         // Perform pruning operation
         let result = CleanupOperations::prune(&mut db, self.dry_run).map_err(CliError::from)?;

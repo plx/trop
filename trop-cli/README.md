@@ -116,14 +116,20 @@ trop autoreserve
 
 ## Configuration
 
-`trop` will support hierarchical configuration:
+`trop` resolves hierarchical configuration in this order, from highest to
+lowest precedence:
 
-1. Command-line arguments (highest priority)
+1. Explicit command-line arguments
 2. Environment variables
 3. `trop.local.yaml` (project-specific, not in source control)
 4. `trop.yaml` (project config, checked into source control)
-5. `~/.trop/config.yaml` (user-level defaults)
-6. Built-in defaults (lowest priority)
+5. `config.yaml` in the selected data directory (`~/.trop` by default)
+6. Built-in defaults
+
+When the same setting is supplied by more than one source, the higher source
+in this list wins. An omitted setting falls through to the next source.
+`--data-dir` or `TROP_DATA_DIR` selects the directory containing the user
+`config.yaml`.
 
 ### Example trop.yaml
 
@@ -160,7 +166,27 @@ See the [implementation specification](../reference/ImplementationSpecification.
 
 ## Environment Variables
 
-Key environment variables:
+Canonical environment variables covered by the effective configuration
+pipeline:
+
+- `TROP_BUSY_TIMEOUT`: Set the database busy timeout in seconds
+- `TROP_ALLOW_PROJECT_CHANGE`: Allow an existing reservation's project to
+  change
+- `TROP_ALLOW_TASK_CHANGE`: Allow an existing reservation's task to change
+- `TROP_OUTPUT_FORMAT`: Set the default `trop list` output format (`table`,
+  `json`, `csv`, or `tsv`)
+
+The following compatibility aliases remain accepted for existing scripts:
+
+- `TROP_MAXIMUM_LOCK_WAIT_SECONDS` aliases `TROP_BUSY_TIMEOUT`
+- `TROP_ALLOW_CHANGE_PROJECT` aliases `TROP_ALLOW_PROJECT_CHANGE`
+- `TROP_ALLOW_CHANGE_TASK` aliases `TROP_ALLOW_TASK_CHANGE`
+
+Prefer the canonical names in new configuration. When a canonical name and its
+alias are both set, the canonical value wins. Command-line arguments still
+override either spelling because the environment layer has lower precedence.
+
+Other key environment variables:
 
 - `TROP_DATA_DIR`: Override data directory location (default: `~/.trop`)
 - `TROP_LOG_MODE`: Control logging verbosity (`quiet`, `normal`, `verbose`)

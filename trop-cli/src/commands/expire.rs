@@ -4,7 +4,7 @@
 //! based on age.
 
 use crate::error::CliError;
-use crate::utils::{load_configuration, open_database, GlobalOptions};
+use crate::invocation::InvocationContext;
 use clap::Args;
 use trop::config::CleanupConfig;
 use trop::operations::CleanupOperations;
@@ -23,14 +23,9 @@ pub struct ExpireCommand {
 
 impl ExpireCommand {
     /// Execute the expire command.
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
-        // Load configuration
-        let config = load_configuration(global)?;
-
-        // Determine expiration threshold
-        let expire_days = self
-            .days
-            .or_else(|| config.cleanup.as_ref().and_then(|c| c.expire_after_days));
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
+        let global = context.global();
+        let expire_days = context.effective()?.cleanup().expire_after_days;
 
         // Validate we have a threshold
         let Some(days) = expire_days else {
@@ -50,7 +45,7 @@ impl ExpireCommand {
         }
 
         // Open database
-        let mut db = open_database(global, &config)?;
+        let mut db = context.open_database()?;
 
         // Perform expiration
         let result = CleanupOperations::expire(&mut db, &cleanup_config, self.dry_run)

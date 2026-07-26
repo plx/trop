@@ -4,10 +4,9 @@
 //! the trop data directory and database.
 
 use crate::error::CliError;
-use crate::utils::GlobalOptions;
+use crate::invocation::InvocationContext;
 use clap::Parser;
 use std::path::PathBuf;
-use trop::database::default_data_dir;
 use trop::operations::init::{init_database, InitOptions};
 
 /// Initialize trop data directory and database.
@@ -16,7 +15,7 @@ use trop::operations::init::{init_database, InitOptions};
 pub struct InitCommand {
     /// Data directory to initialize
     #[arg(long, value_name = "PATH")]
-    data_dir: Option<PathBuf>,
+    pub(crate) data_dir: Option<PathBuf>,
 
     /// Overwrite existing database
     #[arg(long)]
@@ -36,18 +35,8 @@ impl InitCommand {
     ///
     /// Note: This command does NOT accept --disable-autoinit (would be paradoxical).
     /// The --data-dir flag has a different meaning here (where to create, not where to find).
-    pub fn execute(self, global: &GlobalOptions) -> Result<(), CliError> {
-        // Determine data directory to initialize
-        // Priority: command flag > global flag > default
-        let data_dir = self
-            .data_dir
-            .or_else(|| global.data_dir.clone())
-            .or_else(|| default_data_dir().ok())
-            .ok_or_else(|| {
-                CliError::Config(
-                    "Could not determine data directory (home directory not found)".to_string(),
-                )
-            })?;
+    pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
+        let data_dir = context.data_dir()?.to_path_buf();
 
         if self.dry_run {
             // Dry-run mode: show what would be done
@@ -94,7 +83,10 @@ impl InitCommand {
         // Build initialization options
         let options = InitOptions::new(data_dir.clone())
             .with_overwrite(self.overwrite)
-            .with_create_config(self.with_config);
+            .with_create_config(self.with_config)
+            .with_busy_timeout(std::time::Duration::from_secs(
+                context.effective()?.maximum_lock_wait_seconds(),
+            ));
 
         // Execute initialization
         let result = init_database(&options).map_err(CliError::from)?;

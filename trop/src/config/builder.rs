@@ -4,11 +4,12 @@
 //! integrating file loading, merging, environment variables, and validation.
 
 use crate::config::environment::EnvironmentConfig;
-use crate::config::loader::{ConfigLoader, ConfigSource};
-use crate::config::merger::ConfigMerger;
+use crate::config::loader::ConfigLoader;
 use crate::config::schema::{CleanupConfig, Config, OccupancyConfig, OutputFormat, PortConfig};
 use crate::config::validator::ConfigValidator;
+use crate::config::{ConfigField, ConfigFileKind, ConfigValueSource, EffectiveConfig};
 use crate::error::Result;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Builder for loading and constructing configuration.
@@ -30,6 +31,8 @@ pub struct ConfigBuilder {
     skip_env: bool,
     skip_files: bool,
     additional_config: Option<Config>,
+    cli_config: Option<(Config, BTreeSet<ConfigField>)>,
+    project_file: Option<PathBuf>,
 }
 
 impl ConfigBuilder {
@@ -42,6 +45,8 @@ impl ConfigBuilder {
             skip_env: false,
             skip_files: false,
             additional_config: None,
+            cli_config: None,
+            project_file: None,
         }
     }
 
@@ -93,6 +98,43 @@ impl ConfigBuilder {
         self
     }
 
+    /// Add command-line configuration at the highest documented precedence.
+    ///
+    /// Present fields are inferred from `config`. Call
+    /// [`Self::with_cli_config_fields`] when a command needs to identify exact
+    /// nested leaf fields, such as overriding `ports.max` without replacing
+    /// `ports.min`.
+    #[must_use]
+    pub fn with_cli_config(mut self, config: Config) -> Self {
+        let fields = ConfigField::present_in(&config);
+        self.cli_config = Some((config, fields));
+        self
+    }
+
+    /// Add precise command-line configuration fields.
+    ///
+    /// Only fields listed in `explicit_fields` participate in the override.
+    /// This preserves lower-precedence sibling values for partial nested CLI
+    /// options.
+    #[must_use]
+    pub fn with_cli_config_fields<I>(mut self, config: Config, explicit_fields: I) -> Self
+    where
+        I: IntoIterator<Item = ConfigField>,
+    {
+        self.cli_config = Some((config, explicit_fields.into_iter().collect()));
+        self
+    }
+
+    /// Load an explicitly nominated project configuration file.
+    ///
+    /// User configuration is still loaded normally, but automatic project-file
+    /// discovery is replaced by this exact file.
+    #[must_use]
+    pub fn with_project_file(mut self, path: impl AsRef<Path>) -> Self {
+        self.project_file = Some(path.as_ref().to_path_buf());
+        self
+    }
+
     /// Build the final configuration.
     ///
     /// Performs the following steps:
@@ -100,7 +142,8 @@ impl ConfigBuilder {
     /// 2. Loads and merges file-based configurations (if not skipped)
     /// 3. Applies environment variable overrides (if not skipped)
     /// 4. Applies additional configuration (if provided)
-    /// 5. Validates the final configuration
+    /// 5. Applies command-line configuration (if provided)
+    /// 6. Validates the final configuration
     ///
     /// # Errors
     ///
@@ -109,55 +152,77 @@ impl ConfigBuilder {
     /// - Environment variables contain invalid values
     /// - The final configuration fails validation
     pub fn build(self) -> Result<Config> {
+        self.build_effective().map(EffectiveConfig::into_config)
+    }
+
+    /// Build a merged configuration together with field provenance.
+    ///
+    /// This follows the same merge and validation behavior as [`Self::build`]
+    /// while retaining each field's winning and contributing sources.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a source cannot be read or parsed, a source contains
+    /// fields invalid for its kind, an environment value is invalid, or the
+    /// merged result fails validation.
+    pub fn build_effective(self) -> Result<EffectiveConfig> {
         let mut sources = Vec::new();
 
-        // Load configuration files
         if !self.skip_files {
-            let working_dir = self
-                .working_dir
-                .as_deref()
-                .unwrap_or_else(|| Path::new("."));
-            sources = ConfigLoader::load_all(working_dir, self.data_dir.as_deref())?;
+            sources = if let Some(project_file) = self.project_file.as_deref() {
+                ConfigLoader::load_with_project_file(project_file, self.data_dir.as_deref())?
+            } else {
+                let working_dir = self
+                    .working_dir
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("."));
+                ConfigLoader::load_all(working_dir, self.data_dir.as_deref())?
+            };
         }
 
-        // Add default configuration at lowest precedence
-        sources.insert(
-            0,
-            ConfigSource {
-                path: PathBuf::from("<defaults>"),
-                precedence: 0,
-                config: Self::default_config(),
-            },
-        );
-
-        // Check if we should treat this as a tropfile before consuming sources
-        // Consider it a tropfile if any source was a tropfile OR if additional config was provided
-        // (additional config is programmatic and should allow tropfile-only fields)
         let is_tropfile = self.additional_config.is_some()
-            || sources.iter().any(|s| {
-                s.path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n == "trop.yaml" || n == "trop.local.yaml")
-            });
+            || self.cli_config.is_some()
+            || self.project_file.is_some()
+            || sources.iter().any(|source| source.precedence >= 2);
 
-        // Merge all file-based configs
-        let mut config = ConfigMerger::merge(sources);
+        let mut effective = EffectiveConfig::from_defaults(Self::default_config());
 
-        // Apply environment overrides
+        for source in sources {
+            let kind = match source.precedence {
+                1 => ConfigFileKind::User,
+                3 => ConfigFileKind::Local,
+                _ => ConfigFileKind::Project,
+            };
+            let value_source = ConfigValueSource::File {
+                kind,
+                path: source.path.clone(),
+            };
+
+            ConfigValidator::validate_source(&source.config, &value_source)?;
+            effective.record_file(kind, source.path);
+            effective.merge_config(&source.config, &value_source);
+        }
+
         if !self.skip_env {
-            EnvironmentConfig::apply_overrides(&mut config)?;
+            let mut changes = Vec::new();
+            EnvironmentConfig::apply_overrides_with(effective.config_mut(), |field, variable| {
+                changes.push((field, variable));
+            })?;
+            for (field, variable) in changes {
+                effective.record(field, ConfigValueSource::Environment { variable });
+            }
         }
 
-        // Apply additional config if provided
         if let Some(additional) = self.additional_config {
-            ConfigMerger::merge_into(&mut config, &additional);
+            effective.merge_config(&additional, &ConfigValueSource::Programmatic);
         }
 
-        // Validate final configuration
-        ConfigValidator::validate(&config, is_tropfile)?;
+        if let Some((cli_config, fields)) = self.cli_config {
+            effective.apply_precise(&cli_config, fields, &ConfigValueSource::CommandLine);
+        }
 
-        Ok(config)
+        effective.validate(is_tropfile)?;
+        Ok(effective)
     }
 
     /// Create default configuration.
@@ -214,6 +279,7 @@ impl Default for ConfigBuilder {
 mod tests {
     use super::*;
     use crate::config::schema::PortExclusion;
+    use crate::config::ConfigMerger;
     use std::fs;
     use tempfile::TempDir;
 
