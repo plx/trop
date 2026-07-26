@@ -303,7 +303,6 @@ impl ConfigValidator {
         let mut seen_preferred = HashSet::new();
         let mut seen_env_vars = HashSet::new();
         let mut seen_tags = HashSet::new();
-        let mut has_default_offset = false;
 
         for (tag, service) in &group.services {
             // Validate tag
@@ -315,28 +314,14 @@ impl ConfigValidator {
                 });
             }
 
-            // Check offset uniqueness for services that participate in offset allocation.
-            // Preferred-only services don't use the offset pattern unless an explicit
-            // offset is supplied.
-            if service.offset.is_some() || service.preferred.is_none() {
-                let offset = service.offset.unwrap_or(0);
-                if offset == 0 && service.offset.is_none() && has_default_offset {
-                    return Err(Error::Validation {
-                        field: "reservations.services.offset".into(),
-                        message: "Only one offset-based service can omit offset (default to 0)"
-                            .into(),
-                    });
-                }
-                if offset == 0 && service.offset.is_none() {
-                    has_default_offset = true;
-                }
-
-                if !seen_offsets.insert(offset) {
-                    return Err(Error::Validation {
-                        field: "reservations.services.offset".into(),
-                        message: format!("Duplicate offset: {offset}"),
-                    });
-                }
+            // Every service has an offset fallback. Omission defaults to zero
+            // even when a preferred port is also configured.
+            let offset = service.offset.unwrap_or(0);
+            if !seen_offsets.insert(offset) {
+                return Err(Error::Validation {
+                    field: "reservations.services.offset".into(),
+                    message: format!("Duplicate offset: {offset}"),
+                });
             }
 
             // Check preferred port uniqueness
@@ -670,7 +655,37 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_reservation_group_preferred_only_services_do_not_duplicate_offsets() {
+    fn test_validate_reservation_group_rejects_invalid_preferred_port() {
+        let services = HashMap::from([(
+            "web".to_string(),
+            ServiceDefinition {
+                offset: Some(0),
+                preferred: Some(0),
+                env: None,
+            },
+        )]);
+        let group = ReservationGroup {
+            base: None,
+            services,
+        };
+
+        let error = ConfigValidator::validate_reservation_group(&group)
+            .expect_err("Port zero is not a valid preferred port");
+        assert!(
+            matches!(
+                error,
+                Error::Validation {
+                    ref field,
+                    ref message
+                } if field == "reservations.services.preferred"
+                    && message == "Invalid port: 0"
+            ),
+            "Expected a precise invalid-preferred error, got {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_reservation_group_preferred_services_still_default_to_offset_zero() {
         let mut services = HashMap::new();
         services.insert(
             "web".to_string(),
@@ -694,7 +709,19 @@ mod tests {
             services,
         };
 
-        assert!(ConfigValidator::validate_reservation_group(&group).is_ok());
+        let error = ConfigValidator::validate_reservation_group(&group)
+            .expect_err("Omitted offsets must both default to zero and conflict");
+        assert!(
+            matches!(
+                error,
+                Error::Validation {
+                    ref field,
+                    ref message
+                } if field == "reservations.services.offset"
+                    && message.contains("Duplicate offset: 0")
+            ),
+            "Expected a duplicate default-offset error, got {error}"
+        );
     }
 
     #[test]

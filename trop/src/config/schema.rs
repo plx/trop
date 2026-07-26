@@ -303,10 +303,13 @@ pub struct ReservationGroup {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceDefinition {
-    /// Offset from the base port.
+    /// Offset from the base port, defaulting to zero when omitted.
+    ///
+    /// When [`Self::preferred`] is also present, this is the fallback used if
+    /// the preferred port is reserved, excluded, or occupied.
     pub offset: Option<u16>,
 
-    /// Preferred absolute port number.
+    /// Preferred absolute port number, which may be outside the scan range.
     pub preferred: Option<u16>,
 
     /// Explicit environment-variable name to export.

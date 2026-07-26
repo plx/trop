@@ -61,6 +61,8 @@ For recurring reservation patterns, you add a "tropfile" (`trop.yaml`) file to y
 reservations:
   services:
     web:
+      offset: 0
+      preferred: 8080
       env: WEB_PORT
     api:
       offset: 1
@@ -69,6 +71,16 @@ reservations:
       offset: 2
       env: DB_PORT
 ```
+
+Each service offset is unique within the group and defaults to `0` when
+omitted, including for a service that also has `preferred`. A preferred port
+may be any valid port from 1 through 65535; it does not need to be inside the
+configured scan range or match the service's offset. Trop pins available
+preferred ports first. If a preference is reserved, excluded, or occupied, the
+service joins the offset fallback pattern instead. The fallback base is the
+lowest candidate in the configured scan range that fits the complete pattern
+without colliding with another reservation, the operating system, an
+exclusion, or a preferred port pinned by the same request.
 
 Every reservation service must resolve to a portable `export`/`dotenv`
 identifier, regardless of the selected output format. Explicit `env` names must

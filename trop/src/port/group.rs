@@ -3,21 +3,24 @@
 //! This module provides functionality for allocating groups of ports with specific
 //! offset patterns, useful for microservices or applications that need multiple ports.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::database::Database;
 use crate::error::Error;
-use crate::port::allocator::{AllocationOptions, PortAllocator};
+use crate::port::allocator::{PortAllocator, PortAvailability};
 use crate::port::occupancy::{OccupancyCheckConfig, PortOccupancyChecker};
 use crate::{Port, Reservation, ReservationKey, Result};
 
 /// Request for allocating a group of related ports.
 ///
 /// A group allocation request specifies multiple services, each with an optional
-/// offset from a base port and/or a preferred absolute port. The allocator will
-/// find a base port where all the offsets are available.
+/// offset from a base port and/or a preferred absolute port. Available preferred
+/// ports are pinned first across the full valid port domain. Services whose
+/// preference is unavailable use their offset fallback, and the allocator finds
+/// the lowest in-range base where the complete fallback pattern is available and
+/// does not collide with a pinned preference.
 ///
 /// # Examples
 ///
@@ -75,7 +78,9 @@ impl GroupAllocationRequest {
         let mut normalized = self.clone();
         normalized.project = Self::normalize_metadata("project", normalized.project.as_deref())?;
         normalized.task = Self::normalize_metadata("task", normalized.task.as_deref())?;
-        let mut seen_tags = std::collections::HashSet::new();
+        let mut seen_tags = HashSet::new();
+        let mut seen_offsets = HashSet::new();
+        let mut seen_preferred = HashSet::new();
         for service in &mut normalized.services {
             service.tag = service.tag.trim().to_string();
             if service.tag.is_empty() {
@@ -95,6 +100,22 @@ impl GroupAllocationRequest {
                     field: "services".into(),
                     message: "Every service without a preferred port must have an offset".into(),
                 });
+            }
+            if let Some(offset) = service.offset {
+                if !seen_offsets.insert(offset) {
+                    return Err(Error::Validation {
+                        field: "services".into(),
+                        message: format!("Duplicate service offset: {offset}"),
+                    });
+                }
+            }
+            if let Some(preferred) = service.preferred {
+                if !seen_preferred.insert(preferred) {
+                    return Err(Error::Validation {
+                        field: "services".into(),
+                        message: format!("Duplicate preferred port: {preferred}"),
+                    });
+                }
             }
         }
 
@@ -137,7 +158,9 @@ pub struct GroupReconciliationPolicy {
 /// Individual service in a group allocation request.
 ///
 /// Each service has a tag (identifier), an optional offset from the base port,
-/// and an optional preferred absolute port.
+/// and an optional preferred absolute port. The lower-level library API permits
+/// `offset: None` for a preferred-only request; unlike configuration, that
+/// request has no fallback and reports why an unavailable preference failed.
 ///
 /// # Examples
 ///
@@ -152,10 +175,10 @@ pub struct GroupReconciliationPolicy {
 ///     preferred: None,
 /// };
 ///
-/// // Service with preferred absolute port
+/// // Service with preferred absolute port and offset fallback
 /// let api = ServiceAllocationRequest {
 ///     tag: "api".to_string(),
-///     offset: None,
+///     offset: Some(1),
 ///     preferred: Some(Port::try_from(8080).unwrap()),
 /// };
 /// ```
@@ -163,9 +186,9 @@ pub struct GroupReconciliationPolicy {
 pub struct ServiceAllocationRequest {
     /// Tag identifier for this service.
     pub tag: String,
-    /// Optional offset from the base port.
+    /// Optional offset from the base port and fallback when preferred is unavailable.
     pub offset: Option<u16>,
-    /// Optional preferred absolute port (takes precedence over offset).
+    /// Optional preferred absolute port (tried before the offset fallback).
     pub preferred: Option<Port>,
 }
 
@@ -236,9 +259,9 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     ///
     /// Returns an error if:
     /// - The request is invalid (empty services, duplicate tags, etc.)
-    /// - No base port can be found for the offset pattern
+    /// - No base port can be found for the complete offset fallback pattern
     /// - Database operations fail
-    /// - Preferred ports are unavailable
+    /// - A preferred-only port is reserved, excluded, or occupied
     /// - Existing tagged rows form a partial or incompatible group
     ///
     /// # Examples
@@ -525,17 +548,13 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
                 })?;
             let port = reservation.port();
 
-            if let Some(preferred) = service.preferred {
-                if port != preferred {
-                    return Err(Self::group_conflict(
-                        request,
-                        format!("stored port {port} does not match preferred port {preferred}"),
-                    ));
-                }
-            } else {
+            if service.preferred != Some(port) {
                 let offset = service.offset.ok_or_else(|| Error::Validation {
                     field: "services".into(),
-                    message: "An offset-based service is missing its offset".into(),
+                    message: format!(
+                        "Stored port {port} does not match the preferred port and \
+                         the service has no offset fallback"
+                    ),
                 })?;
                 let candidate = self.compatible_offset_base(request, port, offset)?;
 
@@ -651,18 +670,48 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         request: &GroupAllocationRequest,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<GroupAllocationResult> {
-        let (preferred_services, offset_services): (Vec<_>, Vec<_>) =
-            request.services.iter().partition(|s| s.preferred.is_some());
+        let mut services = request.services.iter().collect::<Vec<_>>();
+        services.sort_unstable_by(|left, right| left.tag.cmp(&right.tag));
+        let mut preferred_services = Vec::new();
+        let mut offset_services = Vec::new();
+
+        for service in services {
+            let Some(preferred) = service.preferred else {
+                offset_services.push(service);
+                continue;
+            };
+
+            let availability =
+                self.is_preferred_port_available(preferred, conn, occupancy_config)?;
+            if availability == PortAvailability::Available {
+                preferred_services.push((service, preferred));
+            } else if service.offset.is_some() {
+                offset_services.push(service);
+            } else {
+                return Err(Error::PreferredPortUnavailable {
+                    port: preferred,
+                    reason: availability
+                        .unavailable_reason()
+                        .expect("An unavailable preferred port must have a reason"),
+                });
+            }
+        }
+
+        let preferred_ports = preferred_services
+            .iter()
+            .map(|(_, port)| *port)
+            .collect::<HashSet<_>>();
 
         let base_port = if offset_services.is_empty() {
             None
         } else {
             let pattern: Vec<u16> = offset_services.iter().filter_map(|s| s.offset).collect();
             let base = self
-                .find_pattern_match(&pattern, conn, occupancy_config)?
+                .find_pattern_match_avoiding(&pattern, &preferred_ports, conn, occupancy_config)?
                 .ok_or_else(|| Error::GroupAllocationFailed {
-                    attempted: 0,
-                    reason: "No base port found for offset pattern".into(),
+                    attempted: offset_services.len(),
+                    reason: "No scanned base can satisfy the complete offset fallback pattern"
+                        .into(),
                 })?;
 
             Some(base)
@@ -671,35 +720,12 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         let mut allocations = HashMap::new();
         let mut reservations_to_create = Vec::new();
 
-        for service in &preferred_services {
-            let port = service.preferred.ok_or_else(|| Error::Validation {
-                field: "services".into(),
-                message: "A preferred-port service is missing its preferred port".into(),
-            })?;
+        for (service, port) in &preferred_services {
             let key = ReservationKey::new(request.base_path.clone(), Some(service.tag.clone()))?;
 
-            let options = AllocationOptions {
-                preferred: Some(port),
-                ignore_occupied: false,
-                ignore_exclusions: false,
-            };
+            allocations.insert(service.tag.clone(), *port);
 
-            match self.allocate_single(conn, &options, occupancy_config)? {
-                crate::port::allocator::AllocationResult::Allocated(_) => {}
-                crate::port::allocator::AllocationResult::PreferredUnavailable { port, reason } => {
-                    return Err(Error::PreferredPortUnavailable { port, reason });
-                }
-                crate::port::allocator::AllocationResult::Exhausted { .. } => {
-                    return Err(Error::GroupAllocationFailed {
-                        attempted: allocations.len(),
-                        reason: format!("Preferred port {port} not available"),
-                    });
-                }
-            }
-
-            allocations.insert(service.tag.clone(), port);
-
-            let reservation = Reservation::builder(key, port)
+            let reservation = Reservation::builder(key, *port)
                 .project(request.project.clone())
                 .task(request.task.clone())
                 .build()?;
@@ -743,8 +769,8 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
 
     /// Find a base port where all offsets in the pattern are available.
     ///
-    /// This scans forward from the range minimum looking for a base port where
-    /// base+offset is available for every offset in the pattern.
+    /// This scans forward from the range minimum looking for the lowest base
+    /// port where `base + offset` is available for every offset in the pattern.
     ///
     /// # Errors
     ///
@@ -752,6 +778,16 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     pub fn find_pattern_match(
         &self,
         pattern: &[u16],
+        conn: &rusqlite::Connection,
+        occupancy_config: &OccupancyCheckConfig,
+    ) -> Result<Option<Port>> {
+        self.find_pattern_match_avoiding(pattern, &HashSet::new(), conn, occupancy_config)
+    }
+
+    fn find_pattern_match_avoiding(
+        &self,
+        pattern: &[u16],
+        unavailable_in_request: &HashSet<Port>,
         conn: &rusqlite::Connection,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<Option<Port>> {
@@ -767,17 +803,24 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         let max_offset = pattern.iter().copied().max().unwrap_or(0);
 
         // We need to ensure base + max_offset <= range.max()
-        let scan_end = end.checked_sub(max_offset).unwrap_or(start);
+        let Some(scan_end_value) = end
+            .value()
+            .checked_sub(max_offset)
+            .filter(|scan_end| *scan_end >= start.value())
+        else {
+            return Ok(None);
+        };
 
-        for base_value in start.value()..=scan_end.value() {
+        for base_value in start.value()..=scan_end_value {
             let base = Port::try_from(base_value)?;
 
             // Check if all offsets are available from this base
             let mut all_available = true;
             for &offset in pattern {
                 if let Some(port) = base.checked_add(offset) {
-                    if self.is_port_available(port, conn, occupancy_config)?
-                        == super::allocator::PortAvailability::Available
+                    if !unavailable_in_request.contains(&port)
+                        && self.is_port_available(port, conn, occupancy_config)?
+                            == super::allocator::PortAvailability::Available
                     {
                         // Good, continue checking
                     } else {
@@ -804,6 +847,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
 mod tests {
     use super::*;
     use crate::database::test_util::create_test_database;
+    use crate::error::PortUnavailableReason;
     use crate::port::allocator::PortAllocator;
     use crate::port::exclusions::ExclusionManager;
     use crate::port::occupancy::{MockOccupancyChecker, OccupancyCheckConfig};
@@ -819,6 +863,23 @@ mod tests {
         let range =
             PortRange::new(Port::try_from(min).unwrap(), Port::try_from(max).unwrap()).unwrap();
         PortAllocator::new(checker, ExclusionManager::empty(), range)
+    }
+
+    fn single_preferred_request(
+        base_path: &str,
+        preferred: Port,
+        offset: Option<u16>,
+    ) -> GroupAllocationRequest {
+        GroupAllocationRequest {
+            base_path: PathBuf::from(base_path),
+            project: None,
+            task: None,
+            services: vec![ServiceAllocationRequest {
+                tag: "web".to_string(),
+                offset,
+                preferred: Some(preferred),
+            }],
+        }
     }
 
     #[test]
@@ -1051,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn test_group_allocation_with_preferred() {
+    fn test_group_allocation_accepts_free_preferred_outside_scan_range() {
         let db = create_test_database();
         let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
 
@@ -1059,7 +1120,238 @@ mod tests {
             base_path: PathBuf::from("/test/project"),
             project: Some("test".to_string()),
             task: None,
+            services: vec![ServiceAllocationRequest {
+                tag: "api".to_string(),
+                offset: Some(0),
+                preferred: Some(Port::try_from(8080).unwrap()),
+            }],
+        };
+
+        let config = OccupancyCheckConfig::default();
+        let result = allocator
+            .allocate_group(db.connection(), &request, &config)
+            .expect("A valid free preferred port is independent of the scan range");
+        assert_eq!(result.allocations["api"], Port::try_from(8080).unwrap());
+        assert_eq!(result.base_port, None);
+    }
+
+    #[test]
+    fn test_group_occupied_preferred_falls_back_to_offset_pattern() {
+        let db = create_test_database();
+        let allocator =
+            create_test_allocator(HashSet::from([Port::try_from(5050).unwrap()]), 5000, 5100);
+        let request = GroupAllocationRequest {
+            base_path: PathBuf::from("/test/project"),
+            project: None,
+            task: None,
             services: vec![
+                ServiceAllocationRequest {
+                    tag: "web".to_string(),
+                    offset: Some(0),
+                    preferred: Some(Port::try_from(5050).unwrap()),
+                },
+                ServiceAllocationRequest {
+                    tag: "api".to_string(),
+                    offset: Some(1),
+                    preferred: None,
+                },
+            ],
+        };
+
+        let result = allocator
+            .allocate_group(db.connection(), &request, &OccupancyCheckConfig::default())
+            .expect("An unavailable preferred port should use its offset fallback");
+
+        assert_eq!(result.base_port, Some(Port::try_from(5000).unwrap()));
+        assert_eq!(result.allocations["web"], Port::try_from(5000).unwrap());
+        assert_eq!(result.allocations["api"], Port::try_from(5001).unwrap());
+    }
+
+    #[test]
+    fn test_group_excluded_preferred_falls_back_to_offset_pattern() {
+        let db = create_test_database();
+        let preferred = Port::try_from(5050).unwrap();
+        let mut exclusions = ExclusionManager::empty();
+        exclusions.add_port(preferred);
+        let range =
+            PortRange::new(Port::try_from(5000).unwrap(), Port::try_from(5100).unwrap()).unwrap();
+        let allocator =
+            PortAllocator::new(MockOccupancyChecker::new(HashSet::new()), exclusions, range);
+        let request = GroupAllocationRequest {
+            base_path: PathBuf::from("/test/project"),
+            project: None,
+            task: None,
+            services: vec![
+                ServiceAllocationRequest {
+                    tag: "web".to_string(),
+                    offset: Some(0),
+                    preferred: Some(preferred),
+                },
+                ServiceAllocationRequest {
+                    tag: "api".to_string(),
+                    offset: Some(1),
+                    preferred: None,
+                },
+            ],
+        };
+
+        let result = allocator
+            .allocate_group(db.connection(), &request, &OccupancyCheckConfig::default())
+            .expect("An excluded preferred port should use its offset fallback");
+
+        assert_eq!(result.base_port, Some(Port::try_from(5000).unwrap()));
+        assert_eq!(result.allocations["web"], Port::try_from(5000).unwrap());
+        assert_eq!(result.allocations["api"], Port::try_from(5001).unwrap());
+    }
+
+    #[test]
+    fn test_group_reserved_preferred_fallback_is_reused() {
+        let db = create_test_database();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
+        let preferred = Port::try_from(5050).unwrap();
+        let blocker = Reservation::builder(
+            ReservationKey::new(PathBuf::from("/other/project"), Some("blocker".to_string()))
+                .unwrap(),
+            preferred,
+        )
+        .build()
+        .unwrap();
+        Database::create_reservation_simple(db.connection(), &blocker).unwrap();
+        let request = GroupAllocationRequest {
+            base_path: PathBuf::from("/test/project"),
+            project: None,
+            task: None,
+            services: vec![
+                ServiceAllocationRequest {
+                    tag: "web".to_string(),
+                    offset: Some(0),
+                    preferred: Some(preferred),
+                },
+                ServiceAllocationRequest {
+                    tag: "api".to_string(),
+                    offset: Some(1),
+                    preferred: None,
+                },
+            ],
+        };
+        let config = OccupancyCheckConfig::default();
+
+        let first = allocator
+            .allocate_group(db.connection(), &request, &config)
+            .expect("A reserved preferred port should use its offset fallback");
+        let repeated = allocator
+            .allocate_group(db.connection(), &request, &config)
+            .expect("A stored fallback pattern should remain shape-compatible");
+
+        assert_eq!(repeated, first);
+        assert_eq!(first.base_port, Some(Port::try_from(5000).unwrap()));
+        assert_eq!(first.allocations["web"], Port::try_from(5000).unwrap());
+        assert_eq!(first.allocations["api"], Port::try_from(5001).unwrap());
+        assert_eq!(
+            Database::list_all_reservations(db.connection())
+                .unwrap()
+                .len(),
+            3,
+            "Repeating a fallback allocation must not insert another group"
+        );
+    }
+
+    #[test]
+    fn test_group_preferred_without_fallback_reports_reserved() {
+        let db = create_test_database();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
+        let preferred = Port::try_from(5050).unwrap();
+        let blocker = Reservation::builder(
+            ReservationKey::new(PathBuf::from("/other/project"), Some("blocker".to_string()))
+                .unwrap(),
+            preferred,
+        )
+        .build()
+        .unwrap();
+        Database::create_reservation_simple(db.connection(), &blocker).unwrap();
+
+        let error = allocator
+            .allocate_group(
+                db.connection(),
+                &single_preferred_request("/test/project", preferred, None),
+                &OccupancyCheckConfig::default(),
+            )
+            .expect_err("A reserved preferred-only port must fail");
+
+        assert!(matches!(
+            error,
+            Error::PreferredPortUnavailable {
+                port,
+                reason: PortUnavailableReason::Reserved,
+            } if port == preferred
+        ));
+    }
+
+    #[test]
+    fn test_group_preferred_without_fallback_reports_excluded() {
+        let db = create_test_database();
+        let preferred = Port::try_from(5050).unwrap();
+        let mut exclusions = ExclusionManager::empty();
+        exclusions.add_port(preferred);
+        let range =
+            PortRange::new(Port::try_from(5000).unwrap(), Port::try_from(5100).unwrap()).unwrap();
+        let allocator =
+            PortAllocator::new(MockOccupancyChecker::new(HashSet::new()), exclusions, range);
+
+        let error = allocator
+            .allocate_group(
+                db.connection(),
+                &single_preferred_request("/test/project", preferred, None),
+                &OccupancyCheckConfig::default(),
+            )
+            .expect_err("An excluded preferred-only port must fail");
+
+        assert!(matches!(
+            error,
+            Error::PreferredPortUnavailable {
+                port,
+                reason: PortUnavailableReason::Excluded,
+            } if port == preferred
+        ));
+    }
+
+    #[test]
+    fn test_group_preferred_without_fallback_reports_occupied() {
+        let db = create_test_database();
+        let preferred = Port::try_from(5050).unwrap();
+        let allocator = create_test_allocator(HashSet::from([preferred]), 5000, 5100);
+
+        let error = allocator
+            .allocate_group(
+                db.connection(),
+                &single_preferred_request("/test/project", preferred, None),
+                &OccupancyCheckConfig::default(),
+            )
+            .expect_err("An occupied preferred-only port must fail");
+
+        assert!(matches!(
+            error,
+            Error::PreferredPortUnavailable {
+                port,
+                reason: PortUnavailableReason::Occupied,
+            } if port == preferred
+        ));
+    }
+
+    #[test]
+    fn test_group_preferred_port_collision_advances_fallback_pattern() {
+        let db = create_test_database();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
+        let request = GroupAllocationRequest {
+            base_path: PathBuf::from("/test/project"),
+            project: None,
+            task: None,
+            services: vec![
+                ServiceAllocationRequest {
+                    tag: "admin".to_string(),
+                    offset: Some(2),
+                    preferred: Some(Port::try_from(5000).unwrap()),
+                },
                 ServiceAllocationRequest {
                     tag: "web".to_string(),
                     offset: Some(0),
@@ -1067,17 +1359,30 @@ mod tests {
                 },
                 ServiceAllocationRequest {
                     tag: "api".to_string(),
-                    offset: None,
-                    preferred: Some(Port::try_from(8080).unwrap()),
+                    offset: Some(1),
+                    preferred: None,
                 },
             ],
         };
 
-        let config = OccupancyCheckConfig::default();
+        let result = allocator
+            .allocate_group(db.connection(), &request, &OccupancyCheckConfig::default())
+            .expect("The allocator should scan past an internal preferred collision");
 
-        // This should fail because 8080 is outside the range
-        let result = allocator.allocate_group(db.connection(), &request, &config);
-        assert!(result.is_err());
+        assert_eq!(result.allocations["admin"], Port::try_from(5000).unwrap());
+        assert_eq!(result.base_port, Some(Port::try_from(5001).unwrap()));
+        assert_eq!(result.allocations["web"], Port::try_from(5001).unwrap());
+        assert_eq!(result.allocations["api"], Port::try_from(5002).unwrap());
+        assert_eq!(
+            result
+                .allocations
+                .values()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len(),
+            result.allocations.len(),
+            "Every successful group allocation must use distinct ports"
+        );
     }
 
     #[test]
@@ -1137,6 +1442,69 @@ mod tests {
             }
             _ => panic!("Expected validation error"),
         }
+    }
+
+    #[test]
+    fn test_group_allocation_rejects_duplicate_offsets_and_preferred_ports() {
+        let db = create_test_database();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
+        let duplicate_offsets = GroupAllocationRequest {
+            base_path: PathBuf::from("/test/offsets"),
+            project: None,
+            task: None,
+            services: vec![
+                ServiceAllocationRequest {
+                    tag: "web".to_string(),
+                    offset: Some(0),
+                    preferred: None,
+                },
+                ServiceAllocationRequest {
+                    tag: "api".to_string(),
+                    offset: Some(0),
+                    preferred: None,
+                },
+            ],
+        };
+        let preferred = Port::try_from(5050).unwrap();
+        let duplicate_preferred = GroupAllocationRequest {
+            base_path: PathBuf::from("/test/preferred"),
+            project: None,
+            task: None,
+            services: vec![
+                ServiceAllocationRequest {
+                    tag: "web".to_string(),
+                    offset: Some(0),
+                    preferred: Some(preferred),
+                },
+                ServiceAllocationRequest {
+                    tag: "api".to_string(),
+                    offset: Some(1),
+                    preferred: Some(preferred),
+                },
+            ],
+        };
+
+        for (request, expected) in [
+            (duplicate_offsets, "Duplicate service offset"),
+            (duplicate_preferred, "Duplicate preferred port"),
+        ] {
+            let error = allocator
+                .allocate_group(db.connection(), &request, &OccupancyCheckConfig::default())
+                .expect_err("Invalid group constraints must fail before allocation");
+            assert!(
+                matches!(
+                    error,
+                    Error::Validation {
+                        ref field,
+                        ref message
+                    } if field == "services" && message.contains(expected)
+                ),
+                "Expected a precise validation error containing {expected:?}, got {error}"
+            );
+        }
+        assert!(Database::list_all_reservations(db.connection())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1294,6 +1662,47 @@ mod tests {
             .find_pattern_match(&pattern, db.connection(), &config)
             .unwrap();
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_group_allocation_reports_complete_pattern_exhaustion() {
+        let db = create_test_database();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5001);
+        let request = GroupAllocationRequest {
+            base_path: PathBuf::from("/test/project"),
+            project: None,
+            task: None,
+            services: vec![
+                ServiceAllocationRequest {
+                    tag: "web".to_string(),
+                    offset: Some(0),
+                    preferred: None,
+                },
+                ServiceAllocationRequest {
+                    tag: "api".to_string(),
+                    offset: Some(2),
+                    preferred: None,
+                },
+            ],
+        };
+
+        let error = allocator
+            .allocate_group(db.connection(), &request, &OccupancyCheckConfig::default())
+            .expect_err("A pattern wider than the scan range must be exhausted");
+
+        assert!(
+            matches!(
+                error,
+                Error::GroupAllocationFailed {
+                    attempted: 2,
+                    ref reason,
+                } if reason.contains("complete offset fallback pattern")
+            ),
+            "Expected a precise complete-pattern exhaustion error, got {error}"
+        );
+        assert!(Database::list_all_reservations(db.connection())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

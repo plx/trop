@@ -1542,12 +1542,12 @@ reservations:
     assert!(all_fields.env.is_some());
 }
 
-/// Test that preferred-only services can omit offsets.
+/// Test the default offset for services with preferred ports.
 ///
-/// Preferred-only services reserve their absolute preferred ports and don't
-/// participate in offset-based allocation unless an offset is explicit.
+/// Every omitted service offset means zero, so two preferred services that
+/// both omit it violate the same offset-uniqueness rule as any other pair.
 #[test]
-fn test_reservation_groups_preferred_only_services_without_offsets() {
+fn test_reservation_groups_preferred_services_share_default_offset_zero() {
     let temp = TempDir::new().unwrap();
     create_temp_config(
         temp.path(),
@@ -1569,10 +1569,18 @@ reservations:
         .skip_env()
         .build();
 
-    let config = result.unwrap();
-    let services = &config.reservations.as_ref().unwrap().services;
-    assert_eq!(services.get("web").unwrap().offset, None);
-    assert_eq!(services.get("api").unwrap().offset, None);
+    let error = result.expect_err("Both omitted offsets should resolve to zero and conflict");
+    assert!(
+        matches!(
+            error,
+            Error::Validation {
+                ref field,
+                ref message
+            } if field.starts_with("reservations.services.offset")
+                && message == "Duplicate offset: 0"
+        ),
+        "Expected a precise duplicate-default-offset error, got {error}"
+    );
 }
 
 // ============================================================================

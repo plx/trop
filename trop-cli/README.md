@@ -169,11 +169,20 @@ reservations:
   services:
     web:
       offset: 0
+      preferred: 8080
       env: WEB_PORT
     api:
       offset: 1
       env: API_PORT
 ```
+
+Offsets are unique within a reservation group and default to `0` when omitted,
+even when the same service declares `preferred`. Preferred ports use the full
+valid port domain (1 through 65535), so they may sit outside `ports.min` and
+`ports.max`. Trop pins each available preference before scanning. A reserved,
+excluded, or occupied preference falls back to that service's offset, and trop
+chooses the lowest in-range base whose complete fallback pattern avoids both
+external conflicts and preferred ports pinned by the same request.
 
 Every reservation service must resolve to a portable `export`/`dotenv`
 identifier, regardless of the selected output format. Explicit `env` names must

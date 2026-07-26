@@ -118,6 +118,7 @@ reservations:
     api:
       offset: 1
     admin:
+      offset: 2
       preferred: 8080
 "#
     .to_string()
@@ -133,8 +134,10 @@ ports:
 reservations:
   services:
     web:
+      offset: 0
       preferred: 5010
     api:
+      offset: 1
       preferred: 5020
 "#
     .to_string()
@@ -305,6 +308,98 @@ fn test_successful_group_reservation_with_offsets() {
     }
 }
 
+#[test]
+fn test_group_preferred_outside_range_and_reserved_fallback_semantics() {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(
+        temp_dir.path(),
+        "trop.yaml",
+        r#"
+project: preferred-semantics
+ports:
+  min: 5000
+  max: 5010
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    external:
+      offset: 2
+      preferred: 65535
+    web:
+      offset: 0
+      preferred: 5005
+    api:
+      offset: 1
+"#,
+    );
+    let db = create_test_database();
+    let blocker = Reservation::builder(
+        ReservationKey::new(PathBuf::from("/other/project"), Some("blocker".to_string()))
+            .expect("Should build blocker key"),
+        Port::try_from(5005).unwrap(),
+    )
+    .build()
+    .expect("Should build blocker reservation");
+    Database::create_reservation_simple(db.connection(), &blocker)
+        .expect("Should reserve the in-range preferred port");
+    let blocker_before = Database::get_reservation(db.connection(), blocker.key())
+        .expect("Should load blocker snapshot")
+        .expect("Blocker must exist");
+
+    let result = execute_group(&db, &config_path)
+        .expect("The outside-range preferred should succeed and the reserved preferred fallback");
+
+    assert_eq!(result["external"], Port::try_from(65535).unwrap());
+    assert_eq!(result["web"], Port::try_from(5000).unwrap());
+    assert_eq!(result["api"], Port::try_from(5001).unwrap());
+    assert_eq!(
+        result
+            .values()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        result.len()
+    );
+    let blocker_after = Database::get_reservation(db.connection(), blocker.key())
+        .expect("Should load blocker")
+        .expect("Blocker must remain");
+    assert_eq!(blocker_after, blocker_before);
+}
+
+#[test]
+fn test_group_internal_preferred_collision_uses_next_complete_pattern() {
+    let temp_dir = create_temp_dir();
+    let config_path = create_config_file(
+        temp_dir.path(),
+        "trop.yaml",
+        r#"
+ports:
+  min: 5000
+  max: 5010
+occupancy_check:
+  skip: true
+reservations:
+  services:
+    external:
+      offset: 2
+      preferred: 5000
+    web:
+      offset: 0
+    api:
+      offset: 1
+"#,
+    );
+    let db = create_test_database();
+
+    let result = execute_group(&db, &config_path)
+        .expect("The first colliding pattern should be skipped atomically");
+
+    assert_eq!(result["external"], Port::try_from(5000).unwrap());
+    assert_eq!(result["web"], Port::try_from(5001).unwrap());
+    assert_eq!(result["api"], Port::try_from(5002).unwrap());
+}
+
 /// Group keys use the canonical config parent even when an absolute config
 /// argument contains lexical parent-directory components.
 #[test]
@@ -469,37 +564,9 @@ reservations:
     api:
       offset: 2
 "#;
-    let initial_preferred = r#"
-ports:
-  min: 5000
-  max: 7000
-occupancy_check:
-  skip: true
-reservations:
-  services:
-    web:
-      preferred: 5010
-    api:
-      preferred: 5020
-"#;
-    let changed_preferred = r#"
-ports:
-  min: 5000
-  max: 7000
-occupancy_check:
-  skip: true
-reservations:
-  services:
-    web:
-      preferred: 5011
-    api:
-      preferred: 5020
-"#;
-
     assert_incompatible_group_is_unchanged(initial_offsets, added_service);
     assert_incompatible_group_is_unchanged(initial_offsets, removed_service);
     assert_incompatible_group_is_unchanged(initial_offsets, changed_offset);
-    assert_incompatible_group_is_unchanged(initial_preferred, changed_preferred);
 }
 
 /// Group metadata is sticky on every row, and a narrow allow flag updates only
@@ -993,8 +1060,10 @@ occupancy_check:
 reservations:
   services:
     web:
+      offset: 0
       preferred: 5011
     api:
+      offset: 1
       preferred: 5021
 "#;
     create_config_file(temp_dir.path(), "trop.yaml", changed_preferred);
@@ -2010,24 +2079,24 @@ reservations:
     assert_eq!(reservation.port().value(), 5000);
 }
 
-/// Test error when preferred port is outside allowed range.
+/// Test a preferred port outside the ordinary scan range.
 ///
-/// This test verifies port range validation:
-/// - Preferred ports must be within configured range
-/// - Error occurs during execution (allocation)
-/// - No partial allocations occur
+/// Preferred absolute ports use the full valid port domain. Only a fallback
+/// base scan is constrained by `ports.min..=ports.max`.
 ///
 /// Invariants tested:
-/// - Port range boundaries are enforced
-/// - Validation catches out-of-range ports
+/// - A free outside-range preference is selected
+/// - The stored reservation uses that exact preferred port
 #[test]
-fn test_error_preferred_port_out_of_range() {
+fn test_preferred_port_outside_range_succeeds() {
     let temp_dir = create_temp_dir();
     let config_content = r#"
 project: test-project
 ports:
   min: 5000
   max: 5010
+occupancy_check:
+  skip: true
 reservations:
   services:
     web:
@@ -2043,36 +2112,38 @@ reservations:
         .expect("Should build plan");
 
     let mut executor = PlanExecutor::new(db.connection());
-    let result = executor.execute(&plan);
-
-    assert!(
-        result.is_err(),
-        "Should fail when preferred port is out of range"
+    let result = executor
+        .execute(&plan)
+        .expect("A free preferred port outside the scan range should succeed");
+    assert_eq!(
+        result
+            .allocated_ports
+            .expect("Should return the allocation")["web"],
+        Port::try_from(9000).unwrap()
     );
 
-    // Verify no reservations were created (atomicity)
     let all_reservations =
         Database::list_all_reservations(db.connection()).expect("Should be able to list");
     assert_eq!(
         all_reservations.len(),
-        0,
-        "No reservations should be created on failure"
+        1,
+        "The outside-range preference should be stored"
     );
+    assert_eq!(all_reservations[0].port(), Port::try_from(9000).unwrap());
 }
 
-/// Test error when preferred port is already occupied.
+/// Test fallback when a preferred port is already reserved.
 ///
-/// This test verifies port availability checking:
-/// - Preferred ports must be available
-/// - Occupancy is checked before allocation
-/// - Clear error when port is unavailable
+/// Configuration services always have an offset (default zero), so an
+/// unavailable preferred port joins the scanned fallback pattern.
 ///
 /// Invariants tested:
-/// - Port occupancy prevents conflicts
-/// - Error indicates which port is unavailable
+/// - The existing reservation remains untouched
+/// - The new group uses the lowest valid fallback port
 #[test]
-fn test_error_preferred_port_occupied() {
-    let temp_dir = create_temp_dir();
+fn test_reserved_preferred_port_uses_default_offset_fallback() {
+    let first_dir = create_temp_dir();
+    let second_dir = create_temp_dir();
     let db = create_test_database();
 
     // First, reserve a port that we'll try to use as preferred
@@ -2081,12 +2152,14 @@ project: first-project
 ports:
   min: 5000
   max: 7000
+occupancy_check:
+  skip: true
 reservations:
   services:
     existing:
       offset: 0
 "#;
-    let first_path = create_config_file(temp_dir.path(), "first.yaml", first_config);
+    let first_path = create_config_file(first_dir.path(), "trop.yaml", first_config);
     let first_options = test_group_options(first_path);
     let first_planner = ReserveGroupPlan::new(first_options).expect("Should create planner");
     let first_plan = first_planner
@@ -2099,13 +2172,15 @@ reservations:
     let first_ports = first_result.allocated_ports.expect("Should have ports");
     let occupied_port = first_ports.get("existing").expect("Should have port");
 
-    // Now try to allocate a group with a preferred port that's already taken
+    // Now allocate a group whose preferred port is already taken.
     let second_config = format!(
         r#"
 project: second-project
 ports:
   min: 5000
   max: 7000
+occupancy_check:
+  skip: true
 reservations:
   services:
     web:
@@ -2113,27 +2188,28 @@ reservations:
 "#,
         occupied_port.value()
     );
-    let second_path = create_config_file(temp_dir.path(), "second.yaml", &second_config);
+    let second_path = create_config_file(second_dir.path(), "trop.yaml", &second_config);
     let second_options = test_group_options(second_path);
     let second_planner = ReserveGroupPlan::new(second_options).expect("Should create planner");
     let second_plan = second_planner
         .build_plan(db.connection())
         .expect("Should build plan");
     let mut second_executor = PlanExecutor::new(db.connection());
-    let result = second_executor.execute(&second_plan);
+    let result = second_executor
+        .execute(&second_plan)
+        .expect("The unavailable preference should use offset zero");
+    let fallback = result
+        .allocated_ports
+        .expect("Should return fallback mapping")["web"];
+    assert_ne!(fallback, *occupied_port);
+    assert_eq!(fallback, Port::try_from(occupied_port.value() + 1).unwrap());
 
-    assert!(
-        result.is_err(),
-        "Should fail when preferred port is occupied"
-    );
-
-    // Verify only first group's reservations exist
     let all_reservations =
         Database::list_all_reservations(db.connection()).expect("Should be able to list");
     assert_eq!(
         all_reservations.len(),
-        1,
-        "Only first group should be allocated"
+        2,
+        "The original reservation and fallback reservation should coexist"
     );
 }
 
