@@ -328,6 +328,7 @@ pub(crate) struct DeferredReserve {
     options: ReserveOptions,
     full_config: Config,
     occupancy_config: OccupancyCheckConfig,
+    existing_at_planning: bool,
 }
 
 pub(crate) struct AutomaticReserveOutcome {
@@ -552,6 +553,7 @@ impl<'a> ReservePlan<'a> {
             options: self.options.clone(),
             full_config: self.config.clone(),
             occupancy_config: self.occupancy_config(),
+            existing_at_planning: ignored_key.is_some(),
         });
 
         if ignored_key.is_some() {
@@ -632,10 +634,25 @@ fn reconcile_deferred_key(
 ) -> Result<DeferredKeyReconciliation> {
     let options = &deferred.options;
     let Some(existing) = Database::get_reservation(conn, &options.key)? else {
+        let (project, task) = if deferred.existing_at_planning {
+            (
+                options
+                    .project
+                    .resolve_new(super::inference::infer_project(&options.key.path)),
+                options
+                    .task
+                    .resolve_new(super::inference::infer_task(&options.key.path)),
+            )
+        } else {
+            (
+                placeholder.project().map(ToOwned::to_owned),
+                placeholder.task().map(ToOwned::to_owned),
+            )
+        };
         return Ok(DeferredKeyReconciliation::Allocate(
             PendingDeferredAllocation {
-                project: placeholder.project().map(ToOwned::to_owned),
-                task: placeholder.task().map(ToOwned::to_owned),
+                project,
+                task,
                 created_at: None,
                 ignored_key: None,
             },
@@ -1587,6 +1604,68 @@ mod tests {
     }
 
     #[test]
+    fn test_deferred_overwrite_reinfers_metadata_when_target_disappears() {
+        let directory = tempdir().unwrap();
+        let blocker_path = directory.path().join("blocker");
+        let target_path = directory.path().join("target");
+        std::fs::create_dir(&blocker_path).unwrap();
+        std::fs::create_dir(&target_path).unwrap();
+        let blocker_key = ReservationKey::new(blocker_path, None).unwrap();
+        let target_key = ReservationKey::new(target_path, None).unwrap();
+        let available_port = Port::try_from(5452).unwrap();
+        let old_target_port = Port::try_from(5453).unwrap();
+        let mut db = create_test_database();
+
+        db.create_reservation(
+            &Reservation::builder(blocker_key.clone(), available_port)
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        db.create_reservation(
+            &Reservation::builder(target_key.clone(), old_target_port)
+                .project(Some("deleted-project".into()))
+                .task(Some("deleted-task".into()))
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let config = Config {
+            ports: Some(PortConfig {
+                min: available_port.value(),
+                max: Some(available_port.value()),
+                max_offset: None,
+            }),
+            ..Default::default()
+        };
+        let plan = ReservePlan::new(
+            ReserveOptions::new(target_key.clone(), None)
+                .with_overwrite(true)
+                .with_allow_unrelated_path(true),
+            &config,
+        )
+        .build_plan(db.connection())
+        .unwrap();
+        assert!(matches!(
+            plan.actions.as_slice(),
+            [PlanAction::UpdateReservation(reservation)]
+                if reservation.requires_allocation_at_execution()
+        ));
+
+        Database::delete_reservation_simple(db.connection(), &target_key).unwrap();
+        Database::delete_reservation_simple(db.connection(), &blocker_key).unwrap();
+
+        let result = PlanExecutor::new(db.connection()).execute(&plan).unwrap();
+        assert_eq!(result.port, Some(available_port));
+        let stored = Database::get_reservation(db.connection(), &target_key)
+            .unwrap()
+            .expect("the disappeared target should be recreated");
+        assert_eq!(stored.project(), None);
+        assert_eq!(stored.task(), None);
+    }
+
+    #[test]
     fn test_cleanup_retry_exposes_typed_aggregate_blockers_and_rolls_back() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let occupied_port = Port::try_from(listener.local_addr().unwrap().port()).unwrap();
@@ -1797,6 +1876,7 @@ mod tests {
                     .with_ignore_occupied(true),
                 full_config: config,
                 occupancy_config: OccupancyCheckConfig::default(),
+                existing_at_planning: false,
             });
         let transaction = reserve_db.begin_transaction().unwrap();
         let outcome =
