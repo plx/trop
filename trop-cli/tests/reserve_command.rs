@@ -74,8 +74,8 @@ fn set_single_reservation_timestamps(env: &TestEnv, created_at: i64, last_used_a
 
 fn occupied_port_with_free_neighbor() -> (TcpListener, u16) {
     loop {
-        let listener =
-            TcpListener::bind(("0.0.0.0", 0)).expect("Failed to bind an occupied test port");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("Failed to bind an occupied test port");
         let occupied = listener
             .local_addr()
             .expect("Failed to inspect occupied test port")
@@ -86,7 +86,7 @@ fn occupied_port_with_free_neighbor() -> (TcpListener, u16) {
             .flatten()
             .filter(|candidate| *candidate > 1024)
         {
-            if let Ok(probe) = TcpListener::bind(("0.0.0.0", candidate)) {
+            if let Ok(probe) = TcpListener::bind((Ipv4Addr::LOCALHOST, candidate)) {
                 drop(probe);
                 return (listener, candidate);
             }

@@ -62,7 +62,11 @@ fn test_toctou_port_availability() {
     // Range 50000-50010 inclusive = 11 available ports
     // Config files go in the data directory
     let config_path = data_dir.join("config.yaml");
-    std::fs::write(&config_path, "ports:\n  min: 50000\n  max: 50010\n").unwrap();
+    std::fs::write(
+        &config_path,
+        "ports:\n  min: 50000\n  max: 50010\noccupancy_check:\n  skip: true\n",
+    )
+    .unwrap();
 
     // Spawn 20 processes trying to reserve from the same small pool
     // This guarantees we'll exhaust the pool and test failure handling
