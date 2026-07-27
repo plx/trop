@@ -143,6 +143,19 @@ remain protected by the matching sticky-field permission. Set and clear
 updates keep the stored port unless overwrite or force also requests
 reallocation.
 
+Opening a writable schema-v1 database automatically migrates it to schema v2
+in one durable transaction. Schema v2 uses strict SQLite tables and enforces
+unique reservation keys, globally unique ports in `1..=65535`, and nonnegative
+timestamps. The public optional-tag model is unchanged; the empty-string
+sentinel used for an untagged row is internal.
+
+Migration preflight reports every detected duplicate or invalid legacy
+category and leaves v1 unchanged instead of choosing rows. A read-only v1
+database returns `Error::MigrationRequired`; read-only v2 access is supported.
+No persistent backup or reverse migration is provided. Stop users of the
+database and copy the complete data directory before upgrading if a downgrade
+restore point is required.
+
 ## Usage Example
 
 ```rust

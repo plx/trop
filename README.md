@@ -221,6 +221,29 @@ always canonicalized. Consequently, bare, relative, absolute, and
 symbolic-link directory routes to the same group configuration share one
 absolute stored path.
 
+### Database schema upgrades
+
+The first writable launch against a schema-v1 database automatically migrates
+it to schema v2 in one durable transaction. Schema v2 enforces unique
+path-and-tag identities, globally unique valid ports, nonnegative timestamps,
+and strict SQLite value types. Untagged identities remain untagged in the CLI
+and library APIs; their non-null representation is an internal storage detail.
+
+Before changing the database, trop checks the complete legacy state. Duplicate
+keys or ports, empty legacy tags, invalid ports or timestamps, unexpected
+SQLite value types, and unsupported table layouts stop the migration with
+actionable recovery details. Trop does not silently select or discard a row,
+and a failed or interrupted migration leaves either the complete v1 database
+or the complete committed v2 database, never a hybrid. A read-only v1 database
+likewise reports that a writable upgrade is required; read-only use works after
+migration to v2.
+
+The migration does not create a persistent backup and there is no reverse
+schema migration. An older client rejects schema v2 without modifying it. If
+you may need to downgrade, stop processes using trop and copy the complete
+data directory before the first launch of the newer client. Restore that copy
+to return to the older schema.
+
 ### Projects and Tasks
 
 `trop` reservations are *keyed* by a path and optional tag, but support two additional metadata fields:

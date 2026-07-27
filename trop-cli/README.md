@@ -247,6 +247,23 @@ without ASCII case.
 
 See the [implementation specification](../reference/ImplementationSpecification.md) for complete configuration details.
 
+## Database Upgrades
+
+The first writable launch against a schema-v1 database automatically migrates
+it to schema v2 in one durable transaction. Trop checks all legacy rows before
+changing the database and refuses to guess when it finds duplicate keys or
+ports, empty legacy tags, invalid values, unexpected SQLite types, or an
+unsupported layout. The reported recovery details identify every detected
+category. A failure or interruption leaves either the complete v1 database or
+the complete committed v2 database, never a hybrid.
+
+A read-only v1 database cannot be upgraded; reopen it writable or migrate a
+writable copy first. Read-only use works once the database is at v2. The
+migration does not create a persistent backup, and trop does not support
+reverse schema migration. Older clients reject schema v2 without modifying it.
+If downgrade recovery matters, stop processes using trop and copy the complete
+data directory before launching the newer client for the first time.
+
 ## Environment Variables
 
 Canonical environment variables covered by the effective configuration

@@ -334,7 +334,7 @@ fn reservation_rows(env: &TestEnv) -> Vec<(String, u16, i64, i64)> {
         .prepare(
             "SELECT tag, port, created_at, last_used_at
              FROM reservations
-             WHERE tag IS NOT NULL
+             WHERE tag <> ''
              ORDER BY tag",
         )
         .expect("Failed to prepare reservation query");
@@ -355,7 +355,7 @@ fn reservation_metadata_rows(env: &TestEnv) -> Vec<ReservationMetadataRow> {
         .prepare(
             "SELECT tag, port, project, task, created_at, last_used_at
              FROM reservations
-             WHERE tag IS NOT NULL
+             WHERE tag <> ''
              ORDER BY tag",
         )
         .expect("Failed to prepare reservation metadata query");

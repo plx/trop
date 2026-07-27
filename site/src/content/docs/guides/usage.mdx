@@ -71,3 +71,20 @@ Version 0.2.0 rejects invalid identifiers. See
 [the GitHub security advisory](https://github.com/plx/trop/security/advisories/GHSA-h2jc-jr86-m5vq)
 for affected usage and remediation. Until upgraded, use human or JSON output,
 inspect the result, and set only trusted variables manually.
+
+## Database Schema Upgrades
+
+The first writable launch against a schema-v1 database automatically migrates
+it to schema v2 in one durable transaction. Trop checks all legacy rows before
+making changes. Duplicate keys or ports, empty legacy tags, invalid values,
+unexpected SQLite value types, and unsupported layouts stop the migration with
+recovery details; trop never silently chooses or discards a row.
+
+A failed or interrupted migration leaves either the complete v1 database or
+the complete committed v2 database, never a hybrid. A read-only v1 database
+cannot be migrated, while read-only use works after a writable upgrade to v2.
+
+The migration does not create a persistent backup or support a reverse
+migration. Older clients reject schema v2 without changing it. If you may need
+to downgrade, stop processes using trop and copy the complete data directory
+before the first launch of the newer client, then restore that copy if needed.

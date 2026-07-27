@@ -63,7 +63,13 @@ fn test_schema_version_compatibility() {
     let result = Database::open(config);
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(err.to_string().contains("newer than client"));
+    assert!(matches!(
+        err,
+        trop::Error::UnsupportedSchemaVersion {
+            expected: 2,
+            found: 999
+        }
+    ));
 }
 
 #[test]
