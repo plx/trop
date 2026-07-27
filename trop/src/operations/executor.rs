@@ -214,12 +214,28 @@ impl<'conn> PlanExecutor<'conn> {
     fn execute_action(&mut self, action: &PlanAction) -> Result<ActionOutcome> {
         match action {
             PlanAction::CreateReservation(reservation) => {
+                if reservation.requires_allocation_at_execution() {
+                    let outcome = execute_reserve_after_cleanup(self.conn, reservation)?;
+                    return Ok(ActionOutcome {
+                        port: Some(outcome.port),
+                        warnings: outcome.warning.into_iter().collect(),
+                        ..ActionOutcome::default()
+                    });
+                }
                 // Use simple create - transaction is managed by caller (CLI layer)
                 // The UNIQUE constraint on the port column ensures we can't double-allocate
                 Database::create_reservation_simple(self.conn, reservation)?;
                 Ok(ActionOutcome::default())
             }
             PlanAction::UpdateReservation(reservation) => {
+                if reservation.requires_allocation_at_execution() {
+                    let outcome = execute_reserve_after_cleanup(self.conn, reservation)?;
+                    return Ok(ActionOutcome {
+                        port: Some(outcome.port),
+                        warnings: outcome.warning.into_iter().collect(),
+                        ..ActionOutcome::default()
+                    });
+                }
                 // For updates, use the simple create (upsert) - no transaction needed here
                 // Updates are for existing reservations where we're changing metadata
                 Database::create_reservation_simple(self.conn, reservation)?;
@@ -232,37 +248,6 @@ impl<'conn> PlanExecutor<'conn> {
             PlanAction::DeleteReservation(key) => {
                 Database::delete_reservation_simple(self.conn, key)?;
                 Ok(ActionOutcome::default())
-            }
-            PlanAction::ReserveAfterCleanup {
-                key,
-                project,
-                task,
-                created_at,
-                allocation_options,
-                ignored_key,
-                prune,
-                expire,
-                full_config,
-                occupancy_config,
-            } => {
-                let outcome = execute_reserve_after_cleanup(
-                    self.conn,
-                    key,
-                    project.as_deref(),
-                    task.as_deref(),
-                    *created_at,
-                    allocation_options,
-                    ignored_key.as_ref(),
-                    *prune,
-                    *expire,
-                    full_config,
-                    occupancy_config,
-                )?;
-                Ok(ActionOutcome {
-                    port: Some(outcome.port),
-                    warnings: outcome.warning.into_iter().collect(),
-                    ..ActionOutcome::default()
-                })
             }
             PlanAction::AllocateGroup {
                 request,
@@ -293,7 +278,9 @@ impl<'conn> PlanExecutor<'conn> {
         for action in &plan.actions {
             match action {
                 PlanAction::CreateReservation(r) | PlanAction::UpdateReservation(r) => {
-                    return Some(r.port());
+                    if !r.requires_allocation_at_execution() {
+                        return Some(r.port());
+                    }
                 }
                 PlanAction::UpdateLastUsed(key) => {
                     // For idempotent case, get the existing reservation's port
@@ -301,9 +288,7 @@ impl<'conn> PlanExecutor<'conn> {
                         return Some(reservation.port());
                     }
                 }
-                PlanAction::DeleteReservation(_)
-                | PlanAction::ReserveAfterCleanup { .. }
-                | PlanAction::AllocateGroup { .. } => {
+                PlanAction::DeleteReservation(_) | PlanAction::AllocateGroup { .. } => {
                     // Release operations and group allocations don't return a single port
                 }
             }
@@ -320,11 +305,12 @@ impl<'conn> PlanExecutor<'conn> {
         for action in &plan.actions {
             match action {
                 PlanAction::CreateReservation(r) | PlanAction::UpdateReservation(r) => {
-                    return Some(r.port());
+                    if !r.requires_allocation_at_execution() {
+                        return Some(r.port());
+                    }
                 }
                 PlanAction::UpdateLastUsed(_)
                 | PlanAction::DeleteReservation(_)
-                | PlanAction::ReserveAfterCleanup { .. }
                 | PlanAction::AllocateGroup { .. } => {
                     // In dry-run mode, we don't query the database.
                     // For UpdateLastUsed and AllocateGroup, return None.

@@ -861,7 +861,7 @@ fn test_reserve_cleanup_retry_failure_rolls_back_cleanup() {
         .failure()
         .stderr(
             predicate::str::contains("after cleanup").and(predicate::str::contains(
-                "reserved, excluded, or occupied after the single retry",
+                "remaining blockers after the single retry: occupied",
             )),
         );
 

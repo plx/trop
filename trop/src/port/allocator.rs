@@ -8,7 +8,7 @@ use rusqlite::Connection;
 
 use crate::database::Database;
 use crate::error::{Error, PortUnavailableReason};
-use crate::{Port, PortRange, ReservationKey, Result};
+use crate::{Port, PortExhaustionBlockers, PortRange, ReservationKey, Result};
 
 use super::exclusions::ExclusionManager;
 use super::occupancy::{OccupancyCheckConfig, PortOccupancyChecker, SystemOccupancyChecker};
@@ -224,6 +224,32 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         ignored_key: &ReservationKey,
     ) -> Result<AllocationResult> {
         self.allocate_single_ignoring(conn, options, occupancy_config, Some(ignored_key))
+    }
+
+    /// Classify the reasons the configured fallback range remains exhausted.
+    ///
+    /// This repeats the same ordered availability checks as the forward scan
+    /// and is used only to attach typed diagnostics to a terminal failure.
+    pub(crate) fn exhaustion_blockers(
+        &self,
+        conn: &Connection,
+        occupancy_config: &OccupancyCheckConfig,
+        ignored_key: Option<&ReservationKey>,
+    ) -> Result<PortExhaustionBlockers> {
+        let mut reserved = false;
+        let mut excluded = false;
+        let mut occupied = false;
+
+        for port in self.range {
+            match self.port_availability(port, conn, occupancy_config, true, ignored_key)? {
+                PortAvailability::Available => {}
+                PortAvailability::Reserved => reserved = true,
+                PortAvailability::Excluded => excluded = true,
+                PortAvailability::Occupied => occupied = true,
+            }
+        }
+
+        Ok(PortExhaustionBlockers::new(reserved, excluded, occupied))
     }
 
     fn allocate_single_ignoring(

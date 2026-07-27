@@ -147,9 +147,13 @@ If initial allocation is exhausted, a reserve plan defers the enabled
 prune/expire selection to execution. The executor rechecks exhaustion, applies
 the same guarded cleanup predicates as explicit cleanup, retries allocation
 once, and persists the resulting reservation under one `IMMEDIATE` transaction
-(or a savepoint inside a caller-owned transaction). The result warning exposes
-only aggregate cleanup counts; disabled phases and exhaustion-after-retry remain
-typed `PortExhausted` errors.
+(or a savepoint inside a caller-owned transaction). Deferred plans retain the
+published `PlanAction` variants; their placeholder reservation reports
+`requires_allocation_at_execution() == true`, and the execution result carries
+the final port. The result warning exposes only aggregate cleanup counts.
+Disabled phases and exhaustion-after-retry remain `PortExhausted` errors whose
+typed cleanup and blocker context is available through
+`Error::port_exhaustion_details()`.
 
 Opening a writable schema-v1 database automatically migrates it to schema v2
 in one durable transaction. Schema v2 uses strict SQLite tables and enforces

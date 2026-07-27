@@ -3,11 +3,9 @@
 //! This module defines the plan structures that describe what actions
 //! will be taken during an operation, without actually performing them.
 
-use crate::port::allocator::AllocationOptions;
 use crate::port::group::{GroupAllocationRequest, GroupReconciliationPolicy};
 use crate::port::occupancy::OccupancyCheckConfig;
 use crate::{Reservation, ReservationKey};
-use std::time::SystemTime;
 
 /// A single action to be taken during plan execution.
 ///
@@ -39,31 +37,6 @@ pub enum PlanAction {
     /// Delete a reservation.
     DeleteReservation(ReservationKey),
 
-    /// Recheck an exhausted allocation, run the enabled automatic-cleanup
-    /// phases, retry once, and persist the resulting reservation atomically.
-    ReserveAfterCleanup {
-        /// Reservation identity being created or replaced.
-        key: ReservationKey,
-        /// Resolved project metadata.
-        project: Option<String>,
-        /// Resolved task metadata.
-        task: Option<String>,
-        /// Original creation time when replacing an existing reservation.
-        created_at: Option<SystemTime>,
-        /// Preferred-port and allocation bypass policy.
-        allocation_options: AllocationOptions,
-        /// Existing key whose current port remains available to itself.
-        ignored_key: Option<ReservationKey>,
-        /// Whether stale-path pruning is enabled.
-        prune: bool,
-        /// Whether age-based expiration is enabled.
-        expire: bool,
-        /// Full effective configuration.
-        full_config: crate::config::Config,
-        /// Effective occupancy-check configuration.
-        occupancy_config: OccupancyCheckConfig,
-    },
-
     /// Allocate a group of related ports.
     AllocateGroup {
         /// The group allocation request.
@@ -82,8 +55,20 @@ impl PlanAction {
     #[must_use]
     pub fn description(&self) -> String {
         match self {
+            Self::CreateReservation(r) if r.requires_allocation_at_execution() => {
+                format!(
+                    "Retry reservation for {} with enabled automatic cleanup after exhaustion",
+                    r.key()
+                )
+            }
             Self::CreateReservation(r) => {
                 format!("Create reservation for {} on port {}", r.key(), r.port())
+            }
+            Self::UpdateReservation(r) if r.requires_allocation_at_execution() => {
+                format!(
+                    "Retry replacement for {} with enabled automatic cleanup after exhaustion",
+                    r.key()
+                )
             }
             Self::UpdateReservation(r) => {
                 format!("Update reservation for {} to port {}", r.key(), r.port())
@@ -93,11 +78,6 @@ impl PlanAction {
             }
             Self::DeleteReservation(key) => {
                 format!("Delete reservation for {key}")
-            }
-            Self::ReserveAfterCleanup { key, .. } => {
-                format!(
-                    "Retry reservation for {key} with enabled automatic cleanup after exhaustion"
-                )
             }
             Self::AllocateGroup { request, .. } => {
                 format!(
