@@ -218,6 +218,10 @@ fn database_validation_rejects_missing_and_wrong_named_indexes() {
     for replacement in [
         "",
         "CREATE INDEX idx_reservations_project ON reservations(task);",
+        "CREATE INDEX idx_reservations_project
+         ON reservations(project COLLATE NOCASE DESC);",
+        "CREATE INDEX idx_reservations_project
+         ON reservations(lower(project));",
     ] {
         let dir = tempdir().unwrap();
         let path = dir.path().join("trop.db");
@@ -235,6 +239,59 @@ fn database_validation_rejects_missing_and_wrong_named_indexes() {
         assert!(details.contains("idx_reservations_project"), "{details}");
         assert!(details.contains("reservations.project"), "{details}");
     }
+}
+
+#[test]
+fn database_validation_rejects_hidden_columns_and_constraint_text_in_comments() {
+    let dir = tempdir().unwrap();
+    let hidden_path = dir.path().join("hidden-column.db");
+    create_database(&hidden_path);
+    let conn = Connection::open(&hidden_path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE reservations
+         ADD COLUMN hidden_copy TEXT GENERATED ALWAYS AS (path) VIRTUAL;",
+    )
+    .unwrap();
+    drop(conn);
+    let details =
+        corruption_details(Database::validate(&DatabaseConfig::new(&hidden_path)).unwrap_err());
+    assert!(details.contains("required layout"), "{details}");
+
+    let comment_path = dir.path().join("comment-constraints.db");
+    let conn = Connection::open(&comment_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE metadata (
+            key TEXT PRIMARY KEY NOT NULL,
+            value TEXT NOT NULL
+         ) STRICT;
+         INSERT INTO metadata VALUES ('schema_version', '2');
+         CREATE TABLE reservations (
+            path TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            port INTEGER NOT NULL UNIQUE,
+            project TEXT,
+            task TEXT,
+            created_at INTEGER NOT NULL,
+            last_used_at INTEGER NOT NULL,
+            /*
+             CONSTRAINT valid_port CHECK (port BETWEEN 1 AND 65535)
+             CONSTRAINT valid_created_at CHECK (created_at >= 0)
+             CONSTRAINT valid_last_used_at CHECK (last_used_at >= 0)
+            */
+            PRIMARY KEY (path, tag)
+         ) STRICT;
+         CREATE INDEX idx_reservations_port ON reservations(port);
+         CREATE INDEX idx_reservations_project ON reservations(project);
+         CREATE INDEX idx_reservations_last_used ON reservations(last_used_at);",
+    )
+    .unwrap();
+    drop(conn);
+    let details =
+        corruption_details(Database::validate(&DatabaseConfig::new(&comment_path)).unwrap_err());
+    assert!(
+        details.contains("does not exactly match the required definition"),
+        "{details}"
+    );
 }
 
 #[test]

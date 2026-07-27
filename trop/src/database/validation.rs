@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::error::{Error, Result};
 
 use super::operations::row_to_reservation;
-use super::schema::CURRENT_SCHEMA_VERSION;
+use super::schema::{CREATE_METADATA_TABLE, CREATE_RESERVATIONS_TABLE, CURRENT_SCHEMA_VERSION};
 
 const EXPECTED_METADATA_COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("key", "TEXT", true, 1),
@@ -59,6 +59,14 @@ struct ActualColumn {
     declared_type: String,
     not_null: bool,
     primary_key_position: i64,
+    hidden: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexTerm {
+    name: Option<String>,
+    descending: bool,
+    collation: String,
 }
 
 /// Validates the current database without changing connection or persistent
@@ -126,6 +134,7 @@ fn validate_current_database_inner(conn: &Connection) -> Result<()> {
     }
 
     validate_required_constraints(conn)?;
+    validate_exact_table_definitions(conn)?;
     validate_indexes(conn)?;
     validate_foreign_keys(conn)?;
     validate_physical_integrity(conn)?;
@@ -308,6 +317,31 @@ fn validate_required_constraints(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn validate_exact_table_definitions(conn: &Connection) -> Result<()> {
+    for (table, create_sql) in [
+        ("metadata", CREATE_METADATA_TABLE),
+        ("reservations", CREATE_RESERVATIONS_TABLE),
+    ] {
+        let actual: String = conn.query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        let expected = normalize_schema_sql(create_sql).replacen("ifnotexists", "", 1);
+        if normalize_schema_sql(&actual) != expected {
+            return Err(Error::DatabaseCorruption {
+                details: format!(
+                    "schema v2 table {table} does not exactly match the required definition; \
+                     restore a known-good database or recreate disposable reservations. \
+                     trop did not modify or repair the stored data"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_indexes(conn: &Connection) -> Result<()> {
     for (index, column) in REQUIRED_NAMED_INDEXES {
         let descriptor = conn
@@ -326,7 +360,12 @@ fn validate_indexes(conn: &Connection) -> Result<()> {
             )
             .optional()?;
         if descriptor.as_ref() != Some(&(0, "c".to_string(), 0))
-            || index_columns(conn, index)? != [*column]
+            || index_key_terms(conn, index)?
+                != [IndexTerm {
+                    name: Some((*column).to_string()),
+                    descending: false,
+                    collation: "BINARY".to_string(),
+                }]
         {
             return Err(Error::DatabaseCorruption {
                 details: format!(
@@ -360,19 +399,38 @@ fn has_unique_index(conn: &Connection, columns: &[&str], origin: &str) -> Result
         .query_map([origin], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     for name in names {
-        if index_columns(conn, &name)? == columns {
+        let expected = columns
+            .iter()
+            .map(|column| IndexTerm {
+                name: Some((*column).to_string()),
+                descending: false,
+                collation: "BINARY".to_string(),
+            })
+            .collect::<Vec<_>>();
+        if index_key_terms(conn, &name)? == expected {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn index_columns(conn: &Connection, index: &str) -> Result<Vec<String>> {
-    let mut statement = conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
-    let columns = statement
-        .query_map([index], |row| row.get::<_, String>(0))?
+fn index_key_terms(conn: &Connection, index: &str) -> Result<Vec<IndexTerm>> {
+    let mut statement = conn.prepare(
+        "SELECT name, \"desc\", coll
+         FROM pragma_index_xinfo(?1)
+         WHERE key = 1
+         ORDER BY seqno",
+    )?;
+    let terms = statement
+        .query_map([index], |row| {
+            Ok(IndexTerm {
+                name: row.get(0)?,
+                descending: row.get::<_, i64>(1)? != 0,
+                collation: row.get(2)?,
+            })
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(columns)
+    Ok(terms)
 }
 
 fn validate_foreign_keys(conn: &Connection) -> Result<()> {
@@ -408,8 +466,8 @@ fn validate_physical_integrity(conn: &Connection) -> Result<()> {
 
 fn table_columns(conn: &Connection, table: &str) -> Result<Vec<ActualColumn>> {
     let mut statement = conn.prepare(
-        "SELECT name, type, \"notnull\", pk
-         FROM pragma_table_info(?1)
+        "SELECT name, type, \"notnull\", pk, hidden
+         FROM pragma_table_xinfo(?1)
          ORDER BY cid",
     )?;
     let columns = statement
@@ -419,6 +477,7 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<ActualColumn>> {
                 declared_type: row.get(1)?,
                 not_null: row.get::<_, i64>(2)? != 0,
                 primary_key_position: row.get(3)?,
+                hidden: row.get(4)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -433,6 +492,7 @@ fn column_shapes_match(actual: &[ActualColumn], expected: &[ColumnSpec]) -> bool
                     .declared_type
                     .eq_ignore_ascii_case(expected.declared_type)
                 && actual.not_null == expected.not_null
+                && actual.hidden == 0
         })
 }
 
