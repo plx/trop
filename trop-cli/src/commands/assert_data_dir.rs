@@ -16,7 +16,7 @@ pub struct AssertDataDirCommand {
     #[arg(long)]
     pub not: bool,
 
-    /// Also validate database contents
+    /// Read-only physical, schema, and logical database validation
     #[arg(long)]
     pub validate: bool,
 }
@@ -26,18 +26,29 @@ impl AssertDataDirCommand {
         // 1. Use the data directory selected once for this invocation.
         let data_dir = context.data_dir()?;
 
-        // 2. Check existence
-        let exists = data_dir.exists();
-
-        // 3. If validating, check database integrity
-        let valid = if exists && self.validate {
-            match validate_database(context) {
-                Ok(()) => true,
-                Err(_) => false,
-            }
+        // 2. Validation must distinguish an absent directory (a clean false
+        // predicate) from a directory whose existence cannot be determined.
+        let exists = if self.validate {
+            data_dir.try_exists().map_err(|error| {
+                CliError::from(trop::Error::DatabaseCorruption {
+                    details: format!(
+                        "cannot access the selected data directory {}: {error}; \
+                         verify its path and permissions before retrying. \
+                         trop did not initialize or modify the data directory",
+                        data_dir.display()
+                    ),
+                })
+            })?
         } else {
-            exists
+            data_dir.exists()
         };
+
+        // 3. Validation failures are internal errors, not a false predicate
+        // that --not may invert into success.
+        if exists && self.validate {
+            validate_database(context)?;
+        }
+        let valid = exists;
 
         // 4. Check assertion
         let success = if self.not { !valid } else { valid };
@@ -65,11 +76,5 @@ impl AssertDataDirCommand {
 }
 
 fn validate_database(context: &InvocationContext) -> Result<(), CliError> {
-    // Open the existing database with the effective lock timeout.
-    let mut db = context.open_existing_database()?;
-
-    // Run PRAGMA integrity_check
-    db.verify_integrity().map_err(CliError::from)?;
-
-    Ok(())
+    context.validate_existing_database()
 }

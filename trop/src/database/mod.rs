@@ -34,6 +34,7 @@ pub mod migrations;
 mod operations;
 mod schema;
 mod transaction;
+mod validation;
 
 #[cfg(test)]
 pub mod test_util;

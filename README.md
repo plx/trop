@@ -244,6 +244,24 @@ you may need to downgrade, stop processes using trop and copy the complete
 data directory before the first launch of the newer client. Restore that copy
 to return to the older schema.
 
+### Database integrity validation
+
+Run `trop assert-data-dir --validate` to inspect the selected database through
+a read-only connection. Validation never initializes, migrates, repairs, or
+rewrites the database. It checks SQLite physical and foreign-key integrity,
+schema version, strict table and constraint layouts, primary-key and unique
+rules, the required named indexes, metadata, duplicate logical keys and ports,
+and every stored reservation value.
+
+A valid existing database exits `0`. A clean negative assertion exits `1`;
+database corruption, an inaccessible or missing database inside an existing
+data directory, and other validation failures exit `6`, including with
+`--not`. Corruption diagnostics identify the affected table, field, and escaped
+reservation key when available, without printing project/task values or raw
+blobs. Make a copy before recovery, then restore a known-good database or
+delete only a disposable database and recreate its reservations. Trop does not
+automatically choose, discard, or repair stored rows.
+
 ### Projects and Tasks
 
 `trop` reservations are *keyed* by a path and optional tag, but support two additional metadata fields:

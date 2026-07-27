@@ -32,6 +32,24 @@ pub struct Database {
 }
 
 impl Database {
+    /// Opens an existing database read-only and validates its physical,
+    /// schema, and logical integrity.
+    ///
+    /// This entry point never initializes or migrates a database and never
+    /// changes its journal mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed compatibility, corruption, I/O, or database error.
+    pub fn validate(config: &DatabaseConfig) -> Result<()> {
+        let conn = Connection::open_with_flags(
+            &config.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(config.busy_timeout)?;
+        super::validation::validate_current_database(&conn)
+    }
+
     /// Opens a database connection with the given configuration.
     ///
     /// This function will:
@@ -80,7 +98,9 @@ impl Database {
         let conn = Connection::open_with_flags(&config.path, flags)?;
 
         // Set pragmas for optimal operation (skip for read-only databases)
-        if !config.read_only {
+        if config.read_only {
+            conn.busy_timeout(config.busy_timeout)?;
+        } else {
             enable_wal_with_retry(&conn, config.busy_timeout)?;
             conn.execute_batch("PRAGMA synchronous = NORMAL")?;
         }

@@ -283,6 +283,19 @@ impl From<crate::reservation::ValidationError> for Error {
 }
 
 impl Error {
+    /// Builds a corruption error for one stored field without including the
+    /// rest of the row in diagnostics.
+    pub(crate) fn corrupt_stored_value(table: &str, field: &str, key: &str, reason: &str) -> Self {
+        Self::DatabaseCorruption {
+            details: format!(
+                "table={table}, field={field}, key={key}: {reason}. \
+                 Make a copy before recovery; restore a known-good database or \
+                 delete the disposable database and recreate its reservations. \
+                 trop did not modify or repair the stored data"
+            ),
+        }
+    }
+
     /// Check if error indicates a path does not exist.
     ///
     /// # Examples

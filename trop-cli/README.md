@@ -264,6 +264,28 @@ reverse schema migration. Older clients reject schema v2 without modifying it.
 If downgrade recovery matters, stop processes using trop and copy the complete
 data directory before launching the newer client for the first time.
 
+## Database Integrity Validation
+
+`trop assert-data-dir --validate` opens the selected `trop.db` read-only and
+checks physical SQLite integrity, foreign keys, schema version, exact strict
+table/constraint/index structure, metadata, logical uniqueness, and every
+stored reservation field. It does not initialize, migrate, repair, or rewrite
+the database.
+
+Use this command as a health check:
+
+```bash
+trop assert-data-dir --validate
+```
+
+A valid existing database exits `0`. Exit `1` is reserved for a clean false
+assertion. Corruption, an inaccessible database, a missing `trop.db` inside an
+existing data directory, and other validation failures exit `6`; `--not`
+cannot invert those failures into success. Diagnostics report recovery-relevant
+table, field, and escaped key context without exposing project/task values or
+raw blobs. Copy the database before recovery, then restore a known-good copy or
+delete only disposable state and recreate its reservations.
+
 ## Environment Variables
 
 Canonical environment variables covered by the effective configuration
@@ -309,6 +331,7 @@ Other key environment variables:
 - `trop port-info <port>` - Show reservation info for a port
 - `trop assert-reservation` - Check if reservation exists (exit code 0/1)
 - `trop assert-port <port>` - Check if port is reserved (exit code 0/1)
+- `trop assert-data-dir --validate` - Read-only database integrity check
 - `trop list-projects` - List all active projects
 
 ### Management
@@ -336,7 +359,10 @@ Other key environment variables:
 - `1` - Semantic error (e.g., assertion failed)
 - `2` - Timeout (e.g., database lock)
 - `3` - No data directory found
-- `4+` - Other errors
+- `4` - Invalid arguments
+- `5` - I/O error
+- `6` - Library or database error, including corruption
+- `7` - Configuration error
 
 ## Logging
 
