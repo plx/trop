@@ -1,5 +1,7 @@
 //! Read-only physical, schema, and logical database validation.
 
+use std::fmt::Write as _;
+
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
 
@@ -295,14 +297,14 @@ fn validate_required_constraints(conn: &Connection) -> Result<()> {
         .ok_or_else(|| Error::DatabaseCorruption {
             details: "schema v2 reservations table is missing".into(),
         })?;
-    let normalized = normalize_schema_sql(&sql);
+    let normalized = normalize_schema_sql(&sql, None);
 
     for (name, expression) in [
-        ("valid_port", "check(portbetween1and65535)"),
-        ("valid_created_at", "check(created_at>=0)"),
-        ("valid_last_used_at", "check(last_used_at>=0)"),
+        ("valid_port", "CHECK (port BETWEEN 1 AND 65535)"),
+        ("valid_created_at", "CHECK (created_at >= 0)"),
+        ("valid_last_used_at", "CHECK (last_used_at >= 0)"),
     ] {
-        let required = format!("constraint{name}{expression}");
+        let required = normalize_schema_sql(&format!("CONSTRAINT {name} {expression}"), None);
         if !normalized.contains(&required) {
             return Err(Error::DatabaseCorruption {
                 details: format!(
@@ -328,8 +330,9 @@ fn validate_exact_table_definitions(conn: &Connection) -> Result<()> {
             [table],
             |row| row.get(0),
         )?;
-        let expected = normalize_schema_sql(create_sql).replacen("ifnotexists", "", 1);
-        if normalize_schema_sql(&actual) != expected {
+        let expected_sql = create_sql.replacen("IF NOT EXISTS", "", 1);
+        let expected = normalize_schema_sql(&expected_sql, Some(table));
+        if normalize_schema_sql(&actual, Some(table)) != expected {
             return Err(Error::DatabaseCorruption {
                 details: format!(
                     "schema v2 table {table} does not exactly match the required definition; \
@@ -557,93 +560,131 @@ fn value_kind(value: ValueRef<'_>) -> &'static str {
     }
 }
 
-fn normalize_schema_sql(sql: &str) -> String {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Quote {
-        Single,
-        Backtick,
-        Bracket,
-    }
-
+fn normalize_schema_sql(sql: &str, allowed_quoted_identifier: Option<&str>) -> String {
     let mut normalized = String::with_capacity(sql.len());
     let mut characters = sql.chars().peekable();
-    let mut quote = None;
 
     while let Some(character) = characters.next() {
-        match quote {
-            Some(Quote::Single | Quote::Backtick) => {
-                normalized.push(character);
-                let delimiter = match quote {
-                    Some(Quote::Single) => '\'',
-                    Some(Quote::Backtick) => '`',
-                    _ => unreachable!(),
-                };
-                if character == delimiter {
-                    if characters.peek() == Some(&delimiter) {
-                        normalized.push(characters.next().expect("peeked delimiter"));
-                    } else {
-                        quote = None;
-                    }
+        if character.is_ascii_whitespace() {
+            continue;
+        }
+
+        if is_schema_word_character(character) {
+            let mut word = String::from(character);
+            while characters
+                .peek()
+                .is_some_and(|next| is_schema_word_character(*next))
+            {
+                word.push(characters.next().expect("peeked word character"));
+            }
+            push_schema_token(&mut normalized, 'w', &word.to_ascii_lowercase());
+            continue;
+        }
+
+        match character {
+            '"' => {
+                let (raw, decoded, closed) = read_quoted_schema_token(&mut characters, '"', true);
+                if closed && allowed_quoted_identifier == Some(decoded.as_str()) {
+                    push_schema_token(&mut normalized, 'w', &decoded.to_ascii_lowercase());
+                } else {
+                    push_schema_token(&mut normalized, 'q', &raw);
                 }
             }
-            Some(Quote::Bracket) => {
-                normalized.push(character);
-                if character == ']' {
-                    quote = None;
-                }
+            '\'' | '`' => {
+                let (raw, _, _) = read_quoted_schema_token(&mut characters, character, true);
+                push_schema_token(&mut normalized, character, &raw);
             }
-            None => match character {
-                '\'' => {
-                    normalized.push(character);
-                    quote = Some(Quote::Single);
-                }
-                '"' => {
-                    let mut raw = String::from(character);
-                    let mut identifier = String::new();
-                    let mut closed = false;
-                    while let Some(quoted) = characters.next() {
-                        raw.push(quoted);
-                        if quoted == '"' {
-                            if characters.peek() == Some(&'"') {
-                                raw.push(characters.next().expect("peeked delimiter"));
-                                identifier.push('"');
-                            } else {
-                                closed = true;
-                                break;
-                            }
-                        } else {
-                            identifier.push(quoted);
-                        }
-                    }
-                    if closed && is_simple_sql_identifier(&identifier) {
-                        normalized.extend(identifier.chars().flat_map(char::to_lowercase));
-                    } else {
-                        normalized.push_str(&raw);
+            '[' => {
+                let mut raw = String::from(character);
+                for quoted in characters.by_ref() {
+                    raw.push(quoted);
+                    if quoted == ']' {
+                        break;
                     }
                 }
-                '`' => {
-                    normalized.push(character);
-                    quote = Some(Quote::Backtick);
+                push_schema_token(&mut normalized, '[', &raw);
+            }
+            '-' if characters.peek() == Some(&'-') => {
+                let mut comment = String::from(character);
+                comment.push(characters.next().expect("peeked comment delimiter"));
+                for content in characters.by_ref() {
+                    comment.push(content);
+                    if content == '\n' {
+                        break;
+                    }
                 }
-                '[' => {
-                    normalized.push(character);
-                    quote = Some(Quote::Bracket);
+                push_schema_token(&mut normalized, 'c', &comment);
+            }
+            '/' if characters.peek() == Some(&'*') => {
+                let mut comment = String::from(character);
+                comment.push(characters.next().expect("peeked comment delimiter"));
+                while let Some(content) = characters.next() {
+                    comment.push(content);
+                    if content == '*' && characters.peek() == Some(&'/') {
+                        comment.push(characters.next().expect("peeked comment delimiter"));
+                        break;
+                    }
                 }
-                _ if character.is_ascii_whitespace() => {}
-                _ => normalized.extend(character.to_lowercase()),
-            },
+                push_schema_token(&mut normalized, 'c', &comment);
+            }
+            _ => {
+                let mut operator = String::from(character);
+                if characters
+                    .peek()
+                    .is_some_and(|next| is_two_character_sql_operator(character, *next))
+                {
+                    operator.push(characters.next().expect("peeked operator"));
+                    if operator == "->" && characters.peek() == Some(&'>') {
+                        operator.push(characters.next().expect("peeked operator"));
+                    }
+                }
+                push_schema_token(&mut normalized, 's', &operator);
+            }
         }
     }
 
     normalized
 }
 
-fn is_simple_sql_identifier(value: &str) -> bool {
-    let mut characters = value.chars();
-    characters
-        .next()
-        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
-        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+fn is_schema_word_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '$') || !character.is_ascii()
+}
+
+fn is_two_character_sql_operator(first: char, second: char) -> bool {
+    matches!(
+        (first, second),
+        ('<' | '>' | '!' | '=', '=') | ('<' | '-', '>') | ('|', '|')
+    )
+}
+
+fn read_quoted_schema_token<I>(
+    characters: &mut std::iter::Peekable<I>,
+    delimiter: char,
+    doubled_delimiter_escape: bool,
+) -> (String, String, bool)
+where
+    I: Iterator<Item = char>,
+{
+    let mut raw = String::from(delimiter);
+    let mut decoded = String::new();
+    while let Some(character) = characters.next() {
+        raw.push(character);
+        if character == delimiter {
+            if doubled_delimiter_escape && characters.peek() == Some(&delimiter) {
+                raw.push(characters.next().expect("peeked delimiter"));
+                decoded.push(delimiter);
+            } else {
+                return (raw, decoded, true);
+            }
+        } else {
+            decoded.push(character);
+        }
+    }
+    (raw, decoded, false)
+}
+
+fn push_schema_token(normalized: &mut String, kind: char, value: &str) {
+    write!(normalized, "{kind}{}:{value};", value.len()).expect("writing to String cannot fail");
 }
 
 fn is_physical_corruption(error: &rusqlite::Error) -> bool {

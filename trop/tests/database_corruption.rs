@@ -289,7 +289,7 @@ fn database_validation_rejects_hidden_columns_and_constraint_text_in_comments() 
     let details =
         corruption_details(Database::validate(&DatabaseConfig::new(&comment_path)).unwrap_err());
     assert!(
-        details.contains("does not exactly match the required definition"),
+        details.contains("missing required constraint valid_port"),
         "{details}"
     );
 }
@@ -299,6 +299,7 @@ fn database_validation_preserves_quoted_schema_tokens_during_comparison() {
     for port_constraint in [
         r#"CONSTRAINT valid_port CHECK (port BETWEEN 1 AND "655 35")"#,
         r#"CONSTRAINT "valid_ port" CHECK (port BETWEEN 1 AND 65535)"#,
+        r#"CONSTRAINT valid_port CHECK ("portbetween1and65535")"#,
     ] {
         let dir = tempdir().unwrap();
         let path = dir.path().join("quoted-token.db");
@@ -335,6 +336,12 @@ fn database_validation_preserves_quoted_schema_tokens_during_comparison() {
             )
             .expect("the malformed quoted bound demonstrates ineffective enforcement");
             conn.execute("DELETE FROM reservations", []).unwrap();
+        } else if port_constraint.contains("portbetween") {
+            conn.execute(
+                "INSERT INTO reservations VALUES ('/project', '', 5000, NULL, NULL, 1, 1)",
+                [],
+            )
+            .expect_err("the fused quoted token must not enforce the canonical port predicate");
         }
         drop(conn);
 
