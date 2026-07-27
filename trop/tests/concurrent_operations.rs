@@ -487,14 +487,22 @@ fn run_cleanup_reserve_group_race() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    for index in 0..8 {
+    let stale_fixtures = (0..8)
+        .map(|index| {
+            let argument = format!("/cleanup-load/stale-{index}");
+            let normalized =
+                trop::path::normalize::normalize(std::path::Path::new(&argument)).unwrap();
+            (argument, normalized)
+        })
+        .collect::<Vec<_>>();
+    for (argument, _) in &stale_fixtures {
         let output = trop_cmd()
             .args([
                 "--data-dir",
                 data_dir.to_str().unwrap(),
                 "reserve",
                 "--path",
-                &format!("/cleanup-load/stale-{index}"),
+                argument,
                 "--allow-unrelated-path",
             ])
             .output()
@@ -650,14 +658,15 @@ reservations:
             path.display()
         );
     }
-    assert!(
-        rows.iter().all(|row| {
-            !row["path"]
-                .as_str()
-                .is_some_and(|path| path.starts_with("/cleanup-load/stale-"))
-        }),
-        "cleanup left a deliberately stale fixture behind"
-    );
+    for (_, normalized_path) in &stale_fixtures {
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row["path"].as_str() == normalized_path.to_str()),
+            "cleanup left deliberately stale fixture {} behind",
+            normalized_path.display()
+        );
+    }
 
     let ports = rows
         .iter()

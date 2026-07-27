@@ -525,6 +525,20 @@ impl CleanupOperations {
             }
         }
 
+        // Preserve the public ordering of the former two-phase cleanup:
+        // prune candidates retain the path/tag order of the unified scan,
+        // followed by expiration candidates from oldest to newest. The stable
+        // sort retains path/tag order when expiration timestamps tie.
+        planned_removals.sort_by(|left, right| match (left.reason, right.reason) {
+            (CleanupReason::Prune, CleanupReason::Prune) => std::cmp::Ordering::Equal,
+            (CleanupReason::Prune, CleanupReason::Expire) => std::cmp::Ordering::Less,
+            (CleanupReason::Expire, CleanupReason::Prune) => std::cmp::Ordering::Greater,
+            (CleanupReason::Expire, CleanupReason::Expire) => left
+                .reservation
+                .last_used_at()
+                .cmp(&right.reservation.last_used_at()),
+        });
+
         after_candidate_discovery();
 
         let removed = if dry_run {
@@ -1544,6 +1558,50 @@ mod tests {
         assert_eq!(removed.key().tag, Some("svc".to_string()));
         assert_eq!(removed.project(), Some("old-project"));
         assert_eq!(removed.task(), Some("dev"));
+    }
+
+    #[test]
+    fn test_expire_and_autoclean_preserve_oldest_first_result_order() {
+        let mut db = create_test_database();
+        let existing_path = std::env::current_dir().unwrap();
+        let now = SystemTime::now();
+        for (tag, port, age_days) in [
+            ("a-newer", 5000, 20),
+            ("z-oldest", 5001, 30),
+            ("m-middle", 5002, 25),
+        ] {
+            let key = ReservationKey::new(existing_path.clone(), Some(tag.to_string())).unwrap();
+            let reservation = Reservation::builder(key, Port::try_from(port).unwrap())
+                .last_used_at(now - Duration::from_secs(age_days * SECONDS_PER_DAY))
+                .build()
+                .unwrap();
+            db.create_reservation(&reservation).unwrap();
+        }
+
+        let config = CleanupConfig {
+            expire_after_days: Some(7),
+        };
+        let expected_tags = ["z-oldest", "m-middle", "a-newer"];
+
+        let expired = CleanupOperations::expire(&mut db, &config, true).unwrap();
+        assert_eq!(
+            expired
+                .removed_reservations
+                .iter()
+                .map(|reservation| reservation.key().tag.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            expected_tags
+        );
+
+        let autoclean = CleanupOperations::autoclean(&mut db, &config, true).unwrap();
+        assert_eq!(
+            autoclean
+                .expired_reservations
+                .iter()
+                .map(|reservation| reservation.key().tag.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            expected_tags
+        );
     }
 
     #[test]
