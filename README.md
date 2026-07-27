@@ -60,6 +60,26 @@ Unsupported families, permission failures, and other unexpected socket errors
 are reported with the failed protocol, family, scope, and address; allocation
 treats those failures conservatively as possibly occupied.
 
+`reserve`, `reserve-group`, `autoreserve`, `scan`, and
+`port-info --include-occupancy` all derive this policy from the same effective
+configuration snapshot. Command-line flags override only their named setting,
+so other occupancy fields continue to inherit from user, project, local, or
+environment configuration. The allocation and information commands accept
+`--skip-occupancy-check` plus the selective flags above. As the deliberate
+exception, `scan` accepts the selective flags but not
+`--skip-occupancy-check`. Occupancy flags on `port-info` require
+`--include-occupancy`.
+
+`scan` emits one row for every occupied probe, ordered by port and then by the
+probe matrix. Its existing `port`, `status`, and `reserved` fields are followed
+by `protocol`, `address_family`, `scope`, `address`, `process_id`,
+`process_name`, `user`, and `owner_status`. Process and user discovery is
+best-effort and never changes the bind result. JSON keeps nullable typed owner
+fields; table, CSV, and TSV output render missing values as `unavailable`.
+`owner_status` is always `available`, `partial`, or `unavailable`.
+`port-info --include-occupancy` presents the same evidence in human-readable
+form and distinguishes a disabled policy from an available port.
+
 ### Tags & `trop autoreserve`
 
 For projects with multiple services, you can reserve a distinct port for each service, like so:

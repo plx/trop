@@ -5,8 +5,11 @@ use crate::error::CliError;
 use crate::invocation::InvocationContext;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
+use std::fmt::Write as _;
 use trop::config::{Config, PortExclusion, DEFAULT_MAX_PORT, DEFAULT_MIN_PORT};
-use trop::port::occupancy::{OccupancyCheckConfig, PortOccupancyChecker, SystemOccupancyChecker};
+use trop::port::occupancy::{
+    OccupancyCheckConfig, OccupancyReport, OccupiedProbe, SystemOccupancyChecker,
+};
 use trop::{Database, Port, PortRange};
 
 /// Scan port range for occupied ports.
@@ -57,6 +60,43 @@ pub enum ScanOutputFormat {
     Tsv,
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ScanResult {
+    port: u16,
+    status: String,
+    reserved: bool,
+    protocol: String,
+    address_family: String,
+    scope: String,
+    address: String,
+    process_id: Option<u32>,
+    process_name: Option<String>,
+    user: Option<String>,
+    owner_status: String,
+}
+
+impl ScanResult {
+    fn from_probe(report: &OccupancyReport, probe: &OccupiedProbe, reserved: bool) -> Self {
+        Self {
+            port: report.port.value(),
+            status: if reserved {
+                "occupied (reserved)".to_string()
+            } else {
+                "occupied".to_string()
+            },
+            reserved,
+            protocol: probe.protocol.as_str().to_string(),
+            address_family: probe.address_family.as_str().to_string(),
+            scope: probe.scope.as_str().to_string(),
+            address: probe.address.to_string(),
+            process_id: probe.owner.process_id,
+            process_name: probe.owner.process_name.clone(),
+            user: probe.owner.user.clone(),
+            owner_status: probe.owner.status.as_str().to_string(),
+        }
+    }
+}
+
 impl ScanCommand {
     pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
         // 1. Load configuration and determine port range
@@ -74,9 +114,10 @@ impl ScanCommand {
             .map(OccupancyCheckConfig::from)
             .unwrap_or_default();
 
-        let occupied_ports = checker
-            .find_occupied_ports(&range, &check_config)
+        let reports = checker
+            .find_occupied_reports(&range, &check_config)
             .map_err(CliError::from)?;
+        let occupied_ports = reports.iter().map(|report| report.port).collect::<Vec<_>>();
 
         // 4. Get reserved ports from database
         let reserved_ports = Database::get_reserved_ports_in_range(db.connection(), &range)
@@ -99,7 +140,7 @@ impl ScanCommand {
         }
 
         // 7. Format and output results
-        self.output_results(&occupied_ports, &reserved_ports, &unreserved_occupied)?;
+        self.output_results(&reports, &reserved_ports, &unreserved_occupied)?;
 
         Ok(())
     }
@@ -186,43 +227,25 @@ impl ScanCommand {
 
     fn output_results(
         &self,
-        occupied: &[Port],
+        reports: &[OccupancyReport],
         reserved: &[Port],
         unreserved: &[Port],
     ) -> Result<(), CliError> {
-        #[derive(Serialize)]
-        struct ScanResult {
-            port: u16,
-            status: String,
-            reserved: bool,
-        }
-
         let mut results = Vec::new();
-
-        for port in occupied {
-            let is_reserved = reserved.contains(port);
-            results.push(ScanResult {
-                port: port.value(),
-                status: if is_reserved {
-                    "occupied (reserved)".to_string()
-                } else {
-                    "occupied".to_string()
-                },
-                reserved: is_reserved,
-            });
+        for report in reports {
+            let is_reserved = reserved.contains(&report.port);
+            results.extend(
+                report
+                    .occupied_probes
+                    .iter()
+                    .map(|probe| ScanResult::from_probe(report, probe, is_reserved)),
+            );
         }
 
         // Format based on requested output format
         match self.format {
             ScanOutputFormat::Table => {
-                println!("{:<10} {:<20} Reserved", "Port", "Status");
-                println!("{}", "-".repeat(40));
-                for result in &results {
-                    println!(
-                        "{:<10} {:<20} {}",
-                        result.port, result.status, result.reserved
-                    );
-                }
+                print!("{}", render_table(&results));
             }
             ScanOutputFormat::Json => {
                 let json = serde_json::to_string_pretty(&results)
@@ -230,16 +253,10 @@ impl ScanCommand {
                 println!("{json}");
             }
             ScanOutputFormat::Csv => {
-                println!("port,status,reserved");
-                for result in &results {
-                    println!("{},{},{}", result.port, result.status, result.reserved);
-                }
+                print!("{}", render_delimited(&results, b',')?);
             }
             ScanOutputFormat::Tsv => {
-                println!("port\tstatus\treserved");
-                for result in &results {
-                    println!("{}\t{}\t{}", result.port, result.status, result.reserved);
-                }
+                print!("{}", render_delimited(&results, b'\t')?);
             }
         }
 
@@ -252,6 +269,93 @@ impl ScanCommand {
     }
 }
 
+fn optional_display<T: ToString>(value: Option<T>) -> String {
+    value.map_or_else(|| "unavailable".to_string(), |value| value.to_string())
+}
+
+fn render_table(results: &[ScanResult]) -> String {
+    let mut output = String::new();
+    writeln!(
+        output,
+        "{:<6} {:<20} {:<9} {:<9} {:<7} {:<10} {:<15} {:<12} {:<16} {:<16} Owner Status",
+        "Port",
+        "Status",
+        "Reserved",
+        "Protocol",
+        "Family",
+        "Scope",
+        "Address",
+        "Process ID",
+        "Process",
+        "User",
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(output, "{}", "-".repeat(145)).expect("writing to a String cannot fail");
+    for result in results {
+        writeln!(
+            output,
+            "{:<6} {:<20} {:<9} {:<9} {:<7} {:<10} {:<15} {:<12} {:<16} {:<16} {}",
+            result.port,
+            result.status,
+            result.reserved,
+            result.protocol,
+            result.address_family,
+            result.scope,
+            result.address,
+            optional_display(result.process_id),
+            optional_display(result.process_name.as_deref()),
+            optional_display(result.user.as_deref()),
+            result.owner_status,
+        )
+        .expect("writing to a String cannot fail");
+    }
+    output
+}
+
+fn render_delimited(results: &[ScanResult], delimiter: u8) -> Result<String, CliError> {
+    let mut writer = csv::WriterBuilder::new()
+        .delimiter(delimiter)
+        .from_writer(Vec::new());
+    writer
+        .write_record([
+            "port",
+            "status",
+            "reserved",
+            "protocol",
+            "address_family",
+            "scope",
+            "address",
+            "process_id",
+            "process_name",
+            "user",
+            "owner_status",
+        ])
+        .map_err(|error| CliError::Config(format!("Delimited output failed: {error}")))?;
+    for result in results {
+        writer
+            .write_record([
+                result.port.to_string(),
+                result.status.clone(),
+                result.reserved.to_string(),
+                result.protocol.clone(),
+                result.address_family.clone(),
+                result.scope.clone(),
+                result.address.clone(),
+                optional_display(result.process_id),
+                optional_display(result.process_name.as_deref()),
+                optional_display(result.user.as_deref()),
+                result.owner_status.clone(),
+            ])
+            .map_err(|error| CliError::Config(format!("Delimited output failed: {error}")))?;
+    }
+    let bytes = writer
+        .into_inner()
+        .map_err(|error| CliError::Config(format!("Delimited output failed: {error}")))?;
+    let output = String::from_utf8(bytes)
+        .map_err(|error| CliError::Config(format!("Delimited output was not UTF-8: {error}")))?;
+    Ok(output)
+}
+
 fn load_raw_config(path: &std::path::Path) -> Result<Config, CliError> {
     if !path.exists() {
         return Ok(Config::default());
@@ -259,4 +363,76 @@ fn load_raw_config(path: &std::path::Path) -> Result<Config, CliError> {
     let contents = std::fs::read_to_string(path)?;
     serde_yaml::from_str(&contents)
         .map_err(|error| CliError::Config(format!("Failed to parse config: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unavailable_result() -> ScanResult {
+        ScanResult {
+            port: 5050,
+            status: "occupied".to_string(),
+            reserved: false,
+            protocol: "tcp".to_string(),
+            address_family: "ipv4".to_string(),
+            scope: "localhost".to_string(),
+            address: "127.0.0.1".to_string(),
+            process_id: None,
+            process_name: None,
+            user: None,
+            owner_status: "unavailable".to_string(),
+        }
+    }
+
+    #[test]
+    fn json_schema_snapshot_keeps_explicit_unavailable_owner_fields() {
+        let json = serde_json::to_string_pretty(&[unavailable_result()]).unwrap();
+        assert_eq!(
+            json,
+            r#"[
+  {
+    "port": 5050,
+    "status": "occupied",
+    "reserved": false,
+    "protocol": "tcp",
+    "address_family": "ipv4",
+    "scope": "localhost",
+    "address": "127.0.0.1",
+    "process_id": null,
+    "process_name": null,
+    "user": null,
+    "owner_status": "unavailable"
+  }
+]"#
+        );
+    }
+
+    #[test]
+    fn delimited_schema_snapshots_append_deterministic_evidence_columns() {
+        let results = [unavailable_result()];
+        assert_eq!(
+            render_delimited(&results, b',').unwrap(),
+            "port,status,reserved,protocol,address_family,scope,address,process_id,process_name,user,owner_status\n\
+             5050,occupied,false,tcp,ipv4,localhost,127.0.0.1,unavailable,unavailable,unavailable,unavailable\n"
+        );
+        assert_eq!(
+            render_delimited(&results, b'\t').unwrap(),
+            "port\tstatus\treserved\tprotocol\taddress_family\tscope\taddress\tprocess_id\tprocess_name\tuser\towner_status\n\
+             5050\toccupied\tfalse\ttcp\tipv4\tlocalhost\t127.0.0.1\tunavailable\tunavailable\tunavailable\tunavailable\n"
+        );
+    }
+
+    #[test]
+    fn table_schema_snapshot_renders_unavailable_fields_explicitly() {
+        let rendered = render_table(&[unavailable_result()]);
+        assert_eq!(
+            rendered,
+            concat!(
+                "Port   Status               Reserved  Protocol  Family  Scope      Address         Process ID   Process          User             Owner Status\n",
+                "-------------------------------------------------------------------------------------------------------------------------------------------------\n",
+                "5050   occupied             false     tcp       ipv4    localhost  127.0.0.1       unavailable  unavailable      unavailable      unavailable\n",
+            )
+        );
+    }
 }

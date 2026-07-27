@@ -11,12 +11,16 @@
 //! `IPV6_V6ONLY` before binding so operating-system dual-stack defaults cannot
 //! make an IPv6 probe accidentally test IPv4 too.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use netstat2::{
+    get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, SocketInfo,
+};
 use socket2::{Domain, Protocol, Socket, Type};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
 
 use crate::config::OccupancyConfig;
 use crate::{Error, Port, PortRange, Result};
@@ -137,13 +141,16 @@ pub trait PortOccupancyChecker: Send + Sync {
 #[derive(Debug, Clone, Copy)]
 pub struct SystemOccupancyChecker;
 
+/// Transport protocol represented by one occupancy probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Transport {
+pub enum OccupancyProtocol {
+    /// Transmission Control Protocol.
     Tcp,
+    /// User Datagram Protocol.
     Udp,
 }
 
-impl Transport {
+impl OccupancyProtocol {
     fn socket_type(self) -> Type {
         match self {
             Self::Tcp => Type::STREAM,
@@ -157,9 +164,18 @@ impl Transport {
             Self::Udp => Protocol::UDP,
         }
     }
+
+    /// Stable lowercase representation used by machine-readable output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
 }
 
-impl fmt::Display for Transport {
+impl fmt::Display for OccupancyProtocol {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Tcp => "TCP",
@@ -168,9 +184,175 @@ impl fmt::Display for Transport {
     }
 }
 
+/// Address family represented by one occupancy probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OccupancyAddressFamily {
+    /// Internet Protocol version 4.
+    Ipv4,
+    /// Internet Protocol version 6.
+    Ipv6,
+}
+
+impl OccupancyAddressFamily {
+    /// Stable lowercase representation used by machine-readable output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+        }
+    }
+}
+
+impl fmt::Display for OccupancyAddressFamily {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Ipv4 => "IPv4",
+            Self::Ipv6 => "IPv6",
+        })
+    }
+}
+
+/// Bind-address scope represented by one occupancy probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OccupancyScope {
+    /// The protocol family's localhost address.
+    Localhost,
+    /// The protocol family's unspecified (all-interfaces) address.
+    Wildcard,
+}
+
+impl OccupancyScope {
+    /// Stable lowercase representation used by machine-readable output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Localhost => "localhost",
+            Self::Wildcard => "wildcard",
+        }
+    }
+}
+
+impl fmt::Display for OccupancyScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Availability of best-effort process and user metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OccupancyOwnerStatus {
+    /// Process ID, process name, and user are all available.
+    Available,
+    /// At least one owner field is available, but the complete set is not.
+    Partial,
+    /// No owner fields are safely available.
+    Unavailable,
+}
+
+impl OccupancyOwnerStatus {
+    /// Stable lowercase representation used by machine-readable output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Partial => "partial",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+impl fmt::Display for OccupancyOwnerStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Best-effort owner metadata for an occupied socket probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccupancyOwner {
+    /// Owning process identifier, when the operating system exposes one.
+    pub process_id: Option<u32>,
+    /// Owning process name, when safely available.
+    pub process_name: Option<String>,
+    /// Owning user name, when safely available.
+    pub user: Option<String>,
+    /// Completeness of the owner fields.
+    pub status: OccupancyOwnerStatus,
+}
+
+impl Default for OccupancyOwner {
+    fn default() -> Self {
+        Self {
+            process_id: None,
+            process_name: None,
+            user: None,
+            status: OccupancyOwnerStatus::Unavailable,
+        }
+    }
+}
+
+impl OccupancyOwner {
+    fn refresh_status(&mut self) {
+        let available = [
+            self.process_id.is_some(),
+            self.process_name.is_some(),
+            self.user.is_some(),
+        ]
+        .into_iter()
+        .filter(|value| *value)
+        .count();
+        self.status = match available {
+            0 => OccupancyOwnerStatus::Unavailable,
+            3 => OccupancyOwnerStatus::Available,
+            _ => OccupancyOwnerStatus::Partial,
+        };
+    }
+}
+
+/// Evidence that one enabled bind probe encountered an occupied address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccupiedProbe {
+    /// Transport protocol checked by the probe.
+    pub protocol: OccupancyProtocol,
+    /// Address family checked by the probe.
+    pub address_family: OccupancyAddressFamily,
+    /// Localhost or wildcard scope checked by the probe.
+    pub scope: OccupancyScope,
+    /// Exact IP address passed to the bind operation.
+    pub address: IpAddr,
+    /// Best-effort process and user metadata.
+    pub owner: OccupancyOwner,
+}
+
+/// Detailed, deterministic result of applying one effective occupancy policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccupancyReport {
+    /// Port inspected by this report.
+    pub port: Port,
+    /// Number of probes enabled by the effective policy.
+    pub enabled_probe_count: usize,
+    /// Occupied probes in the documented matrix order.
+    pub occupied_probes: Vec<OccupiedProbe>,
+}
+
+impl OccupancyReport {
+    /// Whether at least one enabled probe found the port occupied.
+    #[must_use]
+    pub fn is_occupied(&self) -> bool {
+        !self.occupied_probes.is_empty()
+    }
+
+    /// Whether the effective policy disabled every probe.
+    #[must_use]
+    pub const fn was_skipped(&self) -> bool {
+        self.enabled_probe_count == 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OccupancyProbe {
-    transport: Transport,
+    protocol: OccupancyProtocol,
     address: SocketAddr,
 }
 
@@ -183,19 +365,29 @@ impl OccupancyProbe {
         }
     }
 
-    fn family_name(self) -> &'static str {
+    fn address_family(self) -> OccupancyAddressFamily {
         if self.address.is_ipv4() {
-            "IPv4"
+            OccupancyAddressFamily::Ipv4
         } else {
-            "IPv6"
+            OccupancyAddressFamily::Ipv6
         }
     }
 
-    fn scope_name(self) -> &'static str {
+    fn scope(self) -> OccupancyScope {
         if self.address.ip().is_unspecified() {
-            "wildcard"
+            OccupancyScope::Wildcard
         } else {
-            "localhost"
+            OccupancyScope::Localhost
+        }
+    }
+
+    fn occupied_evidence(self) -> OccupiedProbe {
+        OccupiedProbe {
+            protocol: self.protocol,
+            address_family: self.address_family(),
+            scope: self.scope(),
+            address: self.address.ip(),
+            owner: OccupancyOwner::default(),
         }
     }
 }
@@ -205,9 +397,9 @@ impl fmt::Display for OccupancyProbe {
         write!(
             formatter,
             "{} {} {} bind at {}",
-            self.transport,
-            self.family_name(),
-            self.scope_name(),
+            self.protocol,
+            self.address_family(),
+            self.scope(),
             self.address
         )
     }
@@ -267,13 +459,13 @@ impl SystemOccupancyChecker {
         {
             if !config.skip_tcp {
                 probes.push(OccupancyProbe {
-                    transport: Transport::Tcp,
+                    protocol: OccupancyProtocol::Tcp,
                     address,
                 });
             }
             if !config.skip_udp {
                 probes.push(OccupancyProbe {
-                    transport: Transport::Udp,
+                    protocol: OccupancyProtocol::Udp,
                     address,
                 });
             }
@@ -283,8 +475,8 @@ impl SystemOccupancyChecker {
     fn probe_socket(probe: &OccupancyProbe) -> io::Result<()> {
         let socket = Socket::new(
             probe.domain(),
-            probe.transport.socket_type(),
-            Some(probe.transport.protocol()),
+            probe.protocol.socket_type(),
+            Some(probe.protocol.protocol()),
         )?;
 
         // Be explicit about the options that materially affect occupancy
@@ -341,18 +533,24 @@ impl SystemOccupancyChecker {
         }
     }
 
-    fn is_occupied_with<F>(
+    fn report_with<F>(
         port: Port,
         config: &OccupancyCheckConfig,
         mut run_probe: F,
-    ) -> Result<bool>
+    ) -> Result<OccupancyReport>
     where
         F: FnMut(&OccupancyProbe) -> io::Result<()>,
     {
-        for probe in Self::probes(port, config) {
+        let probes = Self::probes(port, config);
+        let enabled_probe_count = probes.len();
+        let mut occupied_probes = Vec::new();
+
+        for probe in probes {
             match run_probe(&probe) {
                 Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::AddrInUse => return Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                    occupied_probes.push(probe.occupied_evidence());
+                }
                 Err(source) => {
                     return Err(Error::OccupancyCheckFailed {
                         port,
@@ -362,7 +560,142 @@ impl SystemOccupancyChecker {
             }
         }
 
-        Ok(false)
+        Ok(OccupancyReport {
+            port,
+            enabled_probe_count,
+            occupied_probes,
+        })
+    }
+
+    fn is_occupied_with<F>(port: Port, config: &OccupancyCheckConfig, run_probe: F) -> Result<bool>
+    where
+        F: FnMut(&OccupancyProbe) -> io::Result<()>,
+    {
+        Self::report_with(port, config, run_probe).map(|report| report.is_occupied())
+    }
+
+    /// Inspect one port and return every enabled probe that found occupancy.
+    ///
+    /// Bind probes remain authoritative. Process and user metadata is
+    /// best-effort enrichment: lookup failures leave the stable owner fields
+    /// explicitly unavailable and never change the occupancy result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an enabled bind probe fails for a reason other
+    /// than address-in-use.
+    pub fn inspect_port(
+        &self,
+        port: Port,
+        config: &OccupancyCheckConfig,
+    ) -> Result<OccupancyReport> {
+        let mut report = Self::report_with(port, config, Self::probe_socket)?;
+        Self::enrich_owner_metadata(std::slice::from_mut(&mut report));
+        Ok(report)
+    }
+
+    /// Inspect a range and return detailed reports for occupied ports only.
+    ///
+    /// Reports and their probe evidence follow ascending port order and the
+    /// documented probe-matrix order, respectively. Owner lookup is batched
+    /// across the range so reporting does not repeatedly enumerate the host's
+    /// socket and process tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any enabled bind probe fails for a reason other
+    /// than address-in-use.
+    pub fn find_occupied_reports(
+        &self,
+        range: &PortRange,
+        config: &OccupancyCheckConfig,
+    ) -> Result<Vec<OccupancyReport>> {
+        let mut reports = Vec::new();
+        for port in *range {
+            let report = Self::report_with(port, config, Self::probe_socket)?;
+            if report.is_occupied() {
+                reports.push(report);
+            }
+        }
+        Self::enrich_owner_metadata(&mut reports);
+        Ok(reports)
+    }
+
+    fn enrich_owner_metadata(reports: &mut [OccupancyReport]) {
+        if !reports.iter().any(OccupancyReport::is_occupied) {
+            return;
+        }
+
+        let Ok(sockets) = get_sockets_info(
+            AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6,
+            ProtocolFlags::TCP | ProtocolFlags::UDP,
+        ) else {
+            return;
+        };
+
+        for report in reports.iter_mut() {
+            for probe in &mut report.occupied_probes {
+                probe.owner.process_id = sockets
+                    .iter()
+                    .filter(|socket| Self::socket_matches(report.port, probe, socket))
+                    .flat_map(|socket| socket.associated_pids.iter().copied())
+                    .min();
+            }
+        }
+
+        let pids = reports
+            .iter()
+            .flat_map(|report| &report.occupied_probes)
+            .filter_map(|probe| probe.owner.process_id)
+            .map(Pid::from_u32)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if pids.is_empty() {
+            return;
+        }
+
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&pids),
+            true,
+            ProcessRefreshKind::nothing().with_user(UpdateKind::OnlyIfNotSet),
+        );
+        let users = Users::new_with_refreshed_list();
+
+        for probe in reports
+            .iter_mut()
+            .flat_map(|report| &mut report.occupied_probes)
+        {
+            if let Some(pid) = probe.owner.process_id.map(Pid::from_u32) {
+                if let Some(process) = system.process(pid) {
+                    probe.owner.process_name = Some(process.name().to_string_lossy().into_owned());
+                    probe.owner.user = process
+                        .user_id()
+                        .and_then(|user_id| users.get_user_by_id(user_id))
+                        .map(|user| user.name().to_string());
+                }
+            }
+            probe.owner.refresh_status();
+        }
+    }
+
+    fn socket_matches(port: Port, probe: &OccupiedProbe, socket: &SocketInfo) -> bool {
+        let (protocol, address, socket_port) = match &socket.protocol_socket_info {
+            ProtocolSocketInfo::Tcp(info) => {
+                (OccupancyProtocol::Tcp, info.local_addr, info.local_port)
+            }
+            ProtocolSocketInfo::Udp(info) => {
+                (OccupancyProtocol::Udp, info.local_addr, info.local_port)
+            }
+        };
+
+        protocol == probe.protocol
+            && socket_port == port.value()
+            && address.is_ipv4() == probe.address.is_ipv4()
+            && (address == probe.address
+                || address.is_unspecified()
+                || probe.address.is_unspecified())
     }
 }
 
@@ -895,11 +1228,11 @@ mod tests {
             SystemOccupancyChecker::probes(port, &config),
             vec![
                 OccupancyProbe {
-                    transport: Transport::Udp,
+                    protocol: OccupancyProtocol::Udp,
                     address: SocketAddr::from((Ipv4Addr::LOCALHOST, 5050)),
                 },
                 OccupancyProbe {
-                    transport: Transport::Udp,
+                    protocol: OccupancyProtocol::Udp,
                     address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5050)),
                 },
             ]
@@ -916,14 +1249,14 @@ mod tests {
         let probes = SystemOccupancyChecker::probes(port, &config);
 
         assert_eq!(probes.len(), 8);
-        for transport in [Transport::Tcp, Transport::Udp] {
+        for protocol in [OccupancyProtocol::Tcp, OccupancyProtocol::Udp] {
             for address in [
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 5050)),
                 SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5050)),
                 SocketAddr::from((Ipv6Addr::LOCALHOST, 5050)),
                 SocketAddr::from((Ipv6Addr::UNSPECIFIED, 5050)),
             ] {
-                assert!(probes.contains(&OccupancyProbe { transport, address }));
+                assert!(probes.contains(&OccupancyProbe { protocol, address }));
             }
         }
     }
@@ -946,7 +1279,99 @@ mod tests {
         .unwrap();
 
         assert!(occupied);
-        assert_eq!(probes_run, 1);
+        assert_eq!(probes_run, 4);
+    }
+
+    #[test]
+    fn test_detailed_report_records_all_occupied_probes_in_matrix_order() {
+        let port = Port::try_from(5050).unwrap();
+        let config = OccupancyCheckConfig {
+            check_all_interfaces: true,
+            ..Default::default()
+        };
+        let report = SystemOccupancyChecker::report_with(port, &config, |probe| {
+            let occupied = matches!(
+                (probe.protocol, probe.address),
+                (
+                    OccupancyProtocol::Udp,
+                    SocketAddr::V4(address)
+                ) if address.ip().is_loopback()
+            ) || matches!(
+                (probe.protocol, probe.address),
+                (
+                    OccupancyProtocol::Tcp,
+                    SocketAddr::V6(address)
+                ) if address.ip().is_unspecified()
+            );
+            if occupied {
+                Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "synthetic bind conflict",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(report.enabled_probe_count, 8);
+        assert_eq!(
+            report.occupied_probes,
+            vec![
+                OccupiedProbe {
+                    protocol: OccupancyProtocol::Udp,
+                    address_family: OccupancyAddressFamily::Ipv4,
+                    scope: OccupancyScope::Localhost,
+                    address: Ipv4Addr::LOCALHOST.into(),
+                    owner: OccupancyOwner::default(),
+                },
+                OccupiedProbe {
+                    protocol: OccupancyProtocol::Tcp,
+                    address_family: OccupancyAddressFamily::Ipv6,
+                    scope: OccupancyScope::Wildcard,
+                    address: Ipv6Addr::UNSPECIFIED.into(),
+                    owner: OccupancyOwner::default(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_detailed_report_distinguishes_disabled_policy_from_available_port() {
+        let port = Port::try_from(5050).unwrap();
+        let config = OccupancyCheckConfig {
+            skip_tcp: true,
+            skip_udp: true,
+            ..Default::default()
+        };
+        let report =
+            SystemOccupancyChecker::report_with(port, &config, |_| unreachable!()).unwrap();
+
+        assert!(report.was_skipped());
+        assert!(!report.is_occupied());
+        assert!(report.occupied_probes.is_empty());
+    }
+
+    #[test]
+    fn test_detailed_report_does_not_hide_later_probe_failures() {
+        let port = Port::try_from(5050).unwrap();
+        let mut probes_run = 0;
+        let error =
+            SystemOccupancyChecker::report_with(port, &OccupancyCheckConfig::default(), |_| {
+                probes_run += 1;
+                match probes_run {
+                    1 => Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "synthetic bind conflict",
+                    )),
+                    2 => Err(io::Error::other("synthetic later failure")),
+                    _ => Ok(()),
+                }
+            })
+            .unwrap_err();
+
+        assert_eq!(probes_run, 2);
+        assert!(error.to_string().contains("synthetic later failure"));
     }
 
     #[test]
