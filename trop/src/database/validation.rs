@@ -558,10 +558,92 @@ fn value_kind(value: ValueRef<'_>) -> &'static str {
 }
 
 fn normalize_schema_sql(sql: &str) -> String {
-    sql.chars()
-        .filter(|character| !character.is_ascii_whitespace() && *character != '"')
-        .flat_map(char::to_lowercase)
-        .collect()
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        Single,
+        Backtick,
+        Bracket,
+    }
+
+    let mut normalized = String::with_capacity(sql.len());
+    let mut characters = sql.chars().peekable();
+    let mut quote = None;
+
+    while let Some(character) = characters.next() {
+        match quote {
+            Some(Quote::Single | Quote::Backtick) => {
+                normalized.push(character);
+                let delimiter = match quote {
+                    Some(Quote::Single) => '\'',
+                    Some(Quote::Backtick) => '`',
+                    _ => unreachable!(),
+                };
+                if character == delimiter {
+                    if characters.peek() == Some(&delimiter) {
+                        normalized.push(characters.next().expect("peeked delimiter"));
+                    } else {
+                        quote = None;
+                    }
+                }
+            }
+            Some(Quote::Bracket) => {
+                normalized.push(character);
+                if character == ']' {
+                    quote = None;
+                }
+            }
+            None => match character {
+                '\'' => {
+                    normalized.push(character);
+                    quote = Some(Quote::Single);
+                }
+                '"' => {
+                    let mut raw = String::from(character);
+                    let mut identifier = String::new();
+                    let mut closed = false;
+                    while let Some(quoted) = characters.next() {
+                        raw.push(quoted);
+                        if quoted == '"' {
+                            if characters.peek() == Some(&'"') {
+                                raw.push(characters.next().expect("peeked delimiter"));
+                                identifier.push('"');
+                            } else {
+                                closed = true;
+                                break;
+                            }
+                        } else {
+                            identifier.push(quoted);
+                        }
+                    }
+                    if closed && is_simple_sql_identifier(&identifier) {
+                        normalized.extend(identifier.chars().flat_map(char::to_lowercase));
+                    } else {
+                        normalized.push_str(&raw);
+                    }
+                }
+                '`' => {
+                    normalized.push(character);
+                    quote = Some(Quote::Backtick);
+                }
+                '[' => {
+                    normalized.push(character);
+                    quote = Some(Quote::Bracket);
+                }
+                _ if character.is_ascii_whitespace() => {}
+                _ => normalized.extend(character.to_lowercase()),
+            },
+        }
+    }
+
+    normalized
+}
+
+fn is_simple_sql_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 fn is_physical_corruption(error: &rusqlite::Error) -> bool {

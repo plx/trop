@@ -295,6 +295,60 @@ fn database_validation_rejects_hidden_columns_and_constraint_text_in_comments() 
 }
 
 #[test]
+fn database_validation_preserves_quoted_schema_tokens_during_comparison() {
+    for port_constraint in [
+        r#"CONSTRAINT valid_port CHECK (port BETWEEN 1 AND "655 35")"#,
+        r#"CONSTRAINT "valid_ port" CHECK (port BETWEEN 1 AND 65535)"#,
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("quoted-token.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE metadata (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+             ) STRICT;
+             INSERT INTO metadata VALUES ('schema_version', '2');
+             CREATE TABLE reservations (
+                path TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                port INTEGER NOT NULL UNIQUE
+                    {port_constraint},
+                project TEXT,
+                task TEXT,
+                created_at INTEGER NOT NULL
+                    CONSTRAINT valid_created_at CHECK (created_at >= 0),
+                last_used_at INTEGER NOT NULL
+                    CONSTRAINT valid_last_used_at CHECK (last_used_at >= 0),
+                PRIMARY KEY (path, tag)
+             ) STRICT;
+             CREATE INDEX idx_reservations_port ON reservations(port);
+             CREATE INDEX idx_reservations_project ON reservations(project);
+             CREATE INDEX idx_reservations_last_used ON reservations(last_used_at);"
+        ))
+        .unwrap();
+
+        if port_constraint.contains("655 35") {
+            conn.execute(
+                "INSERT INTO reservations VALUES ('/project', '', 70000, NULL, NULL, 1, 1)",
+                [],
+            )
+            .expect("the malformed quoted bound demonstrates ineffective enforcement");
+            conn.execute("DELETE FROM reservations", []).unwrap();
+        }
+        drop(conn);
+
+        let details =
+            corruption_details(Database::validate(&DatabaseConfig::new(&path)).unwrap_err());
+        assert!(
+            details.contains("valid_port")
+                || details.contains("does not exactly match the required definition"),
+            "{details}"
+        );
+    }
+}
+
+#[test]
 fn database_validation_rejects_missing_check_constraints() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("trop.db");
