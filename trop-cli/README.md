@@ -342,6 +342,14 @@ Other key environment variables:
 - `trop autoclean` - Combined prune and expire
 - `trop migrate` - Move reservations between paths
 
+`prune` treats a reservation target as live only while it resolves to a
+directory. Missing targets, dangling symlinks, paths replaced by files, and
+internally stored paths that are invalid on the current host are eligible for
+pruning. Permission failures, symlink loops, transient I/O failures,
+unsupported operations, and unknown inspection errors keep the reservation and
+emit an actionable warning; `--quiet` suppresses the warning without reporting
+the preserved path as removed.
+
 ### Configuration
 
 - `trop init` - Initialize data directory and config

@@ -2454,6 +2454,7 @@ dependencies = [
  "criterion",
  "gix",
  "home",
+ "libc",
  "log",
  "mockall",
  "netstat2",

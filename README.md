@@ -30,7 +30,7 @@ Website and docs: https://plx.github.io/trop/
 Key features:
 
 - **Idempotent reservations**: Reservations are sticky and keyed by directory—repeated invocations in the same directory receive a stable port.
-- **Directory-based lifecycle**: Reservations can be automatically pruned once their associated directory has been removed—no need to register hooks or perform manual clean up.
+- **Directory-based lifecycle**: Reservations can be automatically pruned once their associated directory has been removed—no need to register hooks or perform manual clean up. Prune follows symlinks and requires the target to remain a directory; missing targets, dangling links, non-directory replacements, and internally stored paths that are invalid on the current host are stale. Permission failures, symlink loops, transient I/O failures, and other uncertain states preserve reservations and produce an actionable warning.
 - **Cross-process safety**: Safe to invoke `trop` concurrently from multiple processes (e.g. by multiple concurrent, indenently-operating agents).
 - **Port occupancy detection & Exclusion Management**: `trop` avoids conflict with non-`trop` managed ports by:
   - verifying a prospective port is unoccupied before creating the reservation

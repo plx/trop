@@ -6,7 +6,7 @@
 use crate::error::CliError;
 use crate::invocation::InvocationContext;
 use clap::Args;
-use trop::operations::CleanupOperations;
+use trop::operations::{CleanupOperations, PrunePathDecision, PrunePathErrorKind, PrunePathStatus};
 
 /// Remove reservations for non-existent directories.
 #[derive(Args)]
@@ -31,6 +31,10 @@ impl PruneCommand {
 
         // Perform pruning operation
         let result = CleanupOperations::prune(&mut db, self.dry_run).map_err(CliError::from)?;
+
+        if !global.quiet {
+            report_uninspectable_paths(&result.path_decisions);
+        }
 
         // Format and output results
         if global.quiet {
@@ -74,5 +78,34 @@ impl PruneCommand {
         }
 
         Ok(())
+    }
+}
+
+pub(super) fn report_uninspectable_paths(decisions: &[PrunePathDecision]) {
+    for decision in decisions {
+        let PrunePathStatus::Uninspectable(error) = &decision.status else {
+            continue;
+        };
+        let advice = match error.kind {
+            PrunePathErrorKind::PermissionDenied => {
+                "Restore access to the path and its parents, then retry."
+            }
+            PrunePathErrorKind::SymlinkLoop => "Repair the symlink loop, then retry.",
+            PrunePathErrorKind::Transient => "Retry when the filesystem or mount is available.",
+            PrunePathErrorKind::Unsupported => {
+                "Verify filesystem support or release the reservation explicitly."
+            }
+            PrunePathErrorKind::Other => {
+                "Inspect the filesystem state or release the reservation explicitly."
+            }
+        };
+        eprintln!(
+            "Warning: could not inspect reserved directory {} ({}: {}); \
+             reservation preserved by prune. {}",
+            decision.path.display(),
+            error.kind,
+            error.message,
+            advice
+        );
     }
 }

@@ -3,6 +3,7 @@
 //! This module implements the `autoclean` command, which combines
 //! prune and expire operations.
 
+use crate::commands::prune::report_uninspectable_paths;
 use crate::error::CliError;
 use crate::invocation::InvocationContext;
 use clap::Args;
@@ -36,6 +37,10 @@ impl AutocleanCommand {
         // Perform combined cleanup
         let result = CleanupOperations::autoclean(&mut db, &cleanup_config, self.dry_run)
             .map_err(CliError::from)?;
+
+        if !global.quiet {
+            report_uninspectable_paths(&result.prune_path_decisions);
+        }
 
         // Format output
         if global.quiet {
