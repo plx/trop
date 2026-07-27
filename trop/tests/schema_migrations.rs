@@ -382,44 +382,54 @@ fn read_only_v1_requires_writable_migration_but_read_only_v2_opens() {
 #[test]
 fn concurrent_migrators_serialize_and_both_observe_v2() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("concurrent.db");
-    let conn = Connection::open(&path).unwrap();
-    create_published_v1_database(&conn);
-    conn.execute(
-        "INSERT INTO reservations VALUES ('/project', NULL, 5000, NULL, NULL, 1, 1)",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-
-    let barrier = Arc::new(Barrier::new(3));
-    let handles = (0..2)
-        .map(|_| {
-            let path = path.clone();
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                barrier.wait();
-                Database::open(DatabaseConfig::new(path))
-            })
-        })
-        .collect::<Vec<_>>();
-    barrier.wait();
-    for handle in handles {
-        let db = handle.join().unwrap().unwrap();
-        assert_eq!(get_schema_version(db.connection()).unwrap(), 2);
-    }
-
-    let conn = Connection::open(&path).unwrap();
-    assert_eq!(get_schema_version(&conn).unwrap(), 2);
-    assert_eq!(
-        conn.query_row(
-            "SELECT tag FROM reservations WHERE path = '/project'",
+    for iteration in 0..50 {
+        let path = dir.path().join(format!("concurrent-{iteration}.db"));
+        let conn = Connection::open(&path).unwrap();
+        create_published_v1_database(&conn);
+        conn.execute(
+            "INSERT INTO reservations VALUES ('/project', NULL, 5000, NULL, NULL, 1, 1)",
             [],
-            |row| row.get::<_, String>(0)
         )
-        .unwrap(),
-        ""
-    );
+        .unwrap();
+        drop(conn);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    Database::open(DatabaseConfig::new(path))
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            let db = handle.join().unwrap().unwrap_or_else(|error| {
+                panic!("concurrent migration iteration {iteration} failed: {error:?}")
+            });
+            assert_eq!(get_schema_version(db.connection()).unwrap(), 2);
+            assert_eq!(
+                db.connection()
+                    .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                5000
+            );
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 2);
+        assert_eq!(
+            conn.query_row(
+                "SELECT tag FROM reservations WHERE path = '/project'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            ""
+        );
+    }
 }
 
 #[test]
