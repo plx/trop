@@ -385,19 +385,43 @@ impl Database {
     pub(crate) fn with_immediate_transaction_or_savepoint<T>(
         conn: &Connection,
         savepoint_name: &str,
+        lock_operation: &str,
         operation: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
+        let timeout_millis =
+            conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u64>(0))?;
+        let timeout = Duration::from_millis(timeout_millis);
+
         if !conn.is_autocommit() {
-            return Self::with_savepoint(conn, savepoint_name, operation);
+            return Self::with_savepoint(conn, savepoint_name, operation).map_err(|error| {
+                error.classify_sqlite_lock(
+                    timeout,
+                    format!("executing {lock_operation} in a caller-owned transaction"),
+                )
+            });
         }
 
-        let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .map_err(Error::from)
+            .map_err(|error| {
+                error.classify_sqlite_lock(
+                    timeout,
+                    format!("starting an immediate transaction for {lock_operation}"),
+                )
+            })?;
         match operation(&transaction) {
             Ok(value) => {
-                transaction.commit()?;
+                transaction.commit().map_err(Error::from).map_err(|error| {
+                    error.classify_sqlite_lock(
+                        timeout,
+                        format!("committing the transaction for {lock_operation}"),
+                    )
+                })?;
                 Ok(value)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                Err(error.classify_sqlite_lock(timeout, format!("executing {lock_operation}")))
+            }
         }
     }
 

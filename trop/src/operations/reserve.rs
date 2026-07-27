@@ -708,7 +708,7 @@ where
             message: "deferred reserve execution requires a deferred reservation".into(),
         })?;
 
-    Database::with_immediate_transaction_or_savepoint(conn, "trop_reserve_after_cleanup", |conn| {
+    let execute = |conn: &Connection| {
         let options = &deferred.options;
         let full_config = &deferred.full_config;
         let occupancy_config = &deferred.occupancy_config;
@@ -783,7 +783,14 @@ where
             )?),
             AllocationResult::PreferredUnavailable { .. } => unreachable!(),
         }
-    })
+    };
+
+    Database::with_immediate_transaction_or_savepoint(
+        conn,
+        "trop_reserve_after_cleanup",
+        "automatic cleanup and reserve retry",
+        execute,
+    )
 }
 
 fn persist_deferred_outcome(
@@ -1643,6 +1650,68 @@ mod tests {
             "terminal exhaustion must roll automatic cleanup back"
         );
         drop(listener);
+    }
+
+    #[test]
+    fn test_deferred_reserve_maps_transaction_contention_to_lock_timeout() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("deferred-lock-timeout.db");
+        let database_config = DatabaseConfig::new(&database_path).with_busy_timeout(Duration::ZERO);
+        let mut planning_db = Database::open(database_config.clone()).unwrap();
+        let competing_db = Database::open(database_config).unwrap();
+        let only_port = Port::try_from(5460).unwrap();
+
+        let blocker_path = directory.path().join("blocker");
+        let target_path = directory.path().join("target");
+        std::fs::create_dir(&blocker_path).unwrap();
+        std::fs::create_dir(&target_path).unwrap();
+        let blocker_key = ReservationKey::new(blocker_path, None).unwrap();
+        let target_key = ReservationKey::new(target_path, None).unwrap();
+        planning_db
+            .create_reservation(
+                &Reservation::builder(blocker_key, only_port)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let config = Config {
+            ports: Some(PortConfig {
+                min: only_port.value(),
+                max: Some(only_port.value()),
+                max_offset: None,
+            }),
+            ..Default::default()
+        };
+        let plan = ReservePlan::new(
+            ReserveOptions::new(target_key, None).with_allow_unrelated_path(true),
+            &config,
+        )
+        .build_plan(planning_db.connection())
+        .unwrap();
+        assert!(matches!(
+            plan.actions.as_slice(),
+            [PlanAction::CreateReservation(reservation)]
+                if reservation.requires_allocation_at_execution()
+        ));
+
+        competing_db
+            .connection()
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+        let error = PlanExecutor::new(planning_db.connection())
+            .execute(&plan)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::LockTimeout {
+                timeout,
+                ref operation
+            } if timeout == Duration::ZERO
+                && operation
+                    == "starting an immediate transaction for automatic cleanup and reserve retry"
+        ));
+        competing_db.connection().execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]
