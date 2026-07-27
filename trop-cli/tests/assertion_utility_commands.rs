@@ -1516,6 +1516,16 @@ fn test_scan_output_formats() {
 fn test_scan_uses_config_range() {
     let env = TestEnv::new();
 
+    // This test covers range fallback, not the host's socket inventory. Keep
+    // it deterministic when the default range contains a platform-reserved
+    // port whose bind fails closed.
+    fs::create_dir_all(&env.data_dir).expect("Failed to create test data directory");
+    fs::write(
+        env.data_dir.join("config.yaml"),
+        "occupancy_check:\n  skip: true\n",
+    )
+    .expect("Failed to write test configuration");
+
     // Scan without specifying range (should use defaults)
     let output = env
         .command()
@@ -1526,7 +1536,8 @@ fn test_scan_uses_config_range() {
     // Should succeed using default/config range
     assert!(
         output.status.success(),
-        "Scan should use default range when none specified"
+        "Scan should use default range when none specified, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
