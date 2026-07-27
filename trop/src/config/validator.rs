@@ -34,6 +34,14 @@ impl ConfigValidator {
     /// Returns a source-annotated validation error when the document is invalid
     /// for its source or contains an invalid value.
     pub fn validate_source(config: &Config, source: &ConfigValueSource) -> Result<()> {
+        Self::validate_source_document(config, source, config.reservations.is_some())
+    }
+
+    pub(crate) fn validate_source_document(
+        config: &Config,
+        source: &ConfigValueSource,
+        reservations_declared: bool,
+    ) -> Result<()> {
         let is_user_file = matches!(
             source,
             ConfigValueSource::File {
@@ -50,7 +58,7 @@ impl ConfigValidator {
             ));
         }
 
-        if is_user_file && config.reservations.is_some() {
+        if is_user_file && reservations_declared {
             return Err(Self::source_error(
                 "reservations",
                 "reservations are only valid in trop.yaml/trop.local.yaml, not user config.yaml",

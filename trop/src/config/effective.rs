@@ -292,6 +292,11 @@ impl EffectiveConfig {
         }
     }
 
+    pub(crate) fn clear_reservations(&mut self, source: &ConfigValueSource) {
+        self.config.reservations = None;
+        self.record(ConfigField::Reservations, source.clone());
+    }
+
     pub(crate) fn record_file(&mut self, kind: ConfigFileKind, path: PathBuf) {
         self.loaded_files.push(LoadedConfigFile::new(kind, path));
     }

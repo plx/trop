@@ -4,7 +4,7 @@
 //! integrating file loading, merging, environment variables, and validation.
 
 use crate::config::environment::EnvironmentConfig;
-use crate::config::loader::ConfigLoader;
+use crate::config::loader::{ConfigLoader, ReservationOverlay};
 use crate::config::schema::{CleanupConfig, Config, OccupancyConfig, OutputFormat, PortConfig};
 use crate::config::validator::ConfigValidator;
 use crate::config::{ConfigField, ConfigFileKind, ConfigValueSource, EffectiveConfig};
@@ -176,7 +176,7 @@ impl ConfigBuilder {
                     .working_dir
                     .as_deref()
                     .unwrap_or_else(|| Path::new("."));
-                ConfigLoader::load_all(working_dir, self.data_dir.as_deref())?
+                ConfigLoader::load_all_effective(working_dir, self.data_dir.as_deref())?
             };
         }
 
@@ -197,10 +197,27 @@ impl ConfigBuilder {
                 kind,
                 path: source.path.clone(),
             };
+            let reservation_overlay = if kind == ConfigFileKind::User
+                && source.reservations == ReservationOverlay::Clear
+            {
+                // Existing generated global files can contain null for
+                // absent optional fields. User config cannot own a group,
+                // so this is inert rather than a project-level clear.
+                ReservationOverlay::Inherit
+            } else {
+                source.reservations
+            };
 
-            ConfigValidator::validate_source(&source.config, &value_source)?;
+            ConfigValidator::validate_source_document(
+                &source.config,
+                &value_source,
+                reservation_overlay != ReservationOverlay::Inherit,
+            )?;
             effective.record_file(kind, source.path);
             effective.merge_config(&source.config, &value_source);
+            if reservation_overlay == ReservationOverlay::Clear {
+                effective.clear_reservations(&value_source);
+            }
         }
 
         if !self.skip_env {
