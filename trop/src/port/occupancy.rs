@@ -288,12 +288,14 @@ impl SystemOccupancyChecker {
         )?;
 
         // Be explicit about the options that materially affect occupancy
-        // results. Address reuse stays disabled, Windows probes use exclusive
-        // address binding, and IPv6 probes never accept IPv4-mapped addresses
-        // regardless of the platform default.
+        // results. Address reuse stays disabled, Windows wildcard probes use
+        // exclusive address binding, and IPv6 probes never accept IPv4-mapped
+        // addresses regardless of the platform default.
         socket.set_reuse_address(false)?;
         #[cfg(windows)]
-        Self::set_exclusive_address_use(&socket)?;
+        if probe.address.ip().is_unspecified() {
+            Self::set_exclusive_address_use(&socket)?;
+        }
         if probe.address.is_ipv6() {
             socket.set_only_v6(true)?;
         }
@@ -514,26 +516,33 @@ mod tests {
         Ok(socket.into())
     }
 
-    fn tcp_ipv4_with_udp_free() -> TcpListener {
+    fn tcp_udp_ipv4_pair() -> io::Result<(TcpListener, UdpSocket)> {
         for _ in 0..100 {
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let port = listener.local_addr().unwrap().port();
-            if UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
-                return listener;
+            // Select through UDP first, then prove the same port is also
+            // bindable by TCP. Some Windows hosts do not make a
+            // TCP-selected ephemeral port eligible for UDP.
+            let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+            let port = udp.local_addr()?.port();
+            if let Ok(tcp) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                return Ok((tcp, udp));
             }
         }
-        panic!("failed to find a TCP/IPv4 port with UDP/IPv4 free");
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "failed to find a port bindable by both TCP/IPv4 and UDP/IPv4",
+        ))
     }
 
-    fn udp_ipv4_with_tcp_free() -> UdpSocket {
-        for _ in 0..100 {
-            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let port = socket.local_addr().unwrap().port();
-            if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
-                return socket;
-            }
-        }
-        panic!("failed to find a UDP/IPv4 port with TCP/IPv4 free");
+    fn tcp_ipv4_with_udp_free() -> io::Result<TcpListener> {
+        let (tcp, udp) = tcp_udp_ipv4_pair()?;
+        drop(udp);
+        Ok(tcp)
+    }
+
+    fn udp_ipv4_with_tcp_free() -> io::Result<UdpSocket> {
+        let (tcp, udp) = tcp_udp_ipv4_pair()?;
+        drop(tcp);
+        Ok(udp)
     }
 
     fn tcp_ipv4_with_ipv6_free() -> io::Result<TcpListener> {
@@ -1013,9 +1022,13 @@ mod tests {
     #[serial]
     fn test_system_checker_respects_tcp_and_udp_skips() {
         let checker = SystemOccupancyChecker;
-        let tcp = tcp_ipv4_with_udp_free();
+        let Ok(tcp) = tcp_ipv4_with_udp_free() else {
+            return;
+        };
         let tcp_port = Port::try_from(tcp.local_addr().unwrap().port()).unwrap();
-        let udp = udp_ipv4_with_tcp_free();
+        let Ok(udp) = udp_ipv4_with_tcp_free() else {
+            return;
+        };
         let udp_port = Port::try_from(udp.local_addr().unwrap().port()).unwrap();
         let ipv4_only = OccupancyCheckConfig {
             skip_ipv6: true,

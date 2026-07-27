@@ -53,12 +53,12 @@ wildcard probes on `0.0.0.0` and `::` to the localhost probes.
 
 The IPv4 and IPv6 probes are deliberately independent. IPv6 sockets use the
 IPv6-only socket option before binding so platform dual-stack defaults do not
-make an IPv6 probe also claim IPv4. Windows probes also request exclusive
-address use so its permissive default binding rules cannot hide a listener on
-a specific interface from a wildcard probe. A bind conflict marks the port
-occupied. Unsupported families, permission failures, and other unexpected
-socket errors are reported with the failed protocol, family, scope, and
-address; allocation treats those failures conservatively as possibly occupied.
+make an IPv6 probe also claim IPv4. Windows wildcard probes also request
+exclusive address use so its permissive default binding rules cannot hide a
+listener on a specific interface. A bind conflict marks the port occupied.
+Unsupported families, permission failures, and other unexpected socket errors
+are reported with the failed protocol, family, scope, and address; allocation
+treats those failures conservatively as possibly occupied.
 
 ### Tags & `trop autoreserve`
 
