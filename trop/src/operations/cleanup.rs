@@ -12,8 +12,11 @@
 //! (committed immediately), but the batch operation as a whole is not transactional. If an
 //! error occurs midway through a cleanup, earlier deletions will have been committed.
 
+use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::CleanupConfig;
@@ -22,6 +25,85 @@ use crate::{Reservation, Result};
 
 /// Number of seconds in a day, used for expiration calculations.
 const SECONDS_PER_DAY: u64 = 86400;
+
+/// Broad category for a filesystem error that made a reserved path uninspectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrunePathErrorKind {
+    /// Access to the path or one of its parents was denied.
+    PermissionDenied,
+    /// Symlink traversal encountered a loop or exceeded the platform limit.
+    SymlinkLoop,
+    /// A retryable or availability-related I/O failure occurred.
+    Transient,
+    /// The filesystem or platform does not support the requested inspection.
+    Unsupported,
+    /// An error occurred that is not definitive evidence of absence.
+    Other,
+}
+
+impl fmt::Display for PrunePathErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PermissionDenied => formatter.write_str("permission denied"),
+            Self::SymlinkLoop => formatter.write_str("symlink loop"),
+            Self::Transient => formatter.write_str("transient I/O error"),
+            Self::Unsupported => formatter.write_str("unsupported filesystem operation"),
+            Self::Other => formatter.write_str("unknown filesystem error"),
+        }
+    }
+}
+
+/// An inspection error that conservatively preserved reservations for one path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrunePathError {
+    /// Stable error category suitable for user-facing diagnostics.
+    pub kind: PrunePathErrorKind,
+    /// Platform error text captured by the one filesystem probe.
+    pub message: String,
+    /// Platform error number, when the operating system supplied one.
+    pub raw_os_error: Option<i32>,
+}
+
+/// Filesystem status captured for one distinct reserved path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrunePathStatus {
+    /// The path resolves to a directory and must be kept.
+    ExistingDirectory,
+    /// The path or its symlink target definitively does not exist.
+    Missing,
+    /// The path does not resolve to a directory.
+    ///
+    /// This covers both an existing non-directory target and a traversal that
+    /// failed because an intermediate component was not a directory. It also
+    /// covers internally stored paths that are invalid on the current host.
+    NotDirectory,
+    /// Inspection failed without proving absence, so reservations must be kept.
+    Uninspectable(PrunePathError),
+}
+
+impl PrunePathStatus {
+    /// Return whether this status makes a directory reservation eligible for pruning.
+    #[must_use]
+    pub const fn is_prunable(&self) -> bool {
+        matches!(self, Self::Missing | Self::NotDirectory)
+    }
+}
+
+/// The single filesystem decision captured for one distinct reserved path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrunePathDecision {
+    /// Reserved path that was inspected.
+    pub path: PathBuf,
+    /// Status captured by that inspection.
+    pub status: PrunePathStatus,
+}
+
+/// Minimal filesystem result used by the prune classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbedPath {
+    Directory,
+    NonDirectory,
+}
 
 /// Result of a prune operation.
 ///
@@ -32,6 +114,8 @@ pub struct PruneResult {
     pub removed_count: usize,
     /// Reservations that were (or would be) removed.
     pub removed_reservations: Vec<Reservation>,
+    /// One captured filesystem decision for every distinct reserved path.
+    pub path_decisions: Vec<PrunePathDecision>,
 }
 
 /// Result of an expire operation.
@@ -60,6 +144,8 @@ pub struct AutocleanResult {
     pub pruned_reservations: Vec<Reservation>,
     /// Reservations that were expired.
     pub expired_reservations: Vec<Reservation>,
+    /// Filesystem decisions captured by the prune portion of the operation.
+    pub prune_path_decisions: Vec<PrunePathDecision>,
 }
 
 /// Cleanup operations for removing stale reservations.
@@ -71,8 +157,10 @@ pub struct CleanupOperations;
 impl CleanupOperations {
     /// Remove reservations for paths that no longer exist on the filesystem.
     ///
-    /// This operation checks each reservation's path against the filesystem and
-    /// removes reservations where the path no longer exists.
+    /// This operation checks each distinct reservation path exactly once and
+    /// removes reservations only when the path is missing or does not resolve
+    /// to a directory. Inspection errors preserve reservations and are returned
+    /// as structured decisions for diagnostics.
     ///
     /// # Arguments
     ///
@@ -81,8 +169,8 @@ impl CleanupOperations {
     ///
     /// # Errors
     ///
-    /// Returns an error if database operations fail. Filesystem errors for individual
-    /// paths are handled gracefully (paths that can't be checked are assumed to exist).
+    /// Returns an error if database operations fail. Filesystem errors for
+    /// individual paths preserve their reservations.
     ///
     /// # Examples
     ///
@@ -102,26 +190,36 @@ impl CleanupOperations {
     /// println!("Pruned {} reservations", result.removed_count);
     /// ```
     pub fn prune(db: &mut Database, dry_run: bool) -> Result<PruneResult> {
-        // Get all reservations
+        Self::prune_with_probe(db, dry_run, Self::probe_path)
+    }
+
+    fn prune_with_probe<F>(db: &mut Database, dry_run: bool, probe: F) -> Result<PruneResult>
+    where
+        F: Fn(&Path) -> io::Result<ProbedPath>,
+    {
         let all_reservations = Database::list_all_reservations(db.connection())?;
 
-        // Filter to those with non-existent paths
-        let mut to_remove = Vec::new();
-        for reservation in all_reservations {
-            // Fail-open policy: if we can't check the path (e.g., permission errors),
-            // we conservatively assume it exists to avoid accidentally removing
-            // valid reservations.
-            let path_exists = Self::check_path_exists(&reservation.key().path);
-            if !path_exists {
-                to_remove.push(reservation);
-            }
+        // Probe each distinct path once so all tags for that path receive the
+        // same decision and reporting never performs a TOCTOU-sensitive recheck.
+        let mut statuses = BTreeMap::new();
+        for reservation in &all_reservations {
+            let path = &reservation.key().path;
+            statuses
+                .entry(path.clone())
+                .or_insert_with(|| Self::classify_path(path, &probe));
         }
 
+        let to_remove = all_reservations
+            .into_iter()
+            .filter(|reservation| {
+                statuses
+                    .get(&reservation.key().path)
+                    .is_some_and(PrunePathStatus::is_prunable)
+            })
+            .collect::<Vec<_>>();
         let removed_count = to_remove.len();
 
-        // If not dry-run, actually delete the reservations
         if !dry_run {
-            // Delete within a transaction by doing all deletes together
             for reservation in &to_remove {
                 db.delete_reservation(reservation.key())?;
             }
@@ -130,6 +228,10 @@ impl CleanupOperations {
         Ok(PruneResult {
             removed_count,
             removed_reservations: to_remove,
+            path_decisions: statuses
+                .into_iter()
+                .map(|(path, status)| PrunePathDecision { path, status })
+                .collect(),
         })
     }
 
@@ -259,16 +361,177 @@ impl CleanupOperations {
             total_removed: prune_result.removed_count + expire_result.removed_count,
             pruned_reservations: prune_result.removed_reservations,
             expired_reservations: expire_result.removed_reservations,
+            prune_path_decisions: prune_result.path_decisions,
         })
     }
 
-    /// Check if a path exists on the filesystem.
-    ///
-    /// This uses a fail-open policy: if we can't check the path (e.g., permission errors),
-    /// we assume it exists to avoid accidentally removing valid reservations.
-    fn check_path_exists(path: &Path) -> bool {
-        fs::metadata(path).is_ok()
+    fn probe_path(path: &Path) -> io::Result<ProbedPath> {
+        fs::metadata(path).map(|metadata| {
+            if metadata.is_dir() {
+                ProbedPath::Directory
+            } else {
+                ProbedPath::NonDirectory
+            }
+        })
     }
+
+    fn classify_path<F>(path: &Path, probe: &F) -> PrunePathStatus
+    where
+        F: Fn(&Path) -> io::Result<ProbedPath>,
+    {
+        match probe(path) {
+            Ok(ProbedPath::Directory) => PrunePathStatus::ExistingDirectory,
+            Ok(ProbedPath::NonDirectory) => PrunePathStatus::NotDirectory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => PrunePathStatus::Missing,
+            Err(error) if is_not_directory(&error) || is_invalid_path(&error) => {
+                PrunePathStatus::NotDirectory
+            }
+            Err(error) => PrunePathStatus::Uninspectable(PrunePathError {
+                kind: Self::classify_probe_error(&error),
+                message: error.to_string(),
+                raw_os_error: error.raw_os_error(),
+            }),
+        }
+    }
+
+    fn classify_probe_error(error: &io::Error) -> PrunePathErrorKind {
+        if is_symlink_loop(error) {
+            return PrunePathErrorKind::SymlinkLoop;
+        }
+        if is_transient_os_error(error) {
+            return PrunePathErrorKind::Transient;
+        }
+
+        match error.kind() {
+            io::ErrorKind::PermissionDenied => PrunePathErrorKind::PermissionDenied,
+            io::ErrorKind::Unsupported => PrunePathErrorKind::Unsupported,
+            io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected => PrunePathErrorKind::Transient,
+            _ => PrunePathErrorKind::Other,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_not_directory(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENOTDIR)
+}
+
+#[cfg(windows)]
+fn is_not_directory(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_DIRECTORY;
+
+    windows_error_code(error) == Some(ERROR_DIRECTORY)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_not_directory(error: &io::Error) -> bool {
+    error.to_string().contains("non-directory ancestor")
+}
+
+fn is_invalid_path(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidFilename
+    ) || is_invalid_path_os_error(error)
+}
+
+#[cfg(unix)]
+fn is_invalid_path_os_error(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENAMETOOLONG)
+}
+
+#[cfg(windows)]
+fn is_invalid_path_os_error(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_BAD_PATHNAME, ERROR_FILENAME_EXCED_RANGE, ERROR_INVALID_NAME,
+    };
+
+    windows_error_code(error).is_some_and(|code| {
+        matches!(
+            code,
+            ERROR_INVALID_NAME | ERROR_BAD_PATHNAME | ERROR_FILENAME_EXCED_RANGE
+        )
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_invalid_path_os_error(_error: &io::Error) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn is_symlink_loop(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(windows)]
+fn is_symlink_loop(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME;
+
+    windows_error_code(error) == Some(ERROR_CANT_RESOLVE_FILENAME)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_symlink_loop(error: &io::Error) -> bool {
+    error.to_string().contains("symlink loop")
+}
+
+#[cfg(unix)]
+fn is_transient_os_error(error: &io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        matches!(
+            code,
+            libc::ESTALE
+                | libc::EBUSY
+                | libc::EDEADLK
+                | libc::ETXTBSY
+                | libc::ENETDOWN
+                | libc::ENETUNREACH
+                | libc::EHOSTUNREACH
+        )
+    })
+}
+
+#[cfg(windows)]
+fn is_transient_os_error(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_BUSY, ERROR_BUSY_DRIVE, ERROR_HOST_UNREACHABLE, ERROR_LOCK_VIOLATION,
+        ERROR_NETWORK_BUSY, ERROR_NETWORK_UNREACHABLE, ERROR_RETRY, ERROR_UNEXP_NET_ERR,
+    };
+
+    // Common availability/busy errors from local and network filesystems:
+    // ERROR_LOCK_VIOLATION, ERROR_NETWORK_BUSY, ERROR_UNEXP_NET_ERR,
+    // ERROR_BUSY_DRIVE, ERROR_BUSY, ERROR_NETWORK_UNREACHABLE,
+    // ERROR_HOST_UNREACHABLE, and ERROR_RETRY.
+    windows_error_code(error).is_some_and(|code| {
+        matches!(
+            code,
+            ERROR_LOCK_VIOLATION
+                | ERROR_NETWORK_BUSY
+                | ERROR_UNEXP_NET_ERR
+                | ERROR_BUSY_DRIVE
+                | ERROR_BUSY
+                | ERROR_NETWORK_UNREACHABLE
+                | ERROR_HOST_UNREACHABLE
+                | ERROR_RETRY
+        )
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_transient_os_error(_error: &io::Error) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn windows_error_code(error: &io::Error) -> Option<u32> {
+    error.raw_os_error().and_then(|code| code.try_into().ok())
 }
 
 #[cfg(test)]
@@ -374,6 +637,295 @@ mod tests {
         // Only the existing path should remain
         let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_prune_probes_each_distinct_path_once() {
+        use std::cell::Cell;
+
+        let mut db = create_test_database();
+        let path = PathBuf::from("/one/probe/per/path");
+        for (port, tag) in [(5000, None), (5001, Some("web".to_string()))] {
+            let key = ReservationKey::new(path.clone(), tag).unwrap();
+            let reservation = Reservation::builder(key, Port::try_from(port).unwrap())
+                .build()
+                .unwrap();
+            db.create_reservation(&reservation).unwrap();
+        }
+
+        let probe_count = Cell::new(0);
+        let result = CleanupOperations::prune_with_probe(&mut db, true, |probed_path| {
+            assert_eq!(probed_path, path);
+            probe_count.set(probe_count.get() + 1);
+            Ok(ProbedPath::Directory)
+        })
+        .unwrap();
+
+        assert_eq!(probe_count.get(), 1);
+        assert_eq!(
+            result.path_decisions,
+            vec![PrunePathDecision {
+                path,
+                status: PrunePathStatus::ExistingDirectory,
+            }]
+        );
+        assert_eq!(result.removed_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_prune_removes_illegal_internal_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut db = create_test_database();
+        let path = PathBuf::from(OsString::from_vec(
+            b"/illegal/internal\0reservation".to_vec(),
+        ));
+        let probe_error = fs::metadata(&path).expect_err("interior NUL path must be illegal");
+        assert_eq!(probe_error.kind(), io::ErrorKind::InvalidInput);
+
+        let key = ReservationKey::new(path.clone(), None).unwrap();
+        let reservation = Reservation::builder(key, Port::try_from(5000).unwrap())
+            .build()
+            .unwrap();
+        db.create_reservation(&reservation).unwrap();
+
+        let result = CleanupOperations::prune(&mut db, false).unwrap();
+
+        assert_eq!(result.removed_count, 1);
+        assert_eq!(
+            result.path_decisions,
+            vec![PrunePathDecision {
+                path,
+                status: PrunePathStatus::NotDirectory,
+            }]
+        );
+        assert!(Database::list_all_reservations(db.connection())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_prune_preserves_and_classifies_injected_probe_errors() {
+        let mut db = create_test_database();
+        let fixtures = [
+            ("permission", PrunePathErrorKind::PermissionDenied),
+            ("loop", PrunePathErrorKind::SymlinkLoop),
+            ("transient", PrunePathErrorKind::Transient),
+            ("broken-mount", PrunePathErrorKind::Transient),
+            ("unsupported", PrunePathErrorKind::Unsupported),
+            ("unknown", PrunePathErrorKind::Other),
+        ];
+        for (index, (name, _)) in fixtures.iter().enumerate() {
+            let key =
+                ReservationKey::new(PathBuf::from(format!("/injected/{name}")), None).unwrap();
+            #[allow(clippy::cast_possible_truncation)]
+            let port = Port::try_from(5000 + index as u16).unwrap();
+            let reservation = Reservation::builder(key, port).build().unwrap();
+            db.create_reservation(&reservation).unwrap();
+        }
+
+        let result = CleanupOperations::prune_with_probe(&mut db, false, |path| {
+            match path.file_name().and_then(std::ffi::OsStr::to_str) {
+                Some("permission") => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "simulated ACL denial",
+                )),
+                Some("loop") => Err(simulated_symlink_loop_error()),
+                Some("transient") => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "simulated unavailable mount",
+                )),
+                Some("broken-mount") => Err(simulated_broken_mount_error()),
+                Some("unsupported") => Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "simulated unsupported operation",
+                )),
+                Some("unknown") => Err(io::Error::other("simulated unknown I/O failure")),
+                other => panic!("unexpected injected path: {other:?}"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(result.removed_count, 0);
+        assert!(result.removed_reservations.is_empty());
+        assert_eq!(
+            Database::list_all_reservations(db.connection())
+                .unwrap()
+                .len(),
+            fixtures.len()
+        );
+        assert_eq!(result.path_decisions.len(), fixtures.len());
+        for (name, expected_kind) in fixtures {
+            let decision = result
+                .path_decisions
+                .iter()
+                .find(|decision| decision.path.ends_with(name))
+                .unwrap();
+            let PrunePathStatus::Uninspectable(error) = &decision.status else {
+                panic!("expected an uninspectable decision for {name}");
+            };
+            assert_eq!(error.kind, expected_kind);
+            assert!(!error.message.is_empty());
+            if !matches!(name, "loop" | "broken-mount") {
+                assert!(error.message.contains("simulated"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_prune_removes_only_definitive_missing_or_non_directory_paths() {
+        let mut db = create_test_database();
+        for (index, name) in [
+            "directory",
+            "missing",
+            "bad-ancestor",
+            "file",
+            "invalid-input",
+            "invalid-filename",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let key =
+                ReservationKey::new(PathBuf::from(format!("/classified/{name}")), None).unwrap();
+            #[allow(clippy::cast_possible_truncation)]
+            let port = Port::try_from(5000 + index as u16).unwrap();
+            let reservation = Reservation::builder(key, port).build().unwrap();
+            db.create_reservation(&reservation).unwrap();
+        }
+
+        let result = CleanupOperations::prune_with_probe(&mut db, false, |path| {
+            match path.file_name().and_then(std::ffi::OsStr::to_str) {
+                Some("directory") => Ok(ProbedPath::Directory),
+                Some("missing") => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "simulated missing target",
+                )),
+                Some("bad-ancestor") => Err(simulated_not_directory_error()),
+                Some("file") => Ok(ProbedPath::NonDirectory),
+                Some("invalid-input") => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "simulated invalid path",
+                )),
+                Some("invalid-filename") => Err(io::Error::new(
+                    io::ErrorKind::InvalidFilename,
+                    "simulated invalid filename",
+                )),
+                other => panic!("unexpected injected path: {other:?}"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(result.removed_count, 5);
+        let remaining = Database::list_all_reservations(db.connection()).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining[0].key().path.ends_with("directory"));
+
+        let statuses = result
+            .path_decisions
+            .iter()
+            .map(|decision| {
+                (
+                    decision
+                        .path
+                        .file_name()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .unwrap(),
+                    &decision.status,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(statuses["directory"], &PrunePathStatus::ExistingDirectory);
+        assert_eq!(statuses["missing"], &PrunePathStatus::Missing);
+        assert_eq!(statuses["bad-ancestor"], &PrunePathStatus::NotDirectory);
+        assert_eq!(statuses["file"], &PrunePathStatus::NotDirectory);
+        assert_eq!(statuses["invalid-input"], &PrunePathStatus::NotDirectory);
+        assert_eq!(statuses["invalid-filename"], &PrunePathStatus::NotDirectory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_prune_removes_paths_rejected_by_windows() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_BAD_PATHNAME, ERROR_FILENAME_EXCED_RANGE, ERROR_INVALID_NAME,
+        };
+
+        for code in [
+            ERROR_INVALID_NAME,
+            ERROR_BAD_PATHNAME,
+            ERROR_FILENAME_EXCED_RANGE,
+        ] {
+            let raw_code = code.try_into().expect("Windows error code should fit i32");
+            let status = CleanupOperations::classify_path(Path::new("invalid"), &|_| {
+                Err(io::Error::from_raw_os_error(raw_code))
+            });
+            assert_eq!(status, PrunePathStatus::NotDirectory);
+        }
+    }
+
+    #[cfg(unix)]
+    fn simulated_symlink_loop_error() -> io::Error {
+        io::Error::from_raw_os_error(libc::ELOOP)
+    }
+
+    #[cfg(windows)]
+    fn simulated_symlink_loop_error() -> io::Error {
+        use windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME;
+
+        io::Error::from_raw_os_error(
+            ERROR_CANT_RESOLVE_FILENAME
+                .try_into()
+                .expect("Windows error code should fit i32"),
+        )
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn simulated_symlink_loop_error() -> io::Error {
+        io::Error::other("simulated symlink loop")
+    }
+
+    #[cfg(unix)]
+    fn simulated_not_directory_error() -> io::Error {
+        io::Error::from_raw_os_error(libc::ENOTDIR)
+    }
+
+    #[cfg(windows)]
+    fn simulated_not_directory_error() -> io::Error {
+        use windows_sys::Win32::Foundation::ERROR_DIRECTORY;
+
+        io::Error::from_raw_os_error(
+            ERROR_DIRECTORY
+                .try_into()
+                .expect("Windows error code should fit i32"),
+        )
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn simulated_not_directory_error() -> io::Error {
+        io::Error::other("simulated non-directory ancestor")
+    }
+
+    #[cfg(unix)]
+    fn simulated_broken_mount_error() -> io::Error {
+        io::Error::from_raw_os_error(libc::ESTALE)
+    }
+
+    #[cfg(windows)]
+    fn simulated_broken_mount_error() -> io::Error {
+        use windows_sys::Win32::Foundation::ERROR_RETRY;
+
+        io::Error::from_raw_os_error(
+            ERROR_RETRY
+                .try_into()
+                .expect("Windows error code should fit i32"),
+        )
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn simulated_broken_mount_error() -> io::Error {
+        io::Error::new(io::ErrorKind::TimedOut, "simulated broken mount")
     }
 
     #[test]

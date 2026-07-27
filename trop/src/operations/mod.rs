@@ -50,7 +50,10 @@ pub mod reserve_group;
 mod proptests;
 
 pub use autoreserve::{AutoreserveOptions, AutoreservePlan};
-pub use cleanup::{AutocleanResult, CleanupOperations, ExpireResult, PruneResult};
+pub use cleanup::{
+    AutocleanResult, CleanupOperations, ExpireResult, PrunePathDecision, PrunePathError,
+    PrunePathErrorKind, PrunePathStatus, PruneResult,
+};
 pub use executor::{ExecutionResult, PlanExecutor};
 pub use init::{init_database, InitOptions, InitResult};
 pub use migrate::{execute_migrate, MigrateOptions, MigratePlan, MigrateResult, MigrationItem};

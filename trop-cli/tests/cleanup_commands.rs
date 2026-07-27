@@ -396,6 +396,222 @@ fn test_prune_verbose_mode() {
     );
 }
 
+/// Restore a Unix directory's permissions even when an assertion fails.
+#[cfg(unix)]
+struct PermissionRestore {
+    path: std::path::PathBuf,
+    permissions: fs::Permissions,
+}
+
+#[cfg(unix)]
+impl Drop for PermissionRestore {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.path, self.permissions.clone());
+    }
+}
+
+/// Permission failures are unknown states, not evidence that a directory is gone.
+#[cfg(unix)]
+#[test]
+fn test_prune_preserves_permission_denied_paths_in_all_output_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = TestEnv::new();
+    let parent = env.create_dir("permission-denied-parent");
+    let reserved_path = parent.join("project");
+    fs::create_dir(&reserved_path).expect("failed to create reserved directory");
+    env.reserve_simple(&reserved_path);
+
+    let original_permissions = fs::metadata(&parent)
+        .expect("failed to read original permissions")
+        .permissions();
+    let restore = PermissionRestore {
+        path: parent.clone(),
+        permissions: original_permissions,
+    };
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o000))
+        .expect("failed to remove parent permissions");
+
+    let probe_error = match fs::metadata(&reserved_path) {
+        Ok(_) => return,
+        Err(error) => error,
+    };
+    if probe_error.kind() != std::io::ErrorKind::PermissionDenied {
+        return;
+    }
+
+    let dry_run = env
+        .command()
+        .arg("prune")
+        .arg("--dry-run")
+        .output()
+        .expect("failed to run prune dry-run");
+    assert!(dry_run.status.success());
+    assert!(dry_run.stdout.is_empty());
+    let dry_run_stderr = String::from_utf8(dry_run.stderr).expect("invalid UTF-8");
+    assert!(
+        dry_run_stderr.contains("permission denied")
+            && dry_run_stderr.contains("reservation preserved"),
+        "normal dry-run should explain the preserved path: {dry_run_stderr}"
+    );
+    assert!(
+        dry_run_stderr.contains("Would remove 0"),
+        "normal dry-run must not count the unknown path as removed: {dry_run_stderr}"
+    );
+    assert_eq!(env.reservation_count(), 1);
+
+    let verbose = env
+        .command()
+        .arg("--verbose")
+        .arg("prune")
+        .arg("--dry-run")
+        .output()
+        .expect("failed to run verbose prune dry-run");
+    assert!(verbose.status.success());
+    assert!(verbose.stdout.is_empty());
+    let verbose_stderr = String::from_utf8(verbose.stderr).expect("invalid UTF-8");
+    assert!(
+        verbose_stderr.contains(&reserved_path.display().to_string())
+            && verbose_stderr.contains("permission denied")
+            && verbose_stderr.contains("Would remove 0"),
+        "verbose dry-run should identify the preserved path: {verbose_stderr}"
+    );
+    assert_eq!(env.reservation_count(), 1);
+
+    let quiet = env
+        .command()
+        .arg("--quiet")
+        .arg("prune")
+        .arg("--dry-run")
+        .output()
+        .expect("failed to run quiet prune dry-run");
+    assert!(quiet.status.success());
+    assert!(
+        quiet.stdout.is_empty(),
+        "quiet output must not report a removal count for a preserved path"
+    );
+    assert!(
+        quiet.stderr.is_empty(),
+        "quiet mode should suppress diagnostics"
+    );
+    assert_eq!(env.reservation_count(), 1);
+
+    let autoclean = env
+        .command()
+        .arg("autoclean")
+        .arg("--dry-run")
+        .output()
+        .expect("failed to run autoclean dry-run");
+    assert!(autoclean.status.success());
+    assert!(autoclean.stdout.is_empty());
+    let autoclean_stderr = String::from_utf8(autoclean.stderr).expect("invalid UTF-8");
+    assert!(
+        autoclean_stderr.contains("permission denied")
+            && autoclean_stderr.contains("reservation preserved")
+            && autoclean_stderr.contains("Would remove 0 total"),
+        "autoclean should propagate the prune warning without counting a removal: \
+         {autoclean_stderr}"
+    );
+    assert_eq!(env.reservation_count(), 1);
+
+    let prune = env
+        .command()
+        .arg("prune")
+        .output()
+        .expect("failed to run prune");
+    assert!(prune.status.success());
+    let prune_stderr = String::from_utf8(prune.stderr).expect("invalid UTF-8");
+    assert!(
+        prune_stderr.contains("permission denied")
+            && prune_stderr.contains("reservation preserved")
+            && prune_stderr.contains("Removed 0"),
+        "real prune should preserve and diagnose the unknown path: {prune_stderr}"
+    );
+    assert_eq!(env.reservation_count(), 1);
+
+    drop(restore);
+    assert!(fs::metadata(&reserved_path)
+        .expect("permissions should be restored")
+        .is_dir());
+
+    let restored = env
+        .command()
+        .arg("prune")
+        .output()
+        .expect("failed to run prune after restoring permissions");
+    assert!(restored.status.success());
+    assert_eq!(env.reservation_count(), 1);
+}
+
+/// A symlink loop is an inspection error and must not be mistaken for absence.
+#[cfg(unix)]
+#[test]
+fn test_prune_preserves_symlink_loops() {
+    use std::os::unix::fs::symlink;
+
+    let env = TestEnv::new();
+    let first = env.path().join("loop-a");
+    let second = env.path().join("loop-b");
+    symlink(&second, &first).expect("failed to create first loop link");
+    symlink(&first, &second).expect("failed to create second loop link");
+    env.reserve_simple(&first);
+
+    let output = env
+        .command()
+        .arg("prune")
+        .output()
+        .expect("failed to run prune");
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("invalid UTF-8");
+    assert!(
+        stderr.contains("symlink loop") && stderr.contains("reservation preserved"),
+        "symlink loop should produce a preservation warning: {stderr}"
+    );
+    assert_eq!(env.reservation_count(), 1);
+}
+
+/// A dangling symlink has no directory target and is definitively stale.
+#[cfg(unix)]
+#[test]
+fn test_prune_removes_dangling_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let env = TestEnv::new();
+    let missing_target = env.path().join("missing-target");
+    let link = env.path().join("dangling-link");
+    symlink(&missing_target, &link).expect("failed to create dangling link");
+    env.reserve_simple(&link);
+
+    let output = env
+        .command()
+        .arg("prune")
+        .output()
+        .expect("failed to run prune");
+    assert!(output.status.success());
+    assert_eq!(env.reservation_count(), 0);
+}
+
+/// Reservation targets are directories; an exact-path regular file is stale.
+#[test]
+fn test_prune_removes_regular_file_targets() {
+    let env = TestEnv::new();
+    let file = env.path().join("not-a-directory");
+    fs::write(&file, b"replacement").expect("failed to create regular file");
+    env.reserve_simple(&file);
+
+    let output = env
+        .command()
+        .arg("prune")
+        .output()
+        .expect("failed to run prune");
+    assert!(output.status.success());
+    assert_eq!(
+        env.reservation_count(),
+        0,
+        "a regular file cannot keep a directory reservation alive"
+    );
+}
+
 // ============================================================================
 // Expire Command Tests
 // ============================================================================
