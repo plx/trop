@@ -55,8 +55,20 @@ impl PlanAction {
     #[must_use]
     pub fn description(&self) -> String {
         match self {
+            Self::CreateReservation(r) if r.requires_allocation_at_execution() => {
+                format!(
+                    "Retry reservation for {} with enabled automatic cleanup after exhaustion",
+                    r.key()
+                )
+            }
             Self::CreateReservation(r) => {
                 format!("Create reservation for {} on port {}", r.key(), r.port())
+            }
+            Self::UpdateReservation(r) if r.requires_allocation_at_execution() => {
+                format!(
+                    "Retry replacement for {} with enabled automatic cleanup after exhaustion",
+                    r.key()
+                )
             }
             Self::UpdateReservation(r) => {
                 format!("Update reservation for {} to port {}", r.key(), r.port())

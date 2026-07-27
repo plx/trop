@@ -68,15 +68,27 @@ fn test_toctou_port_availability() {
     )
     .unwrap();
 
-    // Spawn 20 processes trying to reserve from the same small pool
-    // This guarantees we'll exhaust the pool and test failure handling
-    let handles: Vec<_> = (0..20)
+    // Keep every reservation path live so automatic pruning cannot turn this
+    // allocation-only race into a cleanup-and-reuse scenario.
+    let reservation_dirs: Vec<_> = (0..20)
         .map(|i| {
+            let path = temp_dir.path().join(format!("race-{i}"));
+            std::fs::create_dir(&path).unwrap();
+            path
+        })
+        .collect();
+
+    // Spawn 20 processes trying to reserve from the same small pool.
+    // This guarantees we'll exhaust the pool and test failure handling.
+    let handles: Vec<_> = reservation_dirs
+        .into_iter()
+        .enumerate()
+        .map(|(i, reservation_dir)| {
             let data_dir = data_dir.clone();
             thread::spawn(move || {
                 // Small staggered delay to increase chance of TOCTOU collision
                 // (processes checking availability around the same time)
-                thread::sleep(Duration::from_millis(i * 5));
+                thread::sleep(Duration::from_millis(u64::try_from(i).unwrap() * 5));
 
                 trop_cmd()
                     .args([
@@ -84,7 +96,7 @@ fn test_toctou_port_availability() {
                         data_dir.to_str().unwrap(),
                         "reserve",
                         "--path",
-                        &format!("/tmp/race-{i}"),
+                        reservation_dir.to_str().unwrap(),
                         "--allow-unrelated-path",
                     ])
                     .output()

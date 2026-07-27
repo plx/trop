@@ -197,7 +197,11 @@ pub enum Error {
     },
 
     /// No ports are available in the specified range.
-    #[error("port range {range} exhausted{}", if *.tried_cleanup { " after cleanup" } else { "" })]
+    #[error(
+        "port range {range} exhausted{}{}",
+        if *.tried_cleanup { " after cleanup" } else { "" },
+        range.exhaustion_details().map_or_else(String::new, |details| details.to_string())
+    )]
     PortExhausted {
         /// The port range that was exhausted.
         range: crate::port::PortRange,
@@ -286,6 +290,16 @@ impl From<crate::reservation::ValidationError> for Error {
 }
 
 impl Error {
+    /// Return structured cleanup and blocker context for a port-exhaustion
+    /// failure produced by reserve allocation.
+    #[must_use]
+    pub const fn port_exhaustion_details(&self) -> Option<crate::port::PortExhaustionDetails> {
+        match self {
+            Self::PortExhausted { range, .. } => range.exhaustion_details(),
+            _ => None,
+        }
+    }
+
     /// Converts a `SQLite` Busy or Locked failure into the lock-timeout
     /// contract while leaving every other error unchanged.
     ///

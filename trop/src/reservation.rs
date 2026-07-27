@@ -197,7 +197,7 @@ impl std::fmt::Display for ReservationKey {
 ///
 /// assert_eq!(reservation.port(), port);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Reservation {
     key: ReservationKey,
     port: Port,
@@ -206,6 +206,8 @@ pub struct Reservation {
     sticky: bool,
     created_at: SystemTime,
     last_used_at: SystemTime,
+    #[serde(skip)]
+    deferred_reserve: Option<Box<crate::operations::reserve::DeferredReserve>>,
 }
 
 impl Reservation {
@@ -276,6 +278,29 @@ impl Reservation {
         self.last_used_at
     }
 
+    /// Whether this reservation is a plan placeholder whose final port will be
+    /// selected atomically by [`crate::operations::PlanExecutor`].
+    ///
+    /// This is true only for a reserve plan created after initial allocation
+    /// exhaustion. In that case [`Self::port`] is a non-persistent placeholder,
+    /// and the executor's result contains the selected port.
+    #[must_use]
+    pub const fn requires_allocation_at_execution(&self) -> bool {
+        self.deferred_reserve.is_some()
+    }
+
+    pub(crate) fn with_deferred_reserve(
+        mut self,
+        deferred_reserve: crate::operations::reserve::DeferredReserve,
+    ) -> Self {
+        self.deferred_reserve = Some(Box::new(deferred_reserve));
+        self
+    }
+
+    pub(crate) fn deferred_reserve(&self) -> Option<&crate::operations::reserve::DeferredReserve> {
+        self.deferred_reserve.as_deref()
+    }
+
     /// Checks if the reservation has expired based on the given maximum age.
     ///
     /// A reservation is considered expired if it hasn't been used for longer
@@ -302,6 +327,37 @@ impl Reservation {
             .is_ok_and(|age| age > max_age)
     }
 }
+
+// Preserve the published persisted-record debug representation; deferred
+// executor intent is neither stored reservation data nor safe diagnostic text.
+#[allow(clippy::missing_fields_in_debug)]
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reservation")
+            .field("key", &self.key)
+            .field("port", &self.port)
+            .field("project", &self.project)
+            .field("task", &self.task)
+            .field("sticky", &self.sticky)
+            .field("created_at", &self.created_at)
+            .field("last_used_at", &self.last_used_at)
+            .finish()
+    }
+}
+
+impl PartialEq for Reservation {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.port == other.port
+            && self.project == other.project
+            && self.task == other.task
+            && self.sticky == other.sticky
+            && self.created_at == other.created_at
+            && self.last_used_at == other.last_used_at
+    }
+}
+
+impl Eq for Reservation {}
 
 /// Builder for creating `Reservation` instances.
 ///
@@ -417,6 +473,7 @@ impl ReservationBuilder {
             sticky: self.sticky,
             created_at: self.created_at.unwrap_or(now),
             last_used_at: self.last_used_at.unwrap_or(now),
+            deferred_reserve: None,
         })
     }
 }

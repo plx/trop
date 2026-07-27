@@ -60,5 +60,7 @@ pub use operations::{
     ReserveOptions, ReservePlan,
 };
 pub use path::{PathProvenance, PathRelationship, PathResolver};
-pub use port::{Port, PortRange};
+pub use port::{
+    AutomaticCleanupStatus, Port, PortExhaustionBlockers, PortExhaustionDetails, PortRange,
+};
 pub use reservation::{Reservation, ReservationKey};

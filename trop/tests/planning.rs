@@ -24,6 +24,25 @@ use trop::{
     ReservationKey, ReserveOptions, ReservePlan,
 };
 
+fn published_plan_action_kind(action: &PlanAction) -> &'static str {
+    match action {
+        PlanAction::CreateReservation(_) => "create",
+        PlanAction::UpdateReservation(_) => "update",
+        PlanAction::UpdateLastUsed(_) => "refresh",
+        PlanAction::DeleteReservation(_) => "delete",
+        PlanAction::AllocateGroup { .. } => "group",
+    }
+}
+
+#[test]
+fn published_plan_action_enum_remains_exhaustively_matchable() {
+    let key = ReservationKey::new(PathBuf::from("/test/compatibility"), None).unwrap();
+    assert_eq!(
+        published_plan_action_kind(&PlanAction::UpdateLastUsed(key)),
+        "refresh"
+    );
+}
+
 // Port base constants for test organization
 const PORT_BASE_NEW_RESERVATION: u16 = 7000;
 const PORT_BASE_EXISTING_RESERVATION: u16 = 7010;

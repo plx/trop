@@ -20,6 +20,7 @@ use serde_json::Value;
 use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::path::Path;
 use std::process::Command as ProcessCommand;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StoredReservation {
@@ -70,6 +71,51 @@ fn set_single_reservation_timestamps(env: &TestEnv, created_at: i64, last_used_a
         )
         .expect("Failed to set reservation timestamps");
     assert_eq!(updated, 1, "Expected exactly one reservation");
+}
+
+fn reserve_one_port_fixture(env: &TestEnv, path: &Path, port: u16) {
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(path)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--min")
+        .arg(port.to_string())
+        .arg("--max")
+        .arg(port.to_string())
+        .arg("--ignore-occupied")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .success()
+        .stdout(format!("{port}\n"));
+}
+
+fn one_port_reserve_command(env: &TestEnv, path: &Path, port: u16) -> Command {
+    let mut command = env.command();
+    command
+        .arg("reserve")
+        .arg("--path")
+        .arg(path)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--min")
+        .arg(port.to_string())
+        .arg("--max")
+        .arg(port.to_string())
+        .arg("--ignore-occupied")
+        .arg("--allow-unrelated-path");
+    command
+}
+
+fn make_single_reservation_expired(env: &TestEnv) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock predates Unix epoch")
+        .as_secs();
+    let expired = now - 31 * 24 * 60 * 60;
+    let expired = i64::try_from(expired).expect("test timestamp fits in SQLite integer");
+    set_single_reservation_timestamps(env, expired, expired);
 }
 
 fn occupied_port_with_free_neighbor() -> (TcpListener, u16) {
@@ -590,6 +636,240 @@ fn test_reserve_with_min_only_uses_existing_max() {
         (min_port..=7000).contains(&port),
         "Port {port} should be in range [{min_port}, 7000]"
     );
+}
+
+// ============================================================================
+// Automatic Cleanup and Exhaustion Retry Tests
+// ============================================================================
+
+/// Exhaustion on a missing-path reservation must prune it and retry once.
+#[test]
+fn test_reserve_autoprunes_missing_path_and_retries_once() {
+    let env = TestEnv::new();
+    let stale_path = env.create_dir("stale-project");
+    let replacement_path = env.create_dir("replacement-project");
+    let port = adjacent_available_ports().0;
+    reserve_one_port_fixture(&env, &stale_path, port);
+    std::fs::remove_dir(&stale_path).expect("failed to remove stale fixture path");
+
+    one_port_reserve_command(&env, &replacement_path, port)
+        .assert()
+        .success()
+        .stdout(format!("{port}\n"))
+        .stderr(predicate::str::contains("Automatic cleanup"));
+
+    let reservations = stored_reservations(&env);
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].path, replacement_path.to_string_lossy());
+    assert_eq!(reservations[0].port, port);
+}
+
+/// Exhaustion on an expired reservation for an existing path must expire it
+/// and retry once.
+#[test]
+fn test_reserve_autoexpires_existing_path_and_retries_once() {
+    let env = TestEnv::new();
+    let expired_path = env.create_dir("expired-project");
+    let replacement_path = env.create_dir("replacement-project");
+    let port = adjacent_available_ports().0;
+    reserve_one_port_fixture(&env, &expired_path, port);
+    make_single_reservation_expired(&env);
+
+    one_port_reserve_command(&env, &replacement_path, port)
+        .assert()
+        .success()
+        .stdout(format!("{port}\n"))
+        .stderr(predicate::str::contains("Automatic cleanup"));
+
+    let reservations = stored_reservations(&env);
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].path, replacement_path.to_string_lossy());
+    assert_eq!(reservations[0].port, port);
+}
+
+/// Disabling autoprune must preserve a fresh missing-path reservation even
+/// though the still-enabled expiration phase is attempted.
+#[test]
+fn test_reserve_disable_autoprune_preserves_missing_path() {
+    let env = TestEnv::new();
+    let stale_path = env.create_dir("stale-project");
+    let replacement_path = env.create_dir("replacement-project");
+    let port = adjacent_available_ports().0;
+    reserve_one_port_fixture(&env, &stale_path, port);
+    std::fs::remove_dir(&stale_path).expect("failed to remove stale fixture path");
+
+    one_port_reserve_command(&env, &replacement_path, port)
+        .arg("--disable-autoprune")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("after cleanup")
+                .and(predicate::str::contains("automatic pruning disabled")),
+        );
+
+    let reservations = stored_reservations(&env);
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].path, stale_path.to_string_lossy());
+}
+
+/// Disabling autoexpire must preserve an old reservation whose path still
+/// exists even though the still-enabled prune phase is attempted.
+#[test]
+fn test_reserve_disable_autoexpire_preserves_expired_path() {
+    let env = TestEnv::new();
+    let expired_path = env.create_dir("expired-project");
+    let replacement_path = env.create_dir("replacement-project");
+    let port = adjacent_available_ports().0;
+    reserve_one_port_fixture(&env, &expired_path, port);
+    make_single_reservation_expired(&env);
+
+    one_port_reserve_command(&env, &replacement_path, port)
+        .arg("--disable-autoexpire")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("after cleanup")
+                .and(predicate::str::contains("automatic expiration disabled")),
+        );
+
+    let reservations = stored_reservations(&env);
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].path, expired_path.to_string_lossy());
+}
+
+/// Combined disable remains authoritative under force and skips cleanup
+/// entirely, so exhaustion is not reported as occurring after cleanup.
+#[test]
+fn test_reserve_disable_autoclean_is_not_overridden_by_force() {
+    let env = TestEnv::new();
+    let stale_path = env.create_dir("stale-project");
+    let replacement_path = env.create_dir("replacement-project");
+    let port = adjacent_available_ports().0;
+    reserve_one_port_fixture(&env, &stale_path, port);
+    std::fs::remove_dir(&stale_path).expect("failed to remove stale fixture path");
+    make_single_reservation_expired(&env);
+
+    one_port_reserve_command(&env, &replacement_path, port)
+        .arg("--disable-autoclean")
+        .arg("--force")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("port range")
+                .and(predicate::str::contains(
+                    "automatic pruning and expiration disabled",
+                ))
+                .and(predicate::str::contains("after cleanup").not()),
+        );
+
+    let reservations = stored_reservations(&env);
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].path, stale_path.to_string_lossy());
+}
+
+/// Environment-derived disable policy must reach the automatic cleanup path.
+#[test]
+fn test_reserve_honors_environment_disable_autoprune() {
+    let env = TestEnv::new();
+    let stale_path = env.create_dir("stale-project");
+    let replacement_path = env.create_dir("replacement-project");
+    let port = adjacent_available_ports().0;
+    reserve_one_port_fixture(&env, &stale_path, port);
+    std::fs::remove_dir(&stale_path).expect("failed to remove stale fixture path");
+
+    one_port_reserve_command(&env, &replacement_path, port)
+        .env("TROP_DISABLE_AUTOPRUNE", "true")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("automatic pruning disabled"));
+
+    assert_eq!(stored_reservations(&env).len(), 1);
+}
+
+/// Data-directory configuration must reach the automatic cleanup path.
+#[test]
+fn test_reserve_honors_configured_disable_autoexpire() {
+    let env = TestEnv::new();
+    let expired_path = env.create_dir("expired-project");
+    let replacement_path = env.create_dir("replacement-project");
+    let port = adjacent_available_ports().0;
+    reserve_one_port_fixture(&env, &expired_path, port);
+    make_single_reservation_expired(&env);
+    std::fs::write(
+        env.data_dir.join("config.yaml"),
+        "disable_autoexpire: true\n",
+    )
+    .expect("failed to write global config");
+
+    one_port_reserve_command(&env, &replacement_path, port)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("automatic expiration disabled"));
+
+    assert_eq!(stored_reservations(&env).len(), 1);
+}
+
+/// Quiet mode must retain shell-friendly stdout while suppressing automatic
+/// cleanup details from stderr.
+#[test]
+fn test_reserve_quiet_autocleanup_suppresses_destructive_details() {
+    let env = TestEnv::new();
+    let stale_path = env.create_dir("stale-project");
+    let replacement_path = env.create_dir("replacement-project");
+    let port = adjacent_available_ports().0;
+    reserve_one_port_fixture(&env, &stale_path, port);
+    std::fs::remove_dir(&stale_path).expect("failed to remove stale fixture path");
+
+    one_port_reserve_command(&env, &replacement_path, port)
+        .arg("--quiet")
+        .assert()
+        .success()
+        .stdout(format!("{port}\n"))
+        .stderr(predicate::str::is_empty());
+
+    assert_eq!(stored_reservations(&env).len(), 1);
+}
+
+/// If cleanup finds a candidate but the freed port is still occupied, the
+/// single retry must fail and the enclosing reserve transaction must restore
+/// the cleaned row.
+#[test]
+fn test_reserve_cleanup_retry_failure_rolls_back_cleanup() {
+    let env = TestEnv::new();
+    let stale_path = env.create_dir("stale-project");
+    let replacement_path = env.create_dir("replacement-project");
+    let (occupied_listener, _) = occupied_port_with_free_neighbor();
+    let port = occupied_listener
+        .local_addr()
+        .expect("failed to inspect occupied fixture port")
+        .port();
+    reserve_one_port_fixture(&env, &stale_path, port);
+    std::fs::remove_dir(&stale_path).expect("failed to remove stale fixture path");
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&replacement_path)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--min")
+        .arg(port.to_string())
+        .arg("--max")
+        .arg(port.to_string())
+        .arg("--allow-unrelated-path")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("after cleanup").and(predicate::str::contains(
+                "remaining blockers after the single retry: occupied",
+            )),
+        );
+
+    let reservations = stored_reservations(&env);
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].path, stale_path.to_string_lossy());
+    assert_eq!(reservations[0].port, port);
+    drop(occupied_listener);
 }
 
 // ============================================================================

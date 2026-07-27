@@ -23,6 +23,7 @@ use std::time::Duration;
 use crate::config::CleanupConfig;
 use crate::database::Database;
 use crate::{Reservation, Result};
+use rusqlite::Connection;
 
 /// Number of seconds in a day, used for expiration calculations.
 const SECONDS_PER_DAY: u64 = 86400;
@@ -436,6 +437,41 @@ impl CleanupOperations {
             error.classify_sqlite_lock(timeout, "automatically cleaning reservations")
         })?;
 
+        Ok(Self::autoclean_result(execution))
+    }
+
+    /// Run the enabled automatic-cleanup phases inside a transaction already
+    /// owned by a reserve invocation.
+    pub(crate) fn automatic_cleanup_in_connection<B>(
+        conn: &Connection,
+        config: &CleanupConfig,
+        prune: bool,
+        expire: bool,
+        after_candidate_discovery: B,
+    ) -> Result<AutocleanResult>
+    where
+        B: FnOnce(),
+    {
+        #[allow(clippy::cast_lossless)]
+        let max_age = expire
+            .then(|| {
+                config
+                    .expire_after_days
+                    .map(|days| Duration::from_secs(days as u64 * SECONDS_PER_DAY))
+            })
+            .flatten();
+        let execution = Self::execute_cleanup_in_connection(
+            conn,
+            CleanupSelection { prune, max_age },
+            false,
+            Self::probe_path,
+            after_candidate_discovery,
+        )?;
+
+        Ok(Self::autoclean_result(execution))
+    }
+
+    fn autoclean_result(execution: CleanupExecution) -> AutocleanResult {
         let mut pruned_reservations = Vec::new();
         let mut expired_reservations = Vec::new();
         let mut removed_reservations = Vec::with_capacity(execution.removed.len());
@@ -447,7 +483,7 @@ impl CleanupOperations {
             removed_reservations.push(removal.reservation);
         }
 
-        Ok(AutocleanResult {
+        AutocleanResult {
             considered_count: execution.considered_reservations.len(),
             preserved_count: execution.preserved_reservations.len(),
             pruned_count: pruned_reservations.len(),
@@ -459,7 +495,7 @@ impl CleanupOperations {
             pruned_reservations,
             expired_reservations,
             prune_path_decisions: execution.path_decisions,
-        })
+        }
     }
 
     fn execute_cleanup<F, B>(
@@ -477,8 +513,30 @@ impl CleanupOperations {
         // entire invocation one linearization point relative to reserve,
         // reserve-group, and other cleanup writers.
         let transaction = db.begin_transaction()?;
+        let execution = Self::execute_cleanup_in_connection(
+            &transaction,
+            selection,
+            dry_run,
+            probe,
+            after_candidate_discovery,
+        )?;
+        transaction.commit()?;
+        Ok(execution)
+    }
+
+    fn execute_cleanup_in_connection<F, B>(
+        conn: &Connection,
+        selection: CleanupSelection,
+        dry_run: bool,
+        probe: F,
+        after_candidate_discovery: B,
+    ) -> Result<CleanupExecution>
+    where
+        F: Fn(&Path) -> io::Result<ProbedPath>,
+        B: FnOnce(),
+    {
         let evaluated_at = Self::captured_evaluation_time();
-        let considered_reservations = Database::list_all_reservations(&transaction)?;
+        let considered_reservations = Database::list_all_reservations(conn)?;
 
         // Probe each distinct path once inside the transaction so all tags for
         // that path share one observation. The selected reservation snapshot
@@ -546,7 +604,7 @@ impl CleanupOperations {
         } else {
             let mut removed = Vec::with_capacity(planned_removals.len());
             for planned in planned_removals {
-                let current = Database::get_reservation(&transaction, planned.reservation.key())?;
+                let current = Database::get_reservation(conn, planned.reservation.key())?;
                 let Some(current) = current else {
                     // A database trigger may have removed another selected row
                     // as part of an earlier guarded delete in this transaction.
@@ -572,10 +630,10 @@ impl CleanupOperations {
                     continue;
                 }
 
-                if Database::delete_reservation_if_unchanged(&transaction, &current)? {
+                if Database::delete_reservation_if_unchanged(conn, &current)? {
                     removed.push(planned);
                 } else if let Some(current) =
-                    Database::get_reservation(&transaction, planned.reservation.key())?
+                    Database::get_reservation(conn, planned.reservation.key())?
                 {
                     preserved_reservations.push(current);
                 } else {
@@ -584,8 +642,6 @@ impl CleanupOperations {
             }
             removed
         };
-
-        transaction.commit()?;
 
         Ok(CleanupExecution {
             considered_reservations,

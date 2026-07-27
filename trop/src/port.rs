@@ -169,6 +169,186 @@ impl fmt::Display for InvalidPortError {
 
 impl std::error::Error for InvalidPortError {}
 
+/// Structured summary of the automatic cleanup attempted after allocation
+/// exhaustion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AutomaticCleanupStatus {
+    attempted: bool,
+    prune_enabled: bool,
+    expire_enabled: bool,
+    pruned: usize,
+    expired: usize,
+}
+
+impl AutomaticCleanupStatus {
+    pub(crate) const fn new(
+        attempted: bool,
+        prune_enabled: bool,
+        expire_enabled: bool,
+        pruned: usize,
+        expired: usize,
+    ) -> Self {
+        Self {
+            attempted,
+            prune_enabled,
+            expire_enabled,
+            pruned,
+            expired,
+        }
+    }
+
+    /// Whether automatic cleanup ran.
+    #[must_use]
+    pub const fn attempted(self) -> bool {
+        self.attempted
+    }
+
+    /// Whether stale-path pruning was enabled.
+    #[must_use]
+    pub const fn prune_enabled(self) -> bool {
+        self.prune_enabled
+    }
+
+    /// Whether age-based expiration was enabled.
+    #[must_use]
+    pub const fn expire_enabled(self) -> bool {
+        self.expire_enabled
+    }
+
+    /// Number of reservations removed by pruning.
+    #[must_use]
+    pub const fn pruned(self) -> usize {
+        self.pruned
+    }
+
+    /// Number of reservations removed by expiration.
+    #[must_use]
+    pub const fn expired(self) -> usize {
+        self.expired
+    }
+
+    fn policy_description(self) -> &'static str {
+        match (self.prune_enabled, self.expire_enabled) {
+            (true, true) => "automatic pruning and expiration enabled",
+            (true, false) => "automatic expiration disabled",
+            (false, true) => "automatic pruning disabled",
+            (false, false) => "automatic pruning and expiration disabled",
+        }
+    }
+}
+
+/// Typed reasons that prevented every port in a configured range from being
+/// allocated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PortExhaustionBlockers {
+    reserved: bool,
+    excluded: bool,
+    occupied: bool,
+}
+
+impl PortExhaustionBlockers {
+    pub(crate) const fn new(reserved: bool, excluded: bool, occupied: bool) -> Self {
+        Self {
+            reserved,
+            excluded,
+            occupied,
+        }
+    }
+
+    /// Whether stored reservations blocked at least one candidate.
+    #[must_use]
+    pub const fn reserved(self) -> bool {
+        self.reserved
+    }
+
+    /// Whether configured exclusions blocked at least one candidate.
+    #[must_use]
+    pub const fn excluded(self) -> bool {
+        self.excluded
+    }
+
+    /// Whether operating-system occupancy blocked at least one candidate.
+    #[must_use]
+    pub const fn occupied(self) -> bool {
+        self.occupied
+    }
+}
+
+impl fmt::Display for PortExhaustionBlockers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut separator = "";
+        for (blocked, description) in [
+            (self.reserved, "reserved"),
+            (self.excluded, "excluded"),
+            (self.occupied, "occupied"),
+        ] {
+            if blocked {
+                write!(f, "{separator}{description}")?;
+                separator = ", ";
+            }
+        }
+        if separator.is_empty() {
+            write!(f, "unavailable")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Machine-readable context for a [`crate::Error::PortExhausted`] failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PortExhaustionDetails {
+    cleanup: AutomaticCleanupStatus,
+    blockers: PortExhaustionBlockers,
+}
+
+impl PortExhaustionDetails {
+    pub(crate) const fn new(
+        cleanup: AutomaticCleanupStatus,
+        blockers: PortExhaustionBlockers,
+    ) -> Self {
+        Self { cleanup, blockers }
+    }
+
+    /// Automatic-cleanup policy and aggregate outcome.
+    #[must_use]
+    pub const fn cleanup(self) -> AutomaticCleanupStatus {
+        self.cleanup
+    }
+
+    /// Typed reasons that kept the range exhausted.
+    #[must_use]
+    pub const fn blockers(self) -> PortExhaustionBlockers {
+        self.blockers
+    }
+}
+
+impl fmt::Display for PortExhaustionDetails {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.cleanup.attempted {
+            write!(
+                f,
+                ": remaining blockers after the single retry: {}; automatic cleanup pruned {} \
+                 and expired {} reservation(s); {}",
+                self.blockers,
+                self.cleanup.pruned,
+                self.cleanup.expired,
+                self.cleanup.policy_description()
+            )
+        } else {
+            write!(
+                f,
+                ": cleanup was skipped ({}); remaining blockers: {}",
+                self.cleanup.policy_description(),
+                self.blockers
+            )
+        }
+    }
+}
+
 /// A range of ports (inclusive on both ends).
 ///
 /// # Examples
@@ -184,10 +364,11 @@ impl std::error::Error for InvalidPortError {}
 /// assert!(range.contains(Port::try_from(5005).unwrap()));
 /// assert!(!range.contains(Port::try_from(4999).unwrap()));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub struct PortRange {
     min: Port,
     max: Port,
+    exhaustion_details: Option<PortExhaustionDetails>,
 }
 
 impl PortRange {
@@ -217,8 +398,21 @@ impl PortRange {
                 reason: "max must be greater than or equal to min".into(),
             })
         } else {
-            Ok(Self { min, max })
+            Ok(Self {
+                min,
+                max,
+                exhaustion_details: None,
+            })
         }
+    }
+
+    pub(crate) const fn with_exhaustion_details(mut self, details: PortExhaustionDetails) -> Self {
+        self.exhaustion_details = Some(details);
+        self
+    }
+
+    pub(crate) const fn exhaustion_details(self) -> Option<PortExhaustionDetails> {
+        self.exhaustion_details
     }
 
     /// Returns the minimum port in the range.
@@ -306,6 +500,26 @@ impl PortRange {
         }
     }
 }
+
+// Preserve the published range-only debug representation; the private
+// exhaustion annotation is error context, not part of range identity.
+#[allow(clippy::missing_fields_in_debug)]
+impl fmt::Debug for PortRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PortRange")
+            .field("min", &self.min)
+            .field("max", &self.max)
+            .finish()
+    }
+}
+
+impl PartialEq for PortRange {
+    fn eq(&self, other: &Self) -> bool {
+        self.min == other.min && self.max == other.max
+    }
+}
+
+impl Eq for PortRange {}
 
 impl fmt::Display for PortRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
