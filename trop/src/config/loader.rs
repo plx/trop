@@ -6,6 +6,7 @@
 use crate::config::schema::Config;
 use crate::error::{Error, Result};
 use crate::PathResolver;
+use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -36,6 +37,67 @@ pub struct ConfigSource {
     pub config: Config,
 }
 
+/// Reservation-group operation declared by one YAML document.
+///
+/// `Config` intentionally retains its public `Option<ReservationGroup>` shape,
+/// so file loading keeps the distinction between an omitted key and explicit
+/// YAML `null` alongside the parsed value until effective merging is complete.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ReservationOverlay {
+    /// The document omits `reservations` and inherits a lower-precedence group.
+    #[default]
+    Inherit,
+    /// The document supplies a complete replacement group.
+    Replace,
+    /// The document explicitly clears the effective group with YAML `null`.
+    Clear,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EffectiveConfigSource {
+    pub(crate) path: PathBuf,
+    pub(crate) precedence: u8,
+    pub(crate) config: Config,
+    pub(crate) reservations: ReservationOverlay,
+}
+
+impl EffectiveConfigSource {
+    fn into_public(self) -> ConfigSource {
+        ConfigSource {
+            path: self.path,
+            precedence: self.precedence,
+            config: self.config,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConfigDocument {
+    config: Config,
+    reservations: ReservationOverlay,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ReservationPresence {
+    #[serde(default, deserialize_with = "deserialize_reservation_overlay")]
+    reservations: ReservationOverlay,
+}
+
+fn deserialize_reservation_overlay<'de, D>(
+    deserializer: D,
+) -> std::result::Result<ReservationOverlay, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde::de::IgnoredAny>::deserialize(deserializer).map(|value| {
+        if value.is_some() {
+            ReservationOverlay::Replace
+        } else {
+            ReservationOverlay::Clear
+        }
+    })
+}
+
 /// Loads configuration from various sources.
 ///
 /// # Examples
@@ -64,15 +126,27 @@ impl ConfigLoader {
     /// Returns an error if any configuration file exists but cannot be read
     /// or parsed.
     pub fn load_all(working_dir: &Path, data_dir: Option<&Path>) -> Result<Vec<ConfigSource>> {
+        Self::load_all_effective(working_dir, data_dir).map(|sources| {
+            sources
+                .into_iter()
+                .map(EffectiveConfigSource::into_public)
+                .collect()
+        })
+    }
+
+    pub(crate) fn load_all_effective(
+        working_dir: &Path,
+        data_dir: Option<&Path>,
+    ) -> Result<Vec<EffectiveConfigSource>> {
         let mut sources = Vec::new();
 
         // Load user config (~/.trop/config.yaml or custom data dir)
-        if let Some(user_config) = Self::load_user_config(data_dir)? {
+        if let Some(user_config) = Self::load_user_config_effective(data_dir)? {
             sources.push(user_config);
         }
 
         // Walk up directory tree looking for trop.yaml/trop.local.yaml
-        let project_configs = Self::discover_project_configs(working_dir)?;
+        let project_configs = Self::discover_project_configs_effective(working_dir)?;
         sources.extend(project_configs);
 
         // Sort by precedence (higher precedence last for easier processing)
@@ -84,28 +158,31 @@ impl ConfigLoader {
     pub(crate) fn load_with_project_file(
         project_file: &Path,
         data_dir: Option<&Path>,
-    ) -> Result<Vec<ConfigSource>> {
+    ) -> Result<Vec<EffectiveConfigSource>> {
         let mut sources = Vec::new();
 
-        if let Some(user_config) = Self::load_user_config(data_dir)? {
+        if let Some(user_config) = Self::load_user_config_effective(data_dir)? {
             sources.push(user_config);
         }
 
-        let precedence = if project_file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == "trop.local.yaml")
-        {
-            3
-        } else {
-            2
-        };
+        if !project_file.exists() {
+            // Preserve the explicit-file contract even when a canonically
+            // named sibling happens to exist.
+            Self::load_effective_source(project_file, 2)?;
+        }
 
-        sources.push(ConfigSource {
-            path: project_file.to_path_buf(),
-            precedence,
-            config: Self::load_file(project_file)?,
-        });
+        match project_file.file_name().and_then(|name| name.to_str()) {
+            Some("trop.yaml" | "trop.local.yaml") => {
+                let parent = project_file.parent().unwrap_or_else(|| Path::new(""));
+                for (name, precedence) in [("trop.yaml", 2), ("trop.local.yaml", 3)] {
+                    let path = parent.join(name);
+                    if path.exists() {
+                        sources.push(Self::load_effective_source(&path, precedence)?);
+                    }
+                }
+            }
+            _ => sources.push(Self::load_effective_source(project_file, 2)?),
+        }
         sources.sort_by_key(|source| source.precedence);
         Ok(sources)
     }
@@ -118,7 +195,9 @@ impl ConfigLoader {
     /// # Errors
     ///
     /// Returns an error if the file exists but cannot be read or parsed.
-    fn load_user_config(data_dir: Option<&Path>) -> Result<Option<ConfigSource>> {
+    fn load_user_config_effective(
+        data_dir: Option<&Path>,
+    ) -> Result<Option<EffectiveConfigSource>> {
         let config_path = if let Some(dir) = data_dir {
             dir.join("config.yaml")
         } else {
@@ -129,12 +208,7 @@ impl ConfigLoader {
             return Ok(None);
         }
 
-        let config = Self::load_file(&config_path)?;
-        Ok(Some(ConfigSource {
-            path: config_path,
-            precedence: 1, // Lowest precedence
-            config,
-        }))
+        Self::load_effective_source(&config_path, 1).map(Some)
     }
 
     /// Discover project configurations by walking up directories.
@@ -149,6 +223,15 @@ impl ConfigLoader {
     /// Returns an error if the discovery root cannot be canonicalized or if any
     /// discovered file cannot be read or parsed.
     pub fn discover_project_configs(start_dir: &Path) -> Result<Vec<ConfigSource>> {
+        Self::discover_project_configs_effective(start_dir).map(|sources| {
+            sources
+                .into_iter()
+                .map(EffectiveConfigSource::into_public)
+                .collect()
+        })
+    }
+
+    fn discover_project_configs_effective(start_dir: &Path) -> Result<Vec<EffectiveConfigSource>> {
         let mut configs = Vec::new();
         let mut current = PathResolver::new()
             .resolve_implicit(start_dir)?
@@ -160,24 +243,14 @@ impl ConfigLoader {
             // Check for trop.yaml
             let trop_yaml = current.join("trop.yaml");
             if trop_yaml.exists() {
-                let config = Self::load_file(&trop_yaml)?;
-                configs.push(ConfigSource {
-                    path: trop_yaml,
-                    precedence: 2,
-                    config,
-                });
+                configs.push(Self::load_effective_source(&trop_yaml, 2)?);
                 found_any = true;
             }
 
             // Check for trop.local.yaml (higher precedence)
             let trop_local = current.join("trop.local.yaml");
             if trop_local.exists() {
-                let config = Self::load_file(&trop_local)?;
-                configs.push(ConfigSource {
-                    path: trop_local,
-                    precedence: 3,
-                    config,
-                });
+                configs.push(Self::load_effective_source(&trop_local, 3)?);
                 found_any = true;
             }
 
@@ -196,14 +269,36 @@ impl ConfigLoader {
     ///
     /// Returns an error if the file cannot be read or the YAML is invalid.
     pub fn load_file(path: &Path) -> Result<Config> {
+        Self::load_document(path).map(|document| document.config)
+    }
+
+    fn load_effective_source(path: &Path, precedence: u8) -> Result<EffectiveConfigSource> {
+        let document = Self::load_document(path)?;
+        Ok(EffectiveConfigSource {
+            path: path.to_path_buf(),
+            precedence,
+            config: document.config,
+            reservations: document.reservations,
+        })
+    }
+
+    fn load_document(path: &Path) -> Result<ConfigDocument> {
         let contents = fs::read_to_string(path).map_err(|e| Error::InvalidPath {
             path: path.to_path_buf(),
             reason: format!("Failed to read configuration file: {e}"),
         })?;
 
-        serde_yaml::from_str(&contents).map_err(|e| Error::Validation {
+        let invalid_yaml = |error: serde_yaml::Error| Error::Validation {
             field: format!("{}", path.display()),
-            message: format!("Invalid YAML: {e}"),
+            message: format!("Invalid YAML: {error}"),
+        };
+        let config = serde_yaml::from_str(&contents).map_err(&invalid_yaml)?;
+        let presence: ReservationPresence =
+            serde_yaml::from_str(&contents).map_err(invalid_yaml)?;
+
+        Ok(ConfigDocument {
+            config,
+            reservations: presence.reservations,
         })
     }
 

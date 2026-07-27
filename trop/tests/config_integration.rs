@@ -2529,3 +2529,278 @@ reservations:
     assert_eq!(autoreserve.discovered_config_path(), &project_path);
     assert_eq!(autoreserve.config(), effective.config());
 }
+
+/// Canonically named explicit group files compose their sibling project layers.
+#[test]
+fn test_effective_explicit_group_file_loads_project_and_local_siblings() {
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("data");
+    let project_dir = temp.path().join("project");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&project_dir).unwrap();
+    let project_path = create_temp_config(
+        &project_dir,
+        "trop.yaml",
+        r"
+project: base-project
+reservations:
+  services:
+    web:
+      offset: 0
+      env: WEB_PORT
+",
+    );
+    let local_path = create_temp_config(
+        &project_dir,
+        "trop.local.yaml",
+        r"
+project: local-project
+excluded_ports: [5001]
+",
+    );
+
+    for nominated_path in [&project_path, &local_path] {
+        let effective = ConfigBuilder::new()
+            .with_data_dir(&data_dir)
+            .with_project_file(nominated_path)
+            .skip_env()
+            .build_effective()
+            .unwrap();
+
+        assert_eq!(effective.project(), Some("local-project"));
+        assert_eq!(effective.excluded_ports(), &[PortExclusion::Single(5001)]);
+        assert!(effective
+            .reservations()
+            .unwrap()
+            .services
+            .contains_key("web"));
+        assert_eq!(
+            effective.loaded_file(ConfigFileKind::Project),
+            Some(project_path.as_path())
+        );
+        assert_eq!(
+            effective.loaded_file(ConfigFileKind::Local),
+            Some(local_path.as_path())
+        );
+        assert_eq!(
+            effective
+                .provenance(ConfigField::Reservations)
+                .unwrap()
+                .winner(),
+            &ConfigValueSource::File {
+                kind: ConfigFileKind::Project,
+                path: project_path.clone(),
+            }
+        );
+
+        let planner = ReserveGroupPlan::from_effective(
+            ReserveGroupOptions::new(nominated_path.clone()),
+            &effective,
+        )
+        .unwrap();
+        assert_eq!(planner.config_path(), &project_path);
+    }
+}
+
+/// Reservation overlays distinguish inheritance, atomic replacement, and clear.
+#[test]
+fn test_effective_reservation_overlay_contract() {
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let project_path = create_temp_config(
+        temp.path(),
+        "trop.yaml",
+        r"
+reservations:
+  services:
+    web:
+      offset: 0
+      env: WEB_PORT
+",
+    );
+    let local_path = create_temp_config(temp.path(), "trop.local.yaml", "excluded_ports: [5001]\n");
+    let project_path = project_path.canonicalize().unwrap();
+    let local_path = local_path.canonicalize().unwrap();
+
+    let inherited = ConfigBuilder::new()
+        .with_data_dir(&data_dir)
+        .with_working_dir(temp.path())
+        .skip_env()
+        .build_effective()
+        .unwrap();
+    assert!(inherited
+        .reservations()
+        .unwrap()
+        .services
+        .contains_key("web"));
+    assert_eq!(
+        inherited
+            .provenance(ConfigField::Reservations)
+            .unwrap()
+            .winner(),
+        &ConfigValueSource::File {
+            kind: ConfigFileKind::Project,
+            path: project_path.clone(),
+        }
+    );
+
+    fs::write(
+        &local_path,
+        r"
+reservations:
+  services:
+    api:
+      offset: 0
+      env: API_PORT
+",
+    )
+    .unwrap();
+    let replaced = ConfigBuilder::new()
+        .with_data_dir(&data_dir)
+        .with_working_dir(temp.path())
+        .skip_env()
+        .build_effective()
+        .unwrap();
+    let services = &replaced.reservations().unwrap().services;
+    assert_eq!(services.len(), 1);
+    assert!(services.contains_key("api"));
+    assert_eq!(
+        replaced
+            .provenance(ConfigField::Reservations)
+            .unwrap()
+            .winner(),
+        &ConfigValueSource::File {
+            kind: ConfigFileKind::Local,
+            path: local_path.clone(),
+        }
+    );
+    let replaced_planner =
+        ReserveGroupPlan::from_effective(ReserveGroupOptions::new(project_path.clone()), &replaced)
+            .unwrap();
+    assert_eq!(replaced_planner.config_path(), &local_path);
+
+    fs::write(&local_path, "reservations: null\n").unwrap();
+    let cleared = ConfigBuilder::new()
+        .with_data_dir(&data_dir)
+        .with_working_dir(temp.path())
+        .skip_env()
+        .build_effective()
+        .unwrap();
+    assert!(cleared.reservations().is_none());
+    let provenance = cleared
+        .provenance(ConfigField::Reservations)
+        .expect("an explicit clear must retain provenance");
+    assert_eq!(
+        provenance.winner(),
+        &ConfigValueSource::File {
+            kind: ConfigFileKind::Local,
+            path: local_path.clone(),
+        }
+    );
+    assert_eq!(
+        provenance.contributors(),
+        &[
+            ConfigValueSource::BuiltIn,
+            ConfigValueSource::File {
+                kind: ConfigFileKind::Project,
+                path: project_path,
+            },
+            ConfigValueSource::File {
+                kind: ConfigFileKind::Local,
+                path: local_path,
+            },
+        ]
+    );
+}
+
+/// Arbitrarily named explicit files remain standalone project sources.
+#[test]
+fn test_effective_arbitrary_project_file_does_not_infer_siblings() {
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    create_temp_config(temp.path(), "trop.yaml", "project: sibling\n");
+    create_temp_config(temp.path(), "trop.local.yaml", "reservations: null\n");
+    let chosen_path = create_temp_config(
+        temp.path(),
+        "chosen.yaml",
+        r"
+project: chosen
+reservations:
+  services:
+    chosen:
+      offset: 0
+      env: CHOSEN_PORT
+",
+    );
+
+    let effective = ConfigBuilder::new()
+        .with_data_dir(&data_dir)
+        .with_project_file(&chosen_path)
+        .skip_env()
+        .build_effective()
+        .unwrap();
+
+    assert_eq!(effective.project(), Some("chosen"));
+    assert!(effective
+        .reservations()
+        .unwrap()
+        .services
+        .contains_key("chosen"));
+    assert!(effective.loaded_file(ConfigFileKind::Local).is_none());
+    assert_eq!(
+        effective.loaded_file(ConfigFileKind::Project),
+        Some(chosen_path.as_path())
+    );
+}
+
+/// A generated user-wide null is inert because global config cannot own groups.
+#[test]
+fn test_effective_user_config_reservations_null_is_inert() {
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("data");
+    let project_dir = temp.path().join("project");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&project_dir).unwrap();
+    create_temp_config(&data_dir, "config.yaml", "reservations: null\n");
+    let project_path = create_temp_config(
+        &project_dir,
+        "trop.yaml",
+        r"
+reservations:
+  services:
+    web:
+      offset: 0
+      env: WEB_PORT
+",
+    )
+    .canonicalize()
+    .unwrap();
+
+    let effective = ConfigBuilder::new()
+        .with_data_dir(&data_dir)
+        .with_working_dir(&project_dir)
+        .skip_env()
+        .build_effective()
+        .unwrap();
+
+    assert!(effective
+        .reservations()
+        .unwrap()
+        .services
+        .contains_key("web"));
+    assert_eq!(
+        effective
+            .provenance(ConfigField::Reservations)
+            .unwrap()
+            .contributors(),
+        &[
+            ConfigValueSource::BuiltIn,
+            ConfigValueSource::File {
+                kind: ConfigFileKind::Project,
+                path: project_path,
+            },
+        ]
+    );
+}

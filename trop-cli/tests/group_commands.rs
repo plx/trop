@@ -3255,3 +3255,225 @@ fn test_concurrent_distinct_groups_remain_unique_and_stable() {
         "repeating distinct groups must not create or remove rows"
     );
 }
+
+/// The root README reservation-only example inherits the built-in port range.
+#[test]
+fn test_readme_reservations_only_example_uses_built_in_ports() {
+    let env = TestEnv::new();
+    let project_dir = env.create_dir("readme-project");
+    let config_path = project_dir.join("trop.yaml");
+    fs::write(
+        &config_path,
+        r"
+reservations:
+  services:
+    web:
+      offset: 0
+      preferred: 8080
+      env: WEB_PORT
+    api:
+      offset: 1
+      env: API_PORT
+    db:
+      offset: 2
+      env: DB_PORT
+",
+    )
+    .unwrap();
+
+    let output = env
+        .command()
+        .env("TROP_SKIP_OCCUPANCY_CHECK", "true")
+        .arg("autoreserve")
+        .arg("--format")
+        .arg("json")
+        .current_dir(&project_dir)
+        .output()
+        .expect("Failed to run the README group example");
+    assert!(
+        output.status.success(),
+        "README group example failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mapping: BTreeMap<String, u16> =
+        serde_json::from_slice(&output.stdout).expect("README output should be JSON");
+    assert_eq!(mapping.get("web"), Some(&8080));
+    assert_eq!(mapping.get("api"), Some(&5001));
+    assert_eq!(mapping.get("db"), Some(&5002));
+}
+
+/// Both group entrypoints consume every effective source layer identically.
+#[test]
+fn test_group_commands_share_complete_layered_configuration() {
+    let env = TestEnv::new();
+    let project_dir = env.create_dir("layered-project");
+    let project_path = project_dir.join("trop.yaml");
+    let local_path = project_dir.join("trop.local.yaml");
+    fs::write(
+        &project_path,
+        r"
+project: base-project
+reservations:
+  services:
+    web:
+      offset: 0
+      env: WEB_PORT
+    api:
+      offset: 1
+      env: API_PORT
+",
+    )
+    .unwrap();
+    fs::write(
+        &local_path,
+        r"
+project: local-project
+excluded_ports: [5002]
+",
+    )
+    .unwrap();
+
+    let run = |name: &str, kind: GroupCommandKind, nominated: &Path| {
+        let data_dir = env.temp_path.join(name);
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(
+            data_dir.join("config.yaml"),
+            r"
+excluded_ports: [5000]
+cleanup:
+  expire_after_days: 7
+occupancy_check:
+  skip: true
+",
+        )
+        .unwrap();
+
+        let mut command = env.command_bare();
+        command
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .env("TROP_EXCLUDED_PORTS", "5001");
+        match kind {
+            GroupCommandKind::ReserveGroup => {
+                command.arg("reserve-group").arg(nominated);
+            }
+            GroupCommandKind::Autoreserve => {
+                command.arg("autoreserve").current_dir(&project_dir);
+            }
+        }
+        command
+            .arg("--format")
+            .arg("json")
+            .arg("--allow-unrelated-path")
+            .output()
+            .expect("Failed to run layered group command")
+    };
+
+    let cases = [
+        (
+            "explicit-project-data",
+            GroupCommandKind::ReserveGroup,
+            project_path.as_path(),
+        ),
+        (
+            "explicit-local-data",
+            GroupCommandKind::ReserveGroup,
+            local_path.as_path(),
+        ),
+        (
+            "autoreserve-data",
+            GroupCommandKind::Autoreserve,
+            project_path.as_path(),
+        ),
+    ];
+    let expected = BTreeMap::from([("api".to_string(), 5004), ("web".to_string(), 5003)]);
+
+    for (name, kind, nominated) in cases {
+        let output = run(name, kind, nominated);
+        assert!(
+            output.status.success(),
+            "{} failed: {}",
+            kind.name(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mapping: BTreeMap<String, u16> =
+            serde_json::from_slice(&output.stdout).expect("Group output should be JSON");
+        assert_eq!(
+            mapping,
+            expected,
+            "{} did not consume the complete effective configuration",
+            kind.name()
+        );
+    }
+}
+
+/// An explicit local clear disables both entrypoints without touching stored rows.
+#[test]
+fn test_reservations_null_disables_group_commands_without_mutation() {
+    let env = TestEnv::new();
+    let project_dir = env.create_dir("cleared-project");
+    let project_path = project_dir.join("trop.yaml");
+    let local_path = project_dir.join("trop.local.yaml");
+    create_offset_config_without_occupancy_checks(&project_path, "clear-project");
+    fs::write(&local_path, "excluded_ports: [9000]\n").unwrap();
+
+    let seeded = env
+        .command()
+        .arg("autoreserve")
+        .arg("--format")
+        .arg("json")
+        .arg("--allow-unrelated-path")
+        .current_dir(&project_dir)
+        .output()
+        .expect("Failed to seed group before clear");
+    assert!(
+        seeded.status.success(),
+        "Failed to seed group before clear: {}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    let before = reservation_rows(&env);
+
+    fs::write(&local_path, "reservations: null\n").unwrap();
+    for kind in GroupCommandKind::ALL {
+        for dry_run in [true, false] {
+            let mut command = env.command();
+            match kind {
+                GroupCommandKind::ReserveGroup => {
+                    command.arg("reserve-group").arg(&project_path);
+                }
+                GroupCommandKind::Autoreserve => {
+                    command.arg("autoreserve").current_dir(&project_dir);
+                }
+            }
+            command
+                .arg("--format")
+                .arg("json")
+                .arg("--allow-unrelated-path");
+            if dry_run {
+                command.arg("--dry-run");
+            }
+            let output = command
+                .output()
+                .expect("Failed to run cleared group command");
+            assert!(
+                !output.status.success(),
+                "{}{} must fail after reservations: null",
+                kind.name(),
+                if dry_run { " --dry-run" } else { "" }
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("reservations"),
+                "{} should identify the cleared reservation group: {}",
+                kind.name(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                reservation_rows(&env),
+                before,
+                "{} changed stored rows after an explicit clear",
+                kind.name()
+            );
+        }
+    }
+}

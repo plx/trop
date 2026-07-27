@@ -137,6 +137,27 @@ Version 0.2.0 rejects invalid identifiers. See
 for affected usage and remediation. Until upgraded, use human or JSON output,
 inspect the result, and set only trusted variables manually.
 
+### Configuration overlays
+
+At the nearest project boundary, `trop.yaml` and `trop.local.yaml` compose as
+one effective configuration. Ordinary values merge by documented precedence,
+occupancy settings merge one explicit leaf at a time, and exclusions accumulate.
+An omitted value inherits the next lower layer.
+
+Reservation groups are the deliberate exception because merging service maps
+could create an accidental group shape. An omitted `reservations` key inherits
+the lower-precedence group, a non-null mapping replaces the complete group, and
+`reservations: null` explicitly clears it. A cleared group makes
+`reserve-group` and `autoreserve` fail without changing stored reservations.
+In user-wide `config.yaml`, a generated `reservations: null` remains inert
+because that source is not permitted to define project reservation groups.
+
+Explicitly naming `trop.yaml` or `trop.local.yaml` with `reserve-group` loads
+both sibling files when present. An arbitrarily named configuration file is a
+standalone project source. Both group entrypoints otherwise consume the same
+built-ins, user configuration, project layers, environment, and command-line
+overrides.
+
 ### Path identity
 
 `trop` stores reservation paths as lexically normalized absolute paths. An

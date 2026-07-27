@@ -152,6 +152,23 @@ in this list wins. An omitted setting falls through to the next source.
 `--data-dir` or `TROP_DATA_DIR` selects the directory containing the user
 `config.yaml`.
 
+At one project boundary, `trop.yaml` and `trop.local.yaml` are merged rather
+than selected as competing files. Ordinary values and nested occupancy leaves
+follow precedence, while exclusions accumulate. Reservation groups remain
+atomic: omitting `reservations` inherits the lower layer, supplying a mapping
+replaces the whole group, and `reservations: null` explicitly clears it.
+Clearing a group disables `reserve-group` and `autoreserve`; it does not release
+or otherwise modify existing reservations.
+In user-wide `config.yaml`, a generated `reservations: null` is inert because
+that source cannot define project reservation groups.
+
+`trop reserve-group ./trop.yaml` and
+`trop reserve-group ./trop.local.yaml` load both named siblings when present.
+An explicitly supplied file with any other name remains standalone. Explicit
+and discovered group commands share the same effective defaults, global and
+project files, environment settings, CLI overrides, and reservation-source
+provenance.
+
 ### Example trop.yaml
 
 ```yaml

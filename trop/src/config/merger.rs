@@ -4,7 +4,7 @@
 //! with special handling for accumulated fields like `excluded_ports`.
 
 use crate::config::loader::ConfigSource;
-use crate::config::schema::{CleanupConfig, Config, PortConfig};
+use crate::config::schema::{CleanupConfig, Config, OccupancyConfig, PortConfig};
 use crate::config::ConfigField;
 
 /// Merges configuration sources according to precedence rules.
@@ -48,7 +48,7 @@ impl ConfigMerger {
     /// - Simple fields: source overwrites if Some
     /// - Excluded ports: accumulated (union)
     /// - Nested configs: field-by-field merge
-    /// - Occupancy config: atomic replacement
+    /// - Occupancy config: field-by-field merge
     /// - Reservation groups: complete replacement
     pub fn merge_into(target: &mut Config, source: &Config) {
         Self::merge_into_observed(target, source, |_| {});
@@ -149,15 +149,13 @@ impl ConfigMerger {
             }
         }
 
-        // Occupancy config - full replacement (not field-by-field)
-        if source.occupancy_check.is_some() {
-            target.occupancy_check.clone_from(&source.occupancy_check);
-            on_field(ConfigField::OccupancySkip);
-            on_field(ConfigField::OccupancySkipIp4);
-            on_field(ConfigField::OccupancySkipIp6);
-            on_field(ConfigField::OccupancySkipTcp);
-            on_field(ConfigField::OccupancySkipUdp);
-            on_field(ConfigField::OccupancyCheckAllInterfaces);
+        // Merge occupancy leaves independently so an overlay can change one
+        // dimension without resetting lower-precedence protocol/family policy.
+        if let Some(source_occupancy) = &source.occupancy_check {
+            let target_occupancy = target
+                .occupancy_check
+                .get_or_insert_with(OccupancyConfig::default);
+            Self::merge_occupancy(target_occupancy, source_occupancy, &mut on_field);
         }
 
         // Reservation groups - don't merge, only replace
@@ -194,6 +192,46 @@ impl ConfigMerger {
     fn merge_cleanup(target: &CleanupConfig, source: &CleanupConfig) -> CleanupConfig {
         CleanupConfig {
             expire_after_days: source.expire_after_days.or(target.expire_after_days),
+        }
+    }
+
+    fn merge_occupancy(
+        target: &mut OccupancyConfig,
+        source: &OccupancyConfig,
+        on_field: &mut impl FnMut(ConfigField),
+    ) {
+        for (source_value, target_value, field) in [
+            (source.skip, &mut target.skip, ConfigField::OccupancySkip),
+            (
+                source.skip_ip4,
+                &mut target.skip_ip4,
+                ConfigField::OccupancySkipIp4,
+            ),
+            (
+                source.skip_ip6,
+                &mut target.skip_ip6,
+                ConfigField::OccupancySkipIp6,
+            ),
+            (
+                source.skip_tcp,
+                &mut target.skip_tcp,
+                ConfigField::OccupancySkipTcp,
+            ),
+            (
+                source.skip_udp,
+                &mut target.skip_udp,
+                ConfigField::OccupancySkipUdp,
+            ),
+            (
+                source.check_all_interfaces,
+                &mut target.check_all_interfaces,
+                ConfigField::OccupancyCheckAllInterfaces,
+            ),
+        ] {
+            if let Some(value) = source_value {
+                *target_value = Some(value);
+                on_field(field);
+            }
         }
     }
 }
@@ -355,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_occupancy_atomic_replacement() {
+    fn test_merge_occupancy_field_by_field() {
         let mut target = Config {
             occupancy_check: Some(OccupancyConfig {
                 skip: Some(false),
@@ -381,9 +419,12 @@ mod tests {
 
         ConfigMerger::merge_into(&mut target, &source);
         let occ = target.occupancy_check.unwrap();
-        // Complete replacement - target values are lost
         assert_eq!(occ.skip, Some(true));
-        assert_eq!(occ.skip_ip4, None);
+        assert_eq!(occ.skip_ip4, Some(true));
+        assert_eq!(occ.skip_ip6, Some(false));
+        assert_eq!(occ.skip_tcp, Some(false));
+        assert_eq!(occ.skip_udp, Some(false));
+        assert_eq!(occ.check_all_interfaces, Some(false));
     }
 
     #[test]
@@ -797,20 +838,19 @@ mod property_tests {
     }
 
     // ==================================================================================
-    // PROPERTY TESTS FOR OCCUPANCY CONFIG (ATOMIC REPLACEMENT)
+    // PROPERTY TESTS FOR OCCUPANCY CONFIG (FIELD-BY-FIELD MERGE)
     // ==================================================================================
 
-    /// Property: Occupancy config is atomically replaced, not field-merged
+    /// Property: Occupancy config is merged one explicit leaf at a time
     ///
-    /// Mathematical Property: merge(c1, c2).occupancy_check = c2.occupancy_check (complete)
-    /// Unlike other nested configs, occupancy is replaced as a unit.
+    /// Mathematical Property: explicit source leaves win while omitted source
+    /// leaves preserve the target value.
     ///
-    /// WHY THIS MATTERS: Occupancy checks are tightly coupled. Mixing fields from
-    /// different sources could create inconsistent check behavior. Atomic replacement
-    /// ensures clarity about which config source controls occupancy checking.
+    /// WHY THIS MATTERS: A private overlay that disables one protocol must not
+    /// accidentally reset lower-precedence address-family or interface policy.
     proptest! {
         #[test]
-        fn prop_merge_occupancy_atomic_replacement(
+        fn prop_merge_occupancy_field_by_field(
             target_skip in any::<bool>(),
             target_skip_ip4 in any::<bool>(),
             source_skip in any::<bool>(),
@@ -844,11 +884,16 @@ mod property_tests {
 
             let merged = target.occupancy_check.unwrap();
 
-            // Source completely replaces target (atomic)
             prop_assert_eq!(merged.skip, Some(source_skip), "Source skip used");
-            prop_assert_eq!(merged.skip_ip4, None, "Target skip_ip4 replaced with None");
-            prop_assert_eq!(merged.skip_ip6, None, "Target skip_ip6 replaced with None");
-            // Not field-by-field merge - complete replacement
+            prop_assert_eq!(
+                merged.skip_ip4,
+                Some(target_skip_ip4),
+                "Omitted source skip_ip4 preserves the target"
+            );
+            prop_assert_eq!(merged.skip_ip6, Some(true));
+            prop_assert_eq!(merged.skip_tcp, Some(false));
+            prop_assert_eq!(merged.skip_udp, Some(true));
+            prop_assert_eq!(merged.check_all_interfaces, Some(false));
         }
     }
 

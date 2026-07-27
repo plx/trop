@@ -119,7 +119,14 @@ impl ReserveGroupCommand {
             .with_allow_project_change(context.effective()?.allow_project_change())
             .with_allow_task_change(context.effective()?.allow_task_change());
 
-        // 3. Handle dry-run mode
+        // 3. Resolve and validate the group source before any early return or
+        // database access. In particular, an explicitly cleared group must not
+        // make dry-run report a false success.
+        let effective = context.effective()?;
+        let planner =
+            ReserveGroupPlan::from_effective(options, effective).map_err(CliError::from)?;
+
+        // 4. Handle dry-run mode
         if self.dry_run {
             if !global.quiet {
                 eprintln!("Dry run - would perform the following actions:");
@@ -131,13 +138,8 @@ impl ReserveGroupCommand {
             return Ok(());
         }
 
-        // 4. Validate the selected output format before opening a transaction.
+        // 5. Validate the selected output format before opening a transaction.
         let output_format = self.format.to_output_format(self.shell.as_deref())?;
-
-        // 5. Resolve and validate the group source before opening the database.
-        let effective = context.effective()?;
-        let planner =
-            ReserveGroupPlan::from_effective(options, effective).map_err(CliError::from)?;
 
         // 6. Open the database only after planner construction succeeds.
         let mut db = context.open_database()?;

@@ -7,7 +7,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, ConfigLoader, ConfigValidator, EffectiveConfig};
+use crate::config::{Config, ConfigField, ConfigLoader, ConfigValidator, EffectiveConfig};
 use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::port::group::{
@@ -198,6 +198,21 @@ impl ReserveGroupPlan {
     /// file, its containing directory cannot be canonicalized, or the
     /// effective group configuration is invalid.
     pub fn from_effective(options: ReserveGroupOptions, config: &EffectiveConfig) -> Result<Self> {
+        let group_source = config
+            .provenance(ConfigField::Reservations)
+            .and_then(|provenance| provenance.winner().file_path())
+            .unwrap_or(&options.config_path)
+            .to_path_buf();
+        let mut options = options;
+        options.config_path = group_source;
+
+        if config.reservations().is_none() {
+            return Err(Error::Validation {
+                field: "reservations".to_string(),
+                message: "Effective configuration does not contain a reservation group".to_string(),
+            });
+        }
+
         Self::from_config(options, config.config().clone())
     }
 
