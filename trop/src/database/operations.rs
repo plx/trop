@@ -14,21 +14,25 @@ use crate::path::PathRelationship;
 use crate::{Port, PortRange, Reservation, ReservationKey};
 
 use super::connection::Database;
-use super::schema::{DELETE_RESERVATION, INSERT_RESERVATION};
+use super::schema::{decode_tag, encode_tag, DELETE_RESERVATION, INSERT_RESERVATION};
 
 /// Converts a `SystemTime` to Unix epoch seconds for database storage.
 ///
 /// # Errors
 ///
 /// Returns an error if the time is before the Unix epoch.
-#[allow(clippy::cast_possible_wrap)]
 pub(super) fn systemtime_to_unix_secs(time: SystemTime) -> Result<i64> {
-    time.duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|e| crate::error::Error::Validation {
+    let seconds = time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|error| crate::error::Error::Validation {
             field: "timestamp".into(),
-            message: format!("Invalid timestamp: {e}"),
-        })
-        .map(|d| d.as_secs() as i64)
+            message: format!("Invalid timestamp: {error}"),
+        })?
+        .as_secs();
+    i64::try_from(seconds).map_err(|_| crate::error::Error::Validation {
+        field: "timestamp".into(),
+        message: "timestamp exceeds SQLite's signed 64-bit representation".into(),
+    })
 }
 
 /// Converts Unix epoch seconds from the database to a `SystemTime`.
@@ -42,7 +46,7 @@ pub(super) fn unix_secs_to_systemtime(secs: i64) -> SystemTime {
 /// Expects row fields in this order: path, tag, port, project, task, `created_at`, `last_used_at`
 fn row_to_reservation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reservation> {
     let path: String = row.get(0)?;
-    let tag: Option<String> = row.get(1)?;
+    let tag = decode_tag(row.get::<_, String>(1)?);
     let port_value: u16 = row.get(2)?;
     let project: Option<String> = row.get(3)?;
     let task: Option<String> = row.get(4)?;
@@ -71,19 +75,19 @@ fn row_to_reservation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reservation> 
 const SELECT_RESERVATION: &str = r"
     SELECT port, project, task, created_at, last_used_at
     FROM reservations
-    WHERE path = ? AND tag IS ?
+    WHERE path = ? AND tag = ?
 ";
 
 const UPDATE_LAST_USED: &str = r"
     UPDATE reservations
     SET last_used_at = ?
-    WHERE path = ? AND tag IS ?
+    WHERE path = ? AND tag = ?
 ";
 
 const UPDATE_METADATA_AND_LAST_USED: &str = r"
     UPDATE reservations
     SET project = ?, task = ?, last_used_at = ?
-    WHERE path = ? AND tag IS ?
+    WHERE path = ? AND tag = ?
 ";
 
 const LIST_RESERVATIONS: &str = r"
@@ -109,7 +113,7 @@ const SELECT_BY_PATH_PREFIX: &str = r"
 const SELECT_TAGGED_BY_EXACT_PATH: &str = r"
     SELECT path, tag, port, project, task, created_at, last_used_at
     FROM reservations
-    WHERE path = ? AND tag IS NOT NULL
+    WHERE path = ? AND tag <> ''
     ORDER BY tag
 ";
 
@@ -185,11 +189,12 @@ impl Database {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        // For NULL tags, explicitly delete first to ensure replacement works
-        // (INSERT OR REPLACE doesn't work with NULL in PRIMARY KEY due to NULL != NULL)
         tx.execute(
             DELETE_RESERVATION,
-            params![reservation.key().path_as_string(), reservation.key().tag],
+            params![
+                reservation.key().path_as_string(),
+                encode_tag(reservation.key().tag.as_deref())
+            ],
         )?;
 
         let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
@@ -199,7 +204,7 @@ impl Database {
             INSERT_RESERVATION,
             params![
                 reservation.key().path_as_string(),
-                reservation.key().tag,
+                encode_tag(reservation.key().tag.as_deref()),
                 reservation.port().value(),
                 reservation.project(),
                 reservation.task(),
@@ -241,11 +246,12 @@ impl Database {
     /// ```
     pub fn create_reservation_simple(conn: &Connection, reservation: &Reservation) -> Result<()> {
         Self::with_savepoint(conn, "trop_create_reservation", |conn| {
-            // For NULL tags, explicitly delete first to ensure replacement works
-            // (INSERT OR REPLACE doesn't work with NULL in PRIMARY KEY due to NULL != NULL)
             conn.execute(
                 DELETE_RESERVATION,
-                params![reservation.key().path_as_string(), reservation.key().tag],
+                params![
+                    reservation.key().path_as_string(),
+                    encode_tag(reservation.key().tag.as_deref())
+                ],
             )?;
 
             let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
@@ -255,7 +261,7 @@ impl Database {
                 INSERT_RESERVATION,
                 params![
                     reservation.key().path_as_string(),
-                    reservation.key().tag,
+                    encode_tag(reservation.key().tag.as_deref()),
                     reservation.port().value(),
                     reservation.project(),
                     reservation.task(),
@@ -296,27 +302,30 @@ impl Database {
     pub fn get_reservation(conn: &Connection, key: &ReservationKey) -> Result<Option<Reservation>> {
         let mut stmt = conn.prepare(SELECT_RESERVATION)?;
 
-        match stmt.query_row(params![key.path_as_string(), key.tag], |row| {
-            let port_value: u16 = row.get(0)?;
-            let port = Port::try_from(port_value)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        match stmt.query_row(
+            params![key.path_as_string(), encode_tag(key.tag.as_deref())],
+            |row| {
+                let port_value: u16 = row.get(0)?;
+                let port = Port::try_from(port_value)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
-            let project: Option<String> = row.get(1)?;
-            let task: Option<String> = row.get(2)?;
-            let created_secs: i64 = row.get(3)?;
-            let last_used_secs: i64 = row.get(4)?;
+                let project: Option<String> = row.get(1)?;
+                let task: Option<String> = row.get(2)?;
+                let created_secs: i64 = row.get(3)?;
+                let last_used_secs: i64 = row.get(4)?;
 
-            let created_at = unix_secs_to_systemtime(created_secs);
-            let last_used_at = unix_secs_to_systemtime(last_used_secs);
+                let created_at = unix_secs_to_systemtime(created_secs);
+                let last_used_at = unix_secs_to_systemtime(last_used_secs);
 
-            Reservation::builder(key.clone(), port)
-                .project(project)
-                .task(task)
-                .created_at(created_at)
-                .last_used_at(last_used_at)
-                .build()
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-        }) {
+                Reservation::builder(key.clone(), port)
+                    .project(project)
+                    .task(task)
+                    .created_at(created_at)
+                    .last_used_at(last_used_at)
+                    .build()
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            },
+        ) {
             Ok(reservation) => Ok(Some(reservation)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
@@ -356,7 +365,7 @@ impl Database {
 
         let rows_affected = tx.execute(
             UPDATE_LAST_USED,
-            params![now, key.path_as_string(), key.tag],
+            params![now, key.path_as_string(), encode_tag(key.tag.as_deref())],
         )?;
 
         tx.commit()?;
@@ -392,8 +401,10 @@ impl Database {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let rows_affected =
-            tx.execute(DELETE_RESERVATION, params![key.path_as_string(), key.tag])?;
+        let rows_affected = tx.execute(
+            DELETE_RESERVATION,
+            params![key.path_as_string(), encode_tag(key.tag.as_deref())],
+        )?;
 
         tx.commit()?;
         Ok(rows_affected > 0)
@@ -411,7 +422,7 @@ impl Database {
         let now = systemtime_to_unix_secs(SystemTime::now())?;
         let rows_affected = conn.execute(
             UPDATE_LAST_USED,
-            params![now, key.path_as_string(), key.tag],
+            params![now, key.path_as_string(), encode_tag(key.tag.as_deref())],
         )?;
         Ok(rows_affected > 0)
     }
@@ -428,7 +439,13 @@ impl Database {
         let last_used_at = systemtime_to_unix_secs(last_used_at)?;
         let rows_affected = conn.execute(
             UPDATE_METADATA_AND_LAST_USED,
-            params![project, task, last_used_at, key.path_as_string(), key.tag],
+            params![
+                project,
+                task,
+                last_used_at,
+                key.path_as_string(),
+                encode_tag(key.tag.as_deref())
+            ],
         )?;
         Ok(rows_affected > 0)
     }
@@ -442,8 +459,10 @@ impl Database {
     ///
     /// Returns an error if the database deletion fails.
     pub fn delete_reservation_simple(conn: &Connection, key: &ReservationKey) -> Result<bool> {
-        let rows_affected =
-            conn.execute(DELETE_RESERVATION, params![key.path_as_string(), key.tag])?;
+        let rows_affected = conn.execute(
+            DELETE_RESERVATION,
+            params![key.path_as_string(), encode_tag(key.tag.as_deref())],
+        )?;
         Ok(rows_affected > 0)
     }
 

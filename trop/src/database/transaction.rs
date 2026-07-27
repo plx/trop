@@ -9,7 +9,7 @@ use crate::{Reservation, ReservationKey};
 
 use super::connection::Database;
 use super::operations::systemtime_to_unix_secs;
-use super::schema::{DELETE_RESERVATION, INSERT_RESERVATION};
+use super::schema::{encode_tag, DELETE_RESERVATION, INSERT_RESERVATION};
 
 impl Database {
     /// Creates multiple reservations in a single transaction.
@@ -58,16 +58,16 @@ impl Database {
             let mut insert_stmt = tx.prepare(INSERT_RESERVATION)?;
             for reservation in reservations {
                 delete_stmt.execute(params![
-                    reservation.key().path.to_string_lossy().to_string(),
-                    reservation.key().tag,
+                    reservation.key().path_as_string(),
+                    encode_tag(reservation.key().tag.as_deref()),
                 ])?;
 
                 let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
                 let last_used_secs = systemtime_to_unix_secs(reservation.last_used_at())?;
 
                 insert_stmt.execute(params![
-                    reservation.key().path.to_string_lossy().to_string(),
-                    reservation.key().tag,
+                    reservation.key().path_as_string(),
+                    encode_tag(reservation.key().tag.as_deref()),
                     reservation.port().value(),
                     reservation.project(),
                     reservation.task(),
@@ -120,8 +120,10 @@ impl Database {
         {
             let mut stmt = tx.prepare(DELETE_RESERVATION)?;
             for key in keys {
-                let rows_affected =
-                    stmt.execute(params![key.path.to_string_lossy().to_string(), key.tag])?;
+                let rows_affected = stmt.execute(params![
+                    key.path_as_string(),
+                    encode_tag(key.tag.as_deref())
+                ])?;
                 total_deleted += rows_affected;
             }
         }

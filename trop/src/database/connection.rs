@@ -3,6 +3,8 @@
 //! This module provides the main database connection type with proper
 //! initialization and PRAGMA settings for optimal `SQLite` configuration.
 
+use std::time::{Duration, Instant};
+
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
 use crate::error::Result;
@@ -35,8 +37,8 @@ impl Database {
     /// This function will:
     /// - Create the parent directory if `auto_create` is enabled
     /// - Open the database with appropriate flags
-    /// - Set WAL mode for concurrent access
     /// - Configure busy timeout
+    /// - Set WAL mode for concurrent access
     /// - Initialize or verify the database schema
     ///
     /// # Errors
@@ -79,13 +81,8 @@ impl Database {
 
         // Set pragmas for optimal operation (skip for read-only databases)
         if !config.read_only {
-            // Note: PRAGMA journal_mode returns a result, so we use query_row
-            let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+            enable_wal_with_retry(&conn, config.busy_timeout)?;
             conn.execute_batch("PRAGMA synchronous = NORMAL")?;
-            conn.execute_batch(&format!(
-                "PRAGMA busy_timeout = {}",
-                config.busy_timeout.as_millis()
-            ))?;
         }
 
         // Check and initialize schema (will be implemented in migrations module)
@@ -158,6 +155,58 @@ impl Database {
     }
 }
 
+fn enable_wal_with_retry(conn: &Connection, timeout: Duration) -> rusqlite::Result<()> {
+    let result = enable_wal_with_retry_inner(conn, timeout);
+    let restore_result = set_busy_timeout(conn, timeout);
+
+    match (result, restore_result) {
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn enable_wal_with_retry_inner(conn: &Connection, timeout: Duration) -> rusqlite::Result<()> {
+    let started = Instant::now();
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        set_busy_timeout(conn, remaining)?;
+
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        }) {
+            Ok(_) => return Ok(()),
+            Err(error) if is_lock_contention(&error) => {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+
+                // Simultaneous journal-mode upgrades can deadlock while both
+                // connections hold read locks, causing SQLite to bypass its
+                // busy handler. Drop the completed statement, yield briefly,
+                // and retry within the caller's configured timeout.
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn set_busy_timeout(conn: &Connection, timeout: Duration) -> rusqlite::Result<()> {
+    conn.execute_batch(&format!("PRAGMA busy_timeout = {}", timeout.as_millis()))
+}
+
+fn is_lock_contention(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(sqlite, _)
+            if matches!(
+                sqlite.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +227,11 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(journal_mode.to_lowercase(), "wal");
+        let busy_timeout: i64 = db
+            .connection()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 5000);
     }
 
     #[test]

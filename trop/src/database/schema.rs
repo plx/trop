@@ -7,7 +7,7 @@
 ///
 /// This version is stored in the metadata table and is used to ensure
 /// compatibility between the database and the application.
-pub const CURRENT_SCHEMA_VERSION: i32 = 1;
+pub const CURRENT_SCHEMA_VERSION: i32 = 2;
 
 /// SQL statement to create the metadata table.
 ///
@@ -17,25 +17,29 @@ pub const CREATE_METADATA_TABLE: &str = r"
     CREATE TABLE IF NOT EXISTS metadata (
         key TEXT PRIMARY KEY NOT NULL,
         value TEXT NOT NULL
-    )";
+    ) STRICT";
 
 /// SQL statement to create the reservations table.
 ///
 /// The reservations table stores all port reservations with their associated
-/// metadata. The primary key is the combination of (path, tag) to ensure
-/// uniqueness of reservations. The port column has a UNIQUE constraint to
-/// prevent duplicate port allocations under concurrent load.
+/// metadata. Schema v2 stores an absent tag as the empty string, which is not a
+/// valid domain tag, so both tagged and untagged identities participate in the
+/// non-null primary key. The path representation remains unchanged pending the
+/// separate cross-platform path-storage contract.
 pub const CREATE_RESERVATIONS_TABLE: &str = r"
     CREATE TABLE IF NOT EXISTS reservations (
         path TEXT NOT NULL,
-        tag TEXT,
-        port INTEGER NOT NULL UNIQUE,
+        tag TEXT NOT NULL,
+        port INTEGER NOT NULL UNIQUE
+            CONSTRAINT valid_port CHECK (port BETWEEN 1 AND 65535),
         project TEXT,
         task TEXT,
-        created_at INTEGER NOT NULL,
-        last_used_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+            CONSTRAINT valid_created_at CHECK (created_at >= 0),
+        last_used_at INTEGER NOT NULL
+            CONSTRAINT valid_last_used_at CHECK (last_used_at >= 0),
         PRIMARY KEY (path, tag)
-    )";
+    ) STRICT";
 
 /// SQL statement to create an index on the port column.
 ///
@@ -78,5 +82,21 @@ pub const INSERT_RESERVATION: &str = r"
 /// Used by both single and batch delete operations.
 pub const DELETE_RESERVATION: &str = r"
     DELETE FROM reservations
-    WHERE path = ? AND tag IS ?
+    WHERE path = ? AND tag = ?
 ";
+
+/// Encodes the domain-level optional tag in schema v2's non-null storage form.
+#[must_use]
+pub(super) fn encode_tag(tag: Option<&str>) -> &str {
+    tag.unwrap_or("")
+}
+
+/// Decodes schema v2's non-null tag representation for the domain model.
+#[must_use]
+pub(super) fn decode_tag(tag: String) -> Option<String> {
+    if tag.is_empty() {
+        None
+    } else {
+        Some(tag)
+    }
+}

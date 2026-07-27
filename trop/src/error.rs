@@ -127,6 +127,28 @@ pub enum Error {
         found: u32,
     },
 
+    /// The database must be migrated or initialized in a writable location.
+    #[error("database schema migration required from version {found} to {target}: {action}")]
+    MigrationRequired {
+        /// The schema version currently stored, or zero for an uninitialized database.
+        found: i32,
+        /// The schema version required by this client.
+        target: i32,
+        /// A safe action the user can take without losing data.
+        action: String,
+    },
+
+    /// Legacy state prevents a deterministic, lossless schema migration.
+    #[error("database migration from schema {from} to {to} blocked: {details}")]
+    MigrationBlocked {
+        /// The migration's source version.
+        from: i32,
+        /// The migration's target version.
+        to: i32,
+        /// Recovery-relevant details that do not choose or discard user data.
+        details: String,
+    },
+
     /// A path operation attempted to modify an unrelated path.
     #[error("cannot modify unrelated path: {}", path.display())]
     UnrelatedPath {
