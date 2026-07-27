@@ -32,6 +32,10 @@ pub struct ReleaseCommand {
     #[arg(long)]
     pub force: bool,
 
+    /// Allow operations on unrelated paths
+    #[arg(long)]
+    pub allow_unrelated_path: bool,
+
     /// Perform a dry run
     #[arg(long)]
     pub dry_run: bool,
@@ -51,11 +55,18 @@ impl ReleaseCommand {
             ));
         }
 
-        // 3. Open the database from the shared effective configuration.
+        // 3. Consume the path permission from the shared effective configuration.
+        let allow_unrelated_path = context.effective()?.allow_unrelated_path();
+
+        // 4. Open the database from the shared effective configuration.
         let mut db = context.open_database()?;
 
         // 5. Handle recursive release or single release
         if self.recursive {
+            if !self.force && !allow_unrelated_path {
+                Database::validate_path_relationship(&path, false).map_err(CliError::from)?;
+            }
+
             // For recursive release, we need to find all reservations under this path
             // and release them one by one
             let all_reservations =
@@ -84,7 +95,9 @@ impl ReleaseCommand {
                 // Build release options for this reservation
                 let options = ReleaseOptions::new(reservation.key().clone())
                     .with_force(self.force)
-                    .with_allow_unrelated_path(true); // Already validated
+                    // Validate the requested recursive root once. Descendant keys
+                    // can be sideways from the CWD even when that root is an ancestor.
+                    .with_allow_unrelated_path(true);
 
                 // Build plan using database connection for reading
                 let plan = ReleasePlan::new(options)
@@ -122,7 +135,8 @@ impl ReleaseCommand {
                 }
             }
         } else {
-            // Single release: build key and release it
+            // Exact release: an omitted filter selects every tag at this path.
+            let release_all_exact_path_tags = self.tag.is_none() && !self.untagged_only;
             let tag = if self.untagged_only { None } else { self.tag };
 
             let key = ReservationKey::new(path, tag)
@@ -130,12 +144,13 @@ impl ReleaseCommand {
 
             let options = ReleaseOptions::new(key)
                 .with_force(self.force)
-                .with_allow_unrelated_path(true); // Path was resolved from CWD
+                .with_allow_unrelated_path(allow_unrelated_path);
 
             // Begin transaction for single release
             let tx = db.begin_transaction().map_err(CliError::from)?;
 
             let plan = ReleasePlan::new(options)
+                .with_all_exact_path_tags(release_all_exact_path_tags)
                 .build_plan(&tx)
                 .map_err(CliError::from)?;
 

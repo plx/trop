@@ -135,6 +135,34 @@ phase. Normal mode reports only aggregate prune/expire counts on stderr, while
 Exhaustion errors distinguish skipped cleanup from an attempted cleanup and
 report that the remaining ports are reserved, excluded, or occupied.
 
+### Releasing Reservations
+
+Without a tag filter, `trop release` removes every tagged and untagged
+reservation at exactly the resolved path. Planning and deletion for that exact
+path share one transaction, so a failure cannot leave only part of the
+exact-path set deleted. Descendant reservations remain unless `--recursive` is
+supplied.
+
+```bash
+# Release every reservation for the current directory
+trop release
+
+# Release one tagged reservation
+trop release --tag web
+
+# Release only the untagged reservation
+trop release --untagged-only
+```
+
+`--tag` and `--untagged-only` are mutually exclusive. A selector with no match
+succeeds as an idempotent no-op, and either selector can be combined with
+`--recursive` to select matching descendant rows.
+
+The target path must be the current directory, an ancestor, or a descendant.
+Use `--allow-unrelated-path` to bypass only that relationship check, or
+`--force` to authorize the release despite it. The effective
+`allow_unrelated_path` configuration permission is honored as well.
+
 ### Use in Build Scripts
 
 Example `justfile`:

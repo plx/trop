@@ -330,6 +330,13 @@ const SELECT_BY_PATH_PREFIX: &str = r"
     ORDER BY path, tag
 ";
 
+const SELECT_BY_EXACT_PATH: &str = r"
+    SELECT path, tag, port, project, task, created_at, last_used_at
+    FROM reservations
+    WHERE path = ?
+    ORDER BY tag
+";
+
 const SELECT_TAGGED_BY_EXACT_PATH: &str = r"
     SELECT path, tag, port, project, task, created_at, last_used_at
     FROM reservations
@@ -856,6 +863,22 @@ impl Database {
             }
         }
 
+        Ok(reservations)
+    }
+
+    /// Returns every tagged and untagged reservation at one exact path.
+    ///
+    /// Reservations below the path are deliberately excluded.
+    pub(crate) fn get_reservations_by_exact_path(
+        conn: &Connection,
+        path: &Path,
+    ) -> Result<Vec<Reservation>> {
+        let mut stmt = conn.prepare_cached(SELECT_BY_EXACT_PATH)?;
+        let mut rows = stmt.query([path.to_string_lossy().to_string()])?;
+        let mut reservations = Vec::new();
+        while let Some(row) = rows.next()? {
+            reservations.push(row_to_reservation(row)?);
+        }
         Ok(reservations)
     }
 

@@ -92,6 +92,23 @@ DB_PORT=$(trop reserve --tag db)
 
 As with `trop reserve`, these reservations will be associated with the current directory, and thus will be automatically pruned when the directory is removed. 
 
+### Releasing reservations
+
+`trop release` without a tag filter removes every tagged and untagged
+reservation at exactly the resolved path in one transaction. Descendant paths
+are left alone unless `--recursive` is supplied.
+
+Use `--tag <TAG>` to remove only that tagged reservation, or
+`--untagged-only` to remove only the untagged reservation. The two filters are
+mutually exclusive, and a filter with no match succeeds as an idempotent no-op.
+The same filter selects matching rows below the path when combined with
+`--recursive`.
+
+Release follows the standard path guard: the target must be the current
+directory, an ancestor, or a descendant. A sideways unrelated path is rejected
+before mutation unless `--allow-unrelated-path`, the corresponding effective
+configuration permission, or `--force` authorizes it.
+
 For recurring reservation patterns, you add a "tropfile" (`trop.yaml`) file to your project root, which can then define a "reservation group" like so:
 
 ```yaml

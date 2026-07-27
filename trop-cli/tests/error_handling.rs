@@ -127,6 +127,7 @@ fn test_success_exit_code() {
         .arg("release")
         .arg("--path")
         .arg(&test_path)
+        .current_dir(env.path())
         .assert()
         .code(0);
 }
@@ -771,6 +772,7 @@ fn test_release_idempotent_success() {
         .arg("release")
         .arg("--path")
         .arg(&test_path)
+        .current_dir(env.path())
         .output()
         .unwrap();
 
@@ -874,6 +876,7 @@ fn test_release_nonexistent_clear_message() {
         .arg("release")
         .arg("--path")
         .arg(&test_path)
+        .current_dir(env.path())
         .output()
         .unwrap();
 
