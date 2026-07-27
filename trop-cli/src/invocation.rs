@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use trop::config::{Config, ConfigBuilder, ConfigField, ConfigFileKind, EffectiveConfig};
-use trop::{Database, DatabaseConfig, PathResolver};
+use trop::{Database, DatabaseConfig, MetadataIntent, PathResolver};
 
 /// Configuration-file discovery profile for a command.
 #[derive(Debug, Clone)]
@@ -33,12 +33,28 @@ pub(crate) enum ConfigScope {
 pub(crate) struct CommandLineConfig {
     pub(crate) config: Config,
     pub(crate) fields: BTreeSet<ConfigField>,
+    pub(crate) reservation_metadata: Option<ReservationMetadataRequest>,
 }
 
 impl CommandLineConfig {
     pub(crate) fn record(&mut self, field: ConfigField) {
         self.fields.insert(field);
     }
+}
+
+/// Reservation-only metadata inputs that are not part of the YAML schema.
+#[derive(Debug, Default)]
+pub(crate) struct ReservationMetadataRequest {
+    pub(crate) clear_project: bool,
+    pub(crate) task: Option<String>,
+    pub(crate) clear_task: bool,
+}
+
+/// Metadata intent resolved once for the reserve command.
+#[derive(Debug)]
+pub(crate) struct ResolvedReservationMetadata {
+    pub(crate) project: MetadataIntent,
+    pub(crate) task: MetadataIntent,
 }
 
 /// Everything needed to resolve configuration for one command.
@@ -70,6 +86,7 @@ pub struct InvocationContext {
     global: GlobalOptions,
     data_dir: Option<PathBuf>,
     effective: Option<EffectiveConfig>,
+    reservation_metadata: Option<ResolvedReservationMetadata>,
     path_resolver: PathResolver,
     working_dir: PathBuf,
 }
@@ -82,6 +99,11 @@ impl InvocationContext {
             command_line,
             data_dir_override,
         } = request;
+        let CommandLineConfig {
+            config: command_line_config,
+            fields: command_line_fields,
+            reservation_metadata,
+        } = command_line;
         let data_dir = data_dir_override.or_else(|| global.data_dir.clone());
         let path_resolver = PathResolver::new();
         let process_working_dir = std::env::current_dir().map_err(CliError::Io)?;
@@ -91,7 +113,17 @@ impl InvocationContext {
             .into_path_buf();
         let mut builder = ConfigBuilder::new()
             .with_working_dir(&working_dir)
-            .with_cli_config_fields(command_line.config, command_line.fields);
+            .with_cli_config_fields(command_line_config, command_line_fields);
+        if let Some(metadata) = reservation_metadata.as_ref() {
+            if metadata.clear_project {
+                builder = builder.with_cli_project_clear();
+            }
+            if metadata.clear_task {
+                builder = builder.with_cli_task(None);
+            } else if let Some(task) = &metadata.task {
+                builder = builder.with_cli_task(Some(task.clone()));
+            }
+        }
         if let Some(data_dir) = &data_dir {
             builder = builder.with_data_dir(data_dir);
         }
@@ -116,11 +148,15 @@ impl InvocationContext {
                     .map_err(|error| CliError::Config(error.to_string()))?,
             ),
         };
+        let reservation_metadata = reservation_metadata
+            .map(|request| Self::resolve_reservation_metadata(request, effective.as_ref()))
+            .transpose()?;
 
         Ok(Self {
             global,
             data_dir,
             effective,
+            reservation_metadata,
             path_resolver,
             working_dir,
         })
@@ -141,6 +177,13 @@ impl InvocationContext {
     /// The effective value model consumed by existing library operations.
     pub(crate) fn config(&self) -> Result<&Config, CliError> {
         Ok(self.effective()?.config())
+    }
+
+    /// Return the centrally resolved metadata intent for `reserve`.
+    pub(crate) fn reservation_metadata(&self) -> Result<&ResolvedReservationMetadata, CliError> {
+        self.reservation_metadata.as_ref().ok_or_else(|| {
+            CliError::Config("this command does not resolve reservation metadata".to_string())
+        })
     }
 
     /// Resolve a reservation path according to how the caller supplied it.
@@ -174,6 +217,33 @@ impl InvocationContext {
     /// The canonical working directory selected once for this invocation.
     pub(crate) fn working_dir(&self) -> &Path {
         &self.working_dir
+    }
+
+    fn resolve_reservation_metadata(
+        request: ReservationMetadataRequest,
+        effective: Option<&EffectiveConfig>,
+    ) -> Result<ResolvedReservationMetadata, CliError> {
+        let effective = effective.ok_or_else(|| {
+            CliError::Config("reserve requires effective configuration".to_string())
+        })?;
+
+        let project = if request.clear_project {
+            MetadataIntent::Clear
+        } else {
+            effective
+                .project()
+                .map_or(MetadataIntent::Preserve, MetadataIntent::set)
+        };
+
+        let task = if request.clear_task {
+            MetadataIntent::Clear
+        } else {
+            effective
+                .task()
+                .map_or(MetadataIntent::Preserve, MetadataIntent::set)
+        };
+
+        Ok(ResolvedReservationMetadata { project, task })
     }
 
     /// Open the database using the effective autoinit and timeout settings.

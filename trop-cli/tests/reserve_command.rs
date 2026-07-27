@@ -18,6 +18,8 @@ use common::{create_directory_symlink, parse_port, TestEnv};
 use predicates::prelude::*;
 use serde_json::Value;
 use std::net::TcpListener;
+use std::path::Path;
+use std::process::Command as ProcessCommand;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StoredReservation {
@@ -100,6 +102,31 @@ fn adjacent_available_ports() -> (u16, u16) {
         .port();
     drop(listener);
     (neighbor, formerly_occupied)
+}
+
+fn run_git(path: &Path, args: &[&str]) {
+    let output = ProcessCommand::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .expect("Failed to execute git");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn initialize_git_repository(path: &Path, branch: &str) {
+    run_git(path, &["init"]);
+    run_git(path, &["config", "user.name", "Trop Test"]);
+    run_git(path, &["config", "user.email", "trop@example.invalid"]);
+    std::fs::write(path.join("README.md"), "test repository\n")
+        .expect("Failed to create repository fixture");
+    run_git(path, &["add", "README.md"]);
+    run_git(path, &["commit", "-m", "Initial commit"]);
+    run_git(path, &["checkout", "-b", branch]);
 }
 
 // ============================================================================
@@ -862,6 +889,439 @@ fn test_reserve_persists_authorized_changes_and_overwrite() {
     assert_eq!(after_idempotent[0].port, port_b);
     assert_eq!(after_idempotent[0].created_at, 100);
     assert!(after_idempotent[0].last_used_at > 100);
+}
+
+/// Omitting metadata on an exact-key repeat preserves the stored values rather
+/// than proposing accidental clears.
+#[test]
+fn test_reserve_omitted_metadata_preserves_existing_values() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("preserve-metadata");
+
+    let initial = env
+        .command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("project-a")
+        .arg("--task")
+        .arg("task-a")
+        .arg("--allow-unrelated-path")
+        .output()
+        .expect("Failed to create initial reservation");
+    assert!(
+        initial.status.success(),
+        "initial reserve failed: {}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let initial_port = parse_port(&String::from_utf8(initial.stdout).unwrap());
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--allow-unrelated-path")
+        .assert()
+        .success()
+        .stdout(format!("{initial_port}\n"));
+
+    let stored = stored_reservations(&env);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].project.as_deref(), Some("project-a"));
+    assert_eq!(stored[0].task.as_deref(), Some("task-a"));
+}
+
+/// New reservations infer project and task from the target Git repository when
+/// no higher-precedence source supplies either field.
+#[test]
+fn test_reserve_infers_git_metadata_for_new_reservation() {
+    let env = TestEnv::new();
+    let repository = env.create_dir("inferred-project");
+    initialize_git_repository(&repository, "feature-task");
+
+    env.command()
+        .arg("reserve")
+        .arg("--allow-unrelated-path")
+        .current_dir(&repository)
+        .assert()
+        .success();
+
+    let stored = stored_reservations(&env);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].project.as_deref(), Some("inferred-project"));
+    assert_eq!(stored[0].task.as_deref(), Some("feature-task"));
+}
+
+/// Explicit clear intent is sticky-field protected and persists only with the
+/// matching narrow permission.
+#[test]
+fn test_reserve_explicit_metadata_clear_requires_permission() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("clear-metadata");
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("project-a")
+        .arg("--task")
+        .arg("task-a")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .success();
+    let original = stored_reservations(&env);
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--clear-project")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("allow-project-change"));
+    assert_eq!(stored_reservations(&env), original);
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--clear-project")
+        .arg("--allow-project-change")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .success();
+    let project_cleared = stored_reservations(&env);
+    assert_eq!(project_cleared[0].project, None);
+    assert_eq!(project_cleared[0].task.as_deref(), Some("task-a"));
+    assert_eq!(project_cleared[0].port, original[0].port);
+    assert_eq!(project_cleared[0].created_at, original[0].created_at);
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--clear-task")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("allow-task-change"));
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--clear-task")
+        .arg("--allow-task-change")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .success();
+    let cleared = stored_reservations(&env);
+    assert_eq!(cleared[0].project, None);
+    assert_eq!(cleared[0].task, None);
+    assert_eq!(cleared[0].port, original[0].port);
+    assert_eq!(cleared[0].created_at, original[0].created_at);
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("project-b")
+        .arg("--task")
+        .arg("task-b")
+        .arg("--allow-change")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .success();
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--clear-project")
+        .arg("--clear-task")
+        .arg("--force")
+        .assert()
+        .success();
+    let force_cleared = stored_reservations(&env);
+    assert_eq!(force_cleared[0].project, None);
+    assert_eq!(force_cleared[0].task, None);
+    assert_eq!(force_cleared[0].created_at, original[0].created_at);
+}
+
+/// Clear flags are explicit top-precedence operations and suppress configured,
+/// environment, and Git-derived values for a new reservation.
+#[test]
+fn test_reserve_clear_metadata_overrides_lower_precedence_sources() {
+    let env = TestEnv::new();
+    let repository = env.create_dir("clear-overrides");
+    initialize_git_repository(&repository, "inferred-task");
+    std::fs::write(repository.join("trop.yaml"), "project: file-project\n")
+        .expect("Failed to write project configuration");
+
+    env.command()
+        .arg("reserve")
+        .arg("--clear-project")
+        .arg("--clear-task")
+        .arg("--allow-unrelated-path")
+        .env("TROP_PROJECT", "environment-project")
+        .env("TROP_TASK", "environment-task")
+        .current_dir(&repository)
+        .assert()
+        .success();
+
+    let stored = stored_reservations(&env);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].project, None);
+    assert_eq!(stored[0].task, None);
+}
+
+/// CLI values outrank environment and project files, environment outranks
+/// files, and all documented sources outrank inference.
+#[test]
+fn test_reserve_metadata_precedence_over_git_inference() {
+    let env = TestEnv::new();
+    let repository = env.create_dir("precedence-project");
+    initialize_git_repository(&repository, "inferred-task");
+    std::fs::write(repository.join("trop.yaml"), "project: file-project\n")
+        .expect("Failed to write project configuration");
+
+    env.command()
+        .arg("reserve")
+        .arg("--tag")
+        .arg("file")
+        .arg("--allow-unrelated-path")
+        .current_dir(&repository)
+        .assert()
+        .success();
+
+    std::fs::write(
+        repository.join("trop.local.yaml"),
+        "project: private-project\n",
+    )
+    .expect("Failed to write private project configuration");
+    env.command()
+        .arg("reserve")
+        .arg("--tag")
+        .arg("private-file")
+        .arg("--allow-unrelated-path")
+        .current_dir(&repository)
+        .assert()
+        .success();
+
+    env.command()
+        .arg("reserve")
+        .arg("--tag")
+        .arg("environment")
+        .arg("--allow-unrelated-path")
+        .env("TROP_PROJECT", "environment-project")
+        .env("TROP_TASK", "environment-task")
+        .current_dir(&repository)
+        .assert()
+        .success();
+
+    env.command()
+        .arg("reserve")
+        .arg("--tag")
+        .arg("command-line")
+        .arg("--project")
+        .arg("cli-project")
+        .arg("--task")
+        .arg("cli-task")
+        .arg("--allow-unrelated-path")
+        .env("TROP_PROJECT", "environment-project")
+        .env("TROP_TASK", "environment-task")
+        .current_dir(&repository)
+        .assert()
+        .success();
+
+    let stored = stored_reservations(&env);
+    let find = |tag: &str| {
+        stored
+            .iter()
+            .find(|reservation| reservation.tag.as_deref() == Some(tag))
+            .expect("Missing tagged reservation")
+    };
+    assert_eq!(find("file").project.as_deref(), Some("file-project"));
+    assert_eq!(find("file").task.as_deref(), Some("inferred-task"));
+    assert_eq!(
+        find("private-file").project.as_deref(),
+        Some("private-project")
+    );
+    assert_eq!(find("private-file").task.as_deref(), Some("inferred-task"));
+    assert_eq!(
+        find("environment").project.as_deref(),
+        Some("environment-project")
+    );
+    assert_eq!(
+        find("environment").task.as_deref(),
+        Some("environment-task")
+    );
+    assert_eq!(find("command-line").project.as_deref(), Some("cli-project"));
+    assert_eq!(find("command-line").task.as_deref(), Some("cli-task"));
+}
+
+/// An existing reservation preserves omitted metadata even if later Git state
+/// would infer a different task.
+#[test]
+fn test_reserve_existing_metadata_is_not_reinferred() {
+    let env = TestEnv::new();
+    let repository = env.create_dir("stable-inference");
+    initialize_git_repository(&repository, "initial-branch");
+
+    env.command()
+        .arg("reserve")
+        .arg("--project")
+        .arg("explicit-project")
+        .arg("--task")
+        .arg("explicit-task")
+        .arg("--allow-unrelated-path")
+        .current_dir(&repository)
+        .assert()
+        .success();
+    run_git(&repository, &["checkout", "-b", "different-branch"]);
+
+    env.command()
+        .arg("reserve")
+        .arg("--allow-unrelated-path")
+        .current_dir(&repository)
+        .assert()
+        .success();
+
+    let stored = stored_reservations(&env);
+    assert_eq!(stored[0].project.as_deref(), Some("explicit-project"));
+    assert_eq!(stored[0].task.as_deref(), Some("explicit-task"));
+}
+
+/// A linked worktree uses the source repository name for project and the
+/// worktree directory name for task.
+#[test]
+fn test_reserve_infers_git_worktree_metadata() {
+    let env = TestEnv::new();
+    let main_repository = env.create_dir("main-project");
+    initialize_git_repository(&main_repository, "main-branch");
+    let worktree = env.path().join("feature-worktree");
+    run_git(
+        &main_repository,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "worktree-branch",
+            worktree.to_str().unwrap(),
+        ],
+    );
+
+    env.command()
+        .arg("reserve")
+        .arg("--allow-unrelated-path")
+        .current_dir(&worktree)
+        .assert()
+        .success();
+
+    let stored = stored_reservations(&env);
+    assert_eq!(stored[0].project.as_deref(), Some("main-project"));
+    assert_eq!(stored[0].task.as_deref(), Some("feature-worktree"));
+}
+
+/// A non-Git path simply leaves both inferred fields absent.
+#[test]
+fn test_reserve_non_git_inference_fallback_is_empty() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("non-git");
+
+    env.command()
+        .arg("reserve")
+        .arg("--allow-unrelated-path")
+        .current_dir(&test_path)
+        .assert()
+        .success();
+
+    let stored = stored_reservations(&env);
+    assert_eq!(stored[0].project, None);
+    assert_eq!(stored[0].task, None);
+}
+
+/// Explicit empty metadata is invalid, while an invalid best-effort Git
+/// candidate is ignored rather than failing the reservation.
+#[test]
+fn test_reserve_rejects_empty_explicit_metadata() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("empty-metadata");
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("   ")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Cannot be empty"));
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--task")
+        .arg("")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Cannot be empty"));
+
+    assert!(!env.data_dir.join("trop.db").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_reserve_ignores_invalid_git_inference_candidate() {
+    let env = TestEnv::new();
+    let repository = env.create_dir("   ");
+    initialize_git_repository(&repository, "valid-task");
+
+    env.command()
+        .arg("reserve")
+        .arg("--allow-unrelated-path")
+        .current_dir(&repository)
+        .assert()
+        .success();
+
+    let stored = stored_reservations(&env);
+    assert_eq!(stored[0].project, None);
+    assert_eq!(stored[0].task.as_deref(), Some("valid-task"));
+}
+
+/// Set and clear forms for the same field are mutually exclusive.
+#[test]
+fn test_reserve_rejects_conflicting_metadata_intent_flags() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("conflicting-intent");
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("project")
+        .arg("--clear-project")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--task")
+        .arg("task")
+        .arg("--clear-task")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 /// Force combines overwrite, both sticky-field permissions, and the two

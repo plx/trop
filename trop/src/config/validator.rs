@@ -183,6 +183,10 @@ impl ConfigValidator {
         Ok(())
     }
 
+    pub(crate) fn validate_runtime_identifier(field: &str, value: &str) -> Result<()> {
+        Self::validate_identifier(field, value)
+    }
+
     /// Validate port configuration.
     ///
     /// Ensures min and max are valid ports, max >= min, and that max and

@@ -3,7 +3,7 @@
 //! This module implements the reservation planning logic, including
 //! idempotency checks, sticky field protection, and path validation.
 
-use crate::config::Config;
+use crate::config::{Config, ConfigValidator};
 use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::port::allocator::{allocator_from_config, AllocationOptions, AllocationResult};
@@ -12,6 +12,58 @@ use crate::{Port, Reservation, ReservationKey};
 use rusqlite::Connection;
 
 use super::plan::{OperationPlan, PlanAction};
+
+/// The requested operation for one optional reservation metadata field.
+///
+/// Absence is deliberately represented as [`Self::Preserve`] rather than as
+/// `None`, because omitting metadata from an idempotent reserve request must
+/// not clear a value that is already stored.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum MetadataIntent {
+    /// Keep an existing value; infer a default when creating a new reservation.
+    #[default]
+    Preserve,
+    /// Store the supplied value.
+    Set(String),
+    /// Store no value.
+    Clear,
+}
+
+impl MetadataIntent {
+    /// Create an explicit set intent.
+    #[must_use]
+    pub fn set(value: impl Into<String>) -> Self {
+        Self::Set(value.into())
+    }
+
+    fn from_optional_value(value: Option<String>) -> Self {
+        value.map_or(Self::Preserve, Self::Set)
+    }
+
+    fn resolve_existing(&self, existing: Option<&str>) -> Option<String> {
+        match self {
+            Self::Preserve => existing.map(ToOwned::to_owned),
+            Self::Set(value) => Some(value.trim().to_string()),
+            Self::Clear => None,
+        }
+    }
+
+    fn resolve_new(&self, inferred: Option<String>) -> Option<String> {
+        match self {
+            Self::Preserve => inferred,
+            Self::Set(value) => Some(value.trim().to_string()),
+            Self::Clear => None,
+        }
+    }
+
+    fn validate(&self, field: &str) -> Result<()> {
+        if let Self::Set(value) = self {
+            ConfigValidator::validate_runtime_identifier(field, value)?;
+        }
+        Ok(())
+    }
+}
 
 /// Options for a reserve operation.
 ///
@@ -23,11 +75,11 @@ pub struct ReserveOptions {
     /// The reservation key (path + optional tag).
     pub key: ReservationKey,
 
-    /// Optional project identifier (sticky field).
-    pub project: Option<String>,
+    /// Requested project metadata operation (sticky field).
+    pub project: MetadataIntent,
 
-    /// Optional task identifier (sticky field).
-    pub task: Option<String>,
+    /// Requested task metadata operation (sticky field).
+    pub task: MetadataIntent,
 
     /// The port to reserve. If None, automatic allocation will be used.
     pub port: Option<Port>,
@@ -67,8 +119,8 @@ impl ReserveOptions {
     /// Creates a new `ReserveOptions` with the given key and port.
     ///
     /// All optional fields and flags are set to defaults:
-    /// - project: None
-    /// - task: None
+    /// - project: [`MetadataIntent::Preserve`]
+    /// - task: [`MetadataIntent::Preserve`]
     /// - `preferred_port`: None
     /// - overwrite: false
     /// - `ignore_occupied`: false
@@ -96,8 +148,8 @@ impl ReserveOptions {
     pub fn new(key: ReservationKey, port: Option<Port>) -> Self {
         Self {
             key,
-            project: None,
-            task: None,
+            project: MetadataIntent::Preserve,
+            task: MetadataIntent::Preserve,
             port,
             preferred_port: None,
             overwrite: false,
@@ -113,16 +165,50 @@ impl ReserveOptions {
     }
 
     /// Sets the project field.
+    ///
+    /// `Some(value)` explicitly sets the field. `None` preserves an existing
+    /// value and permits inference only when a new reservation is created.
     #[must_use]
     pub fn with_project(mut self, project: Option<String>) -> Self {
-        self.project = project;
+        self.project = MetadataIntent::from_optional_value(project);
         self
     }
 
     /// Sets the task field.
+    ///
+    /// `Some(value)` explicitly sets the field. `None` preserves an existing
+    /// value and permits inference only when a new reservation is created.
     #[must_use]
     pub fn with_task(mut self, task: Option<String>) -> Self {
-        self.task = task;
+        self.task = MetadataIntent::from_optional_value(task);
+        self
+    }
+
+    /// Sets the project metadata intent directly.
+    #[must_use]
+    pub fn with_project_intent(mut self, intent: MetadataIntent) -> Self {
+        self.project = intent;
+        self
+    }
+
+    /// Sets the task metadata intent directly.
+    #[must_use]
+    pub fn with_task_intent(mut self, intent: MetadataIntent) -> Self {
+        self.task = intent;
+        self
+    }
+
+    /// Explicitly clears project metadata.
+    #[must_use]
+    pub fn with_clear_project(mut self) -> Self {
+        self.project = MetadataIntent::Clear;
+        self
+    }
+
+    /// Explicitly clears task metadata.
+    #[must_use]
+    pub fn with_clear_task(mut self) -> Self {
+        self.task = MetadataIntent::Clear;
         self
     }
 
@@ -196,15 +282,12 @@ impl ReserveOptions {
         self
     }
 
-    /// Infers project and task from git context if not explicitly provided.
+    /// Retains deferred Git inference for compatibility with earlier callers.
     ///
-    /// This method uses git repository information to automatically set
-    /// project and task fields when they haven't been explicitly specified.
-    ///
-    /// - Project: extracted from repository name
-    /// - Task: extracted from worktree name (in worktree) or branch name (in regular repo)
-    ///
-    /// Only sets fields that are currently `None` - explicit values are preserved.
+    /// Planning performs best-effort inference from the reservation's target
+    /// path only when a new reservation is created. Existing reservations keep
+    /// their stored metadata, so this method deliberately leaves all intents
+    /// unchanged. The `path` argument is retained for source compatibility.
     ///
     /// # Arguments
     ///
@@ -223,16 +306,7 @@ impl ReserveOptions {
     /// // project and task will be inferred from git if available
     /// ```
     #[must_use]
-    pub fn with_git_inference(mut self, path: &std::path::Path) -> Self {
-        use super::inference::{infer_project, infer_task};
-
-        // Only infer if not explicitly provided
-        if self.project.is_none() {
-            self.project = infer_project(path);
-        }
-        if self.task.is_none() {
-            self.task = infer_task(path);
-        }
+    pub fn with_git_inference(self, _path: &std::path::Path) -> Self {
         self
     }
 }
@@ -311,6 +385,9 @@ impl<'a> ReservePlan<'a> {
     pub fn build_plan(&self, conn: &Connection) -> Result<OperationPlan> {
         let mut plan = OperationPlan::new(format!("Reserve port for {}", self.options.key));
 
+        self.options.project.validate("project")?;
+        self.options.task.validate("task")?;
+
         // Step 1: Validate path relationship
         if !self.options.force && !self.options.allow_unrelated_path {
             Database::validate_path_relationship(&self.options.key.path, false)?;
@@ -318,19 +395,23 @@ impl<'a> ReservePlan<'a> {
 
         // Step 2: Check for existing reservation
         if let Some(existing) = Database::get_reservation(conn, &self.options.key)? {
+            let project = self.options.project.resolve_existing(existing.project());
+            let task = self.options.task.resolve_existing(existing.task());
+
             // Reservation exists - validate every requested sticky-field change
             // before planning any write.
-            self.validate_sticky_fields(&existing)?;
+            self.validate_sticky_fields(&existing, project.as_deref(), task.as_deref())?;
 
             if self.options.overwrite || self.options.force {
                 let port = self.allocate_port(conn, Some(&self.options.key))?;
-                let replacement = self.updated_reservation(&existing, port)?;
+                let replacement =
+                    self.updated_reservation(&existing, port, project.clone(), task.clone())?;
                 plan = plan.add_action(PlanAction::UpdateReservation(replacement));
                 return Ok(plan);
             }
 
-            if self.metadata_changed(&existing) {
-                let update = self.updated_reservation(&existing, existing.port())?;
+            if Self::metadata_changed(&existing, project.as_deref(), task.as_deref()) {
+                let update = self.updated_reservation(&existing, existing.port(), project, task)?;
                 plan = plan.add_action(PlanAction::UpdateReservation(update));
                 return Ok(plan);
             }
@@ -346,9 +427,17 @@ impl<'a> ReservePlan<'a> {
         let port = self.allocate_port(conn, None)?;
 
         // Step 4: Create the new reservation
+        let project = self
+            .options
+            .project
+            .resolve_new(super::inference::infer_project(&self.options.key.path));
+        let task = self
+            .options
+            .task
+            .resolve_new(super::inference::infer_task(&self.options.key.path));
         let reservation = Reservation::builder(self.options.key.clone(), port)
-            .project(self.options.project.clone())
-            .task(self.options.task.clone())
+            .project(project)
+            .task(task)
             .build()?;
 
         plan = plan.add_action(PlanAction::CreateReservation(reservation));
@@ -399,66 +488,66 @@ impl<'a> ReservePlan<'a> {
         }
     }
 
-    fn metadata_changed(&self, existing: &Reservation) -> bool {
-        self.options.project.as_deref() != existing.project()
-            || self.options.task.as_deref() != existing.task()
+    fn metadata_changed(existing: &Reservation, project: Option<&str>, task: Option<&str>) -> bool {
+        project != existing.project() || task != existing.task()
     }
 
-    fn updated_reservation(&self, existing: &Reservation, port: Port) -> Result<Reservation> {
+    fn updated_reservation(
+        &self,
+        existing: &Reservation,
+        port: Port,
+        project: Option<String>,
+        task: Option<String>,
+    ) -> Result<Reservation> {
         Ok(Reservation::builder(self.options.key.clone(), port)
-            .project(self.options.project.clone())
-            .task(self.options.task.clone())
+            .project(project)
+            .task(task)
             .created_at(existing.created_at())
             .build()?)
     }
 
     /// Validates that sticky fields aren't being changed without permission.
-    fn validate_sticky_fields(&self, existing: &Reservation) -> Result<()> {
+    fn validate_sticky_fields(
+        &self,
+        existing: &Reservation,
+        project: Option<&str>,
+        task: Option<&str>,
+    ) -> Result<()> {
         // Check project field
-        if !self.can_change_project(existing) {
+        if !can_change_field(
+            project,
+            existing.project(),
+            self.options.force,
+            self.options.allow_project_change,
+        ) {
             return Err(Error::StickyFieldChange {
                 field: "project".to_string(),
                 details: format!(
                     "Cannot change project from {:?} to {:?} without --force or --allow-project-change",
                     existing.project(),
-                    self.options.project
+                    project
                 ),
             });
         }
 
         // Check task field
-        if !self.can_change_task(existing) {
+        if !can_change_field(
+            task,
+            existing.task(),
+            self.options.force,
+            self.options.allow_task_change,
+        ) {
             return Err(Error::StickyFieldChange {
                 field: "task".to_string(),
                 details: format!(
                     "Cannot change task from {:?} to {:?} without --force or --allow-task-change",
                     existing.task(),
-                    self.options.task
+                    task
                 ),
             });
         }
 
         Ok(())
-    }
-
-    /// Checks if the project field can be changed.
-    fn can_change_project(&self, existing: &Reservation) -> bool {
-        can_change_field(
-            self.options.project.as_ref(),
-            existing.project(),
-            self.options.force,
-            self.options.allow_project_change,
-        )
-    }
-
-    /// Checks if the task field can be changed.
-    fn can_change_task(&self, existing: &Reservation) -> bool {
-        can_change_field(
-            self.options.task.as_ref(),
-            existing.task(),
-            self.options.force,
-            self.options.allow_task_change,
-        )
     }
 }
 
@@ -479,7 +568,7 @@ impl<'a> ReservePlan<'a> {
 ///
 /// `true` if the change is allowed, `false` otherwise
 fn can_change_field(
-    new_value: Option<&String>,
+    new_value: Option<&str>,
     existing_value: Option<&str>,
     force: bool,
     allow_change: bool,
@@ -490,7 +579,7 @@ fn can_change_field(
     }
 
     // Otherwise, only allow if the value isn't actually changing
-    match (new_value.map(String::as_str), existing_value) {
+    match (new_value, existing_value) {
         (None, None) => true,
         (Some(new), Some(old)) => new == old,
         _ => false, // One is Some, other is None - this is a change
@@ -632,7 +721,7 @@ mod tests {
                 // PROPERTY: When force=true, can_change_field ALWAYS returns true
                 // This is the key invariant of the force flag - it overrides all protections
                 let result = can_change_field(
-                    new_value.as_ref(),
+                    new_value.as_deref(),
                     existing_value.as_deref(),
                     true,  // force = true
                     allow_change,
@@ -653,7 +742,7 @@ mod tests {
                 // PROPERTY: When the specific allow flag is true, changes are permitted
                 // This verifies the fine-grained override mechanism
                 let result = can_change_field(
-                    new_value.as_ref(),
+                    new_value.as_deref(),
                     existing_value.as_deref(),
                     false,  // force = false
                     true,   // allow_change = true
@@ -674,7 +763,7 @@ mod tests {
                 // This is crucial for reservation idempotency - reapplying the same
                 // reservation parameters should never fail due to sticky fields
                 let result = can_change_field(
-                    value.as_ref(),
+                    value.as_deref(),
                     value.as_deref(),
                     false,  // force = false
                     false,  // allow_change = false
@@ -840,6 +929,8 @@ mod tests {
         let port = Port::try_from(8080).unwrap();
         let options = ReserveOptions::new(key, Some(port));
 
+        assert_eq!(options.project, MetadataIntent::Preserve);
+        assert_eq!(options.task, MetadataIntent::Preserve);
         assert!(!options.force);
         assert!(!options.overwrite);
         assert!(!options.allow_unrelated_path);
@@ -861,8 +952,20 @@ mod tests {
         assert!(options.force);
         assert!(options.overwrite);
         assert!(options.allow_unrelated_path);
-        assert_eq!(options.project, Some("test-project".to_string()));
-        assert_eq!(options.task, Some("test-task".to_string()));
+        assert_eq!(
+            options.project,
+            MetadataIntent::Set("test-project".to_string())
+        );
+        assert_eq!(options.task, MetadataIntent::Set("test-task".to_string()));
+
+        let cleared = ReserveOptions::new(
+            ReservationKey::new(PathBuf::from("/path"), None).unwrap(),
+            Some(port),
+        )
+        .with_clear_project()
+        .with_clear_task();
+        assert_eq!(cleared.project, MetadataIntent::Clear);
+        assert_eq!(cleared.task, MetadataIntent::Clear);
     }
 
     #[test]

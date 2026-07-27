@@ -17,8 +17,8 @@ use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 use trop::{
     config::{Config, OccupancyConfig, PortConfig},
-    Database, PlanAction, PlanExecutor, Port, ReleaseOptions, ReleasePlan, Reservation,
-    ReservationKey, ReserveOptions, ReservePlan,
+    Database, MetadataIntent, PlanAction, PlanExecutor, Port, ReleaseOptions, ReleasePlan,
+    Reservation, ReservationKey, ReserveOptions, ReservePlan,
 };
 
 // Port base constants for test organization
@@ -248,6 +248,155 @@ fn test_authorized_metadata_update_persists_without_moving_port() {
     assert_eq!(stored.task(), Some("task-a"));
     assert_eq!(stored.created_at(), created_at);
     assert!(stored.last_used_at() > original.last_used_at());
+}
+
+#[test]
+fn test_omitted_metadata_intent_preserves_existing_values() {
+    let db = create_test_database();
+    let key = ReservationKey::new(PathBuf::from("/test/preserve-metadata"), None).unwrap();
+    let port = Port::try_from(5062).unwrap();
+    let original = Reservation::builder(key.clone(), port)
+        .project(Some("project-a".to_string()))
+        .task(Some("task-a".to_string()))
+        .build()
+        .unwrap();
+    Database::create_reservation_simple(db.connection(), &original).unwrap();
+
+    let options = ReserveOptions::new(key.clone(), None).with_allow_unrelated_path(true);
+    assert_eq!(options.project, MetadataIntent::Preserve);
+    assert_eq!(options.task, MetadataIntent::Preserve);
+    let plan = ReservePlan::new(options, &reconciliation_config(5062, 5063))
+        .build_plan(db.connection())
+        .unwrap();
+    assert!(matches!(
+        plan.actions.as_slice(),
+        [PlanAction::UpdateLastUsed(_)]
+    ));
+
+    PlanExecutor::new(db.connection()).execute(&plan).unwrap();
+    let stored = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.project(), Some("project-a"));
+    assert_eq!(stored.task(), Some("task-a"));
+}
+
+#[test]
+fn test_git_inference_helper_does_not_reinfer_existing_metadata() {
+    let repository = tempfile::tempdir().unwrap();
+    let git = std::process::Command::new("git")
+        .arg("init")
+        .arg(repository.path())
+        .output()
+        .unwrap();
+    assert!(
+        git.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&git.stderr)
+    );
+
+    let db = create_test_database();
+    let key = ReservationKey::new(repository.path().to_path_buf(), None).unwrap();
+    let port = Port::try_from(5063).unwrap();
+    let original = Reservation::builder(key.clone(), port)
+        .project(Some("stored-project".to_string()))
+        .task(Some("stored-task".to_string()))
+        .build()
+        .unwrap();
+    Database::create_reservation_simple(db.connection(), &original).unwrap();
+
+    let options = ReserveOptions::new(key, None)
+        .with_git_inference(repository.path())
+        .with_allow_unrelated_path(true);
+    let plan = ReservePlan::new(options, &reconciliation_config(5063, 5064))
+        .build_plan(db.connection())
+        .unwrap();
+
+    assert!(matches!(
+        plan.actions.as_slice(),
+        [PlanAction::UpdateLastUsed(_)]
+    ));
+}
+
+#[test]
+fn test_explicit_metadata_is_trimmed_before_sticky_comparison() {
+    let db = create_test_database();
+    let key = ReservationKey::new(PathBuf::from("/test/trimmed-metadata"), None).unwrap();
+    let port = Port::try_from(5064).unwrap();
+    let original = Reservation::builder(key.clone(), port)
+        .project(Some("project-a".to_string()))
+        .task(Some("task-a".to_string()))
+        .build()
+        .unwrap();
+    Database::create_reservation_simple(db.connection(), &original).unwrap();
+
+    let options = ReserveOptions::new(key, None)
+        .with_project(Some("  project-a  ".to_string()))
+        .with_task(Some("  task-a  ".to_string()))
+        .with_allow_unrelated_path(true);
+    let plan = ReservePlan::new(options, &reconciliation_config(5064, 5065))
+        .build_plan(db.connection())
+        .unwrap();
+
+    assert!(matches!(
+        plan.actions.as_slice(),
+        [PlanAction::UpdateLastUsed(_)]
+    ));
+}
+
+#[test]
+fn test_explicit_clear_intent_is_protected_and_persists_when_allowed() {
+    let db = create_test_database();
+    let key = ReservationKey::new(PathBuf::from("/test/clear-metadata"), None).unwrap();
+    let port = Port::try_from(5064).unwrap();
+    let created_at = UNIX_EPOCH + Duration::from_secs(12);
+    let original = Reservation::builder(key.clone(), port)
+        .project(Some("project-a".to_string()))
+        .task(Some("task-a".to_string()))
+        .created_at(created_at)
+        .build()
+        .unwrap();
+    Database::create_reservation_simple(db.connection(), &original).unwrap();
+
+    let rejected = ReserveOptions::new(key.clone(), None)
+        .with_clear_project()
+        .with_allow_unrelated_path(true);
+    assert!(matches!(
+        ReservePlan::new(rejected, &reconciliation_config(5064, 5065)).build_plan(db.connection()),
+        Err(trop::Error::StickyFieldChange { .. })
+    ));
+
+    let clear_project = ReserveOptions::new(key.clone(), None)
+        .with_clear_project()
+        .with_allow_project_change(true)
+        .with_allow_unrelated_path(true);
+    let plan = ReservePlan::new(clear_project, &reconciliation_config(5064, 5065))
+        .build_plan(db.connection())
+        .unwrap();
+    PlanExecutor::new(db.connection()).execute(&plan).unwrap();
+    let project_cleared = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(project_cleared.project(), None);
+    assert_eq!(project_cleared.task(), Some("task-a"));
+    assert_eq!(project_cleared.port(), port);
+    assert_eq!(project_cleared.created_at(), created_at);
+
+    let clear_task = ReserveOptions::new(key.clone(), None)
+        .with_clear_task()
+        .with_allow_task_change(true)
+        .with_allow_unrelated_path(true);
+    let plan = ReservePlan::new(clear_task, &reconciliation_config(5064, 5065))
+        .build_plan(db.connection())
+        .unwrap();
+    PlanExecutor::new(db.connection()).execute(&plan).unwrap();
+    let cleared = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleared.project(), None);
+    assert_eq!(cleared.task(), None);
+    assert_eq!(cleared.port(), port);
+    assert_eq!(cleared.created_at(), created_at);
 }
 
 #[test]
@@ -584,9 +733,9 @@ fn test_cannot_change_project_from_some_to_none() {
     let mut executor = PlanExecutor::new(db.connection());
     executor.execute(&plan).unwrap();
 
-    // Try to remove project (change to None)
+    // Try to explicitly remove project.
     let opts2 = ReserveOptions::new(key, Some(port))
-        .with_project(None)
+        .with_clear_project()
         .with_allow_unrelated_path(true);
 
     let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());

@@ -16,7 +16,7 @@ use std::process::Command;
 use tempfile::TempDir;
 use trop::operations::inference::{infer_project, infer_task};
 
-use trop::operations::ReserveOptions;
+use trop::operations::{MetadataIntent, ReserveOptions};
 
 use trop::{Port, ReservationKey};
 
@@ -314,6 +314,56 @@ mod infer_project_tests {
             project,
             Some("main-repo".to_string()),
             "Worktree should infer project name from main repository, not worktree directory"
+        );
+    }
+
+    /// A bare source repository uses its own directory name, with the conventional
+    /// `.git` suffix removed, rather than the name of its parent directory.
+    #[test]
+    fn test_infer_project_from_bare_source_worktree() {
+        let temp = TempDir::new().unwrap();
+        let seed_repo = temp.path().join("seed");
+        std::fs::create_dir(&seed_repo).unwrap();
+        helpers::create_test_repo(&seed_repo).unwrap();
+
+        let bare_repo = temp.path().join("source-project.git");
+        let clone = Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                seed_repo.to_str().unwrap(),
+                bare_repo.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            clone.status.success(),
+            "bare clone failed: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+
+        let worktree_path = temp.path().join("feature-worktree");
+        let add = Command::new("git")
+            .args([
+                "--git-dir",
+                bare_repo.to_str().unwrap(),
+                "worktree",
+                "add",
+                "-b",
+                "feature-branch",
+                worktree_path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            add.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+
+        assert_eq!(
+            infer_project(&worktree_path),
+            Some("source-project".to_string())
         );
     }
 
@@ -661,33 +711,30 @@ mod integration_tests {
         // Verify explicit values are preserved
         assert_eq!(
             options.project,
-            Some("my-project".to_string()),
+            MetadataIntent::Set("my-project".to_string()),
             "Explicit project value must be preserved by git inference"
         );
         assert_eq!(
             options.task,
-            Some("my-task".to_string()),
+            MetadataIntent::Set("my-task".to_string()),
             "Explicit task value must be preserved by git inference"
         );
     }
 
-    /// Tests that with_git_inference() infers values when fields are None.
+    /// Tests that `with_git_inference()` leaves fallback inference deferred.
     ///
-    /// SEMANTIC INVARIANT: When project and task are not explicitly specified
-    /// (i.e., they are None), with_git_inference() should populate them from
-    /// git context if available. This is the primary purpose of the inference
-    /// feature.
+    /// SEMANTIC INVARIANT: Preserve intents must remain distinguishable from
+    /// explicit values so an existing exact key is never re-inferred.
     ///
     /// TEST SCENARIO:
     /// - Create a git repository named "inferred-project" on branch "inferred-task"
     /// - Create ReserveOptions with project and task set to None
     /// - Call with_git_inference()
-    /// - Verify project is set to "inferred-project" and task to "inferred-task"
+    /// - Verify both intents remain Preserve for planning-time inference
     ///
-    /// WHY THIS MATTERS: This is the main use case - automatic population of
-    /// project and task from git context, saving users from manual specification.
+    /// WHY THIS MATTERS: Planning can then infer only for new reservations.
     #[test]
-    fn test_with_git_inference_infers_when_none() {
+    fn test_with_git_inference_defers_preserve_intents() {
         let temp = TempDir::new().unwrap();
         let repo_path = temp.path().join("inferred-project");
         std::fs::create_dir(&repo_path).unwrap();
@@ -701,34 +748,31 @@ mod integration_tests {
         // Create options with NO explicit project or task
         let options = ReserveOptions::new(key, Some(port)).with_git_inference(&repo_path);
 
-        // Verify values were inferred from git
         assert_eq!(
             options.project,
-            Some("inferred-project".to_string()),
-            "Project should be inferred from repository name when not explicitly set"
+            MetadataIntent::Preserve,
+            "Project inference should remain deferred"
         );
         assert_eq!(
             options.task,
-            Some("inferred-task".to_string()),
-            "Task should be inferred from branch name when not explicitly set"
+            MetadataIntent::Preserve,
+            "Task inference should remain deferred"
         );
     }
 
-    /// Tests partial inference: explicit project, inferred task.
+    /// Tests deferred partial inference with an explicit project.
     ///
-    /// SEMANTIC INVARIANT: Project and task inference should be independent -
-    /// one can be explicitly set while the other is inferred. This allows users
-    /// to mix explicit and inferred values as needed.
+    /// SEMANTIC INVARIANT: Project and task intents remain independent. An
+    /// explicit project is retained while task inference remains deferred.
     ///
     /// TEST SCENARIO:
     /// - Create a git repository on branch "feature-branch"
     /// - Create ReserveOptions with explicit project but no task
     /// - Call with_git_inference()
-    /// - Verify explicit project is preserved and task is inferred from git
+    /// - Verify explicit project is preserved and task remains Preserve
     ///
-    /// WHY THIS MATTERS: Users might want to override the project name (e.g., to
-    /// group multiple repos) while still benefiting from automatic task inference
-    /// based on the current branch.
+    /// WHY THIS MATTERS: Planning can infer the task for a new key without
+    /// losing the distinction needed to preserve an existing key.
     #[test]
     fn test_with_git_inference_partial_explicit_project() {
         let temp = TempDir::new().unwrap();
@@ -748,31 +792,29 @@ mod integration_tests {
 
         assert_eq!(
             options.project,
-            Some("explicit-project".to_string()),
+            MetadataIntent::Set("explicit-project".to_string()),
             "Explicit project should be preserved"
         );
         assert_eq!(
             options.task,
-            Some("feature-branch".to_string()),
-            "Task should be inferred when not explicitly set"
+            MetadataIntent::Preserve,
+            "Task inference should remain deferred"
         );
     }
 
-    /// Tests partial inference: inferred project, explicit task.
+    /// Tests deferred partial inference with an explicit task.
     ///
     /// SEMANTIC INVARIANT: Similar to the previous test, but in the opposite
-    /// direction - project is inferred while task is explicit. This demonstrates
-    /// the symmetry and independence of the two inference mechanisms.
+    /// direction: project remains deferred while task is explicit.
     ///
     /// TEST SCENARIO:
     /// - Create a git repository named "inferred-repo"
     /// - Create ReserveOptions with explicit task but no project
     /// - Call with_git_inference()
-    /// - Verify project is inferred from git and explicit task is preserved
+    /// - Verify project remains Preserve and explicit task is preserved
     ///
-    /// WHY THIS MATTERS: Users might want to use a specific task name (e.g., a
-    /// ticket number) while still benefiting from automatic project inference
-    /// based on the repository name.
+    /// WHY THIS MATTERS: Planning can infer the project for a new key while
+    /// preserving the explicit task.
     #[test]
     fn test_with_git_inference_partial_explicit_task() {
         let temp = TempDir::new().unwrap();
@@ -792,12 +834,12 @@ mod integration_tests {
 
         assert_eq!(
             options.project,
-            Some("inferred-repo".to_string()),
-            "Project should be inferred when not explicitly set"
+            MetadataIntent::Preserve,
+            "Project inference should remain deferred"
         );
         assert_eq!(
             options.task,
-            Some("explicit-task".to_string()),
+            MetadataIntent::Set("explicit-task".to_string()),
             "Explicit task should be preserved"
         );
     }
@@ -830,31 +872,31 @@ mod integration_tests {
 
         // Values should remain None, but no error should occur
         assert_eq!(
-            options.project, None,
+            options.project,
+            MetadataIntent::Preserve,
             "Project should remain None for non-git directory"
         );
         assert_eq!(
-            options.task, None,
+            options.task,
+            MetadataIntent::Preserve,
             "Task should remain None for non-git directory"
         );
     }
 
-    /// Tests that with_git_inference() handles detached HEAD gracefully.
+    /// Tests that `with_git_inference()` remains deferred at detached HEAD.
     ///
-    /// SEMANTIC INVARIANT: In a detached HEAD state, project can still be inferred
-    /// (from repository name), but task cannot (no branch). The function should
-    /// handle this mixed state correctly without errors.
+    /// SEMANTIC INVARIANT: The compatibility helper does not collapse either
+    /// fallback into an explicit Set intent, regardless of Git state.
     ///
     /// TEST SCENARIO:
     /// - Create a git repository named "test-project"
     /// - Detach HEAD
     /// - Create ReserveOptions with no explicit project/task
     /// - Call with_git_inference()
-    /// - Verify project is inferred, task remains None
+    /// - Verify both absent inputs remain Preserve
     ///
-    /// WHY THIS MATTERS: Detached HEAD is a valid git state. The inference should
-    /// work partially, providing what information is available (project) while
-    /// gracefully handling what isn't (task).
+    /// WHY THIS MATTERS: The planner decides whether the key is new before
+    /// consulting the available Git metadata.
     #[test]
     fn test_with_git_inference_detached_head() {
         let temp = TempDir::new().unwrap();
@@ -869,35 +911,32 @@ mod integration_tests {
 
         let options = ReserveOptions::new(key, Some(port)).with_git_inference(&repo_path);
 
-        // Project should be inferred, task should be None (detached HEAD)
         assert_eq!(
             options.project,
-            Some("test-project".to_string()),
-            "Project should be inferred even in detached HEAD state"
+            MetadataIntent::Preserve,
+            "Project inference should remain deferred"
         );
         assert_eq!(
-            options.task, None,
+            options.task,
+            MetadataIntent::Preserve,
             "Task should be None for detached HEAD (no branch)"
         );
     }
 
-    /// Tests inference in a worktree: project from main repo, task from worktree dir.
+    /// Tests that worktree inference remains deferred until planning.
     ///
-    /// SEMANTIC INVARIANT: In a worktree context, both project and task inference
-    /// should work, but with different sources:
-    /// - Project comes from the main repository's directory name
-    /// - Task comes from the worktree's directory name (not the branch)
+    /// SEMANTIC INVARIANT: Worktree metadata stays represented as fallback
+    /// intent until the planner establishes that the key is new.
     ///
     /// TEST SCENARIO:
     /// - Create a main repository named "main-project"
     /// - Create a worktree in directory "feature-work" on branch "some-branch"
     /// - Create ReserveOptions with no explicit project/task
     /// - Call with_git_inference() from the worktree
-    /// - Verify project="main-project" and task="feature-work"
+    /// - Verify both intents remain Preserve
     ///
-    /// WHY THIS MATTERS: This tests the complete integration of worktree support,
-    /// ensuring both inference functions work correctly together in the worktree
-    /// scenario, which is a key use case for the feature.
+    /// WHY THIS MATTERS: Repeating an existing worktree reservation must not
+    /// reinterpret metadata when the worktree or branch context changes.
     #[test]
     fn test_with_git_inference_in_worktree() {
         let temp = TempDir::new().unwrap();
@@ -916,13 +955,13 @@ mod integration_tests {
 
         assert_eq!(
             options.project,
-            Some("main-project".to_string()),
-            "Project should be inferred from main repository in worktree"
+            MetadataIntent::Preserve,
+            "Project inference should remain deferred"
         );
         assert_eq!(
             options.task,
-            Some("feature-work".to_string()),
-            "Task should be inferred from worktree directory name"
+            MetadataIntent::Preserve,
+            "Task inference should remain deferred"
         );
     }
 }
