@@ -181,7 +181,7 @@ pub enum Error {
     },
 
     /// Port occupancy check failed.
-    #[error("occupancy check failed for port {port}: {source}")]
+    #[error("port {port} is possibly occupied because its occupancy probe failed: {source}")]
     OccupancyCheckFailed {
         /// The port that failed the check.
         port: crate::port::Port,

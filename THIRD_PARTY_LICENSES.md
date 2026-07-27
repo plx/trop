@@ -12,7 +12,7 @@ See `LICENSE`, `LICENSE-APACHE`, and `LICENSE-MIT` for the full text.
 
 ## Overview
 
-- **MIT License** — 227 crate(s)
+- **MIT License** — 223 crate(s)
 - **Unicode License v3** — 19 crate(s)
 - **Apache License 2.0** — 10 crate(s)
 - **BSD 3-Clause "New" or "Revised" License** — 1 crate(s)
@@ -1524,6 +1524,7 @@ Used by:
 - [filetime 0.2.26](https://github.com/alexcrichton/filetime)
 - [find-msvc-tools 0.1.4](https://github.com/rust-lang/cc-rs)
 - [pkg-config 0.3.32](https://github.com/rust-lang/pkg-config-rs)
+- [socket2 0.6.5](https://github.com/rust-lang/socket2)
 - [wait-timeout 0.2.1](https://github.com/alexcrichton/wait-timeout)
 
 ```
@@ -2629,42 +2630,6 @@ SOFTWARE.
 
 Used by:
 
-- [getrandom 0.2.16](https://github.com/rust-random/getrandom)
-
-```
-Copyright (c) 2018-2024 The rust-random Project Developers
-Copyright (c) 2014 The Rust Project Developers
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
-### MIT License
-
-Used by:
-
 - [getrandom 0.3.3](https://github.com/rust-random/getrandom)
 
 ```
@@ -3078,11 +3043,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Used by:
 
-- [rand 0.8.5](https://github.com/rust-random/rand)
 - [rand 0.9.2](https://github.com/rust-random/rand)
-- [rand_chacha 0.3.1](https://github.com/rust-random/rand)
 - [rand_chacha 0.9.0](https://github.com/rust-random/rand)
-- [rand_core 0.6.4](https://github.com/rust-random/rand)
 - [rand_core 0.9.3](https://github.com/rust-random/rand)
 - [rand_xorshift 0.4.0](https://github.com/rust-random/rngs)
 
@@ -3291,37 +3253,6 @@ Used by:
 MIT License
 
 Copyright (c) 2020 Soveu
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-```
-
-### MIT License
-
-Used by:
-
-- [port-selector 0.1.6](https://github.com/ZingerLittleBee/port-selector-rs)
-
-```
-MIT License
-
-Copyright (c) 2022 勤劳的小蜜蜂
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use tempfile::TempDir;
 
-use trop::config::{Config, ConfigBuilder};
+use trop::config::{Config, ConfigBuilder, OccupancyConfig};
 use trop::database::{Database, DatabaseConfig};
 use trop::operations::{
     ExecutionResult, PlanExecutor, ReleaseOptions, ReleasePlan, ReserveOptions, ReservePlan,
@@ -16,6 +16,13 @@ const BULK_RESERVATION_SIZES: &[usize] = &[10, 100, 250];
 fn benchmark_config() -> Config {
     let overrides = Config {
         allow_unrelated_path: Some(true),
+        // These benchmarks measure reservation/database operations, not the
+        // host's socket state. Disable the whole occupancy matrix so automatic
+        // scans remain deterministic across platform-reserved ports.
+        occupancy_check: Some(OccupancyConfig {
+            skip: Some(true),
+            ..OccupancyConfig::default()
+        }),
         ..Config::default()
     };
 

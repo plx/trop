@@ -3,11 +3,23 @@
 //! This module provides trait-based occupancy checking to determine if ports
 //! are actually in use on the system. The design uses traits for testability,
 //! allowing both real system checks and mock implementations for testing.
+//!
+//! The production checker builds an explicit matrix from the enabled
+//! transports (TCP and UDP), address families (IPv4 and IPv6), and address
+//! scopes. Localhost addresses are always checked; wildcard addresses are
+//! added when `check_all_interfaces` is enabled. IPv6 probe sockets set
+//! `IPV6_V6ONLY` before binding so operating-system dual-stack defaults cannot
+//! make an IPv6 probe accidentally test IPv4 too.
 
 use std::collections::HashSet;
+use std::fmt;
+use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::config::OccupancyConfig;
-use crate::{Port, PortRange, Result};
+use crate::{Error, Port, PortRange, Result};
 
 /// Configuration for a single occupancy check.
 ///
@@ -101,13 +113,17 @@ pub trait PortOccupancyChecker: Send + Sync {
     }
 }
 
-/// Production implementation using the port-selector crate.
+/// Production implementation using explicit socket bind probes.
 ///
-/// This checker uses actual system calls to determine port availability.
+/// Each enabled protocol/address-family pair is checked on localhost. When
+/// `check_all_interfaces` is enabled, a wildcard-address probe is added for
+/// every enabled pair. Successful binds are immediately closed. An
+/// `AddrInUse` result means occupied; any other system error is returned with
+/// probe context so callers can fail closed without losing the diagnostic.
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use trop::port::occupancy::{PortOccupancyChecker, SystemOccupancyChecker, OccupancyCheckConfig};
 /// use trop::Port;
 ///
@@ -121,28 +137,238 @@ pub trait PortOccupancyChecker: Send + Sync {
 #[derive(Debug, Clone, Copy)]
 pub struct SystemOccupancyChecker;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Tcp,
+    Udp,
+}
+
+impl Transport {
+    fn socket_type(self) -> Type {
+        match self {
+            Self::Tcp => Type::STREAM,
+            Self::Udp => Type::DGRAM,
+        }
+    }
+
+    fn protocol(self) -> Protocol {
+        match self {
+            Self::Tcp => Protocol::TCP,
+            Self::Udp => Protocol::UDP,
+        }
+    }
+}
+
+impl fmt::Display for Transport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Tcp => "TCP",
+            Self::Udp => "UDP",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OccupancyProbe {
+    transport: Transport,
+    address: SocketAddr,
+}
+
+impl OccupancyProbe {
+    fn domain(self) -> Domain {
+        if self.address.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        }
+    }
+
+    fn family_name(self) -> &'static str {
+        if self.address.is_ipv4() {
+            "IPv4"
+        } else {
+            "IPv6"
+        }
+    }
+
+    fn scope_name(self) -> &'static str {
+        if self.address.ip().is_unspecified() {
+            "wildcard"
+        } else {
+            "localhost"
+        }
+    }
+}
+
+impl fmt::Display for OccupancyProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} {} {} bind at {}",
+            self.transport,
+            self.family_name(),
+            self.scope_name(),
+            self.address
+        )
+    }
+}
+
+#[derive(Debug)]
+struct ProbeFailure {
+    probe: OccupancyProbe,
+    source: io::Error,
+}
+
+impl fmt::Display for ProbeFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} failed: {}", self.probe, self.source)
+    }
+}
+
+impl std::error::Error for ProbeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl SystemOccupancyChecker {
+    fn probes(port: Port, config: &OccupancyCheckConfig) -> Vec<OccupancyProbe> {
+        let mut probes = Vec::with_capacity(if config.check_all_interfaces { 8 } else { 4 });
+
+        if !config.skip_ipv4 {
+            Self::add_family_probes(
+                &mut probes,
+                config,
+                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port.value()),
+                SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port.value()),
+            );
+        }
+        if !config.skip_ipv6 {
+            Self::add_family_probes(
+                &mut probes,
+                config,
+                SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port.value()),
+                SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port.value()),
+            );
+        }
+
+        probes
+    }
+
+    fn add_family_probes(
+        probes: &mut Vec<OccupancyProbe>,
+        config: &OccupancyCheckConfig,
+        localhost: SocketAddr,
+        wildcard: SocketAddr,
+    ) {
+        for address in [localhost]
+            .into_iter()
+            .chain(config.check_all_interfaces.then_some(wildcard))
+        {
+            if !config.skip_tcp {
+                probes.push(OccupancyProbe {
+                    transport: Transport::Tcp,
+                    address,
+                });
+            }
+            if !config.skip_udp {
+                probes.push(OccupancyProbe {
+                    transport: Transport::Udp,
+                    address,
+                });
+            }
+        }
+    }
+
+    fn probe_socket(probe: &OccupancyProbe) -> io::Result<()> {
+        let socket = Socket::new(
+            probe.domain(),
+            probe.transport.socket_type(),
+            Some(probe.transport.protocol()),
+        )?;
+
+        // Be explicit about the options that materially affect occupancy
+        // results. Address reuse stays disabled, Windows wildcard probes use
+        // exclusive address binding, and IPv6 probes never accept IPv4-mapped
+        // addresses regardless of the platform default.
+        socket.set_reuse_address(false)?;
+        #[cfg(windows)]
+        if probe.address.ip().is_unspecified() {
+            Self::set_exclusive_address_use(&socket)?;
+        }
+        if probe.address.is_ipv6() {
+            socket.set_only_v6(true)?;
+        }
+
+        socket.bind(&probe.address.into())
+    }
+
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    fn set_exclusive_address_use(socket: &Socket) -> io::Result<()> {
+        use std::mem::size_of_val;
+        use std::os::windows::io::AsRawSocket;
+
+        use windows_sys::Win32::Networking::WinSock::{
+            setsockopt, WSAGetLastError, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+        };
+
+        let exclusive = 1_i32;
+        let raw_socket = usize::try_from(socket.as_raw_socket()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "socket handle does not fit a Winsock SOCKET",
+            )
+        })?;
+        // SAFETY: `socket` owns a valid Winsock SOCKET, `exclusive` remains
+        // alive for the call, and the pointer/length describe that i32 exactly.
+        let result = unsafe {
+            setsockopt(
+                raw_socket,
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                std::ptr::from_ref(&exclusive).cast::<u8>(),
+                size_of_val(&exclusive) as i32,
+            )
+        };
+
+        if result == SOCKET_ERROR {
+            // SAFETY: Winsock records the calling thread's last socket error.
+            let error = unsafe { WSAGetLastError() };
+            Err(io::Error::from_raw_os_error(error))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn is_occupied_with<F>(
+        port: Port,
+        config: &OccupancyCheckConfig,
+        mut run_probe: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(&OccupancyProbe) -> io::Result<()>,
+    {
+        for probe in Self::probes(port, config) {
+            match run_probe(&probe) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => return Ok(true),
+                Err(source) => {
+                    return Err(Error::OccupancyCheckFailed {
+                        port,
+                        source: Box::new(ProbeFailure { probe, source }),
+                    });
+                }
+            }
+        }
+
+        Ok(false)
+    }
+}
+
 impl PortOccupancyChecker for SystemOccupancyChecker {
     fn is_occupied(&self, port: Port, config: &OccupancyCheckConfig) -> Result<bool> {
-        // If we're skipping all checks, the port is available
-        if config.skip_tcp && config.skip_udp {
-            return Ok(false);
-        }
-        if config.skip_ipv4 && config.skip_ipv6 {
-            return Ok(false);
-        }
-
-        // Use port-selector to check availability
-        // The port-selector crate's is_free checks if we can bind to the port
-        let port_u16 = port.value();
-
-        // By default, port-selector checks localhost binding
-        // If the port is free, we can bind to it, so it's NOT occupied
-        // Note: `check_all_interfaces` is currently reserved for future use when we implement
-        // interface-specific binding checks. For now, we always check localhost.
-        let is_free = port_selector::is_free(port_u16);
-
-        // Port is occupied if it's NOT free
-        Ok(!is_free)
+        Self::is_occupied_with(port, config, Self::probe_socket)
     }
 }
 
@@ -278,6 +504,74 @@ impl PortOccupancyChecker for MockOccupancyChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
+
+    fn bind_ipv6_only_tcp(port: u16) -> io::Result<TcpListener> {
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(false)?;
+        socket.set_only_v6(true)?;
+        socket.bind(&SocketAddr::from((Ipv6Addr::LOCALHOST, port)).into())?;
+        socket.listen(1)?;
+        Ok(socket.into())
+    }
+
+    fn tcp_udp_ipv4_pair() -> io::Result<(TcpListener, UdpSocket)> {
+        for _ in 0..100 {
+            // Select through UDP first, then prove the same port is also
+            // bindable by TCP. Some Windows hosts do not make a
+            // TCP-selected ephemeral port eligible for UDP.
+            let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+            let port = udp.local_addr()?.port();
+            if let Ok(tcp) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                return Ok((tcp, udp));
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "failed to find a port bindable by both TCP/IPv4 and UDP/IPv4",
+        ))
+    }
+
+    fn tcp_ipv4_with_udp_free() -> io::Result<TcpListener> {
+        let (tcp, udp) = tcp_udp_ipv4_pair()?;
+        drop(udp);
+        Ok(tcp)
+    }
+
+    fn udp_ipv4_with_tcp_free() -> io::Result<UdpSocket> {
+        let (tcp, udp) = tcp_udp_ipv4_pair()?;
+        drop(tcp);
+        Ok(udp)
+    }
+
+    fn tcp_ipv4_with_ipv6_free() -> io::Result<TcpListener> {
+        for _ in 0..100 {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+            let port = listener.local_addr()?.port();
+            if bind_ipv6_only_tcp(port).is_ok() {
+                return Ok(listener);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "failed to find a TCP/IPv4 port with TCP/IPv6 free",
+        ))
+    }
+
+    fn tcp_ipv6_with_ipv4_free() -> io::Result<TcpListener> {
+        for _ in 0..100 {
+            let listener = bind_ipv6_only_tcp(0)?;
+            let port = listener.local_addr()?.port();
+            if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+                return Ok(listener);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "failed to find a TCP/IPv6 port with TCP/IPv4 free",
+        ))
+    }
 
     #[test]
     fn test_occupancy_check_config_default() {
@@ -588,29 +882,242 @@ mod tests {
     }
 
     #[test]
-    fn test_system_checker_partial_skip_combinations() {
-        // Test various partial skip configurations to ensure correct logic
-        // Verifies that only when ALL checks are skipped do we report available
-        let checker = SystemOccupancyChecker;
-        let port = Port::try_from(8080).unwrap();
-
-        // Skip TCP but not UDP - should still check
-        let config1 = OccupancyCheckConfig {
+    fn test_system_checker_builds_exact_selected_probe_matrix() {
+        let port = Port::try_from(5050).unwrap();
+        let config = OccupancyCheckConfig {
             skip_tcp: true,
-            skip_udp: false,
+            skip_ipv6: true,
+            check_all_interfaces: true,
             ..Default::default()
         };
-        // This will actually check the port (system-dependent result)
-        let result1 = checker.is_occupied(port, &config1);
-        assert!(result1.is_ok()); // Should not error
 
-        // Skip IPv4 but not IPv6 - should still check
-        let config2 = OccupancyCheckConfig {
-            skip_ipv4: true,
-            skip_ipv6: false,
+        assert_eq!(
+            SystemOccupancyChecker::probes(port, &config),
+            vec![
+                OccupancyProbe {
+                    transport: Transport::Udp,
+                    address: SocketAddr::from((Ipv4Addr::LOCALHOST, 5050)),
+                },
+                OccupancyProbe {
+                    transport: Transport::Udp,
+                    address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5050)),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_system_checker_all_interfaces_adds_wildcards_to_localhost_matrix() {
+        let port = Port::try_from(5050).unwrap();
+        let config = OccupancyCheckConfig {
+            check_all_interfaces: true,
             ..Default::default()
         };
-        let result2 = checker.is_occupied(port, &config2);
-        assert!(result2.is_ok());
+        let probes = SystemOccupancyChecker::probes(port, &config);
+
+        assert_eq!(probes.len(), 8);
+        for transport in [Transport::Tcp, Transport::Udp] {
+            for address in [
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 5050)),
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5050)),
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 5050)),
+                SocketAddr::from((Ipv6Addr::UNSPECIFIED, 5050)),
+            ] {
+                assert!(probes.contains(&OccupancyProbe { transport, address }));
+            }
+        }
+    }
+
+    #[test]
+    fn test_system_checker_addr_in_use_is_occupied() {
+        let port = Port::try_from(5050).unwrap();
+        let mut probes_run = 0;
+        let occupied = SystemOccupancyChecker::is_occupied_with(
+            port,
+            &OccupancyCheckConfig::default(),
+            |_| {
+                probes_run += 1;
+                Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "synthetic bind conflict",
+                ))
+            },
+        )
+        .unwrap();
+
+        assert!(occupied);
+        assert_eq!(probes_run, 1);
+    }
+
+    #[test]
+    fn test_system_checker_permission_error_fails_closed_with_probe_context() {
+        let port = Port::try_from(5050).unwrap();
+        let error = SystemOccupancyChecker::is_occupied_with(
+            port,
+            &OccupancyCheckConfig::default(),
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "synthetic permission failure",
+                ))
+            },
+        )
+        .unwrap_err();
+        let diagnostic = error.to_string();
+
+        assert!(matches!(error, Error::OccupancyCheckFailed { .. }));
+        assert!(diagnostic.contains("TCP IPv4 localhost bind at 127.0.0.1:5050"));
+        assert!(diagnostic.contains("synthetic permission failure"));
+    }
+
+    #[test]
+    fn test_system_checker_unknown_error_fails_closed_with_probe_context() {
+        let port = Port::try_from(5050).unwrap();
+        let error = SystemOccupancyChecker::is_occupied_with(
+            port,
+            &OccupancyCheckConfig::default(),
+            |_| Err(io::Error::other("synthetic unknown failure")),
+        )
+        .unwrap_err();
+        let diagnostic = error.to_string();
+
+        assert!(matches!(error, Error::OccupancyCheckFailed { .. }));
+        assert!(diagnostic.contains("TCP IPv4 localhost bind at 127.0.0.1:5050"));
+        assert!(diagnostic.contains("synthetic unknown failure"));
+    }
+
+    #[test]
+    fn test_system_checker_skipped_unsupported_family_is_never_probed() {
+        let port = Port::try_from(5050).unwrap();
+        let unsupported_ipv6 = |probe: &OccupancyProbe| {
+            if probe.address.is_ipv6() {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "synthetic IPv6 unavailable",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+
+        let error = SystemOccupancyChecker::is_occupied_with(
+            port,
+            &OccupancyCheckConfig::default(),
+            unsupported_ipv6,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("IPv6"));
+        assert!(error.to_string().contains("synthetic IPv6 unavailable"));
+
+        let skip_ipv6 = OccupancyCheckConfig {
+            skip_ipv6: true,
+            ..Default::default()
+        };
+        assert!(
+            !SystemOccupancyChecker::is_occupied_with(port, &skip_ipv6, unsupported_ipv6).unwrap()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_system_checker_respects_tcp_and_udp_skips() {
+        let checker = SystemOccupancyChecker;
+        let Ok(tcp) = tcp_ipv4_with_udp_free() else {
+            return;
+        };
+        let tcp_port = Port::try_from(tcp.local_addr().unwrap().port()).unwrap();
+        let Ok(udp) = udp_ipv4_with_tcp_free() else {
+            return;
+        };
+        let udp_port = Port::try_from(udp.local_addr().unwrap().port()).unwrap();
+        let ipv4_only = OccupancyCheckConfig {
+            skip_ipv6: true,
+            ..Default::default()
+        };
+
+        assert!(checker.is_occupied(tcp_port, &ipv4_only).unwrap());
+        assert!(checker.is_occupied(udp_port, &ipv4_only).unwrap());
+
+        let skip_tcp = OccupancyCheckConfig {
+            skip_tcp: true,
+            skip_ipv6: true,
+            ..Default::default()
+        };
+        let skip_udp = OccupancyCheckConfig {
+            skip_udp: true,
+            skip_ipv6: true,
+            ..Default::default()
+        };
+
+        assert!(!checker.is_occupied(tcp_port, &skip_tcp).unwrap());
+        assert!(!checker.is_occupied(udp_port, &skip_udp).unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn test_system_checker_respects_ipv4_and_ipv6_skips() {
+        let checker = SystemOccupancyChecker;
+        let Ok(ipv4) = tcp_ipv4_with_ipv6_free() else {
+            return;
+        };
+        let ipv4_port = Port::try_from(ipv4.local_addr().unwrap().port()).unwrap();
+        let Ok(ipv6) = tcp_ipv6_with_ipv4_free() else {
+            return;
+        };
+        let ipv6_port = Port::try_from(ipv6.local_addr().unwrap().port()).unwrap();
+        let tcp_only = OccupancyCheckConfig {
+            skip_udp: true,
+            ..Default::default()
+        };
+
+        assert!(checker.is_occupied(ipv4_port, &tcp_only).unwrap());
+        assert!(checker.is_occupied(ipv6_port, &tcp_only).unwrap());
+
+        let skip_ipv4 = OccupancyCheckConfig {
+            skip_ipv4: true,
+            skip_udp: true,
+            ..Default::default()
+        };
+        let skip_ipv6 = OccupancyCheckConfig {
+            skip_ipv6: true,
+            skip_udp: true,
+            ..Default::default()
+        };
+
+        assert!(!checker.is_occupied(ipv4_port, &skip_ipv4).unwrap());
+        assert!(!checker.is_occupied(ipv6_port, &skip_ipv6).unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn test_system_checker_adds_wildcard_probes_for_all_interfaces() {
+        let checker = SystemOccupancyChecker;
+        let mut listener = None;
+        for _ in 0..100 {
+            let Ok(candidate) = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), 0)) else {
+                return;
+            };
+            let port = candidate.local_addr().unwrap().port();
+            if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+                listener = Some(candidate);
+                break;
+            }
+        }
+        let Some(listener) = listener else {
+            return;
+        };
+        let port = Port::try_from(listener.local_addr().unwrap().port()).unwrap();
+        let localhost_only = OccupancyCheckConfig {
+            skip_udp: true,
+            skip_ipv6: true,
+            ..Default::default()
+        };
+        let all_interfaces = OccupancyCheckConfig {
+            check_all_interfaces: true,
+            ..localhost_only.clone()
+        };
+
+        assert!(!checker.is_occupied(port, &localhost_only).unwrap());
+        assert!(checker.is_occupied(port, &all_interfaces).unwrap());
     }
 }
