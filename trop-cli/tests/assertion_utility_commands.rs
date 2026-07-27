@@ -43,6 +43,7 @@ use assert_cmd::Command;
 use common::{create_directory_symlink, TestEnv};
 use predicates::prelude::*;
 use std::fs;
+use std::net::{TcpListener, UdpSocket};
 use std::path::Path;
 
 // ============================================================================
@@ -335,6 +336,29 @@ fn test_assert_port_not_flag() {
         .arg("assert-port")
         .arg("9999")
         .arg("--not")
+        .assert()
+        .success();
+}
+
+/// Socket occupancy does not change the reservation-only assert-port contract.
+#[test]
+fn test_assert_port_ignores_socket_occupancy() {
+    let env = TestEnv::new();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("Failed to bind TCP fixture");
+    let bound_unreserved = listener.local_addr().unwrap().port();
+
+    env.command()
+        .arg("assert-port")
+        .arg(bound_unreserved.to_string())
+        .arg("--not")
+        .assert()
+        .success();
+
+    let test_path = env.create_dir("reserved-but-unbound");
+    let reserved_unbound = env.reserve_simple(&test_path);
+    env.command()
+        .arg("assert-port")
+        .arg(reserved_unbound.to_string())
         .assert()
         .success();
 }
@@ -830,6 +854,169 @@ fn test_port_info_include_occupancy() {
     assert!(
         stdout.contains("Occupancy") || stdout.contains("occupancy"),
         "Should show occupancy status: {stdout}"
+    );
+}
+
+/// All occupancy-aware commands consume the same project policy and probe
+/// evidence while assert-port remains reservation-only.
+#[test]
+fn test_real_socket_policy_is_consistent_across_commands() {
+    let env = TestEnv::new();
+    let project = env.create_dir("occupancy-project");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("Failed to bind TCP fixture");
+    let port = listener.local_addr().unwrap().port();
+    let config_path = project.join("trop.yaml");
+    fs::write(
+        &config_path,
+        format!(
+            r"project: occupancy-test
+ports:
+  min: {port}
+  max: {port}
+occupancy_check:
+  skip_udp: true
+  skip_ip6: true
+reservations:
+  services:
+    web:
+      offset: 0
+      env: WEB_PORT
+"
+        ),
+    )
+    .expect("Failed to write occupancy project config");
+
+    let reserve = env
+        .command()
+        .current_dir(&project)
+        .arg("reserve")
+        .arg("--port")
+        .arg(port.to_string())
+        .output()
+        .expect("Failed to run reserve");
+    assert!(
+        !reserve.status.success(),
+        "reserve must reject the occupied TCP/IPv4 probe"
+    );
+
+    for command in ["reserve-group", "autoreserve"] {
+        let mut invocation = env.command();
+        invocation.current_dir(&project).arg(command);
+        if command == "reserve-group" {
+            invocation.arg(&config_path);
+        }
+        let output = invocation
+            .arg("--format")
+            .arg("json")
+            .output()
+            .unwrap_or_else(|error| panic!("Failed to run {command}: {error}"));
+        assert!(
+            !output.status.success(),
+            "{command} must reject the same occupied TCP/IPv4 probe; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let scan = env
+        .command()
+        .current_dir(&project)
+        .arg("scan")
+        .arg("--min")
+        .arg(port.to_string())
+        .arg("--max")
+        .arg(port.to_string())
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to run scan");
+    assert!(
+        scan.status.success(),
+        "scan failed: {}",
+        String::from_utf8_lossy(&scan.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_slice(&scan.stdout).expect("scan output must be JSON");
+    let rows = rows.as_array().expect("scan output must be a JSON array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["port"], port);
+    assert_eq!(rows[0]["protocol"], "tcp");
+    assert_eq!(rows[0]["address_family"], "ipv4");
+    assert_eq!(rows[0]["scope"], "localhost");
+    assert_eq!(rows[0]["address"], "127.0.0.1");
+    assert!(rows[0].get("process_id").is_some());
+    assert!(rows[0].get("process_name").is_some());
+    assert!(rows[0].get("user").is_some());
+    assert!(matches!(
+        rows[0]["owner_status"].as_str(),
+        Some("available" | "partial" | "unavailable")
+    ));
+
+    let info = env
+        .command()
+        .current_dir(&project)
+        .arg("port-info")
+        .arg(port.to_string())
+        .arg("--include-occupancy")
+        .output()
+        .expect("Failed to run port-info");
+    assert!(
+        info.status.success(),
+        "port-info failed: {}",
+        String::from_utf8_lossy(&info.stderr)
+    );
+    let info = String::from_utf8(info.stdout).expect("port-info output must be UTF-8");
+    assert!(info.contains("Port is currently in use"));
+    assert!(info.contains("TCP IPv4 localhost at 127.0.0.1"));
+    assert!(info.contains("Owner metadata:"));
+
+    env.command()
+        .current_dir(&project)
+        .arg("assert-port")
+        .arg(port.to_string())
+        .arg("--not")
+        .assert()
+        .success();
+}
+
+/// A CLI occupancy leaf must not reset an unrelated lower-precedence leaf.
+#[test]
+fn test_partial_cli_occupancy_override_preserves_project_sibling() {
+    let env = TestEnv::new();
+    let project = env.create_dir("partial-overlay-project");
+    let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("Failed to bind UDP fixture");
+    let port = socket.local_addr().unwrap().port();
+    fs::write(
+        project.join("trop.yaml"),
+        format!(
+            r"ports:
+  min: {port}
+  max: {port}
+occupancy_check:
+  skip_udp: true
+"
+        ),
+    )
+    .expect("Failed to write partial occupancy config");
+
+    let output = env
+        .command()
+        .current_dir(project)
+        .arg("scan")
+        .arg("--skip-ipv6")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to run scan");
+    assert!(
+        output.status.success(),
+        "scan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!([]),
+        "the project skip_udp leaf must survive the CLI skip_ipv6 override"
     );
 }
 

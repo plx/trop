@@ -57,6 +57,30 @@ pub struct ReserveGroupCommand {
     /// Perform a dry run
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Skip occupancy checks
+    #[arg(long)]
+    pub skip_occupancy_check: bool,
+
+    /// Skip TCP occupancy probes
+    #[arg(long)]
+    pub skip_tcp: bool,
+
+    /// Skip UDP occupancy probes
+    #[arg(long)]
+    pub skip_udp: bool,
+
+    /// Skip IPv6 occupancy probes
+    #[arg(long)]
+    pub skip_ipv6: bool,
+
+    /// Skip IPv4 occupancy probes
+    #[arg(long)]
+    pub skip_ipv4: bool,
+
+    /// Add wildcard probes for all network interfaces
+    #[arg(long)]
+    pub check_all_interfaces: bool,
 }
 
 /// Output format argument for clap.

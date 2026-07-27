@@ -235,6 +235,15 @@ impl Command {
                     command.allow_task_change,
                     command.allow_change,
                 );
+                set_occupancy_overrides(
+                    &mut command_line,
+                    command.skip_occupancy_check,
+                    command.skip_ipv4,
+                    command.skip_ipv6,
+                    command.skip_tcp,
+                    command.skip_udp,
+                    command.check_all_interfaces,
+                );
                 ConfigScope::ExplicitProject(command.config_path.clone())
             }
             Self::Autoreserve(command) => {
@@ -244,6 +253,15 @@ impl Command {
                     command.allow_project_change,
                     command.allow_task_change,
                     command.allow_change,
+                );
+                set_occupancy_overrides(
+                    &mut command_line,
+                    command.skip_occupancy_check,
+                    command.skip_ipv4,
+                    command.skip_ipv6,
+                    command.skip_tcp,
+                    command.skip_udp,
+                    command.check_all_interfaces,
                 );
                 ConfigScope::Discover
             }
@@ -280,11 +298,22 @@ impl Command {
                 );
                 ConfigScope::Discover
             }
+            Self::PortInfo(command) => {
+                set_occupancy_overrides(
+                    &mut command_line,
+                    command.skip_occupancy_check,
+                    command.skip_ipv4,
+                    command.skip_ipv6,
+                    command.skip_tcp,
+                    command.skip_udp,
+                    command.check_all_interfaces,
+                );
+                ConfigScope::Discover
+            }
             Self::Release(_)
             | Self::Prune(_)
             | Self::AssertReservation(_)
             | Self::AssertPort(_)
-            | Self::PortInfo(_)
             | Self::Exclude(_)
             | Self::ListProjects(_)
             | Self::Migrate(_) => ConfigScope::Discover,
@@ -447,4 +476,125 @@ fn set_true(command_line: &mut CommandLineConfig, enabled: bool, field: ConfigFi
         _ => unreachable!("set_true called for a non-boolean command override"),
     }
     command_line.record(field);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn globals() -> GlobalOptions {
+        GlobalOptions {
+            verbose: false,
+            quiet: false,
+            data_dir: None,
+            busy_timeout: None,
+            disable_autoinit: false,
+        }
+    }
+
+    fn occupancy_request(args: &[&str]) -> OccupancyConfig {
+        let cli = Cli::try_parse_from(args).expect("occupancy arguments should parse");
+        cli.command
+            .config_request(&globals())
+            .expect("occupancy config request should build")
+            .command_line
+            .config
+            .occupancy_check
+            .expect("command should create an occupancy CLI layer")
+    }
+
+    fn all_cli_overrides() -> OccupancyConfig {
+        OccupancyConfig {
+            skip: Some(true),
+            skip_ip4: Some(true),
+            skip_ip6: Some(true),
+            skip_tcp: Some(true),
+            skip_udp: Some(true),
+            check_all_interfaces: Some(true),
+        }
+    }
+
+    #[test]
+    fn occupancy_cli_layer_is_identical_for_all_allocation_commands() {
+        let project = tempfile::NamedTempFile::new().unwrap();
+        let project_path = project.path().to_string_lossy().into_owned();
+        let flags = [
+            "--skip-occupancy-check",
+            "--skip-ipv4",
+            "--skip-ipv6",
+            "--skip-tcp",
+            "--skip-udp",
+            "--check-all-interfaces",
+        ];
+
+        let mut reserve = vec!["trop", "reserve"];
+        reserve.extend(flags.iter().copied());
+        let mut reserve_group = vec!["trop", "reserve-group", &project_path];
+        reserve_group.extend(flags.iter().copied());
+        let mut autoreserve = vec!["trop", "autoreserve"];
+        autoreserve.extend(flags.iter().copied());
+
+        let expected = all_cli_overrides();
+        assert_eq!(occupancy_request(&reserve), expected);
+        assert_eq!(occupancy_request(&reserve_group), expected);
+        assert_eq!(occupancy_request(&autoreserve), expected);
+    }
+
+    #[test]
+    fn port_info_uses_the_same_complete_occupancy_cli_layer() {
+        let args = [
+            "trop",
+            "port-info",
+            "5050",
+            "--include-occupancy",
+            "--skip-occupancy-check",
+            "--skip-ipv4",
+            "--skip-ipv6",
+            "--skip-tcp",
+            "--skip-udp",
+            "--check-all-interfaces",
+        ];
+
+        assert_eq!(occupancy_request(&args), all_cli_overrides());
+    }
+
+    #[test]
+    fn scan_uses_the_same_leaf_overrides_except_for_intentional_skip_all_omission() {
+        let args = [
+            "trop",
+            "scan",
+            "--skip-ipv4",
+            "--skip-ipv6",
+            "--skip-tcp",
+            "--skip-udp",
+            "--check-all-interfaces",
+        ];
+        let mut expected = all_cli_overrides();
+        expected.skip = None;
+
+        assert_eq!(occupancy_request(&args), expected);
+    }
+
+    #[test]
+    fn port_info_rejects_occupancy_overrides_without_requested_occupancy_output() {
+        let Err(error) = Cli::try_parse_from(["trop", "port-info", "5050", "--skip-tcp"]) else {
+            panic!("an ignored occupancy override must be rejected");
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn a_partial_cli_override_records_only_its_named_leaf() {
+        let request = occupancy_request(&["trop", "scan", "--skip-tcp"]);
+        assert_eq!(
+            request,
+            OccupancyConfig {
+                skip_tcp: Some(true),
+                ..Default::default()
+            }
+        );
+    }
 }

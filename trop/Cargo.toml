@@ -23,6 +23,8 @@ anyhow = { workspace = true }
 log = { workspace = true }
 home = { workspace = true }
 socket2 = "0.6"
+netstat2 = "0.11"
+sysinfo = { version = "0.33", default-features = false, features = ["system", "user"] }
 gix = { version = "0.68", default-features = false, features = ["revision"] }
 
 [target.'cfg(windows)'.dependencies]

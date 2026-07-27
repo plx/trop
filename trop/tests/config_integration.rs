@@ -2145,7 +2145,17 @@ reservations:
     assert_eq!(effective.ports().max_offset, None);
     assert_eq!(effective.excluded_ports().len(), 5);
     assert_eq!(effective.cleanup().expire_after_days, Some(55));
-    assert_eq!(effective.occupancy_check().skip, Some(false));
+    assert_eq!(
+        effective.occupancy_check(),
+        &OccupancyConfig {
+            skip: Some(false),
+            skip_ip4: Some(false),
+            skip_ip6: Some(false),
+            skip_tcp: Some(false),
+            skip_udp: Some(false),
+            check_all_interfaces: Some(false),
+        }
+    );
     assert!(effective.reservations().is_some());
     assert!(!effective.disable_autoinit());
     assert!(!effective.disable_autoprune());
