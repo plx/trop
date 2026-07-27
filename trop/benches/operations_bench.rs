@@ -36,7 +36,12 @@ fn setup_database() -> (TempDir, Database) {
 }
 
 fn perform_reserve(db: &Database, config: &Config, key: ReservationKey) -> ExecutionResult {
-    let options = ReserveOptions::new(key.clone(), None).with_allow_unrelated_path(true);
+    // These benchmarks measure reservation/database operations, not the host's
+    // socket state. Keep them deterministic when a benchmark range crosses a
+    // platform-reserved or already occupied port.
+    let options = ReserveOptions::new(key.clone(), None)
+        .with_allow_unrelated_path(true)
+        .with_ignore_occupied(true);
     let plan = ReservePlan::new(options, config)
         .build_plan(db.connection())
         .expect("failed to plan reservation");
