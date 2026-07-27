@@ -167,6 +167,13 @@ Diagnostics do not include project/task contents or raw blob bytes. Validation
 does not attempt recovery; callers should copy the database before restoring a
 known-good copy or recreating disposable reservations.
 
+`DatabaseConfig::busy_timeout` defaults to five seconds. `Duration::ZERO`
+disables waiting, while values above 2,147,483,647 milliseconds are rejected
+before rusqlite configuration. Database operation boundaries classify only
+SQLite Busy and Locked results as `Error::LockTimeout`, preserving the exact
+duration and operation context. All other SQLite errors remain
+`Error::Database`.
+
 ## Usage Example
 
 ```rust

@@ -396,6 +396,12 @@ pub fn to_operation_plan(migrate_plan: &MigratePlan) -> OperationPlan {
 /// println!("Migrated {} reservations", result.migrated_count);
 /// ```
 pub fn execute_migrate(plan: &MigratePlan, db: &mut Database) -> Result<MigrateResult> {
+    let timeout = db.busy_timeout();
+    execute_migrate_inner(plan, db)
+        .map_err(|error| error.classify_sqlite_lock(timeout, "executing a path migration"))
+}
+
+fn execute_migrate_inner(plan: &MigratePlan, db: &mut Database) -> Result<MigrateResult> {
     use super::executor::PlanExecutor;
 
     // Convert to operation plan

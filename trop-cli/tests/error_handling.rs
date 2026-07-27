@@ -18,6 +18,85 @@ mod common;
 
 use common::TestEnv;
 use predicates::prelude::*;
+use rusqlite::Connection;
+use std::fs;
+use std::path::Path;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+type ReservationRow = (
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+);
+
+fn reservation_snapshot(env: &TestEnv) -> Vec<ReservationRow> {
+    let connection = Connection::open(env.data_dir.join("trop.db")).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT path, tag, port, project, task, created_at, last_used_at
+             FROM reservations
+             ORDER BY path, tag",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+fn assert_locked_database_command(
+    env: &TestEnv,
+    expected_operation: &str,
+    configure: impl FnOnce(&mut assert_cmd::Command),
+) {
+    let before = reservation_snapshot(env);
+    let locker = Connection::open(env.data_dir.join("trop.db")).unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let mut command = env.command();
+    command.arg("--quiet").arg("--busy-timeout").arg("1");
+    configure(&mut command);
+    let output = command.output().unwrap();
+
+    locker.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!("Error: database lock timeout while {expected_operation} after 1s\n")
+    );
+    assert_eq!(
+        reservation_snapshot(env),
+        before,
+        "timed-out command changed reservation state"
+    );
+}
+
+fn create_group_config(path: &Path) {
+    fs::write(
+        path,
+        "ports:\n  min: 8000\n  max: 8010\n\
+         occupancy_check:\n  skip: true\n\
+         reservations:\n  base: 8000\n  services:\n    web:\n      offset: 0\n",
+    )
+    .unwrap();
+}
 
 // ============================================================================
 // Success Cases (Exit Code 0)
@@ -139,36 +218,271 @@ fn test_path_relationship_violation_exit_code() {
 // Timeout (Exit Code 2)
 // ============================================================================
 
-/// Test database timeout returns exit code 2.
-///
-/// When SQLite busy timeout is exceeded, exit code should be 2.
-/// This is difficult to test reliably without concurrent access,
-/// so we document the expected behavior.
-///
-/// Note: This test is informational - actual timeout testing requires
-/// concurrent database access which is complex to set up reliably.
 #[test]
-fn test_timeout_exit_code_documentation() {
-    // This test documents that timeout errors should return exit code 2.
-    // Actual timeout testing would require:
-    // 1. Opening a transaction in one process
-    // 2. Trying to write from another process
-    // 3. Verifying exit code 2 when busy timeout expires
-    //
-    // For now, we verify that the timeout can be configured:
+fn every_database_mutating_command_uses_the_timeout_exit_contract() {
     let env = TestEnv::new();
-    let test_path = env.create_dir("test-project");
+    let existing = env.create_dir("existing");
+    env.reserve_simple(&existing);
+    let new_path = env.create_dir("new");
+    assert_locked_database_command(
+        &env,
+        "starting an immediate database transaction",
+        |command| {
+            command
+                .arg("reserve")
+                .arg("--path")
+                .arg(&new_path)
+                .arg("--allow-unrelated-path");
+        },
+    );
 
-    // Very short timeout should still work for non-contended operations
-    env.command()
+    let env = TestEnv::new();
+    let existing = env.create_dir("release");
+    env.reserve_simple(&existing);
+    assert_locked_database_command(
+        &env,
+        "starting an immediate database transaction",
+        |command| {
+            command.arg("release").arg("--path").arg(&existing);
+        },
+    );
+
+    let env = TestEnv::new();
+    let seed = env.create_dir("seed");
+    env.reserve_simple(&seed);
+    let config = env.path().join("group.yaml");
+    create_group_config(&config);
+    assert_locked_database_command(
+        &env,
+        "starting an immediate database transaction",
+        |command| {
+            command
+                .arg("reserve-group")
+                .arg(&config)
+                .arg("--allow-unrelated-path")
+                .arg("--format")
+                .arg("json");
+        },
+    );
+
+    let env = TestEnv::new();
+    let project = env.create_dir("autoreserve");
+    let seed = env.create_dir("seed");
+    env.reserve_simple(&seed);
+    create_group_config(&project.join("trop.yaml"));
+    assert_locked_database_command(
+        &env,
+        "starting an immediate database transaction",
+        |command| {
+            command
+                .arg("autoreserve")
+                .arg("--allow-unrelated-path")
+                .arg("--format")
+                .arg("json")
+                .current_dir(&project);
+        },
+    );
+
+    let env = TestEnv::new();
+    let missing = env.create_dir("prune");
+    env.reserve_simple(&missing);
+    fs::remove_dir(&missing).unwrap();
+    assert_locked_database_command(&env, "deleting a reservation", |command| {
+        command.arg("prune");
+    });
+
+    let env = TestEnv::new();
+    let expired = env.create_dir("expire");
+    env.reserve_simple(&expired);
+    Connection::open(env.data_dir.join("trop.db"))
+        .unwrap()
+        .execute("UPDATE reservations SET last_used_at = 0", [])
+        .unwrap();
+    assert_locked_database_command(&env, "deleting a reservation", |command| {
+        command.arg("expire").arg("--days").arg("1");
+    });
+
+    let env = TestEnv::new();
+    let missing = env.create_dir("autoclean");
+    env.reserve_simple(&missing);
+    fs::remove_dir(&missing).unwrap();
+    assert_locked_database_command(&env, "deleting a reservation", |command| {
+        command.arg("autoclean").arg("--days").arg("1");
+    });
+
+    let env = TestEnv::new();
+    let source = env.create_dir("source");
+    let destination = env.create_dir("destination");
+    env.reserve_simple(&source);
+    assert_locked_database_command(
+        &env,
+        "starting an immediate database transaction",
+        |command| {
+            command
+                .arg("migrate")
+                .arg("--from")
+                .arg(&source)
+                .arg("--to")
+                .arg(&destination);
+        },
+    );
+}
+
+#[test]
+fn lock_timeout_sources_wait_for_the_configured_interval() {
+    enum TimeoutSource {
+        Cli,
+        Environment,
+        Config,
+    }
+
+    for source in [
+        TimeoutSource::Cli,
+        TimeoutSource::Environment,
+        TimeoutSource::Config,
+    ] {
+        let env = TestEnv::new();
+        let existing = env.create_dir("existing");
+        env.reserve_simple(&existing);
+        let new_path = env.create_dir("new");
+        if matches!(source, TimeoutSource::Config) {
+            fs::write(
+                env.data_dir.join("config.yaml"),
+                "maximum_lock_wait_seconds: 1\n",
+            )
+            .unwrap();
+        }
+
+        let locker = Connection::open(env.data_dir.join("trop.db")).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut command = env.command();
+        if matches!(source, TimeoutSource::Cli) {
+            command.arg("--busy-timeout").arg("1");
+        }
+        if matches!(source, TimeoutSource::Environment) {
+            command.env("TROP_BUSY_TIMEOUT", "1");
+        }
+        command
+            .arg("reserve")
+            .arg("--path")
+            .arg(&new_path)
+            .arg("--allow-unrelated-path");
+
+        let started = Instant::now();
+        let output = command.output().unwrap();
+        let elapsed = started.elapsed();
+        locker.execute_batch("ROLLBACK").unwrap();
+
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "Error: database lock timeout while starting an immediate database transaction after 1s\n"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(800) && elapsed < Duration::from_secs(3),
+            "configured one-second wait took {elapsed:?}"
+        );
+        assert_eq!(env.reservation_count(), 1);
+    }
+}
+
+#[test]
+fn command_proceeds_when_lock_is_released_before_timeout() {
+    let env = TestEnv::new();
+    let existing = env.create_dir("existing");
+    env.reserve_simple(&existing);
+    let new_path = env.create_dir("new");
+    let locker = Connection::open(env.data_dir.join("trop.db")).unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("trop"));
+    command
+        .env("TROP_DATA_DIR", &env.data_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .arg("--data-dir")
+        .arg(&env.data_dir)
         .arg("--busy-timeout")
-        .arg("1")
+        .arg("2")
         .arg("reserve")
         .arg("--path")
-        .arg(&test_path)
-        .arg("--allow-unrelated-path")
-        .assert()
-        .success();
+        .arg(&new_path)
+        .arg("--allow-unrelated-path");
+    let child = command.spawn().unwrap();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let waiter = std::thread::spawn(move || {
+        sender.send(child.wait_with_output()).unwrap();
+    });
+
+    assert!(
+        receiver.recv_timeout(Duration::from_millis(150)).is_err(),
+        "command should remain blocked while the write lock is held"
+    );
+    locker.execute_batch("ROLLBACK").unwrap();
+
+    let output = receiver
+        .recv_timeout(Duration::from_secs(3))
+        .expect("command did not finish after lock release")
+        .unwrap();
+    waiter.join().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(env.reservation_count(), 2);
+}
+
+#[test]
+fn read_only_commands_continue_under_a_wal_writer() {
+    let env = TestEnv::new();
+    let path = env.create_dir("project");
+    let port = env.reserve_simple(&path);
+    let locker = Connection::open(env.data_dir.join("trop.db")).unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let commands = [
+        vec!["list".to_string()],
+        vec![
+            "assert-reservation".to_string(),
+            "--path".to_string(),
+            path.display().to_string(),
+        ],
+        vec!["assert-port".to_string(), port.to_string()],
+        vec!["port-info".to_string(), port.to_string()],
+        vec!["list-projects".to_string()],
+        vec!["assert-data-dir".to_string(), "--validate".to_string()],
+    ];
+    for arguments in commands {
+        let output = env
+            .command()
+            .arg("--busy-timeout")
+            .arg("0")
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    locker.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn malformed_database_error_is_not_overmapped_to_timeout() {
+    let env = TestEnv::new();
+    fs::create_dir_all(&env.data_dir).unwrap();
+    fs::write(env.data_dir.join("trop.db"), b"not a sqlite database").unwrap();
+
+    let output = env
+        .command()
+        .arg("--busy-timeout")
+        .arg("0")
+        .arg("list")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(6), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("database"), "{stderr}");
+    assert!(!stderr.contains("lock timeout"), "{stderr}");
 }
 
 // ============================================================================

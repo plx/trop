@@ -291,7 +291,8 @@ delete only disposable state and recreate its reservations.
 Canonical environment variables covered by the effective configuration
 pipeline:
 
-- `TROP_BUSY_TIMEOUT`: Set the database busy timeout in seconds
+- `TROP_BUSY_TIMEOUT`: Set the database lock wait in seconds. The default is
+  `5`, `0` means do not wait, and the maximum is `2147483`.
 - `TROP_ALLOW_PROJECT_CHANGE`: Allow an existing reservation's project to
   change
 - `TROP_ALLOW_TASK_CHANGE`: Allow an existing reservation's task to change
@@ -357,7 +358,8 @@ Other key environment variables:
 
 - `0` - Success
 - `1` - Semantic error (e.g., assertion failed)
-- `2` - Timeout (e.g., database lock)
+- `2` - SQLite Busy/Locked timeout after the configured wait; stderr includes
+  the duration and operation context
 - `3` - No data directory found
 - `4` - Invalid arguments
 - `5` - I/O error

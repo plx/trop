@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::Duration;
 
 use rusqlite::{params, Connection};
 use tempfile::tempdir;
@@ -430,6 +431,31 @@ fn concurrent_migrators_serialize_and_both_observe_v2() {
             ""
         );
     }
+}
+
+#[test]
+fn migration_lock_expiration_uses_typed_timeout_and_preserves_v1() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("locked-migration.db");
+    let locker = Connection::open(&path).unwrap();
+    create_published_v1_database(&locker);
+    locker.pragma_update(None, "journal_mode", "WAL").unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let error =
+        Database::open(DatabaseConfig::new(&path).with_busy_timeout(Duration::ZERO)).unwrap_err();
+    assert!(matches!(
+        error,
+        Error::LockTimeout {
+            timeout,
+            ref operation
+        } if timeout == Duration::ZERO
+            && operation == "opening, configuring, or migrating the database"
+    ));
+    assert_eq!(get_schema_version(&locker).unwrap(), 1);
+
+    locker.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(raw_schema_version(&path), 1);
 }
 
 #[test]

@@ -47,7 +47,7 @@ fn build_cli() -> Command {
         .arg(
             Arg::new("busy-timeout")
                 .long("busy-timeout")
-                .help("Override the default busy timeout (in seconds)")
+                .help("Database lock wait in seconds; 0 disables waiting (max 2147483)")
                 .value_name("SECONDS")
                 .global(true)
                 .env("TROP_BUSY_TIMEOUT"),

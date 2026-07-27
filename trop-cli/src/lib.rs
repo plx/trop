@@ -25,9 +25,20 @@ pub fn run(cli: Cli) -> Result<(), error::CliError> {
         disable_autoinit: cli.disable_autoinit,
     };
 
+    let command_name = cli.command.name();
     let request = cli.command.config_request(&global)?;
     let context = InvocationContext::resolve(global, request)?;
-    cli.command.execute(&context)
+    let result = cli.command.execute(&context);
+    match context.lock_timeout() {
+        Some(timeout) => result.map_err(|error| match error {
+            error::CliError::Library(source) => error::CliError::Library(
+                source
+                    .classify_sqlite_lock(timeout, format!("executing the {command_name} command")),
+            ),
+            error => error,
+        }),
+        None => result,
+    }
 }
 
 fn resolve_data_dir(cli_value: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {

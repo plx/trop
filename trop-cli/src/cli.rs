@@ -39,7 +39,7 @@ pub struct Cli {
     #[arg(long, value_name = "PATH", global = true, env = "TROP_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
-    /// Override the default busy timeout (in seconds)
+    /// Database lock wait in seconds; 0 disables waiting (max 2147483)
     #[arg(long, value_name = "SECONDS", global = true)]
     pub busy_timeout: Option<u32>,
 
@@ -123,6 +123,34 @@ pub enum Command {
 }
 
 impl Command {
+    /// Stable command name used in database error context.
+    pub(crate) const fn name(&self) -> &'static str {
+        match self {
+            Self::Reserve(_) => "reserve",
+            Self::Release(_) => "release",
+            Self::List(_) => "list",
+            Self::ReserveGroup(_) => "reserve-group",
+            Self::Autoreserve(_) => "autoreserve",
+            Self::Prune(_) => "prune",
+            Self::Expire(_) => "expire",
+            Self::Autoclean(_) => "autoclean",
+            Self::AssertReservation(_) => "assert-reservation",
+            Self::AssertPort(_) => "assert-port",
+            Self::AssertDataDir(_) => "assert-data-dir",
+            Self::PortInfo(_) => "port-info",
+            Self::ShowDataDir(_) => "show-data-dir",
+            Self::ShowPath(_) => "show-path",
+            Self::Scan(_) => "scan",
+            Self::Validate(_) => "validate",
+            Self::Exclude(_) => "exclude",
+            Self::CompactExclusions(_) => "compact-exclusions",
+            Self::Init(_) => "init",
+            Self::ListProjects(_) => "list-projects",
+            Self::Migrate(_) => "migrate",
+            Self::Completions(_) => "completions",
+        }
+    }
+
     /// Translate all configuration-shaped CLI arguments exactly once.
     pub(crate) fn config_request(&self, global: &GlobalOptions) -> Result<ConfigRequest, CliError> {
         let mut command_line = CommandLineConfig::default();

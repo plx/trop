@@ -113,12 +113,17 @@ impl ConfigValidator {
             Self::validate_cleanup(cleanup)?;
         }
 
-        // Validate lock timeout
+        // SQLite stores the timeout as signed 32-bit milliseconds. Zero is
+        // deliberate and disables waiting; larger values would make
+        // rusqlite panic during connection configuration.
         if let Some(timeout) = config.maximum_lock_wait_seconds {
-            if timeout == 0 {
+            if timeout > crate::database::MAX_BUSY_TIMEOUT_SECONDS {
                 return Err(Error::Validation {
                     field: "maximum_lock_wait_seconds".into(),
-                    message: "Timeout must be greater than 0".into(),
+                    message: format!(
+                        "Timeout must not exceed {} seconds",
+                        crate::database::MAX_BUSY_TIMEOUT_SECONDS
+                    ),
                 });
             }
         }

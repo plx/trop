@@ -8,6 +8,9 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 
+pub(crate) const MAX_BUSY_TIMEOUT_MILLISECONDS: u128 = i32::MAX as u128;
+pub(crate) const MAX_BUSY_TIMEOUT_SECONDS: u64 = (i32::MAX as u64) / 1000;
+
 /// Configuration for database connections.
 ///
 /// This struct contains all parameters needed to open and configure
@@ -73,6 +76,10 @@ impl DatabaseConfig {
     ///
     /// The busy timeout determines how long the database connection will
     /// wait when encountering a locked database before returning an error.
+    /// [`Duration::ZERO`] means do not wait. Values above
+    /// 2,147,483,647 milliseconds are rejected when opening the database
+    /// because `SQLite` stores this setting as a signed 32-bit millisecond
+    /// count.
     ///
     /// # Examples
     ///
@@ -87,6 +94,18 @@ impl DatabaseConfig {
     pub fn with_busy_timeout(mut self, timeout: Duration) -> Self {
         self.busy_timeout = timeout;
         self
+    }
+
+    pub(super) fn validate_busy_timeout(&self) -> Result<()> {
+        if self.busy_timeout.as_millis() > MAX_BUSY_TIMEOUT_MILLISECONDS {
+            return Err(Error::Validation {
+                field: "maximum_lock_wait_seconds".into(),
+                message: format!(
+                    "Timeout must not exceed {MAX_BUSY_TIMEOUT_MILLISECONDS} milliseconds"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Configures the database to be opened in read-only mode.
@@ -193,6 +212,28 @@ mod tests {
     fn test_config_with_busy_timeout() {
         let config = DatabaseConfig::new("/tmp/test.db").with_busy_timeout(Duration::from_secs(10));
         assert_eq!(config.busy_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_config_accepts_zero_busy_timeout_as_no_wait() {
+        let config = DatabaseConfig::new("/tmp/test.db").with_busy_timeout(Duration::ZERO);
+        config.validate_busy_timeout().unwrap();
+    }
+
+    #[test]
+    fn test_config_rejects_busy_timeout_larger_than_sqlite_limit() {
+        let config = DatabaseConfig::new("/tmp/test.db").with_busy_timeout(Duration::from_millis(
+            u64::try_from(MAX_BUSY_TIMEOUT_MILLISECONDS).unwrap() + 1,
+        ));
+        let error = config.validate_busy_timeout().unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Validation {
+                ref field,
+                ref message
+            } if field == "maximum_lock_wait_seconds"
+                && message.contains(&MAX_BUSY_TIMEOUT_MILLISECONDS.to_string())
+        ));
     }
 
     #[test]
