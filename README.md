@@ -244,6 +244,21 @@ you may need to downgrade, stop processes using trop and copy the complete
 data directory before the first launch of the newer client. Restore that copy
 to return to the older schema.
 
+### Database lock contention
+
+SQLite writers wait up to five seconds for a database lock by default. Set
+`--busy-timeout SECONDS`, `TROP_BUSY_TIMEOUT`, or
+`maximum_lock_wait_seconds` in configuration to change that interval. Zero
+means do not wait; the maximum accepted value is 2,147,483 seconds, matching
+SQLite's signed 32-bit millisecond limit.
+
+If a Busy or Locked result remains after that interval, trop exits `2`, writes
+one typed error to stderr with the configured duration and operation context,
+prints no normal stdout, and leaves the transaction uncommitted. Read-only
+commands continue to use WAL snapshots while another process holds the writer
+lock. Other SQLite, corruption, configuration, and I/O failures retain their
+separate error categories.
+
 ### Database integrity validation
 
 Run `trop assert-data-dir --validate` to inspect the selected database through

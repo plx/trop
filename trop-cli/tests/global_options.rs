@@ -407,6 +407,53 @@ fn test_busy_timeout_invalid_value() {
         .failure();
 }
 
+#[test]
+fn test_busy_timeout_zero_means_no_wait_and_oversized_values_are_rejected() {
+    let env = TestEnv::new();
+    let zero_path = env.create_dir("zero-timeout");
+    env.command()
+        .arg("--busy-timeout")
+        .arg("0")
+        .arg("reserve")
+        .arg("--path")
+        .arg(&zero_path)
+        .arg("--allow-unrelated-path")
+        .assert()
+        .success();
+
+    for source in ["cli", "environment", "config"] {
+        let env = TestEnv::new();
+        let test_path = env.create_dir(source);
+        let mut command = env.command();
+        match source {
+            "cli" => {
+                command.arg("--busy-timeout").arg("2147484");
+            }
+            "environment" => {
+                command.env("TROP_BUSY_TIMEOUT", "2147484");
+            }
+            "config" => {
+                std::fs::create_dir_all(&env.data_dir).unwrap();
+                std::fs::write(
+                    env.data_dir.join("config.yaml"),
+                    "maximum_lock_wait_seconds: 2147484\n",
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        command
+            .arg("reserve")
+            .arg("--path")
+            .arg(&test_path)
+            .arg("--allow-unrelated-path")
+            .assert()
+            .code(7)
+            .stderr(predicate::str::contains("must not exceed 2147483"));
+        assert_eq!(env.reservation_count(), 0);
+    }
+}
+
 // ============================================================================
 // Disable Autoinit Flag Tests
 // ============================================================================

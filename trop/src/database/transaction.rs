@@ -49,6 +49,12 @@ impl Database {
     /// db.batch_create_reservations(&reservations).unwrap();
     /// ```
     pub fn batch_create_reservations(&mut self, reservations: &[Reservation]) -> Result<()> {
+        let timeout = self.busy_timeout();
+        self.batch_create_reservations_inner(reservations)
+            .map_err(|error| error.classify_sqlite_lock(timeout, "creating a reservation batch"))
+    }
+
+    fn batch_create_reservations_inner(&mut self, reservations: &[Reservation]) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -112,6 +118,12 @@ impl Database {
     /// println!("Deleted {} reservations", deleted);
     /// ```
     pub fn batch_delete_reservations(&mut self, keys: &[ReservationKey]) -> Result<usize> {
+        let timeout = self.busy_timeout();
+        self.batch_delete_reservations_inner(keys)
+            .map_err(|error| error.classify_sqlite_lock(timeout, "deleting a reservation batch"))
+    }
+
+    fn batch_delete_reservations_inner(&mut self, keys: &[ReservationKey]) -> Result<usize> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

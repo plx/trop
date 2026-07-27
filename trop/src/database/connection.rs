@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
-use crate::error::Result;
+use crate::error::{sqlite_error_is_lock_contention, Error, Result};
 
 use super::config::DatabaseConfig;
 
@@ -42,12 +42,19 @@ impl Database {
     ///
     /// Returns a typed compatibility, corruption, I/O, or database error.
     pub fn validate(config: &DatabaseConfig) -> Result<()> {
-        let conn = Connection::open_with_flags(
-            &config.path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        conn.busy_timeout(config.busy_timeout)?;
-        super::validation::validate_current_database(&conn)
+        let timeout = config.busy_timeout;
+        config.validate_busy_timeout()?;
+        (|| {
+            let conn = Connection::open_with_flags(
+                &config.path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            conn.busy_timeout(timeout)?;
+            super::validation::validate_current_database(&conn)
+        })()
+        .map_err(|error: Error| {
+            error.classify_sqlite_lock(timeout, "opening and validating the database")
+        })
     }
 
     /// Opens a database connection with the given configuration.
@@ -76,6 +83,14 @@ impl Database {
     /// let db = Database::open(config).unwrap();
     /// ```
     pub fn open(config: DatabaseConfig) -> Result<Self> {
+        let timeout = config.busy_timeout;
+        config.validate_busy_timeout()?;
+        Self::open_inner(config).map_err(|error| {
+            error.classify_sqlite_lock(timeout, "opening, configuring, or migrating the database")
+        })
+    }
+
+    fn open_inner(config: DatabaseConfig) -> Result<Self> {
         // Ensure parent directory exists if auto-creating
         if config.auto_create && !config.path.exists() {
             if let Some(parent) = config.path.parent() {
@@ -169,9 +184,19 @@ impl Database {
     /// tx.commit().unwrap();
     /// ```
     pub fn begin_transaction(&mut self) -> Result<Transaction<'_>> {
-        Ok(self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?)
+        let timeout = self.config.busy_timeout;
+        self.conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(Error::from)
+            .map_err(|error| {
+                error.classify_sqlite_lock(timeout, "starting an immediate database transaction")
+            })
+    }
+
+    /// Returns the configured maximum wait for `SQLite` lock contention.
+    #[must_use]
+    pub const fn busy_timeout(&self) -> Duration {
+        self.config.busy_timeout
     }
 }
 
@@ -195,7 +220,7 @@ fn enable_wal_with_retry_inner(conn: &Connection, timeout: Duration) -> rusqlite
             row.get::<_, String>(0)
         }) {
             Ok(_) => return Ok(()),
-            Err(error) if is_lock_contention(&error) => {
+            Err(error) if sqlite_error_is_lock_contention(&error) => {
                 let remaining = timeout.saturating_sub(started.elapsed());
                 if remaining.is_zero() {
                     return Err(error);
@@ -216,20 +241,10 @@ fn set_busy_timeout(conn: &Connection, timeout: Duration) -> rusqlite::Result<()
     conn.execute_batch(&format!("PRAGMA busy_timeout = {}", timeout.as_millis()))
 }
 
-fn is_lock_contention(error: &rusqlite::Error) -> bool {
-    matches!(
-        error,
-        rusqlite::Error::SqliteFailure(sqlite, _)
-            if matches!(
-                sqlite.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            )
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{mpsc, Arc, Barrier};
     use tempfile::tempdir;
 
     #[test]
@@ -268,6 +283,28 @@ mod tests {
     }
 
     #[test]
+    fn database_open_rejects_timeout_above_sqlite_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let timeout = Duration::from_millis(i32::MAX as u64 + 1);
+
+        let error =
+            Database::open(DatabaseConfig::new(&path).with_busy_timeout(timeout)).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Validation {
+                ref field,
+                ref message
+            } if field == "maximum_lock_wait_seconds"
+                && message.contains("2147483647 milliseconds")
+        ));
+        assert!(
+            !path.exists(),
+            "invalid timeout must be rejected before creating a database"
+        );
+    }
+
+    #[test]
     fn test_database_read_only() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
@@ -302,5 +339,107 @@ mod tests {
 
         // Test mutable accessor
         let _conn_mut = db.connection_mut();
+    }
+
+    #[test]
+    fn database_open_maps_wal_configuration_contention_to_lock_timeout() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        drop(Database::open(DatabaseConfig::new(&path)).unwrap());
+
+        let locker = Connection::open(&path).unwrap();
+        locker
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let error = Database::open(DatabaseConfig::new(&path).with_busy_timeout(Duration::ZERO))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::LockTimeout {
+                timeout,
+                ref operation
+            } if timeout == Duration::ZERO
+                && operation == "opening, configuring, or migrating the database"
+        ));
+
+        locker.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn begin_transaction_maps_expired_contention_to_lock_timeout() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        drop(Database::open(DatabaseConfig::new(&path)).unwrap());
+
+        let locker = Connection::open(&path).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut database =
+            Database::open(DatabaseConfig::new(&path).with_busy_timeout(Duration::ZERO)).unwrap();
+
+        let error = database.begin_transaction().unwrap_err();
+        assert!(matches!(
+            error,
+            Error::LockTimeout {
+                timeout,
+                ref operation
+            } if timeout == Duration::ZERO
+                && operation == "starting an immediate database transaction"
+        ));
+
+        locker.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn transaction_acquired_before_timeout_succeeds_without_sleeping() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        drop(Database::open(DatabaseConfig::new(&path)).unwrap());
+
+        let locker = Connection::open(&path).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = Arc::new(Barrier::new(2));
+        let contender_started = Arc::clone(&started);
+        let contender_path = path.clone();
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let contender = std::thread::spawn(move || {
+            let mut database = Database::open(
+                DatabaseConfig::new(contender_path).with_busy_timeout(Duration::from_secs(2)),
+            )
+            .unwrap();
+            contender_started.wait();
+            let result = database
+                .begin_transaction()
+                .and_then(|transaction| transaction.commit().map_err(Error::from));
+            result_sender.send(result).unwrap();
+        });
+
+        started.wait();
+        assert!(
+            result_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "contender should remain blocked while the write lock is held"
+        );
+        locker.execute_batch("ROLLBACK").unwrap();
+
+        result_receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("contender did not finish after lock release")
+            .unwrap();
+        contender.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_database_is_not_misclassified_as_lock_timeout() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("malformed.db");
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+
+        let error = Database::open(DatabaseConfig::new(&path).with_busy_timeout(Duration::ZERO))
+            .unwrap_err();
+        assert!(matches!(error, Error::Database(_)));
     }
 }

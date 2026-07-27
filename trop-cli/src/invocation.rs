@@ -174,6 +174,14 @@ impl InvocationContext {
         })
     }
 
+    /// Return the configured SQLite lock wait when this command uses effective
+    /// configuration.
+    pub(crate) fn lock_timeout(&self) -> Option<Duration> {
+        self.effective
+            .as_ref()
+            .map(|effective| Duration::from_secs(effective.maximum_lock_wait_seconds()))
+    }
+
     /// The effective value model consumed by existing library operations.
     pub(crate) fn config(&self) -> Result<&Config, CliError> {
         Ok(self.effective()?.config())

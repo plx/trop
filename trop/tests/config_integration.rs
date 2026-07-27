@@ -906,11 +906,11 @@ fn test_validation_cleanup_expire_days_zero() {
 
 /// Test validation of maximum lock wait timeout.
 ///
-/// The timeout must be > 0. A zero timeout doesn't make sense.
+/// Zero deliberately disables waiting for a lock.
 #[test]
 fn test_validation_lock_timeout_zero() {
     let config = Config {
-        maximum_lock_wait_seconds: Some(0), // Invalid
+        maximum_lock_wait_seconds: Some(0),
         ..Default::default()
     };
 
@@ -920,7 +920,27 @@ fn test_validation_lock_timeout_zero() {
         .with_config(config)
         .build();
 
-    assert!(result.is_err());
+    assert_eq!(result.unwrap().maximum_lock_wait_seconds, Some(0));
+}
+
+#[test]
+fn test_validation_lock_timeout_rejects_values_above_sqlite_limit() {
+    let config = Config {
+        maximum_lock_wait_seconds: Some(2_147_484),
+        ..Default::default()
+    };
+
+    let error = ConfigBuilder::new()
+        .skip_files()
+        .skip_env()
+        .with_config(config)
+        .build()
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("2147483"),
+        "unexpected error: {error}"
+    );
 }
 
 /// Test validation of reservation group offset uniqueness.

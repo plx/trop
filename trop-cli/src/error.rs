@@ -18,9 +18,6 @@ pub enum CliError {
     /// I/O error.
     Io(std::io::Error),
 
-    /// Timeout waiting for database lock.
-    Timeout,
-
     /// Data directory not found (and auto-init disabled).
     NoDataDirectory,
 
@@ -47,11 +44,11 @@ impl CliError {
         match self {
             CliError::SemanticFailure(_) => 1,
             CliError::Library(lib_err) => match lib_err {
+                LibError::LockTimeout { .. } => 2,
                 LibError::StickyFieldChange { .. } => 1,
                 LibError::PathRelationshipViolation { .. } => 1,
                 _ => 6,
             },
-            CliError::Timeout => 2,
             CliError::NoDataDirectory => 3,
             CliError::InvalidArguments(_) => 4,
             CliError::Io(_) => 5,
@@ -66,7 +63,6 @@ impl fmt::Display for CliError {
             CliError::Library(e) => write!(f, "{e}"),
             CliError::InvalidArguments(msg) => write!(f, "Invalid arguments: {msg}"),
             CliError::Io(e) => write!(f, "I/O error: {e}"),
-            CliError::Timeout => write!(f, "Timeout waiting for database lock"),
             CliError::NoDataDirectory => {
                 write!(
                     f,
@@ -91,12 +87,7 @@ impl std::error::Error for CliError {
 
 impl From<LibError> for CliError {
     fn from(e: LibError) -> Self {
-        // Check for specific error types that need special handling
-        if matches!(e, LibError::LockTimeout { .. }) {
-            CliError::Timeout
-        } else {
-            CliError::Library(e)
-        }
+        CliError::Library(e)
     }
 }
 

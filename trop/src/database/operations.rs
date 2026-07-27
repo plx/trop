@@ -394,6 +394,13 @@ impl Database {
     /// db.create_reservation(&reservation).unwrap();
     /// ```
     pub fn create_reservation(&mut self, reservation: &Reservation) -> Result<()> {
+        let timeout = self.busy_timeout();
+        self.create_reservation_inner(reservation).map_err(|error| {
+            error.classify_sqlite_lock(timeout, "creating or updating a reservation")
+        })
+    }
+
+    fn create_reservation_inner(&mut self, reservation: &Reservation) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -542,6 +549,13 @@ impl Database {
     /// let updated = db.update_last_used(&key).unwrap();
     /// ```
     pub fn update_last_used(&mut self, key: &ReservationKey) -> Result<bool> {
+        let timeout = self.busy_timeout();
+        self.update_last_used_inner(key).map_err(|error| {
+            error.classify_sqlite_lock(timeout, "updating reservation access time")
+        })
+    }
+
+    fn update_last_used_inner(&mut self, key: &ReservationKey) -> Result<bool> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -582,6 +596,12 @@ impl Database {
     /// let deleted = db.delete_reservation(&key).unwrap();
     /// ```
     pub fn delete_reservation(&mut self, key: &ReservationKey) -> Result<bool> {
+        let timeout = self.busy_timeout();
+        self.delete_reservation_inner(key)
+            .map_err(|error| error.classify_sqlite_lock(timeout, "deleting a reservation"))
+    }
+
+    fn delete_reservation_inner(&mut self, key: &ReservationKey) -> Result<bool> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

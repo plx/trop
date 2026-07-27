@@ -40,6 +40,7 @@ mod validation;
 pub mod test_util;
 
 // Re-export public API
+pub(crate) use config::MAX_BUSY_TIMEOUT_SECONDS;
 pub use config::{default_data_dir, resolve_database_path, DatabaseConfig};
 pub use connection::Database;
 

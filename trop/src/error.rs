@@ -4,6 +4,7 @@
 //! in the trop library, using `thiserror` for ergonomic error handling.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -98,10 +99,12 @@ pub enum Error {
     },
 
     /// A database lock timeout occurred.
-    #[error("database lock timeout after {seconds}s")]
+    #[error("database lock timeout while {operation} after {timeout:?}")]
     LockTimeout {
-        /// The number of seconds waited before timing out.
-        seconds: u64,
+        /// The configured maximum wait.
+        timeout: Duration,
+        /// The database operation that encountered contention.
+        operation: String,
     },
 
     /// The data directory was not found and auto-initialization is disabled.
@@ -283,6 +286,22 @@ impl From<crate::reservation::ValidationError> for Error {
 }
 
 impl Error {
+    /// Converts a `SQLite` Busy or Locked failure into the lock-timeout
+    /// contract while leaving every other error unchanged.
+    ///
+    /// Callers should apply this at a database operation boundary where the
+    /// configured busy timeout and useful operation context are known.
+    #[must_use]
+    pub fn classify_sqlite_lock(self, timeout: Duration, operation: impl Into<String>) -> Self {
+        match self {
+            Self::Database(error) if sqlite_error_is_lock_contention(&error) => Self::LockTimeout {
+                timeout,
+                operation: operation.into(),
+            },
+            error => error,
+        }
+    }
+
     /// Builds a corruption error for one stored field without including the
     /// rest of the row in diagnostics.
     pub(crate) fn corrupt_stored_value(table: &str, field: &str, key: &str, reason: &str) -> Self {
@@ -327,6 +346,17 @@ impl Error {
     pub fn is_permission_denied(&self) -> bool {
         matches!(self, Self::PermissionDenied { .. })
     }
+}
+
+pub(crate) fn sqlite_error_is_lock_contention(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(sqlite, _)
+            if matches!(
+                sqlite.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 #[cfg(test)]
@@ -413,10 +443,47 @@ mod tests {
 
     #[test]
     fn test_lock_timeout_error() {
-        let err = Error::LockTimeout { seconds: 5 };
+        let err = Error::LockTimeout {
+            timeout: std::time::Duration::from_secs(5),
+            operation: "starting an immediate transaction".to_string(),
+        };
         let display = format!("{err}");
         assert!(display.contains("lock timeout"));
         assert!(display.contains('5'));
+        assert!(display.contains("starting an immediate transaction"));
+    }
+
+    #[test]
+    fn sqlite_lock_classification_preserves_timeout_and_context() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let source = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("contention".to_string()),
+            );
+            let error = Error::Database(source).classify_sqlite_lock(
+                std::time::Duration::from_millis(125),
+                "committing reservation",
+            );
+            assert!(matches!(
+                error,
+                Error::LockTimeout {
+                    timeout,
+                    ref operation
+                } if timeout == std::time::Duration::from_millis(125)
+                    && operation == "committing reservation"
+            ));
+        }
+    }
+
+    #[test]
+    fn sqlite_lock_classification_does_not_overmap_other_failures() {
+        let source = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some("malformed".to_string()),
+        );
+        let error = Error::Database(source)
+            .classify_sqlite_lock(std::time::Duration::ZERO, "reading schema");
+        assert!(matches!(error, Error::Database(_)));
     }
 
     #[test]
