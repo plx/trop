@@ -2,7 +2,8 @@
 
 use std::fmt::Write as _;
 
-use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, DatabaseName, Transaction, TransactionBehavior};
 
 use crate::error::{Error, Result};
 
@@ -43,18 +44,6 @@ const EXPECTED_V1_METADATA_COLUMNS: &[ColumnSpec] = &[
 const EXPECTED_V1_RESERVATION_COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("path", "TEXT", true, 1),
     ColumnSpec::new("tag", "TEXT", false, 2),
-    ColumnSpec::new("port", "INTEGER", true, 0),
-    ColumnSpec::new("project", "TEXT", false, 0),
-    ColumnSpec::new("task", "TEXT", false, 0),
-    ColumnSpec::new("created_at", "INTEGER", true, 0),
-    ColumnSpec::new("last_used_at", "INTEGER", true, 0),
-];
-
-const EXPECTED_V2_METADATA_COLUMNS: &[ColumnSpec] = EXPECTED_V1_METADATA_COLUMNS;
-
-const EXPECTED_V2_RESERVATION_COLUMNS: &[ColumnSpec] = &[
-    ColumnSpec::new("path", "TEXT", true, 1),
-    ColumnSpec::new("tag", "TEXT", true, 2),
     ColumnSpec::new("port", "INTEGER", true, 0),
     ColumnSpec::new("project", "TEXT", false, 0),
     ColumnSpec::new("task", "TEXT", false, 0),
@@ -204,23 +193,67 @@ fn initialize_schema_in_transaction(conn: &Connection) -> Result<()> {
 /// Returns a database error when schema metadata exists but cannot be read as
 /// the integer version expected by trop.
 pub fn get_schema_version(conn: &Connection) -> Result<i32> {
-    match conn.query_row(SELECT_SCHEMA_VERSION, [], |row| {
-        let value: String = row.get(0)?;
-        value
-            .parse::<i32>()
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-    }) {
-        Ok(version) => Ok(version),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
-        Err(error) => {
-            if let rusqlite::Error::SqliteFailure(ref sqlite_error, _) = error {
-                if sqlite_error.code == rusqlite::ErrorCode::Unknown {
-                    return Ok(0);
-                }
-            }
-            Err(error.into())
+    let mut statement = match conn.prepare(SELECT_SCHEMA_VERSION) {
+        Ok(statement) => statement,
+        Err(error) if is_missing_metadata_table(&error) => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut rows = statement.query([])?;
+    let Some(row) = rows.next()? else {
+        return Ok(0);
+    };
+    let value = match row.get_ref(0)? {
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes)
+            .map_err(|_| {
+                Error::corrupt_stored_value(
+                    "metadata",
+                    "value",
+                    "key=\"schema_version\"",
+                    "schema_version TEXT is not valid UTF-8",
+                )
+            })?
+            .to_owned(),
+        value => {
+            return Err(Error::corrupt_stored_value(
+                "metadata",
+                "value",
+                "key=\"schema_version\"",
+                match value {
+                    ValueRef::Null => "schema_version must be TEXT, found NULL",
+                    ValueRef::Integer(_) => "schema_version must be TEXT, found INTEGER",
+                    ValueRef::Real(_) => "schema_version must be TEXT, found REAL",
+                    ValueRef::Text(_) => unreachable!(),
+                    ValueRef::Blob(_) => "schema_version must be TEXT, found BLOB",
+                },
+            ));
         }
+    };
+    if rows.next()?.is_some() {
+        return Err(Error::corrupt_stored_value(
+            "metadata",
+            "value",
+            "key=\"schema_version\"",
+            "exactly one schema_version row is required",
+        ));
     }
+    value.parse::<i32>().map_err(|_| {
+        Error::corrupt_stored_value(
+            "metadata",
+            "value",
+            "key=\"schema_version\"",
+            "schema_version must be a base-10 signed integer",
+        )
+    })
+}
+
+fn is_missing_metadata_table(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(sqlite, Some(message))
+            if sqlite.code == rusqlite::ErrorCode::Unknown
+                && message.contains("no such table")
+                && message.contains("metadata")
+    )
 }
 
 /// Initializes, migrates, or verifies a database for this client.
@@ -501,111 +534,7 @@ fn count_query(conn: &Connection, sql: &str) -> Result<i64> {
 }
 
 fn validate_schema_v2(conn: &Connection) -> Result<()> {
-    let metadata = table_columns(conn, "metadata")?;
-    let reservations = table_columns(conn, "reservations")?;
-    if !columns_match(&metadata, EXPECTED_V2_METADATA_COLUMNS)
-        || !columns_match(&reservations, EXPECTED_V2_RESERVATION_COLUMNS)
-        || !table_is_strict(conn, "metadata")?
-        || !table_is_strict(conn, "reservations")?
-    {
-        return Err(Error::DatabaseCorruption {
-            details: "schema v2 table layout does not match the required strict schema".into(),
-        });
-    }
-
-    for index in [
-        "idx_reservations_port",
-        "idx_reservations_project",
-        "idx_reservations_last_used",
-    ] {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_schema
-                WHERE type = 'index' AND name = ?1 AND tbl_name = 'reservations'
-             )",
-            [index],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(Error::DatabaseCorruption {
-                details: format!("schema v2 is missing required index {index}"),
-            });
-        }
-    }
-
-    let schema_version_rows: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM metadata
-         WHERE key = 'schema_version' AND value = ?1",
-        [CURRENT_SCHEMA_VERSION],
-        |row| row.get(0),
-    )?;
-    if schema_version_rows != 1 {
-        return Err(Error::DatabaseCorruption {
-            details: "schema v2 must contain exactly one current schema-version value".into(),
-        });
-    }
-
-    let invalid_rows = count_query(
-        conn,
-        "SELECT COUNT(*) FROM reservations
-         WHERE typeof(path) <> 'text'
-            OR typeof(tag) <> 'text'
-            OR typeof(port) <> 'integer'
-            OR port NOT BETWEEN 1 AND 65535
-            OR typeof(project) NOT IN ('null', 'text')
-            OR typeof(task) NOT IN ('null', 'text')
-            OR typeof(created_at) <> 'integer'
-            OR created_at < 0
-            OR typeof(last_used_at) <> 'integer'
-            OR last_used_at < 0",
-    )?;
-    if invalid_rows > 0 {
-        return Err(Error::DatabaseCorruption {
-            details: format!("schema v2 contains {invalid_rows} row(s) violating v2 constraints"),
-        });
-    }
-
-    let duplicate_keys = count_query(
-        conn,
-        "SELECT COUNT(*) FROM (
-            SELECT path, tag FROM reservations
-            GROUP BY path, tag HAVING COUNT(*) > 1
-         )",
-    )?;
-    let duplicate_ports = count_query(
-        conn,
-        "SELECT COUNT(*) FROM (
-            SELECT port FROM reservations
-            GROUP BY port HAVING COUNT(*) > 1
-         )",
-    )?;
-    if duplicate_keys > 0 || duplicate_ports > 0 {
-        return Err(Error::DatabaseCorruption {
-            details: format!(
-                "schema v2 uniqueness failure: duplicate keys={duplicate_keys}, \
-                 duplicate ports={duplicate_ports}"
-            ),
-        });
-    }
-
-    let mut foreign_keys = conn.prepare("PRAGMA foreign_key_check")?;
-    if foreign_keys.query([])?.next()?.is_some() {
-        return Err(Error::DatabaseCorruption {
-            details: "schema v2 foreign-key check failed".into(),
-        });
-    }
-
-    let mut integrity = conn.prepare("PRAGMA integrity_check")?;
-    let messages = integrity
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    if messages.as_slice() != ["ok"] {
-        return Err(Error::DatabaseCorruption {
-            details: format!("schema v2 integrity check failed: {}", messages.join("; ")),
-        });
-    }
-
-    Ok(())
+    super::validation::validate_current_database(conn)
 }
 
 fn table_columns(conn: &Connection, table: &str) -> Result<Vec<ActualColumn>> {
@@ -637,17 +566,6 @@ fn columns_match(actual: &[ActualColumn], expected: &[ColumnSpec]) -> bool {
                 && actual.not_null == expected.not_null
                 && actual.primary_key_position == expected.primary_key_position
         })
-}
-
-fn table_is_strict(conn: &Connection, table: &str) -> Result<bool> {
-    Ok(conn
-        .query_row(
-            "SELECT strict FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
-            [table],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?
-        .is_some_and(|strict| strict == 1))
 }
 
 #[cfg(test)]

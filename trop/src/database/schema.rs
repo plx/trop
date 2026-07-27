@@ -90,13 +90,3 @@ pub const DELETE_RESERVATION: &str = r"
 pub(super) fn encode_tag(tag: Option<&str>) -> &str {
     tag.unwrap_or("")
 }
-
-/// Decodes schema v2's non-null tag representation for the domain model.
-#[must_use]
-pub(super) fn decode_tag(tag: String) -> Option<String> {
-    if tag.is_empty() {
-        None
-    } else {
-        Some(tag)
-    }
-}

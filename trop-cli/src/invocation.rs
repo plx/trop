@@ -260,19 +260,34 @@ impl InvocationContext {
         Database::open(db_config).map_err(CliError::from)
     }
 
-    /// Open an already-existing database using the effective lock timeout.
-    pub(crate) fn open_existing_database(&self) -> Result<Database, CliError> {
+    /// Validate an existing database through a read-only connection.
+    pub(crate) fn validate_existing_database(&self) -> Result<(), CliError> {
         let db_path = self.database_path()?;
-        if !db_path.exists() {
-            return Err(CliError::InvalidArguments(
-                "Database file not found".to_string(),
-            ));
+        let database_exists = db_path.try_exists().map_err(|error| {
+            CliError::from(trop::Error::DatabaseCorruption {
+                details: format!(
+                    "cannot access the selected database {}: {error}; \
+                     verify its path and permissions before retrying. \
+                     trop did not initialize or modify the data directory",
+                    db_path.display()
+                ),
+            })
+        })?;
+        if !database_exists {
+            return Err(CliError::from(trop::Error::DatabaseCorruption {
+                details: format!(
+                    "the selected data directory does not contain {}; \
+                     restore a known-good database or recreate disposable reservations. \
+                     trop did not initialize or modify the data directory",
+                    db_path.display()
+                ),
+            }));
         }
 
         let db_config = DatabaseConfig::new(db_path).with_busy_timeout(Duration::from_secs(
             self.effective()?.maximum_lock_wait_seconds(),
         ));
-        Database::open(db_config).map_err(CliError::from)
+        Database::validate(&db_config).map_err(CliError::from)
     }
 
     /// Choose the current legacy YAML write target without flattening layers.

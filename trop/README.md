@@ -156,6 +156,17 @@ No persistent backup or reverse migration is provided. Stop users of the
 database and copy the complete data directory before upgrading if a downgrade
 restore point is required.
 
+`Database::validate(&DatabaseConfig)` is the non-mutating validation entry
+point. It opens the existing file read-only without initializing or migrating,
+then verifies physical integrity, foreign keys, schema/version structure,
+metadata, uniqueness, required indexes and constraints, and all reservation
+values. Stored row decoding is shared by validation and ordinary reads and is
+fully fallible: invalid scalar types or domain values return
+`Error::DatabaseCorruption` with table/field/key context instead of panicking.
+Diagnostics do not include project/task contents or raw blob bytes. Validation
+does not attempt recovery; callers should copy the database before restoring a
+known-good copy or recreating disposable reservations.
+
 ## Usage Example
 
 ```rust

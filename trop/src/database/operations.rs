@@ -3,10 +3,12 @@
 //! This module implements all create, read, update, and delete operations
 //! for port reservations in the database.
 
+use std::collections::BTreeSet;
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, TransactionBehavior};
 
 use crate::error::{Error, Result};
@@ -14,7 +16,7 @@ use crate::path::PathRelationship;
 use crate::{Port, PortRange, Reservation, ReservationKey};
 
 use super::connection::Database;
-use super::schema::{decode_tag, encode_tag, DELETE_RESERVATION, INSERT_RESERVATION};
+use super::schema::{encode_tag, DELETE_RESERVATION, INSERT_RESERVATION};
 
 /// Converts a `SystemTime` to Unix epoch seconds for database storage.
 ///
@@ -29,38 +31,80 @@ pub(super) fn systemtime_to_unix_secs(time: SystemTime) -> Result<i64> {
             message: format!("Invalid timestamp: {error}"),
         })?
         .as_secs();
-    i64::try_from(seconds).map_err(|_| crate::error::Error::Validation {
+    let seconds = i64::try_from(seconds).map_err(|_| crate::error::Error::Validation {
         field: "timestamp".into(),
         message: "timestamp exceeds SQLite's signed 64-bit representation".into(),
-    })
+    })?;
+    if chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0).is_none() {
+        return Err(crate::error::Error::Validation {
+            field: "timestamp".into(),
+            message: "timestamp is outside the supported display and serialization range".into(),
+        });
+    }
+    Ok(seconds)
 }
 
-/// Converts Unix epoch seconds from the database to a `SystemTime`.
-#[allow(clippy::cast_sign_loss)]
-pub(super) fn unix_secs_to_systemtime(secs: i64) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64)
+/// Converts stored Unix epoch seconds to a representable `SystemTime`.
+fn unix_secs_to_systemtime(secs: i64, field: &str, key: &str) -> Result<SystemTime> {
+    let seconds = u64::try_from(secs).map_err(|_| {
+        Error::corrupt_stored_value("reservations", field, key, "timestamp must be nonnegative")
+    })?;
+    if chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).is_none() {
+        return Err(Error::corrupt_stored_value(
+            "reservations",
+            field,
+            key,
+            "timestamp is outside the supported display and serialization range",
+        ));
+    }
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(seconds))
+        .ok_or_else(|| {
+            Error::corrupt_stored_value(
+                "reservations",
+                field,
+                key,
+                "timestamp is outside this platform's representable SystemTime range",
+            )
+        })
 }
 
 /// Helper function to deserialize a reservation from a database row.
 ///
 /// Expects row fields in this order: path, tag, port, project, task, `created_at`, `last_used_at`
-fn row_to_reservation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reservation> {
-    let path: String = row.get(0)?;
-    let tag = decode_tag(row.get::<_, String>(1)?);
-    let port_value: u16 = row.get(2)?;
-    let project: Option<String> = row.get(3)?;
-    let task: Option<String> = row.get(4)?;
-    let created_secs: i64 = row.get(5)?;
-    let last_used_secs: i64 = row.get(6)?;
+pub(super) fn row_to_reservation(row: &rusqlite::Row<'_>) -> Result<Reservation> {
+    let key_context = reservation_key_context(row);
+    let path = required_text(row.get_ref(0)?, "path", &key_context)?;
+    let path = validate_stored_path(path, &key_context)?;
+    let tag = decode_stored_tag(row.get_ref(1)?, &key_context)?;
+    let key = ReservationKey::new(path, tag).map_err(|error| {
+        Error::corrupt_stored_value("reservations", &error.field, &key_context, &error.message)
+    })?;
 
-    let key = ReservationKey::new(path.into(), tag)
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let port_value = required_integer(row.get_ref(2)?, "port", &key_context)?;
+    let port_value = u16::try_from(port_value).map_err(|_| {
+        Error::corrupt_stored_value(
+            "reservations",
+            "port",
+            &key_context,
+            "port must be an integer in 1..=65535",
+        )
+    })?;
+    let port = Port::try_from(port_value).map_err(|_| {
+        Error::corrupt_stored_value(
+            "reservations",
+            "port",
+            &key_context,
+            "port must be an integer in 1..=65535",
+        )
+    })?;
 
-    let port = Port::try_from(port_value)
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-    let created_at = unix_secs_to_systemtime(created_secs);
-    let last_used_at = unix_secs_to_systemtime(last_used_secs);
+    let project = optional_identifier(row.get_ref(3)?, "project", &key_context)?;
+    let task = optional_identifier(row.get_ref(4)?, "task", &key_context)?;
+    let created_secs = required_integer(row.get_ref(5)?, "created_at", &key_context)?;
+    let last_used_secs = required_integer(row.get_ref(6)?, "last_used_at", &key_context)?;
+    let created_at = unix_secs_to_systemtime(created_secs, "created_at", &key_context)?;
+    let last_used_at = unix_secs_to_systemtime(last_used_secs, "last_used_at", &key_context)?;
 
     Reservation::builder(key, port)
         .project(project)
@@ -68,12 +112,177 @@ fn row_to_reservation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reservation> 
         .created_at(created_at)
         .last_used_at(last_used_at)
         .build()
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        .map_err(|error| {
+            Error::corrupt_stored_value("reservations", &error.field, &key_context, &error.message)
+        })
+}
+
+fn validate_stored_path(path: &str, key: &str) -> Result<PathBuf> {
+    if path.is_empty() {
+        return Err(Error::corrupt_stored_value(
+            "reservations",
+            "path",
+            key,
+            "path must be nonempty",
+        ));
+    }
+
+    let path_buf = PathBuf::from(path);
+    if !stored_path_is_absolute(&path_buf, path) {
+        return Err(Error::corrupt_stored_value(
+            "reservations",
+            "path",
+            key,
+            "path must be absolute",
+        ));
+    }
+
+    if !stored_path_is_lexically_normal(&path_buf, path) {
+        return Err(Error::corrupt_stored_value(
+            "reservations",
+            "path",
+            key,
+            "path must already be in its absolute lexical-normal form",
+        ));
+    }
+
+    Ok(path_buf)
+}
+
+fn stored_path_is_absolute(path: &Path, stored: &str) -> bool {
+    path.is_absolute() || cfg!(windows) && stored.starts_with('/')
+}
+
+fn stored_path_is_lexically_normal(path: &Path, stored: &str) -> bool {
+    // Schema v2 can contain a slash-rooted path written on Unix and later read
+    // on Windows. Treat that persisted spelling as a portable absolute lexical
+    // form without silently rewriting the stored key.
+    if cfg!(windows) && !path.is_absolute() && stored.starts_with('/') {
+        return slash_rooted_path_is_lexically_normal(stored);
+    }
+
+    crate::path::normalize::resolve_components(path)
+        .ok()
+        .and_then(|normalized| normalized.to_str().map(|value| value == stored))
+        .unwrap_or(false)
+}
+
+fn slash_rooted_path_is_lexically_normal(path: &str) -> bool {
+    path == "/"
+        || path.strip_prefix('/').is_some_and(|suffix| {
+            !suffix.is_empty()
+                && !suffix.contains('\\')
+                && suffix
+                    .split('/')
+                    .all(|part| !part.is_empty() && part != "." && part != "..")
+        })
+}
+
+fn decode_stored_tag(value: ValueRef<'_>, key: &str) -> Result<Option<String>> {
+    let tag = text_value(value, "tag", key)?;
+    if tag.is_empty() {
+        return Ok(None);
+    }
+    let trimmed = tag.trim();
+    if trimmed.is_empty() || trimmed != tag {
+        return Err(Error::corrupt_stored_value(
+            "reservations",
+            "tag",
+            key,
+            "tag must be the empty untagged sentinel or exact trimmed nonempty text",
+        ));
+    }
+    Ok(Some(tag.to_owned()))
+}
+
+fn optional_identifier(value: ValueRef<'_>, field: &str, key: &str) -> Result<Option<String>> {
+    if value == ValueRef::Null {
+        return Ok(None);
+    }
+    let identifier = text_value(value, field, key)?;
+    if identifier.is_empty() || identifier.trim() != identifier {
+        return Err(Error::corrupt_stored_value(
+            "reservations",
+            field,
+            key,
+            "optional identifier must be NULL or exact trimmed nonempty text",
+        ));
+    }
+    Ok(Some(identifier.to_owned()))
+}
+
+fn required_integer(value: ValueRef<'_>, field: &str, key: &str) -> Result<i64> {
+    if let ValueRef::Integer(value) = value {
+        Ok(value)
+    } else {
+        Err(Error::corrupt_stored_value(
+            "reservations",
+            field,
+            key,
+            &format!("expected INTEGER, found {}", value_kind(value)),
+        ))
+    }
+}
+
+fn required_text<'a>(value: ValueRef<'a>, field: &str, key: &str) -> Result<&'a str> {
+    text_value(value, field, key)
+}
+
+fn text_value<'a>(value: ValueRef<'a>, field: &str, key: &str) -> Result<&'a str> {
+    let ValueRef::Text(bytes) = value else {
+        return Err(Error::corrupt_stored_value(
+            "reservations",
+            field,
+            key,
+            &format!("expected TEXT, found {}", value_kind(value)),
+        ));
+    };
+    std::str::from_utf8(bytes).map_err(|_| {
+        Error::corrupt_stored_value("reservations", field, key, "stored TEXT is not valid UTF-8")
+    })
+}
+
+fn reservation_key_context(row: &rusqlite::Row<'_>) -> String {
+    let path = row
+        .get_ref(0)
+        .map_or_else(|_| "<unreadable>".to_string(), describe_key_text);
+    let tag = row.get_ref(1).map_or_else(
+        |_| "<unreadable>".to_string(),
+        |value| match value {
+            ValueRef::Text([]) => "<untagged>".to_string(),
+            other => describe_key_text(other),
+        },
+    );
+    format!("path={path}, tag={tag}")
+}
+
+fn describe_key_text(value: ValueRef<'_>) -> String {
+    match value {
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes).map_or_else(
+            |_| "<invalid UTF-8>".to_string(),
+            |text| format!("\"{}\"", escape_text(text)),
+        ),
+        other => format!("<{}>", value_kind(other)),
+    }
+}
+
+fn escape_text(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
+}
+
+fn value_kind(value: ValueRef<'_>) -> &'static str {
+    match value {
+        ValueRef::Null => "NULL",
+        ValueRef::Integer(_) => "INTEGER",
+        ValueRef::Real(_) => "REAL",
+        ValueRef::Text(_) => "TEXT",
+        ValueRef::Blob(_) => "BLOB",
+    }
 }
 
 // SQL statements for CRUD operations
 const SELECT_RESERVATION: &str = r"
-    SELECT port, project, task, created_at, last_used_at
+    SELECT path, tag, port, project, task, created_at, last_used_at
     FROM reservations
     WHERE path = ? AND tag = ?
 ";
@@ -97,7 +306,7 @@ const LIST_RESERVATIONS: &str = r"
 ";
 
 const SELECT_RESERVED_PORTS: &str = r"
-    SELECT DISTINCT port
+    SELECT path, tag, port, project, task, created_at, last_used_at
     FROM reservations
     WHERE port >= ? AND port <= ?
     ORDER BY port
@@ -301,35 +510,11 @@ impl Database {
     /// ```
     pub fn get_reservation(conn: &Connection, key: &ReservationKey) -> Result<Option<Reservation>> {
         let mut stmt = conn.prepare(SELECT_RESERVATION)?;
-
-        match stmt.query_row(
-            params![key.path_as_string(), encode_tag(key.tag.as_deref())],
-            |row| {
-                let port_value: u16 = row.get(0)?;
-                let port = Port::try_from(port_value)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-                let project: Option<String> = row.get(1)?;
-                let task: Option<String> = row.get(2)?;
-                let created_secs: i64 = row.get(3)?;
-                let last_used_secs: i64 = row.get(4)?;
-
-                let created_at = unix_secs_to_systemtime(created_secs);
-                let last_used_at = unix_secs_to_systemtime(last_used_secs);
-
-                Reservation::builder(key.clone(), port)
-                    .project(project)
-                    .task(task)
-                    .created_at(created_at)
-                    .last_used_at(last_used_at)
-                    .build()
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-            },
-        ) {
-            Ok(reservation) => Ok(Some(reservation)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        let mut rows = stmt.query(params![
+            key.path_as_string(),
+            encode_tag(key.tag.as_deref())
+        ])?;
+        rows.next()?.map(row_to_reservation).transpose()
     }
 
     /// Updates the `last_used_at` timestamp for a reservation.
@@ -488,11 +673,11 @@ impl Database {
     /// ```
     pub fn list_all_reservations(conn: &Connection) -> Result<Vec<Reservation>> {
         let mut stmt = conn.prepare(LIST_RESERVATIONS)?;
-
-        let reservations = stmt
-            .query_map([], row_to_reservation)?
-            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
-
+        let mut rows = stmt.query([])?;
+        let mut reservations = Vec::new();
+        while let Some(row) = rows.next()? {
+            reservations.push(row_to_reservation(row)?);
+        }
         Ok(reservations)
     }
 
@@ -522,15 +707,11 @@ impl Database {
     /// ```
     pub fn get_reserved_ports(conn: &Connection, range: &PortRange) -> Result<Vec<Port>> {
         let mut stmt = conn.prepare(SELECT_RESERVED_PORTS)?;
-
-        let ports = stmt
-            .query_map(params![range.min().value(), range.max().value()], |row| {
-                let port_value: u16 = row.get(0)?;
-                Port::try_from(port_value)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-            })?
-            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
-
+        let mut rows = stmt.query(params![range.min().value(), range.max().value()])?;
+        let mut ports = Vec::new();
+        while let Some(row) = rows.next()? {
+            ports.push(row_to_reservation(row)?.port());
+        }
         Ok(ports)
     }
 
@@ -559,13 +740,14 @@ impl Database {
         prefix: &Path,
     ) -> Result<Vec<Reservation>> {
         let mut stmt = conn.prepare(SELECT_BY_PATH_PREFIX)?;
-
-        let reservations = stmt
-            .query_map([prefix.to_string_lossy().to_string()], row_to_reservation)?
-            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?
-            .into_iter()
-            .filter(|reservation| reservation.key().path.starts_with(prefix))
-            .collect();
+        let mut rows = stmt.query([prefix.to_string_lossy().to_string()])?;
+        let mut reservations = Vec::new();
+        while let Some(row) = rows.next()? {
+            let reservation = row_to_reservation(row)?;
+            if reservation.key().path.starts_with(prefix) {
+                reservations.push(reservation);
+            }
+        }
 
         Ok(reservations)
     }
@@ -580,9 +762,11 @@ impl Database {
         path: &Path,
     ) -> Result<Vec<Reservation>> {
         let mut stmt = conn.prepare_cached(SELECT_TAGGED_BY_EXACT_PATH)?;
-        let reservations = stmt
-            .query_map([path.to_string_lossy().to_string()], row_to_reservation)?
-            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        let mut rows = stmt.query([path.to_string_lossy().to_string()])?;
+        let mut reservations = Vec::new();
+        while let Some(row) = rows.next()? {
+            reservations.push(row_to_reservation(row)?);
+        }
         Ok(reservations)
     }
 
@@ -616,11 +800,11 @@ impl Database {
         let cutoff = now_secs.saturating_sub(max_age_secs);
 
         let mut stmt = conn.prepare(SELECT_EXPIRED)?;
-
-        let reservations = stmt
-            .query_map([cutoff], row_to_reservation)?
-            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
-
+        let mut rows = stmt.query([cutoff])?;
+        let mut reservations = Vec::new();
+        while let Some(row) = rows.next()? {
+            reservations.push(row_to_reservation(row)?);
+        }
         Ok(reservations)
     }
 
@@ -674,13 +858,8 @@ impl Database {
     /// ```
     pub fn get_reservation_by_port(conn: &Connection, port: Port) -> Result<Option<Reservation>> {
         let mut stmt = conn.prepare_cached(SELECT_BY_PORT)?;
-        let mut rows = stmt.query_map(params![port.value()], row_to_reservation)?;
-
-        match rows.next() {
-            Some(Ok(reservation)) => Ok(Some(reservation)),
-            Some(Err(e)) => Err(e.into()),
-            None => Ok(None),
-        }
+        let mut rows = stmt.query(params![port.value()])?;
+        rows.next()?.map(row_to_reservation).transpose()
     }
 
     /// Gets all reserved ports in a range.
@@ -735,17 +914,11 @@ impl Database {
     /// }
     /// ```
     pub fn list_projects(conn: &Connection) -> Result<Vec<String>> {
-        let query = "SELECT DISTINCT project FROM reservations
-                     WHERE project IS NOT NULL
-                     ORDER BY project";
-
-        let mut stmt = conn.prepare(query)?;
-
-        let projects = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
-
-        Ok(projects)
+        let projects = Self::list_all_reservations(conn)?
+            .into_iter()
+            .filter_map(|reservation| reservation.project().map(ToOwned::to_owned))
+            .collect::<BTreeSet<_>>();
+        Ok(projects.into_iter().collect())
     }
 
     /// Verifies database integrity using PRAGMA `integrity_check`.
@@ -766,18 +939,8 @@ impl Database {
     ///
     /// db.verify_integrity().unwrap();
     /// ```
-    pub fn verify_integrity(&mut self) -> Result<()> {
-        let result: String = self
-            .conn
-            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-
-        if result == "ok" {
-            Ok(())
-        } else {
-            Err(Error::DatabaseCorruption {
-                details: format!("Integrity check failed: {result}"),
-            })
-        }
+    pub fn verify_integrity(&self) -> Result<()> {
+        super::validation::validate_current_database(&self.conn)
     }
 
     /// Validates path relationship for database operations.
@@ -840,7 +1003,109 @@ impl Database {
 mod tests {
     use super::*;
     use crate::database::test_util::{create_test_database, create_test_reservation};
+    use rusqlite::types::Value;
     use std::path::PathBuf;
+
+    #[cfg(feature = "property-tests")]
+    use proptest::prelude::*;
+
+    fn decode_values(values: &[Value]) -> Result<Reservation> {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut statement = conn.prepare("SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7").unwrap();
+        let mut rows = statement
+            .query(rusqlite::params_from_iter(values.iter()))
+            .unwrap();
+        row_to_reservation(rows.next().unwrap().unwrap())
+    }
+
+    #[test]
+    fn test_overflowing_stored_timestamp_is_typed_corruption_without_unwind() {
+        let values = [
+            Value::Text("/project".into()),
+            Value::Text(String::new()),
+            Value::Integer(5000),
+            Value::Null,
+            Value::Null,
+            Value::Integer(1),
+            Value::Integer(i64::MAX),
+        ];
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_values(&values)));
+        let error = outcome
+            .expect("stored values must never unwind")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::DatabaseCorruption { details }
+                if details.contains("table=reservations")
+                    && details.contains("field=last_used_at")
+                    && details.contains("path=\"/project\"")
+        ));
+    }
+
+    #[test]
+    fn test_each_sqlite_scalar_type_mismatch_is_typed_without_unwind_or_blob_leak() {
+        let valid = [
+            Value::Text("/project".into()),
+            Value::Text(String::new()),
+            Value::Integer(5000),
+            Value::Null,
+            Value::Null,
+            Value::Integer(1),
+            Value::Integer(2),
+        ];
+        for (index, replacement, expected_field) in [
+            (0, Value::Blob(b"path-secret".to_vec()), "field=path"),
+            (1, Value::Integer(7), "field=tag"),
+            (2, Value::Real(5000.0), "field=port"),
+            (3, Value::Blob(b"project-secret".to_vec()), "field=project"),
+            (4, Value::Integer(9), "field=task"),
+            (5, Value::Text("1".into()), "field=created_at"),
+            (
+                6,
+                Value::Blob(b"timestamp-secret".to_vec()),
+                "field=last_used_at",
+            ),
+        ] {
+            let mut values = valid.clone();
+            values[index] = replacement;
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_values(&values)));
+            let error = outcome
+                .expect("stored values must never unwind")
+                .unwrap_err();
+            let Error::DatabaseCorruption { details } = error else {
+                panic!("expected typed corruption, got {error:?}");
+            };
+            assert!(details.contains(expected_field), "{details}");
+            assert!(details.contains("found"), "{details}");
+            assert!(!details.contains("secret"), "{details}");
+        }
+    }
+
+    #[cfg(feature = "property-tests")]
+    fn sqlite_value_strategy() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            Just(Value::Null),
+            any::<i64>().prop_map(Value::Integer),
+            any::<f64>().prop_map(Value::Real),
+            any::<String>().prop_map(Value::Text),
+            proptest::collection::vec(any::<u8>(), 0..64).prop_map(Value::Blob),
+        ]
+    }
+
+    #[cfg(feature = "property-tests")]
+    proptest! {
+        #[test]
+        fn arbitrary_sqlite_scalars_never_unwind(
+            values in proptest::collection::vec(sqlite_value_strategy(), 7)
+        ) {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decode_values(&values)
+            }));
+            prop_assert!(outcome.is_ok());
+        }
+    }
 
     #[test]
     fn test_create_reservation() {

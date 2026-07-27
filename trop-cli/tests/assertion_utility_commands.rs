@@ -42,6 +42,7 @@ mod common;
 use assert_cmd::Command;
 use common::{create_directory_symlink, TestEnv};
 use predicates::prelude::*;
+use rusqlite::Connection;
 use std::fs;
 use std::net::{TcpListener, UdpSocket};
 use std::path::Path;
@@ -426,6 +427,78 @@ fn test_assert_port_invalid_port_number() {
 // Assertion Command Tests: assert-data-dir
 // ============================================================================
 
+fn mutate_reservation_database(env: &TestEnv, mutation: &str) {
+    let test_path = env.create_dir("corrupt-project");
+    env.reserve_simple(&test_path);
+    let conn = Connection::open(env.data_dir.join("trop.db")).unwrap();
+    conn.execute_batch(mutation).unwrap();
+}
+
+fn assert_typed_validation_failure(env: &TestEnv, expected: &str) {
+    for inverted in [false, true] {
+        let mut command = env.command();
+        command
+            .env("RUST_BACKTRACE", "1")
+            .arg("assert-data-dir")
+            .arg("--validate");
+        if inverted {
+            command.arg("--not");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(6), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("database corruption detected"), "{stderr}");
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(
+            stderr.contains("trop did not") && stderr.contains("modify"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("panicked"), "{stderr}");
+    }
+}
+
+fn create_duplicate_database(env: &TestEnv, duplicate_port: bool) {
+    fs::create_dir_all(&env.data_dir).unwrap();
+    let conn = Connection::open(env.data_dir.join("trop.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE metadata (
+            key TEXT NOT NULL,
+            value TEXT NOT NULL
+         ) STRICT;
+         INSERT INTO metadata VALUES ('schema_version', '2');
+         CREATE TABLE reservations (
+            path TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            port INTEGER NOT NULL
+                CONSTRAINT valid_port CHECK (port BETWEEN 1 AND 65535),
+            project TEXT,
+            task TEXT,
+            created_at INTEGER NOT NULL
+                CONSTRAINT valid_created_at CHECK (created_at >= 0),
+            last_used_at INTEGER NOT NULL
+                CONSTRAINT valid_last_used_at CHECK (last_used_at >= 0)
+         ) STRICT;
+         CREATE INDEX idx_reservations_port ON reservations(port);
+         CREATE INDEX idx_reservations_project ON reservations(project);
+         CREATE INDEX idx_reservations_last_used ON reservations(last_used_at);",
+    )
+    .unwrap();
+    if duplicate_port {
+        conn.execute_batch(
+            "INSERT INTO reservations VALUES ('/one', '', 5000, NULL, NULL, 1, 1);
+             INSERT INTO reservations VALUES ('/two', '', 5000, NULL, NULL, 1, 1);",
+        )
+        .unwrap();
+    } else {
+        conn.execute_batch(
+            "INSERT INTO reservations VALUES ('/one', '', 5000, NULL, NULL, 1, 1);
+             INSERT INTO reservations VALUES ('/one', '', 5001, NULL, NULL, 1, 1);",
+        )
+        .unwrap();
+    }
+}
+
 /// Test assert-data-dir succeeds when data directory exists.
 ///
 /// After creating any reservation, the data directory should exist.
@@ -498,6 +571,109 @@ fn test_assert_data_dir_validate_flag() {
         .arg("--validate")
         .assert()
         .success();
+}
+
+#[test]
+fn test_assert_data_dir_validate_reports_each_logical_corruption_as_internal_error() {
+    for (mutation, expected) in [
+        (
+            "PRAGMA ignore_check_constraints=ON;
+             UPDATE reservations SET created_at = -1",
+            "field=created_at",
+        ),
+        (
+            "UPDATE reservations SET last_used_at = 9223372036854775807",
+            "field=last_used_at",
+        ),
+        (
+            "PRAGMA ignore_check_constraints=ON;
+             UPDATE reservations SET port = 0",
+            "field=port",
+        ),
+        (
+            "PRAGMA ignore_check_constraints=ON;
+             UPDATE reservations SET port = 70000",
+            "field=port",
+        ),
+        ("UPDATE reservations SET tag = ' padded '", "field=tag"),
+        ("UPDATE reservations SET path = 'relative'", "field=path"),
+        ("UPDATE reservations SET project = ''", "field=project"),
+        (
+            "DROP INDEX idx_reservations_project",
+            "idx_reservations_project",
+        ),
+        (
+            "UPDATE metadata SET value = 'not-a-number' WHERE key = 'schema_version'",
+            "key=\"schema_version\"",
+        ),
+    ] {
+        let env = TestEnv::new();
+        mutate_reservation_database(&env, mutation);
+        assert_typed_validation_failure(&env, expected);
+    }
+}
+
+#[test]
+fn test_assert_data_dir_validate_reports_duplicate_keys_and_ports() {
+    for (duplicate_port, expected) in [(false, "duplicate logical"), (true, "same port")] {
+        let env = TestEnv::new();
+        create_duplicate_database(&env, duplicate_port);
+        assert_typed_validation_failure(&env, expected);
+    }
+}
+
+#[test]
+fn test_list_corrupt_timestamp_returns_typed_error_never_exit_101() {
+    let env = TestEnv::new();
+    mutate_reservation_database(
+        &env,
+        "UPDATE reservations SET last_used_at = 9223372036854775807",
+    );
+
+    let output = env
+        .command()
+        .env("RUST_BACKTRACE", "1")
+        .arg("list")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(6), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("field=last_used_at"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[test]
+fn test_assert_data_dir_validate_reports_physical_corruption() {
+    let env = TestEnv::new();
+    fs::create_dir_all(&env.data_dir).unwrap();
+    fs::write(env.data_dir.join("trop.db"), b"not a sqlite database").unwrap();
+    assert_typed_validation_failure(&env, "physical database corruption");
+}
+
+#[test]
+fn test_assert_data_dir_validate_existing_directory_without_database_is_internal_error() {
+    let env = TestEnv::new();
+    fs::create_dir_all(&env.data_dir).unwrap();
+    assert_typed_validation_failure(&env, "does not contain");
+}
+
+#[test]
+fn test_assert_data_dir_validate_inaccessible_database_is_internal_error_even_when_inverted() {
+    let env = TestEnv::new();
+    fs::create_dir_all(env.data_dir.join("trop.db")).unwrap();
+
+    for inverted in [false, true] {
+        let mut command = env.command();
+        command.arg("assert-data-dir").arg("--validate");
+        if inverted {
+            command.arg("--not");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(6), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+    }
 }
 
 /// Test assert-data-dir with --not flag.
