@@ -124,6 +124,17 @@ remains reserved under every flag, and a failed reconciliation leaves all
 stored fields and timestamps unchanged. Every successful command prints the
 port actually stored after reconciliation.
 
+When the configured range is initially exhausted, `reserve` runs the enabled
+automatic cleanup phases under the same database transaction as allocation:
+stale-path pruning first, then configured age-based expiration. It then retries
+the complete allocation scan exactly once. `--disable-autoprune`,
+`--disable-autoexpire`, and `--disable-autoclean` override the corresponding
+effective config/environment settings; `--force` does not re-enable a disabled
+phase. Normal mode reports only aggregate prune/expire counts on stderr, while
+`--quiet` suppresses that cleanup summary and never prints removed paths.
+Exhaustion errors distinguish skipped cleanup from an attempted cleanup and
+report that the remaining ports are reserved, excluded, or occupied.
+
 ### Use in Build Scripts
 
 Example `justfile`:

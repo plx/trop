@@ -143,6 +143,14 @@ remain protected by the matching sticky-field permission. Set and clear
 updates keep the stored port unless overwrite or force also requests
 reallocation.
 
+If initial allocation is exhausted, a reserve plan defers the enabled
+prune/expire selection to execution. The executor rechecks exhaustion, applies
+the same guarded cleanup predicates as explicit cleanup, retries allocation
+once, and persists the resulting reservation under one `IMMEDIATE` transaction
+(or a savepoint inside a caller-owned transaction). The result warning exposes
+only aggregate cleanup counts; disabled phases and exhaustion-after-retry remain
+typed `PortExhausted` errors.
+
 Opening a writable schema-v1 database automatically migrates it to schema v2
 in one durable transaction. Schema v2 uses strict SQLite tables and enforces
 unique reservation keys, globally unique ports in `1..=65535`, and nonnegative

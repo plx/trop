@@ -30,7 +30,7 @@ use super::occupancy::{OccupancyCheckConfig, PortOccupancyChecker, SystemOccupan
 ///     ignore_exclusions: false,
 /// };
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AllocationOptions {
     /// Preferred port to allocate if available.
     pub preferred: Option<Port>,

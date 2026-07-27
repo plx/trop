@@ -197,12 +197,17 @@ pub enum Error {
     },
 
     /// No ports are available in the specified range.
-    #[error("port range {range} exhausted{}", if *.tried_cleanup { " after cleanup" } else { "" })]
+    #[error(
+        "port range {range} exhausted{}: {details}",
+        if *.tried_cleanup { " after cleanup" } else { "" }
+    )]
     PortExhausted {
         /// The port range that was exhausted.
         range: crate::port::PortRange,
         /// Whether cleanup was attempted.
         tried_cleanup: bool,
+        /// Non-destructive explanation of cleanup policy and remaining blockers.
+        details: String,
     },
 
     /// Port occupancy check failed.

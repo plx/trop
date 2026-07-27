@@ -452,6 +452,160 @@ reservations:\n  base: 7000\n  services:\n"
     }
 }
 
+/// Races multiple reserve processes through the same one-port automatic
+/// cleanup/retry boundary.
+///
+/// Exactly one writer may claim the stale reservation's port. Every loser
+/// must observe the committed replacement and report exhaustion after its own
+/// serialized cleanup attempt, never duplicate or overwrite the winner.
+#[test]
+fn test_automatic_cleanup_retry_serializes_competing_reserve_processes() {
+    for _ in 0..3 {
+        run_automatic_cleanup_retry_race();
+    }
+}
+
+fn run_automatic_cleanup_retry_race() {
+    const COMPETING_PROCESSES: usize = 4;
+    const PORT: &str = "25431";
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_dir = temp_dir.path().join("data");
+    let stale_path = temp_dir.path().join("stale");
+    fs::create_dir(&stale_path).unwrap();
+
+    let fixture = trop_cmd()
+        .args([
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "reserve",
+            "--path",
+            stale_path.to_str().unwrap(),
+            "--port",
+            PORT,
+            "--min",
+            PORT,
+            "--max",
+            PORT,
+            "--ignore-occupied",
+            "--allow-unrelated-path",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        fixture.status.success(),
+        "stale fixture reservation failed: {}",
+        String::from_utf8_lossy(&fixture.stderr)
+    );
+    fs::remove_dir(&stale_path).unwrap();
+
+    let replacement_paths = (0..COMPETING_PROCESSES)
+        .map(|index| {
+            let path = temp_dir.path().join(format!("replacement-{index}"));
+            fs::create_dir(&path).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let start = Arc::new(Barrier::new(COMPETING_PROCESSES + 1));
+    let handles = replacement_paths
+        .iter()
+        .cloned()
+        .map(|path| {
+            let data_dir = data_dir.clone();
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                let output = trop_cmd()
+                    .args([
+                        "--data-dir",
+                        data_dir.to_str().unwrap(),
+                        "reserve",
+                        "--path",
+                        path.to_str().unwrap(),
+                        "--port",
+                        PORT,
+                        "--min",
+                        PORT,
+                        "--max",
+                        PORT,
+                        "--ignore-occupied",
+                        "--allow-unrelated-path",
+                    ])
+                    .output()
+                    .unwrap();
+                (path, output)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    start.wait();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    let winners = results
+        .iter()
+        .filter(|(_, output)| output.status.success())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one reserve process must claim the cleaned port: {results:?}"
+    );
+    assert_eq!(String::from_utf8_lossy(&winners[0].1.stdout), "25431\n");
+
+    for (_, output) in results
+        .iter()
+        .filter(|(_, output)| !output.status.success())
+    {
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("after cleanup"),
+            "a serialized loser must report its cleanup attempt: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let list = trop_cmd()
+        .args([
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "list",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "final list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_slice(&list.stdout).expect("final list output was not JSON");
+    let rows = rows.as_array().expect("final list output was not an array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["port"].as_u64(), Some(25431));
+    assert_eq!(
+        rows[0]["path"].as_str(),
+        Some(winners[0].0.to_str().unwrap())
+    );
+
+    let validation = trop_cmd()
+        .args([
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "assert-data-dir",
+            "--validate",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        validation.status.success(),
+        "database validation failed after automatic cleanup contention: {}",
+        String::from_utf8_lossy(&validation.stderr)
+    );
+}
+
 /// Races both cleanup entry points with individual and group reservation
 /// writers in separate processes.
 ///

@@ -3,7 +3,7 @@
 //! This module implements the reservation planning logic, including
 //! idempotency checks, sticky field protection, and path validation.
 
-use crate::config::{Config, ConfigValidator};
+use crate::config::{CleanupConfig, Config, ConfigValidator};
 use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::port::allocator::{allocator_from_config, AllocationOptions, AllocationResult};
@@ -11,6 +11,7 @@ use crate::port::occupancy::OccupancyCheckConfig;
 use crate::{Port, Reservation, ReservationKey};
 use rusqlite::Connection;
 
+use super::cleanup::{AutocleanResult, CleanupOperations};
 use super::plan::{OperationPlan, PlanAction};
 
 /// The requested operation for one optional reservation metadata field.
@@ -320,6 +321,11 @@ pub struct ReservePlan<'a> {
     config: &'a Config,
 }
 
+pub(crate) struct AutomaticReserveOutcome {
+    pub port: Port,
+    pub warning: Option<String>,
+}
+
 impl<'a> ReservePlan<'a> {
     /// Creates a new reserve plan with the given options and config.
     ///
@@ -403,11 +409,25 @@ impl<'a> ReservePlan<'a> {
             self.validate_sticky_fields(&existing, project.as_deref(), task.as_deref())?;
 
             if self.options.overwrite || self.options.force {
-                let port = self.allocate_port(conn, Some(&self.options.key))?;
-                let replacement =
-                    self.updated_reservation(&existing, port, project.clone(), task.clone())?;
-                plan = plan.add_action(PlanAction::UpdateReservation(replacement));
-                return Ok(plan);
+                return match self.allocate_port(conn, Some(&self.options.key))? {
+                    AllocationResult::Allocated(port) => {
+                        let replacement = self.updated_reservation(
+                            &existing,
+                            port,
+                            project.clone(),
+                            task.clone(),
+                        )?;
+                        Ok(plan.add_action(PlanAction::UpdateReservation(replacement)))
+                    }
+                    AllocationResult::Exhausted { .. } => self.plan_cleanup_retry(
+                        plan,
+                        project,
+                        task,
+                        Some(existing.created_at()),
+                        Some(self.options.key.clone()),
+                    ),
+                    AllocationResult::PreferredUnavailable { .. } => unreachable!(),
+                };
             }
 
             if Self::metadata_changed(&existing, project.as_deref(), task.as_deref()) {
@@ -423,10 +443,6 @@ impl<'a> ReservePlan<'a> {
             return Ok(plan);
         }
 
-        // Step 3: Determine port (unified allocation with fallback)
-        let port = self.allocate_port(conn, None)?;
-
-        // Step 4: Create the new reservation
         let project = self
             .options
             .project
@@ -435,27 +451,31 @@ impl<'a> ReservePlan<'a> {
             .options
             .task
             .resolve_new(super::inference::infer_task(&self.options.key.path));
-        let reservation = Reservation::builder(self.options.key.clone(), port)
-            .project(project)
-            .task(task)
-            .build()?;
 
-        plan = plan.add_action(PlanAction::CreateReservation(reservation));
-
-        Ok(plan)
+        // Step 3: Determine port (unified allocation with fallback)
+        match self.allocate_port(conn, None)? {
+            AllocationResult::Allocated(port) => {
+                // Step 4: Create the new reservation
+                let reservation = Reservation::builder(self.options.key.clone(), port)
+                    .project(project)
+                    .task(task)
+                    .build()?;
+                Ok(plan.add_action(PlanAction::CreateReservation(reservation)))
+            }
+            AllocationResult::Exhausted { .. } => {
+                self.plan_cleanup_retry(plan, project, task, None, None)
+            }
+            AllocationResult::PreferredUnavailable { .. } => unreachable!(),
+        }
     }
 
     fn allocate_port(
         &self,
         conn: &Connection,
         replaced_key: Option<&ReservationKey>,
-    ) -> Result<Port> {
+    ) -> Result<AllocationResult> {
         let allocator = allocator_from_config(self.config)?;
-        let allocation_options = AllocationOptions {
-            preferred: self.options.port.or(self.options.preferred_port),
-            ignore_occupied: self.options.ignore_occupied || self.options.force,
-            ignore_exclusions: self.options.ignore_exclusions || self.options.force,
-        };
+        let allocation_options = self.allocation_options();
         let occupancy_config = self.occupancy_config();
 
         let allocate = |options: &AllocationOptions| match replaced_key {
@@ -463,29 +483,48 @@ impl<'a> ReservePlan<'a> {
             None => allocator.allocate_single(conn, options, &occupancy_config),
         };
 
-        match allocate(&allocation_options)? {
-            AllocationResult::Allocated(port) => Ok(port),
-            AllocationResult::PreferredUnavailable { .. } => {
-                let fallback_options = AllocationOptions {
-                    preferred: None,
-                    ignore_occupied: allocation_options.ignore_occupied,
-                    ignore_exclusions: allocation_options.ignore_exclusions,
-                };
+        allocate_with_fallback(&allocation_options, &allocate)
+    }
 
-                match allocate(&fallback_options)? {
-                    AllocationResult::Allocated(port) => Ok(port),
-                    AllocationResult::Exhausted { .. } => Err(Error::PortExhausted {
-                        range: *allocator.range(),
-                        tried_cleanup: false,
-                    }),
-                    AllocationResult::PreferredUnavailable { .. } => unreachable!(),
-                }
-            }
-            AllocationResult::Exhausted { .. } => Err(Error::PortExhausted {
+    fn allocation_options(&self) -> AllocationOptions {
+        AllocationOptions {
+            preferred: self.options.port.or(self.options.preferred_port),
+            ignore_occupied: self.options.ignore_occupied || self.options.force,
+            ignore_exclusions: self.options.ignore_exclusions || self.options.force,
+        }
+    }
+
+    fn plan_cleanup_retry(
+        &self,
+        plan: OperationPlan,
+        project: Option<String>,
+        task: Option<String>,
+        created_at: Option<std::time::SystemTime>,
+        ignored_key: Option<ReservationKey>,
+    ) -> Result<OperationPlan> {
+        let prune = !self.options.disable_autoprune;
+        let expire = !self.options.disable_autoexpire;
+        if !prune && !expire {
+            let allocator = allocator_from_config(self.config)?;
+            return Err(Error::PortExhausted {
                 range: *allocator.range(),
                 tried_cleanup: false,
-            }),
+                details: cleanup_policy_details(prune, expire).to_string(),
+            });
         }
+
+        Ok(plan.add_action(PlanAction::ReserveAfterCleanup {
+            key: self.options.key.clone(),
+            project,
+            task,
+            created_at,
+            allocation_options: self.allocation_options(),
+            ignored_key,
+            prune,
+            expire,
+            full_config: self.config.clone(),
+            occupancy_config: self.occupancy_config(),
+        }))
     }
 
     fn metadata_changed(existing: &Reservation, project: Option<&str>, task: Option<&str>) -> bool {
@@ -551,6 +590,167 @@ impl<'a> ReservePlan<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_reserve_after_cleanup(
+    conn: &Connection,
+    key: &ReservationKey,
+    project: Option<&str>,
+    task: Option<&str>,
+    created_at: Option<std::time::SystemTime>,
+    allocation_options: &AllocationOptions,
+    ignored_key: Option<&ReservationKey>,
+    prune: bool,
+    expire: bool,
+    full_config: &Config,
+    occupancy_config: &OccupancyCheckConfig,
+) -> Result<AutomaticReserveOutcome> {
+    execute_reserve_after_cleanup_with_barrier(
+        conn,
+        key,
+        project,
+        task,
+        created_at,
+        allocation_options,
+        ignored_key,
+        prune,
+        expire,
+        full_config,
+        occupancy_config,
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_reserve_after_cleanup_with_barrier<B>(
+    conn: &Connection,
+    key: &ReservationKey,
+    project: Option<&str>,
+    task: Option<&str>,
+    created_at: Option<std::time::SystemTime>,
+    allocation_options: &AllocationOptions,
+    ignored_key: Option<&ReservationKey>,
+    prune: bool,
+    expire: bool,
+    full_config: &Config,
+    occupancy_config: &OccupancyCheckConfig,
+    after_candidate_discovery: B,
+) -> Result<AutomaticReserveOutcome>
+where
+    B: FnOnce(),
+{
+    Database::with_immediate_transaction_or_savepoint(conn, "trop_reserve_after_cleanup", |conn| {
+        let allocator = allocator_from_config(full_config)?;
+        let allocate = |options: &AllocationOptions| match ignored_key {
+            Some(ignored_key) => {
+                allocator.allocate_single_replacing(conn, options, occupancy_config, ignored_key)
+            }
+            None => allocator.allocate_single(conn, options, occupancy_config),
+        };
+
+        if let AllocationResult::Allocated(port) =
+            allocate_with_fallback(allocation_options, &allocate)?
+        {
+            persist_deferred_reservation(conn, key, project, task, created_at, port)?;
+            return Ok(AutomaticReserveOutcome {
+                port,
+                warning: None,
+            });
+        }
+
+        if !prune && !expire {
+            return Err(Error::PortExhausted {
+                range: *allocator.range(),
+                tried_cleanup: false,
+                details: cleanup_policy_details(prune, expire).to_string(),
+            });
+        }
+
+        let default_cleanup = CleanupConfig {
+            expire_after_days: Some(30),
+        };
+        let cleanup_config = full_config.cleanup.as_ref().unwrap_or(&default_cleanup);
+        let cleanup = CleanupOperations::automatic_cleanup_in_connection(
+            conn,
+            cleanup_config,
+            prune,
+            expire,
+            after_candidate_discovery,
+        )?;
+
+        match allocate_with_fallback(allocation_options, &allocate)? {
+            AllocationResult::Allocated(port) => {
+                persist_deferred_reservation(conn, key, project, task, created_at, port)?;
+                Ok(AutomaticReserveOutcome {
+                    port,
+                    warning: Some(format!(
+                        "Automatic cleanup after initial port exhaustion pruned {} and expired \
+                             {} reservation(s); allocation succeeded on the single retry.",
+                        cleanup.pruned_count, cleanup.expired_count
+                    )),
+                })
+            }
+            AllocationResult::Exhausted { .. } => Err(Error::PortExhausted {
+                range: *allocator.range(),
+                tried_cleanup: true,
+                details: cleanup_failure_details(prune, expire, &cleanup),
+            }),
+            AllocationResult::PreferredUnavailable { .. } => unreachable!(),
+        }
+    })
+}
+
+fn persist_deferred_reservation(
+    conn: &Connection,
+    key: &ReservationKey,
+    project: Option<&str>,
+    task: Option<&str>,
+    created_at: Option<std::time::SystemTime>,
+    port: Port,
+) -> Result<()> {
+    let mut builder = Reservation::builder(key.clone(), port)
+        .project(project.map(ToOwned::to_owned))
+        .task(task.map(ToOwned::to_owned));
+    if let Some(created_at) = created_at {
+        builder = builder.created_at(created_at);
+    }
+    Database::create_reservation_simple(conn, &builder.build()?)
+}
+
+fn allocate_with_fallback(
+    allocation_options: &AllocationOptions,
+    allocate: &(impl Fn(&AllocationOptions) -> Result<AllocationResult> + ?Sized),
+) -> Result<AllocationResult> {
+    match allocate(allocation_options)? {
+        AllocationResult::PreferredUnavailable { .. } => {
+            let fallback_options = AllocationOptions {
+                preferred: None,
+                ignore_occupied: allocation_options.ignore_occupied,
+                ignore_exclusions: allocation_options.ignore_exclusions,
+            };
+            allocate(&fallback_options)
+        }
+        result => Ok(result),
+    }
+}
+
+fn cleanup_policy_details(prune: bool, expire: bool) -> &'static str {
+    match (prune, expire) {
+        (true, true) => "automatic pruning and expiration enabled",
+        (true, false) => "automatic expiration disabled",
+        (false, true) => "automatic pruning disabled",
+        (false, false) => "automatic pruning and expiration disabled",
+    }
+}
+
+fn cleanup_failure_details(prune: bool, expire: bool, cleanup: &AutocleanResult) -> String {
+    format!(
+        "every port remained reserved, excluded, or occupied after the single retry; {}; \
+         automatic cleanup selected {} reservation(s)",
+        cleanup_policy_details(prune, expire),
+        cleanup.total_removed
+    )
+}
+
 /// Generic helper to check if a sticky field can be changed.
 ///
 /// This function encapsulates the common logic for validating sticky field changes:
@@ -591,7 +791,13 @@ mod tests {
     use super::*;
     use crate::config::{Config, PortConfig};
     use crate::database::test_util::create_test_database;
+    use crate::database::DatabaseConfig;
+    use crate::operations::PlanExecutor;
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, SystemTime};
+    use tempfile::tempdir;
 
     // Helper to create a test config with reasonable defaults
     fn create_test_config() -> Config {
@@ -1177,6 +1383,135 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::PortExhausted { .. }));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_cleanup_retry_serializes_refresh_after_candidate_discovery() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("reserve-cleanup-race.db");
+        let database_config =
+            DatabaseConfig::new(&database_path).with_busy_timeout(Duration::from_secs(2));
+        let mut reserve_db = Database::open(database_config.clone()).unwrap();
+        let mut refresh_db = Database::open(database_config).unwrap();
+
+        let refresh_path = directory.path().join("refresh-target");
+        let other_expired_path = directory.path().join("other-expired");
+        let replacement_path = directory.path().join("replacement");
+        std::fs::create_dir(&refresh_path).unwrap();
+        std::fs::create_dir(&other_expired_path).unwrap();
+        std::fs::create_dir(&replacement_path).unwrap();
+
+        let refresh_key = ReservationKey::new(refresh_path, None).unwrap();
+        let other_expired_key = ReservationKey::new(other_expired_path, None).unwrap();
+        let replacement_key = ReservationKey::new(replacement_path, None).unwrap();
+        let first_port = Port::try_from(5400).unwrap();
+        let second_port = Port::try_from(5401).unwrap();
+        let expired_at = SystemTime::now() - Duration::from_secs(31 * 24 * 60 * 60);
+        reserve_db
+            .create_reservation(
+                &Reservation::builder(refresh_key.clone(), first_port)
+                    .last_used_at(expired_at)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        reserve_db
+            .create_reservation(
+                &Reservation::builder(other_expired_key.clone(), second_port)
+                    .last_used_at(expired_at)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let config = Config {
+            ports: Some(PortConfig {
+                min: first_port.value(),
+                max: Some(second_port.value()),
+                max_offset: None,
+            }),
+            cleanup: Some(CleanupConfig {
+                expire_after_days: Some(30),
+            }),
+            ..Default::default()
+        };
+        let refresh_config = config.clone();
+        let refresh_thread_key = refresh_key.clone();
+        let (start_sender, start_receiver) = mpsc::sync_channel(0);
+        let (attempt_sender, attempt_receiver) = mpsc::sync_channel(0);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let refresh_thread = thread::spawn(move || {
+            start_receiver.recv().unwrap();
+            attempt_sender.send(()).unwrap();
+            let result = (|| -> Result<()> {
+                let transaction = refresh_db.begin_transaction()?;
+                let options = ReserveOptions::new(refresh_thread_key, Some(first_port))
+                    .with_allow_unrelated_path(true)
+                    .with_ignore_occupied(true)
+                    .with_disable_autoprune(true)
+                    .with_disable_autoexpire(true);
+                let plan = ReservePlan::new(options, &refresh_config).build_plan(&transaction)?;
+                PlanExecutor::new(&transaction).execute(&plan)?;
+                transaction.commit()?;
+                Ok(())
+            })();
+            let _ = done_sender.send(());
+            result
+        });
+
+        let transaction = reserve_db.begin_transaction().unwrap();
+        let outcome = execute_reserve_after_cleanup_with_barrier(
+            &transaction,
+            &replacement_key,
+            None,
+            None,
+            None,
+            &AllocationOptions {
+                preferred: None,
+                ignore_occupied: true,
+                ignore_exclusions: false,
+            },
+            None,
+            true,
+            true,
+            &config,
+            &OccupancyCheckConfig::default(),
+            move || {
+                start_sender.send(()).unwrap();
+                attempt_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("refresh connection did not start");
+                let _ = done_receiver.recv_timeout(Duration::from_millis(100));
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.port, first_port);
+        transaction.commit().unwrap();
+        refresh_thread.join().unwrap().unwrap();
+
+        let replacement = Database::get_reservation(reserve_db.connection(), &replacement_key)
+            .unwrap()
+            .expect("cleanup retry must persist the replacement");
+        assert_eq!(replacement.port(), first_port);
+
+        let refreshed = Database::get_reservation(reserve_db.connection(), &refresh_key)
+            .unwrap()
+            .expect("the refresh serialized after cleanup/retry must survive");
+        assert_eq!(refreshed.port(), second_port);
+        assert!(
+            refreshed
+                .last_used_at()
+                .elapsed()
+                .is_ok_and(|age| age < Duration::from_secs(5)),
+            "the surviving refresh must be fresh"
+        );
+        assert!(
+            Database::get_reservation(reserve_db.connection(), &other_expired_key)
+                .unwrap()
+                .is_none(),
+            "the unrelated expired candidate should remain removed"
+        );
     }
 
     #[test]

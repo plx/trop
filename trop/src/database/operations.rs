@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use rusqlite::types::ValueRef;
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 use crate::error::{Error, Result};
 use crate::path::PathRelationship;
@@ -373,6 +373,31 @@ impl Database {
                 let _ = conn.execute_batch(&format!("RELEASE {name}"));
                 Err(error)
             }
+        }
+    }
+
+    /// Executes a mutating operation under one owning `IMMEDIATE`
+    /// transaction, or under a savepoint when the caller already owns a
+    /// transaction.
+    ///
+    /// This lets library entry points preserve the same serialization boundary
+    /// as the CLI without attempting to nest `SQLite` transactions.
+    pub(crate) fn with_immediate_transaction_or_savepoint<T>(
+        conn: &Connection,
+        savepoint_name: &str,
+        operation: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        if !conn.is_autocommit() {
+            return Self::with_savepoint(conn, savepoint_name, operation);
+        }
+
+        let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        match operation(&transaction) {
+            Ok(value) => {
+                transaction.commit()?;
+                Ok(value)
+            }
+            Err(error) => Err(error),
         }
     }
 
