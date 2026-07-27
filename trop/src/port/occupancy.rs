@@ -287,15 +287,56 @@ impl SystemOccupancyChecker {
             Some(probe.transport.protocol()),
         )?;
 
-        // Be explicit about the two options that materially affect occupancy
-        // results. Address reuse stays disabled, and IPv6 probes never accept
-        // IPv4-mapped addresses regardless of the platform default.
+        // Be explicit about the options that materially affect occupancy
+        // results. Address reuse stays disabled, Windows probes use exclusive
+        // address binding, and IPv6 probes never accept IPv4-mapped addresses
+        // regardless of the platform default.
         socket.set_reuse_address(false)?;
+        #[cfg(windows)]
+        Self::set_exclusive_address_use(&socket)?;
         if probe.address.is_ipv6() {
             socket.set_only_v6(true)?;
         }
 
         socket.bind(&probe.address.into())
+    }
+
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    fn set_exclusive_address_use(socket: &Socket) -> io::Result<()> {
+        use std::mem::size_of_val;
+        use std::os::windows::io::AsRawSocket;
+
+        use windows_sys::Win32::Networking::WinSock::{
+            setsockopt, WSAGetLastError, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+        };
+
+        let exclusive = 1_i32;
+        let raw_socket = usize::try_from(socket.as_raw_socket()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "socket handle does not fit a Winsock SOCKET",
+            )
+        })?;
+        // SAFETY: `socket` owns a valid Winsock SOCKET, `exclusive` remains
+        // alive for the call, and the pointer/length describe that i32 exactly.
+        let result = unsafe {
+            setsockopt(
+                raw_socket,
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                std::ptr::from_ref(&exclusive).cast::<u8>(),
+                size_of_val(&exclusive) as i32,
+            )
+        };
+
+        if result == SOCKET_ERROR {
+            // SAFETY: Winsock records the calling thread's last socket error.
+            let error = unsafe { WSAGetLastError() };
+            Err(io::Error::from_raw_os_error(error))
+        } else {
+            Ok(())
+        }
     }
 
     fn is_occupied_with<F>(

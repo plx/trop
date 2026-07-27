@@ -2242,6 +2242,7 @@ dependencies = [
  "socket2",
  "tempfile",
  "thiserror 1.0.69",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

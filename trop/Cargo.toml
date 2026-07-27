@@ -25,6 +25,9 @@ home = { workspace = true }
 socket2 = "0.6"
 gix = { version = "0.68", default-features = false, features = ["revision"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Networking_WinSock"] }
+
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = { workspace = true }
