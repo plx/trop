@@ -8,7 +8,7 @@ use rusqlite::Connection;
 
 use crate::database::Database;
 use crate::error::{Error, PortUnavailableReason};
-use crate::{Port, PortRange, Result};
+use crate::{Port, PortRange, ReservationKey, Result};
 
 use super::exclusions::ExclusionManager;
 use super::occupancy::{OccupancyCheckConfig, PortOccupancyChecker, SystemOccupancyChecker};
@@ -211,6 +211,28 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         options: &AllocationOptions,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<AllocationResult> {
+        self.allocate_single_ignoring(conn, options, occupancy_config, None)
+    }
+
+    /// Allocate a replacement while treating the reservation currently owned
+    /// by `ignored_key` as available to itself.
+    pub(crate) fn allocate_single_replacing(
+        &self,
+        conn: &Connection,
+        options: &AllocationOptions,
+        occupancy_config: &OccupancyCheckConfig,
+        ignored_key: &ReservationKey,
+    ) -> Result<AllocationResult> {
+        self.allocate_single_ignoring(conn, options, occupancy_config, Some(ignored_key))
+    }
+
+    fn allocate_single_ignoring(
+        &self,
+        conn: &Connection,
+        options: &AllocationOptions,
+        occupancy_config: &OccupancyCheckConfig,
+        ignored_key: Option<&ReservationKey>,
+    ) -> Result<AllocationResult> {
         // If a preferred port is specified, try it first
         if let Some(preferred) = options.preferred {
             // Check if the preferred port is in range
@@ -221,37 +243,42 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
                 });
             }
 
-            // Check availability
-            let availability = self.is_port_available(preferred, conn, occupancy_config)?;
-
-            // Check if we should reject the preferred port
-            match availability {
-                PortAvailability::Reserved => {
-                    return Ok(AllocationResult::PreferredUnavailable {
-                        port: preferred,
-                        reason: PortUnavailableReason::Reserved,
-                    });
-                }
-                PortAvailability::Excluded if !options.ignore_exclusions => {
-                    return Ok(AllocationResult::PreferredUnavailable {
-                        port: preferred,
-                        reason: PortUnavailableReason::Excluded,
-                    });
-                }
-                PortAvailability::Occupied if !options.ignore_occupied => {
-                    return Ok(AllocationResult::PreferredUnavailable {
-                        port: preferred,
-                        reason: PortUnavailableReason::Occupied,
-                    });
-                }
-                // Available or ignoring the specific issue
-                _ => {}
+            // Reservation ownership is absolute, while the exclusion and
+            // occupancy guards are independently bypassable. Checking them
+            // separately prevents one narrow ignore flag from accidentally
+            // hiding the other reason a preferred port is unavailable.
+            if Self::is_reserved_by_other(conn, preferred, ignored_key)? {
+                return Ok(AllocationResult::PreferredUnavailable {
+                    port: preferred,
+                    reason: PortUnavailableReason::Reserved,
+                });
+            }
+            if self.exclusions.is_excluded(preferred) && !options.ignore_exclusions {
+                return Ok(AllocationResult::PreferredUnavailable {
+                    port: preferred,
+                    reason: PortUnavailableReason::Excluded,
+                });
+            }
+            let occupied = self
+                .checker
+                .is_occupied(preferred, occupancy_config)
+                .unwrap_or(true);
+            if occupied && !options.ignore_occupied {
+                return Ok(AllocationResult::PreferredUnavailable {
+                    port: preferred,
+                    reason: PortUnavailableReason::Occupied,
+                });
             }
             return Ok(AllocationResult::Allocated(preferred));
         }
 
         // Forward scan from minimum
-        if let Some(port) = self.find_next_available(self.range.min(), conn, occupancy_config)? {
+        if let Some(port) = self.find_next_available_ignoring(
+            self.range.min(),
+            conn,
+            occupancy_config,
+            ignored_key,
+        )? {
             Ok(AllocationResult::Allocated(port))
         } else {
             // No ports available - suggest cleanup might help
@@ -279,12 +306,22 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         conn: &Connection,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<Option<Port>> {
+        self.find_next_available_ignoring(start, conn, occupancy_config, None)
+    }
+
+    fn find_next_available_ignoring(
+        &self,
+        start: Port,
+        conn: &Connection,
+        occupancy_config: &OccupancyCheckConfig,
+        ignored_key: Option<&ReservationKey>,
+    ) -> Result<Option<Port>> {
         // Scan from start to range max
         let scan_range = PortRange::new(start, self.range.max())?;
 
         for port in scan_range {
             if let PortAvailability::Available =
-                self.is_port_available(port, conn, occupancy_config)?
+                self.port_availability(port, conn, occupancy_config, true, ignored_key)?
             {
                 return Ok(Some(port));
             }
@@ -358,7 +395,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         conn: &Connection,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<PortAvailability> {
-        self.port_availability(port, conn, occupancy_config, true)
+        self.port_availability(port, conn, occupancy_config, true, None)
     }
 
     /// Check a preferred port against reservations, exclusions, and operating
@@ -372,7 +409,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         conn: &Connection,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<PortAvailability> {
-        self.port_availability(port, conn, occupancy_config, false)
+        self.port_availability(port, conn, occupancy_config, false, None)
     }
 
     fn port_availability(
@@ -381,13 +418,14 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         conn: &Connection,
         occupancy_config: &OccupancyCheckConfig,
         require_in_range: bool,
+        ignored_key: Option<&ReservationKey>,
     ) -> Result<PortAvailability> {
         if require_in_range && !self.range.contains(port) {
             return Ok(PortAvailability::Excluded);
         }
 
         // Check if reserved in database
-        if Database::is_port_reserved(conn, port)? {
+        if Self::is_reserved_by_other(conn, port, ignored_key)? {
             return Ok(PortAvailability::Reserved);
         }
 
@@ -410,6 +448,15 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         } else {
             Ok(PortAvailability::Available)
         }
+    }
+
+    fn is_reserved_by_other(
+        conn: &Connection,
+        port: Port,
+        ignored_key: Option<&ReservationKey>,
+    ) -> Result<bool> {
+        Ok(Database::get_reservation_by_port(conn, port)?
+            .is_some_and(|reservation| ignored_key != Some(reservation.key())))
     }
 }
 
@@ -806,6 +853,122 @@ mod tests {
         assert_eq!(
             result,
             AllocationResult::Allocated(Port::try_from(5005).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_preferred_ignore_flags_are_independent() {
+        let db = create_test_database();
+        let preferred = Port::try_from(5005).unwrap();
+        let mut exclusions = ExclusionManager::empty();
+        exclusions.add_port(preferred);
+        let allocator = create_test_allocator(HashSet::from([preferred]), exclusions, 5000, 5010);
+        let config = OccupancyCheckConfig::default();
+
+        let ignore_exclusions = allocator
+            .allocate_single(
+                db.connection(),
+                &AllocationOptions {
+                    preferred: Some(preferred),
+                    ignore_exclusions: true,
+                    ..Default::default()
+                },
+                &config,
+            )
+            .unwrap();
+        assert_eq!(
+            ignore_exclusions,
+            AllocationResult::PreferredUnavailable {
+                port: preferred,
+                reason: PortUnavailableReason::Occupied,
+            }
+        );
+
+        let ignore_occupied = allocator
+            .allocate_single(
+                db.connection(),
+                &AllocationOptions {
+                    preferred: Some(preferred),
+                    ignore_occupied: true,
+                    ..Default::default()
+                },
+                &config,
+            )
+            .unwrap();
+        assert_eq!(
+            ignore_occupied,
+            AllocationResult::PreferredUnavailable {
+                port: preferred,
+                reason: PortUnavailableReason::Excluded,
+            }
+        );
+
+        let ignore_both = allocator
+            .allocate_single(
+                db.connection(),
+                &AllocationOptions {
+                    preferred: Some(preferred),
+                    ignore_occupied: true,
+                    ignore_exclusions: true,
+                },
+                &config,
+            )
+            .unwrap();
+        assert_eq!(ignore_both, AllocationResult::Allocated(preferred));
+    }
+
+    #[test]
+    fn test_replacement_ignores_only_the_current_keys_port() {
+        let mut db = create_test_database();
+        let current_key =
+            ReservationKey::new(PathBuf::from("/test/current"), Some("web".to_string())).unwrap();
+        let other_key =
+            ReservationKey::new(PathBuf::from("/test/other"), Some("web".to_string())).unwrap();
+        let current_port = Port::try_from(5000).unwrap();
+        let other_port = Port::try_from(5001).unwrap();
+        db.create_reservation(
+            &Reservation::builder(current_key.clone(), current_port)
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        db.create_reservation(&Reservation::builder(other_key, other_port).build().unwrap())
+            .unwrap();
+
+        let allocator =
+            create_test_allocator(HashSet::new(), ExclusionManager::empty(), 5000, 5001);
+        let config = OccupancyCheckConfig::default();
+
+        let own_result = allocator
+            .allocate_single_replacing(
+                db.connection(),
+                &AllocationOptions {
+                    preferred: Some(current_port),
+                    ..Default::default()
+                },
+                &config,
+                &current_key,
+            )
+            .unwrap();
+        assert_eq!(own_result, AllocationResult::Allocated(current_port));
+
+        let other_result = allocator
+            .allocate_single_replacing(
+                db.connection(),
+                &AllocationOptions {
+                    preferred: Some(other_port),
+                    ..Default::default()
+                },
+                &config,
+                &current_key,
+            )
+            .unwrap();
+        assert_eq!(
+            other_result,
+            AllocationResult::PreferredUnavailable {
+                port: other_port,
+                reason: PortUnavailableReason::Reserved,
+            }
         );
     }
 

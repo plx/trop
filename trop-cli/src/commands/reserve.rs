@@ -41,19 +41,19 @@ pub struct ReserveCommand {
     #[arg(long, value_name = "MAX")]
     pub max: Option<String>,
 
-    /// Overwrite existing reservation
+    /// Reallocate an existing reservation for the exact path and tag
     #[arg(long)]
     pub overwrite: bool,
 
-    /// Ignore if preferred port is occupied
+    /// Allow an occupied preferred port
     #[arg(long)]
     pub ignore_occupied: bool,
 
-    /// Ignore excluded ports
+    /// Allow an excluded preferred port
     #[arg(long)]
     pub ignore_exclusions: bool,
 
-    /// Force operation (overrides all protections)
+    /// Overwrite and bypass path, metadata, occupancy, and exclusion guards
     #[arg(long)]
     pub force: bool,
 
@@ -143,6 +143,7 @@ impl ReserveCommand {
         let options = ReserveOptions::new(key, port)
             .with_project(effective.project().map(ToOwned::to_owned))
             .with_task(self.task)
+            .with_overwrite(self.overwrite)
             .with_ignore_occupied(self.ignore_occupied)
             .with_ignore_exclusions(self.ignore_exclusions)
             .with_force(self.force)

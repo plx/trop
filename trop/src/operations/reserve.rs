@@ -35,6 +35,9 @@ pub struct ReserveOptions {
     /// Preferred port for automatic allocation (hint).
     pub preferred_port: Option<Port>,
 
+    /// Whether an existing reservation may be reallocated.
+    pub overwrite: bool,
+
     /// Whether to ignore system occupancy checks during allocation.
     pub ignore_occupied: bool,
 
@@ -67,6 +70,7 @@ impl ReserveOptions {
     /// - project: None
     /// - task: None
     /// - `preferred_port`: None
+    /// - overwrite: false
     /// - `ignore_occupied`: false
     /// - `ignore_exclusions`: false
     /// - force: false
@@ -96,6 +100,7 @@ impl ReserveOptions {
             task: None,
             port,
             preferred_port: None,
+            overwrite: false,
             ignore_occupied: false,
             ignore_exclusions: false,
             force: false,
@@ -153,6 +158,13 @@ impl ReserveOptions {
     #[must_use]
     pub const fn with_preferred_port(mut self, port: Option<Port>) -> Self {
         self.preferred_port = port;
+        self
+    }
+
+    /// Sets the overwrite flag.
+    #[must_use]
+    pub const fn with_overwrite(mut self, overwrite: bool) -> Self {
+        self.overwrite = overwrite;
         self
     }
 
@@ -306,56 +318,32 @@ impl<'a> ReservePlan<'a> {
 
         // Step 2: Check for existing reservation
         if let Some(existing) = Database::get_reservation(conn, &self.options.key)? {
-            // Reservation exists - validate sticky fields and return idempotent result
+            // Reservation exists - validate every requested sticky-field change
+            // before planning any write.
             self.validate_sticky_fields(&existing)?;
 
-            // Idempotent case: reservation exists with compatible metadata
-            // Just update the timestamp
+            if self.options.overwrite || self.options.force {
+                let port = self.allocate_port(conn, Some(&self.options.key))?;
+                let replacement = self.updated_reservation(&existing, port)?;
+                plan = plan.add_action(PlanAction::UpdateReservation(replacement));
+                return Ok(plan);
+            }
+
+            if self.metadata_changed(&existing) {
+                let update = self.updated_reservation(&existing, existing.port())?;
+                plan = plan.add_action(PlanAction::UpdateReservation(update));
+                return Ok(plan);
+            }
+
+            // A compatible request without overwrite keeps the stable port and
+            // only refreshes its last-used timestamp. An explicit preferred
+            // port remains a hint and does not relocate an existing key.
             plan = plan.add_action(PlanAction::UpdateLastUsed(self.options.key.clone()));
             return Ok(plan);
         }
 
         // Step 3: Determine port (unified allocation with fallback)
-        let port = {
-            let allocator = allocator_from_config(self.config)?;
-            let allocation_options = AllocationOptions {
-                preferred: self.options.port.or(self.options.preferred_port),
-                ignore_occupied: self.options.ignore_occupied,
-                ignore_exclusions: self.options.ignore_exclusions,
-            };
-            let occupancy_config = self.occupancy_config();
-
-            match allocator.allocate_single(conn, &allocation_options, &occupancy_config)? {
-                AllocationResult::Allocated(port) => port,
-
-                AllocationResult::PreferredUnavailable { .. } => {
-                    // Preferred port unavailable - fall back to scanning
-                    let fallback_options = AllocationOptions {
-                        preferred: None,
-                        ignore_occupied: self.options.ignore_occupied,
-                        ignore_exclusions: self.options.ignore_exclusions,
-                    };
-
-                    match allocator.allocate_single(conn, &fallback_options, &occupancy_config)? {
-                        AllocationResult::Allocated(port) => port,
-                        AllocationResult::Exhausted { .. } => {
-                            return Err(Error::PortExhausted {
-                                range: *allocator.range(),
-                                tried_cleanup: false,
-                            });
-                        }
-                        AllocationResult::PreferredUnavailable { .. } => unreachable!(),
-                    }
-                }
-
-                AllocationResult::Exhausted { .. } => {
-                    return Err(Error::PortExhausted {
-                        range: *allocator.range(),
-                        tried_cleanup: false,
-                    });
-                }
-            }
-        };
+        let port = self.allocate_port(conn, None)?;
 
         // Step 4: Create the new reservation
         let reservation = Reservation::builder(self.options.key.clone(), port)
@@ -366,6 +354,62 @@ impl<'a> ReservePlan<'a> {
         plan = plan.add_action(PlanAction::CreateReservation(reservation));
 
         Ok(plan)
+    }
+
+    fn allocate_port(
+        &self,
+        conn: &Connection,
+        replaced_key: Option<&ReservationKey>,
+    ) -> Result<Port> {
+        let allocator = allocator_from_config(self.config)?;
+        let allocation_options = AllocationOptions {
+            preferred: self.options.port.or(self.options.preferred_port),
+            ignore_occupied: self.options.ignore_occupied || self.options.force,
+            ignore_exclusions: self.options.ignore_exclusions || self.options.force,
+        };
+        let occupancy_config = self.occupancy_config();
+
+        let allocate = |options: &AllocationOptions| match replaced_key {
+            Some(key) => allocator.allocate_single_replacing(conn, options, &occupancy_config, key),
+            None => allocator.allocate_single(conn, options, &occupancy_config),
+        };
+
+        match allocate(&allocation_options)? {
+            AllocationResult::Allocated(port) => Ok(port),
+            AllocationResult::PreferredUnavailable { .. } => {
+                let fallback_options = AllocationOptions {
+                    preferred: None,
+                    ignore_occupied: allocation_options.ignore_occupied,
+                    ignore_exclusions: allocation_options.ignore_exclusions,
+                };
+
+                match allocate(&fallback_options)? {
+                    AllocationResult::Allocated(port) => Ok(port),
+                    AllocationResult::Exhausted { .. } => Err(Error::PortExhausted {
+                        range: *allocator.range(),
+                        tried_cleanup: false,
+                    }),
+                    AllocationResult::PreferredUnavailable { .. } => unreachable!(),
+                }
+            }
+            AllocationResult::Exhausted { .. } => Err(Error::PortExhausted {
+                range: *allocator.range(),
+                tried_cleanup: false,
+            }),
+        }
+    }
+
+    fn metadata_changed(&self, existing: &Reservation) -> bool {
+        self.options.project.as_deref() != existing.project()
+            || self.options.task.as_deref() != existing.task()
+    }
+
+    fn updated_reservation(&self, existing: &Reservation, port: Port) -> Result<Reservation> {
+        Ok(Reservation::builder(self.options.key.clone(), port)
+            .project(self.options.project.clone())
+            .task(self.options.task.clone())
+            .created_at(existing.created_at())
+            .build()?)
     }
 
     /// Validates that sticky fields aren't being changed without permission.
@@ -513,6 +557,7 @@ mod tests {
                 project in optional_string_strategy(),
                 task in optional_string_strategy(),
                 force in any::<bool>(),
+                overwrite in any::<bool>(),
                 allow_unrelated in any::<bool>(),
                 allow_project_change in any::<bool>(),
                 allow_task_change in any::<bool>(),
@@ -523,6 +568,7 @@ mod tests {
                     .with_project(project.clone())
                     .with_task(task.clone())
                     .with_force(force)
+                    .with_overwrite(overwrite)
                     .with_allow_unrelated_path(allow_unrelated)
                     .with_allow_project_change(allow_project_change)
                     .with_allow_task_change(allow_task_change);
@@ -531,6 +577,7 @@ mod tests {
                     .with_project(project.clone())
                     .with_task(task.clone())
                     .with_force(force)
+                    .with_overwrite(overwrite)
                     .with_allow_unrelated_path(allow_unrelated)
                     .with_allow_project_change(allow_project_change)
                     .with_allow_task_change(allow_task_change);
@@ -540,6 +587,7 @@ mod tests {
                 prop_assert_eq!(opts1.project, opts2.project);
                 prop_assert_eq!(opts1.task, opts2.task);
                 prop_assert_eq!(opts1.force, opts2.force);
+                prop_assert_eq!(opts1.overwrite, opts2.overwrite);
                 prop_assert_eq!(opts1.allow_unrelated_path, opts2.allow_unrelated_path);
                 prop_assert_eq!(opts1.allow_project_change, opts2.allow_project_change);
                 prop_assert_eq!(opts1.allow_task_change, opts2.allow_task_change);
@@ -793,6 +841,7 @@ mod tests {
         let options = ReserveOptions::new(key, Some(port));
 
         assert!(!options.force);
+        assert!(!options.overwrite);
         assert!(!options.allow_unrelated_path);
         assert!(!options.allow_project_change);
         assert!(!options.allow_task_change);
@@ -806,9 +855,11 @@ mod tests {
             .with_project(Some("test-project".to_string()))
             .with_task(Some("test-task".to_string()))
             .with_force(true)
+            .with_overwrite(true)
             .with_allow_unrelated_path(true);
 
         assert!(options.force);
+        assert!(options.overwrite);
         assert!(options.allow_unrelated_path);
         assert_eq!(options.project, Some("test-project".to_string()));
         assert_eq!(options.task, Some("test-task".to_string()));

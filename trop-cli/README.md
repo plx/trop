@@ -88,6 +88,29 @@ api_port=$(trop reserve --tag api)
 db_port=$(trop reserve --tag db)
 ```
 
+### Updating an existing reservation
+
+Reservations use the exact path and optional tag as their identity. Without
+`--overwrite`, a repeat call keeps and prints the stored port even if the call
+supplies a different `--port` preference.
+
+Explicit project and task changes persist only when authorized by
+`--allow-project-change`, `--allow-task-change`, `--allow-change`, or
+`--force`. Metadata-only updates preserve both the port and creation timestamp.
+
+`--overwrite` re-runs ordinary allocation for the same key, treating its
+current port as available to itself. It prefers `--port` when that candidate
+passes the normal checks and otherwise falls back to the lowest available
+candidate. Overwrite does not itself bypass path, metadata, exclusion, or
+occupancy protections.
+
+`--force` adds overwrite, unrelated-path permission, both metadata permissions,
+`--ignore-occupied`, and `--ignore-exclusions`. The two narrow ignore flags
+independently relax only their named preferred-port guard. Another key's port
+remains reserved under every flag, and a failed reconciliation leaves all
+stored fields and timestamps unchanged. Every successful command prints the
+port actually stored after reconciliation.
+
 ### Use in Build Scripts
 
 Example `justfile`:
