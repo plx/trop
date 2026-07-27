@@ -43,6 +43,21 @@ See `trop --help` or `man trop` for complete usage details.
 
 Full documentation for `trop` advanced's features is forthcoming, but here's a brief overview of `trop`'s advanced features.
 
+### Occupancy checks
+
+Before reserving a port, `trop` checks TCP and UDP on both IPv4 and IPv6
+localhost by default. `--skip-tcp`, `--skip-udp`, `--skip-ipv4`, and
+`--skip-ipv6` remove exactly their named probes; skipping both protocols or
+both address families disables the check. `--check-all-interfaces` adds
+wildcard probes on `0.0.0.0` and `::` to the localhost probes.
+
+The IPv4 and IPv6 probes are deliberately independent. IPv6 sockets use the
+IPv6-only socket option before binding so platform dual-stack defaults do not
+make an IPv6 probe also claim IPv4. A bind conflict marks the port occupied.
+Unsupported families, permission failures, and other unexpected socket errors
+are reported with the failed protocol, family, scope, and address; allocation
+treats those failures conservatively as possibly occupied.
+
 ### Tags & `trop autoreserve`
 
 For projects with multiple services, you can reserve a distinct port for each service, like so:

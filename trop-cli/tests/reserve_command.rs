@@ -17,7 +17,7 @@ use assert_cmd::Command;
 use common::{create_directory_symlink, parse_port, TestEnv};
 use predicates::prelude::*;
 use serde_json::Value;
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 
@@ -102,6 +102,18 @@ fn adjacent_available_ports() -> (u16, u16) {
         .port();
     drop(listener);
     (neighbor, formerly_occupied)
+}
+
+fn udp_ipv4_listener_with_tcp_free() -> UdpSocket {
+    for _ in 0..100 {
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("Failed to bind a UDP-only occupied test port");
+        let port = udp.local_addr().unwrap().port();
+        if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return udp;
+        }
+    }
+    panic!("Failed to find a UDP/IPv4 test port with TCP/IPv4 free");
 }
 
 fn run_git(path: &Path, args: &[&str]) {
@@ -392,6 +404,33 @@ fn test_reserve_with_preferred_port() {
         (5000..=7000).contains(&port),
         "Should allocate a port in valid range (got {port}, preferred was {preferred})"
     );
+}
+
+/// A UDP-only listener must not block a reservation when UDP and IPv6 probes
+/// are explicitly skipped.
+#[test]
+fn test_reserve_skip_udp_ignores_udp_only_listener() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("udp-skip-project");
+    let udp = udp_ipv4_listener_with_tcp_free();
+    let port = udp.local_addr().unwrap().port().to_string();
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--port")
+        .arg(&port)
+        .arg("--min")
+        .arg(&port)
+        .arg("--max")
+        .arg(&port)
+        .arg("--skip-udp")
+        .arg("--skip-ipv6")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .success()
+        .stdout(format!("{port}\n"));
 }
 
 /// Test that preferred port is rejected when already occupied.

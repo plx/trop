@@ -259,11 +259,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
                     reason: PortUnavailableReason::Excluded,
                 });
             }
-            let occupied = self
-                .checker
-                .is_occupied(preferred, occupancy_config)
-                .unwrap_or(true);
-            if occupied && !options.ignore_occupied {
+            if !options.ignore_occupied && self.checker.is_occupied(preferred, occupancy_config)? {
                 return Ok(AllocationResult::PreferredUnavailable {
                     port: preferred,
                     reason: PortUnavailableReason::Occupied,
@@ -362,13 +358,11 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
                 continue;
             }
 
-            // Check if occupied on system
-            // Fail-closed policy: if the occupancy check itself fails (e.g., permission errors),
-            // we conservatively treat the port as occupied.
-            let occupied = self
-                .checker
-                .is_occupied(port, occupancy_config)
-                .unwrap_or(true);
+            // Check if occupied on system. Probe failures are returned with
+            // their diagnostic instead of being erased; this remains
+            // fail-closed because no port is allocated after an uncertain
+            // result.
+            let occupied = self.checker.is_occupied(port, occupancy_config)?;
 
             if !occupied {
                 return Ok(Some(port));
@@ -434,14 +428,10 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
             return Ok(PortAvailability::Excluded);
         }
 
-        // Check if occupied on system
-        // Fail-closed policy: if the occupancy check itself fails (e.g., permission errors),
-        // we conservatively treat the port as occupied to avoid allocating ports that might
-        // be in use.
-        let occupied = self
-            .checker
-            .is_occupied(port, occupancy_config)
-            .unwrap_or(true);
+        // Check if occupied on system. Returning a probe failure is
+        // fail-closed (the port cannot become Available) and preserves the
+        // actionable protocol/family/scope/address diagnostic.
+        let occupied = self.checker.is_occupied(port, occupancy_config)?;
 
         if occupied {
             Ok(PortAvailability::Occupied)
@@ -544,10 +534,31 @@ pub fn allocator_from_config(
 mod tests {
     use super::*;
     use crate::database::test_util::create_test_database;
-    use crate::port::occupancy::MockOccupancyChecker;
+    use crate::port::occupancy::{MockOccupancyChecker, PortOccupancyChecker};
     use crate::reservation::{Reservation, ReservationKey};
     use std::collections::HashSet;
+    use std::io;
     use std::path::PathBuf;
+
+    #[derive(Debug, Clone, Copy)]
+    struct FailingOccupancyChecker;
+
+    impl PortOccupancyChecker for FailingOccupancyChecker {
+        fn is_occupied(&self, port: Port, _config: &OccupancyCheckConfig) -> Result<bool> {
+            Err(Error::OccupancyCheckFailed {
+                port,
+                source: Box::new(io::Error::other(
+                    "TCP IPv6 localhost bind at [::1] failed: synthetic probe failure",
+                )),
+            })
+        }
+    }
+
+    fn create_failing_allocator(min: u16, max: u16) -> PortAllocator<FailingOccupancyChecker> {
+        let range =
+            PortRange::new(Port::try_from(min).unwrap(), Port::try_from(max).unwrap()).unwrap();
+        PortAllocator::new(FailingOccupancyChecker, ExclusionManager::empty(), range)
+    }
 
     fn create_test_allocator(
         occupied: HashSet<Port>,
@@ -575,6 +586,59 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
+            AllocationResult::Allocated(Port::try_from(5000).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_allocation_propagates_actionable_occupancy_probe_failure() {
+        let db = create_test_database();
+        let allocator = create_failing_allocator(5000, 5001);
+        let config = OccupancyCheckConfig::default();
+
+        let error = allocator
+            .allocate_single(db.connection(), &AllocationOptions::default(), &config)
+            .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(matches!(error, Error::OccupancyCheckFailed { .. }));
+        assert!(diagnostic.contains("port 5000"));
+        assert!(diagnostic.contains("possibly occupied"));
+        assert!(diagnostic.contains("TCP IPv6 localhost bind at [::1]"));
+
+        let preferred = AllocationOptions {
+            preferred: Some(Port::try_from(5001).unwrap()),
+            ..Default::default()
+        };
+        let error = allocator
+            .allocate_single(db.connection(), &preferred, &config)
+            .unwrap_err();
+        assert!(error.to_string().contains("port 5001"));
+
+        let error = allocator
+            .find_next_allocatable(Port::try_from(5000).unwrap(), &config)
+            .unwrap_err();
+        assert!(error.to_string().contains("synthetic probe failure"));
+
+        let error = allocator
+            .is_port_available(Port::try_from(5000).unwrap(), db.connection(), &config)
+            .unwrap_err();
+        assert!(error.to_string().contains("synthetic probe failure"));
+    }
+
+    #[test]
+    fn test_ignore_occupied_bypasses_occupancy_probe_failure() {
+        let db = create_test_database();
+        let allocator = create_failing_allocator(5000, 5000);
+        let options = AllocationOptions {
+            preferred: Some(Port::try_from(5000).unwrap()),
+            ignore_occupied: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            allocator
+                .allocate_single(db.connection(), &options, &OccupancyCheckConfig::default(),)
+                .unwrap(),
             AllocationResult::Allocated(Port::try_from(5000).unwrap())
         );
     }
