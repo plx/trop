@@ -16,6 +16,91 @@ mod common;
 use assert_cmd::Command;
 use common::{create_directory_symlink, parse_port, TestEnv};
 use predicates::prelude::*;
+use serde_json::Value;
+use std::net::TcpListener;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredReservation {
+    path: String,
+    tag: Option<String>,
+    port: u16,
+    project: Option<String>,
+    task: Option<String>,
+    created_at: i64,
+    last_used_at: i64,
+}
+
+fn stored_reservations(env: &TestEnv) -> Vec<StoredReservation> {
+    let connection = rusqlite::Connection::open(env.data_dir.join("trop.db"))
+        .expect("Failed to open test database");
+    let mut statement = connection
+        .prepare(
+            "SELECT path, tag, port, project, task, created_at, last_used_at
+             FROM reservations
+             ORDER BY path, COALESCE(tag, '')",
+        )
+        .expect("Failed to prepare reservation query");
+
+    statement
+        .query_map([], |row| {
+            Ok(StoredReservation {
+                path: row.get(0)?,
+                tag: row.get(1)?,
+                port: row.get(2)?,
+                project: row.get(3)?,
+                task: row.get(4)?,
+                created_at: row.get(5)?,
+                last_used_at: row.get(6)?,
+            })
+        })
+        .expect("Failed to query reservations")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("Failed to decode reservations")
+}
+
+fn set_single_reservation_timestamps(env: &TestEnv, created_at: i64, last_used_at: i64) {
+    let connection = rusqlite::Connection::open(env.data_dir.join("trop.db"))
+        .expect("Failed to open test database");
+    let updated = connection
+        .execute(
+            "UPDATE reservations SET created_at = ?, last_used_at = ?",
+            [created_at, last_used_at],
+        )
+        .expect("Failed to set reservation timestamps");
+    assert_eq!(updated, 1, "Expected exactly one reservation");
+}
+
+fn occupied_port_with_free_neighbor() -> (TcpListener, u16) {
+    loop {
+        let listener =
+            TcpListener::bind(("0.0.0.0", 0)).expect("Failed to bind an occupied test port");
+        let occupied = listener
+            .local_addr()
+            .expect("Failed to inspect occupied test port")
+            .port();
+
+        for candidate in [occupied.checked_sub(1), occupied.checked_add(1)]
+            .into_iter()
+            .flatten()
+            .filter(|candidate| *candidate > 1024)
+        {
+            if let Ok(probe) = TcpListener::bind(("0.0.0.0", candidate)) {
+                drop(probe);
+                return (listener, candidate);
+            }
+        }
+    }
+}
+
+fn adjacent_available_ports() -> (u16, u16) {
+    let (listener, neighbor) = occupied_port_with_free_neighbor();
+    let formerly_occupied = listener
+        .local_addr()
+        .expect("Failed to inspect test port")
+        .port();
+    drop(listener);
+    (neighbor, formerly_occupied)
+}
 
 // ============================================================================
 // Basic Reservation Tests
@@ -588,6 +673,345 @@ fn test_reserve_with_allow_change() {
         .arg("--allow-unrelated-path")
         .assert()
         .success();
+}
+
+/// Authorized metadata changes persist without moving the stable reservation,
+/// while overwrite relocates it and every success reports the stored port.
+#[test]
+fn test_reserve_persists_authorized_changes_and_overwrite() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("reconcile-project");
+    let (port_a, port_b) = adjacent_available_ports();
+    let min = port_a.min(port_b).to_string();
+    let max = port_a.max(port_b).to_string();
+
+    let initial = env
+        .command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("project-a")
+        .arg("--task")
+        .arg("task-a")
+        .arg("--port")
+        .arg(port_a.to_string())
+        .arg("--min")
+        .arg(&min)
+        .arg("--max")
+        .arg(&max)
+        .arg("--ignore-occupied")
+        .arg("--allow-unrelated-path")
+        .output()
+        .expect("Failed to create initial reservation");
+    assert!(initial.status.success());
+    assert_eq!(
+        parse_port(&String::from_utf8(initial.stdout).unwrap()),
+        port_a
+    );
+
+    set_single_reservation_timestamps(&env, 100, 100);
+
+    let project_change = env
+        .command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("project-b")
+        .arg("--task")
+        .arg("task-a")
+        .arg("--port")
+        .arg(port_b.to_string())
+        .arg("--min")
+        .arg(&min)
+        .arg("--max")
+        .arg(&max)
+        .arg("--allow-project-change")
+        .arg("--allow-unrelated-path")
+        .output()
+        .expect("Failed to update project");
+    assert!(project_change.status.success());
+    assert_eq!(
+        parse_port(&String::from_utf8(project_change.stdout).unwrap()),
+        port_a,
+        "A preferred port must not relocate an existing key without overwrite"
+    );
+    let after_project = stored_reservations(&env);
+    assert_eq!(after_project.len(), 1);
+    assert_eq!(after_project[0].project.as_deref(), Some("project-b"));
+    assert_eq!(after_project[0].task.as_deref(), Some("task-a"));
+    assert_eq!(after_project[0].port, port_a);
+    assert_eq!(after_project[0].created_at, 100);
+    assert!(after_project[0].last_used_at > 100);
+
+    let task_change = env
+        .command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("project-b")
+        .arg("--task")
+        .arg("task-b")
+        .arg("--port")
+        .arg(port_b.to_string())
+        .arg("--min")
+        .arg(&min)
+        .arg("--max")
+        .arg(&max)
+        .arg("--allow-task-change")
+        .arg("--allow-unrelated-path")
+        .output()
+        .expect("Failed to update task");
+    assert!(task_change.status.success());
+    assert_eq!(
+        parse_port(&String::from_utf8(task_change.stdout).unwrap()),
+        port_a
+    );
+    let after_task = stored_reservations(&env);
+    assert_eq!(after_task[0].project.as_deref(), Some("project-b"));
+    assert_eq!(after_task[0].task.as_deref(), Some("task-b"));
+    assert_eq!(after_task[0].created_at, 100);
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("project-c")
+        .arg("--task")
+        .arg("task-c")
+        .arg("--port")
+        .arg(port_b.to_string())
+        .arg("--min")
+        .arg(&min)
+        .arg("--max")
+        .arg(&max)
+        .arg("--allow-change")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .success()
+        .stdout(format!("{port_a}\n"));
+    let after_combined = stored_reservations(&env);
+    assert_eq!(after_combined[0].project.as_deref(), Some("project-c"));
+    assert_eq!(after_combined[0].task.as_deref(), Some("task-c"));
+    assert_eq!(after_combined[0].port, port_a);
+    assert_eq!(after_combined[0].created_at, 100);
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("project-c")
+        .arg("--task")
+        .arg("task-c")
+        .arg("--port")
+        .arg(port_b.to_string())
+        .arg("--min")
+        .arg(&min)
+        .arg("--max")
+        .arg(&max)
+        .arg("--overwrite")
+        .arg("--ignore-occupied")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .success()
+        .stdout(format!("{port_b}\n"));
+    let after_overwrite = stored_reservations(&env);
+    assert_eq!(after_overwrite[0].port, port_b);
+    assert_eq!(after_overwrite[0].project.as_deref(), Some("project-c"));
+    assert_eq!(after_overwrite[0].task.as_deref(), Some("task-c"));
+    assert_eq!(after_overwrite[0].created_at, 100);
+
+    let json_output = env
+        .command()
+        .arg("list")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to inspect final JSON state");
+    assert!(json_output.status.success());
+    let json: Value =
+        serde_json::from_slice(&json_output.stdout).expect("List output should be valid JSON");
+    assert_eq!(json[0]["port"].as_u64(), Some(u64::from(port_b)));
+    assert_eq!(json[0]["project"].as_str(), Some("project-c"));
+    assert_eq!(json[0]["task"].as_str(), Some("task-c"));
+
+    set_single_reservation_timestamps(&env, 100, 100);
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("project-c")
+        .arg("--task")
+        .arg("task-c")
+        .arg("--port")
+        .arg(port_a.to_string())
+        .arg("--min")
+        .arg(&min)
+        .arg("--max")
+        .arg(&max)
+        .arg("--allow-unrelated-path")
+        .assert()
+        .success()
+        .stdout(format!("{port_b}\n"));
+    let after_idempotent = stored_reservations(&env);
+    assert_eq!(after_idempotent[0].port, port_b);
+    assert_eq!(after_idempotent[0].created_at, 100);
+    assert!(after_idempotent[0].last_used_at > 100);
+}
+
+/// Force combines overwrite, both sticky-field permissions, and the two
+/// preferred-port availability bypasses.
+#[test]
+fn test_reserve_force_overwrites_occupied_excluded_preferred_port() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("force-project");
+    let (occupied_listener, port_a) = occupied_port_with_free_neighbor();
+    let port_b = occupied_listener.local_addr().unwrap().port();
+    let min = port_a.min(port_b).to_string();
+    let max = port_a.max(port_b).to_string();
+    std::fs::write(
+        env.path().join("trop.yaml"),
+        format!("excluded_ports:\n  - {port_b}\n"),
+    )
+    .expect("Failed to write project configuration");
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("project-a")
+        .arg("--task")
+        .arg("task-a")
+        .arg("--port")
+        .arg(port_a.to_string())
+        .arg("--min")
+        .arg(&min)
+        .arg("--max")
+        .arg(&max)
+        .arg("--allow-unrelated-path")
+        .current_dir(env.path())
+        .assert()
+        .success()
+        .stdout(format!("{port_a}\n"));
+    set_single_reservation_timestamps(&env, 200, 200);
+
+    for narrow_flag in ["--ignore-exclusions", "--ignore-occupied"] {
+        let output = env
+            .command()
+            .arg("reserve")
+            .arg("--path")
+            .arg(&test_path)
+            .arg("--project")
+            .arg("project-a")
+            .arg("--task")
+            .arg("task-a")
+            .arg("--port")
+            .arg(port_b.to_string())
+            .arg("--min")
+            .arg(&min)
+            .arg("--max")
+            .arg(&max)
+            .arg("--overwrite")
+            .arg(narrow_flag)
+            .arg("--allow-unrelated-path")
+            .current_dir(env.path())
+            .output()
+            .expect("Failed to run narrow overwrite");
+        assert!(output.status.success());
+        assert_ne!(
+            parse_port(&String::from_utf8(output.stdout).unwrap()),
+            port_b,
+            "{narrow_flag} must not bypass the other availability guard"
+        );
+    }
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("project-force")
+        .arg("--task")
+        .arg("task-force")
+        .arg("--port")
+        .arg(port_b.to_string())
+        .arg("--min")
+        .arg(&min)
+        .arg("--max")
+        .arg(&max)
+        .arg("--force")
+        .current_dir(env.path())
+        .assert()
+        .success()
+        .stdout(format!("{port_b}\n"));
+
+    let forced = stored_reservations(&env);
+    assert_eq!(forced.len(), 1);
+    assert_eq!(forced[0].port, port_b);
+    assert_eq!(forced[0].project.as_deref(), Some("project-force"));
+    assert_eq!(forced[0].task.as_deref(), Some("task-force"));
+    assert_eq!(forced[0].created_at, 200);
+    assert!(forced[0].last_used_at > 200);
+    drop(occupied_listener);
+}
+
+/// Rejected sticky-field changes must not partially apply overwrite or refresh
+/// either timestamp.
+#[test]
+fn test_reserve_rejected_change_is_atomic_noop() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("atomic-project");
+    let (port_a, port_b) = adjacent_available_ports();
+    let min = port_a.min(port_b).to_string();
+    let max = port_a.max(port_b).to_string();
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("project-a")
+        .arg("--task")
+        .arg("task-a")
+        .arg("--port")
+        .arg(port_a.to_string())
+        .arg("--min")
+        .arg(&min)
+        .arg("--max")
+        .arg(&max)
+        .arg("--ignore-occupied")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .success();
+    set_single_reservation_timestamps(&env, 300, 301);
+    let before = stored_reservations(&env);
+
+    env.command()
+        .arg("reserve")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--project")
+        .arg("unauthorized-project")
+        .arg("--task")
+        .arg("task-a")
+        .arg("--port")
+        .arg(port_b.to_string())
+        .arg("--min")
+        .arg(&min)
+        .arg("--max")
+        .arg(&max)
+        .arg("--overwrite")
+        .arg("--allow-unrelated-path")
+        .assert()
+        .failure();
+
+    assert_eq!(stored_reservations(&env), before);
 }
 
 // ============================================================================

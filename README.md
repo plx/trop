@@ -198,6 +198,32 @@ Although you *can* supply these values via the `--project` and `--task` flags, c
 
 Both of these fields are optional and have no impact on port-reservation behavior, but can be useful for inspection and debugging.
 
+### Updating a single reservation
+
+A single reservation is identified by its exact path and optional tag. Repeating
+`trop reserve` without `--overwrite` keeps that key's stored port even when a
+different `--port` preference is supplied, and prints the port that remains
+stored.
+
+Project and task are sticky metadata. An explicit change requires
+`--allow-project-change`, `--allow-task-change`, their combined
+`--allow-change` form, or `--force`. An authorized metadata-only change keeps
+the port and creation timestamp while refreshing the last-used timestamp.
+
+`--overwrite` re-runs normal allocation for that exact key. The key's current
+port is eligible for reuse, a free preferred port wins, and an unavailable
+preference falls back to the normal lowest available candidate. Overwrite alone
+does not bypass path safety, sticky metadata, exclusions, or operating-system
+occupancy.
+
+For single reservations, `--force` combines overwrite with unrelated-path and
+both metadata permissions plus `--ignore-occupied` and
+`--ignore-exclusions`. Those two narrow flags apply independently to the
+preferred port. No flag can take a port owned by another reservation key:
+allocation falls back or fails atomically, leaving the original port, metadata,
+and timestamps unchanged. Successful reconciliation preserves `created_at`,
+refreshes `last_used_at`, and prints the final stored port.
+
 ## Installation
 
 ### From crates.io

@@ -14,10 +14,11 @@ use common::database::create_test_database;
 use common::{create_reservation, release_reservation};
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 use trop::{
-    Database, PlanAction, PlanExecutor, Port, ReleaseOptions, ReleasePlan, ReservationKey,
-    ReserveOptions, ReservePlan,
+    config::{Config, OccupancyConfig, PortConfig},
+    Database, PlanAction, PlanExecutor, Port, ReleaseOptions, ReleasePlan, Reservation,
+    ReservationKey, ReserveOptions, ReservePlan,
 };
 
 // Port base constants for test organization
@@ -26,6 +27,21 @@ const PORT_BASE_STICKY_PROJECT: u16 = 5020;
 const PORT_BASE_STICKY_TASK: u16 = 5030;
 const PORT_BASE_STICKY_COMBINED: u16 = 5040;
 const PORT_BASE_RELEASE_IDEMPOTENCY: u16 = 5050;
+
+fn reconciliation_config(min: u16, max: u16) -> Config {
+    Config {
+        ports: Some(PortConfig {
+            min,
+            max: Some(max),
+            max_offset: None,
+        }),
+        occupancy_check: Some(OccupancyConfig {
+            skip: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
 
 // =============================================================================
 // Idempotency Tests
@@ -193,6 +209,141 @@ fn test_idempotent_reserve_action_is_update_last_used() {
 }
 
 #[test]
+fn test_authorized_metadata_update_persists_without_moving_port() {
+    let db = create_test_database();
+    let key = ReservationKey::new(PathBuf::from("/test/metadata-update"), None).unwrap();
+    let stored_port = Port::try_from(5060).unwrap();
+    let different_preference = Port::try_from(5061).unwrap();
+    let created_at = UNIX_EPOCH + Duration::from_secs(10);
+    let original = Reservation::builder(key.clone(), stored_port)
+        .project(Some("project-a".to_string()))
+        .task(Some("task-a".to_string()))
+        .created_at(created_at)
+        .last_used_at(UNIX_EPOCH + Duration::from_secs(11))
+        .build()
+        .unwrap();
+    Database::create_reservation_simple(db.connection(), &original).unwrap();
+
+    let options = ReserveOptions::new(key.clone(), Some(different_preference))
+        .with_project(Some("project-b".to_string()))
+        .with_task(Some("task-a".to_string()))
+        .with_allow_project_change(true)
+        .with_allow_unrelated_path(true);
+    let plan = ReservePlan::new(options, &reconciliation_config(5060, 5061))
+        .build_plan(db.connection())
+        .unwrap();
+    assert!(matches!(
+        plan.actions.as_slice(),
+        [PlanAction::UpdateReservation(reservation)]
+            if reservation.port() == stored_port
+    ));
+
+    let result = PlanExecutor::new(db.connection()).execute(&plan).unwrap();
+    assert_eq!(result.port, Some(stored_port));
+    let stored = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.port(), stored_port);
+    assert_eq!(stored.project(), Some("project-b"));
+    assert_eq!(stored.task(), Some("task-a"));
+    assert_eq!(stored.created_at(), created_at);
+    assert!(stored.last_used_at() > original.last_used_at());
+}
+
+#[test]
+fn test_overwrite_reallocates_and_preserves_creation_time() {
+    let db = create_test_database();
+    let key = ReservationKey::new(PathBuf::from("/test/overwrite"), None).unwrap();
+    let original_port = Port::try_from(5070).unwrap();
+    let replacement_port = Port::try_from(5071).unwrap();
+    let created_at = UNIX_EPOCH + Duration::from_secs(20);
+    let original = Reservation::builder(key.clone(), original_port)
+        .project(Some("project".to_string()))
+        .task(Some("task".to_string()))
+        .created_at(created_at)
+        .last_used_at(UNIX_EPOCH + Duration::from_secs(21))
+        .build()
+        .unwrap();
+    Database::create_reservation_simple(db.connection(), &original).unwrap();
+
+    let options = ReserveOptions::new(key.clone(), Some(replacement_port))
+        .with_project(Some("project".to_string()))
+        .with_task(Some("task".to_string()))
+        .with_overwrite(true)
+        .with_allow_unrelated_path(true);
+    let plan = ReservePlan::new(options, &reconciliation_config(5070, 5071))
+        .build_plan(db.connection())
+        .unwrap();
+    assert!(matches!(
+        plan.actions.as_slice(),
+        [PlanAction::UpdateReservation(reservation)]
+            if reservation.port() == replacement_port
+    ));
+
+    let result = PlanExecutor::new(db.connection()).execute(&plan).unwrap();
+    assert_eq!(result.port, Some(replacement_port));
+    let stored = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.port(), replacement_port);
+    assert_eq!(stored.created_at(), created_at);
+    assert!(stored.last_used_at() > original.last_used_at());
+}
+
+#[test]
+fn test_force_never_steals_another_reservations_port() {
+    let db = create_test_database();
+    let current_key = ReservationKey::new(PathBuf::from("/test/current"), None).unwrap();
+    let other_key = ReservationKey::new(PathBuf::from("/test/other"), None).unwrap();
+    let current_port = Port::try_from(5080).unwrap();
+    let other_port = Port::try_from(5081).unwrap();
+    Database::create_reservation_simple(
+        db.connection(),
+        &Reservation::builder(current_key.clone(), current_port)
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+    Database::create_reservation_simple(
+        db.connection(),
+        &Reservation::builder(other_key.clone(), other_port)
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let options = ReserveOptions::new(current_key.clone(), Some(other_port))
+        .with_force(true)
+        .with_allow_unrelated_path(true);
+    let plan = ReservePlan::new(options, &reconciliation_config(5080, 5081))
+        .build_plan(db.connection())
+        .unwrap();
+    let result = PlanExecutor::new(db.connection()).execute(&plan).unwrap();
+
+    assert_eq!(result.port, Some(current_port));
+    assert_eq!(
+        Database::get_reservation(db.connection(), &current_key)
+            .unwrap()
+            .unwrap()
+            .port(),
+        current_port
+    );
+    assert_eq!(
+        Database::get_reservation(db.connection(), &other_key)
+            .unwrap()
+            .unwrap()
+            .port(),
+        other_port
+    );
+    assert_eq!(
+        Database::list_all_reservations(db.connection())
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn test_idempotent_reserve_with_different_tags() {
     // Tests that reservations with the same path but different tags are
     // independent and each maintains its own idempotency.
@@ -327,16 +478,15 @@ fn test_can_change_project_with_force_flag() {
         .with_force(true)
         .with_allow_unrelated_path(true);
 
-    let result = ReservePlan::new(opts2, &create_test_config()).build_plan(db.connection());
+    let plan = ReservePlan::new(opts2, &create_test_config())
+        .build_plan(db.connection())
+        .expect("Force flag should allow planning project change");
+    executor.execute(&plan).unwrap();
 
-    assert!(
-        result.is_ok(),
-        "Force flag should allow planning project change"
-    );
-
-    // Note: Currently the implementation validates that force allows the change,
-    // but doesn't actually update sticky fields (generates UpdateLastUsed not UpdateReservation).
-    // This test verifies that the validation passes with force, which is the current behavior.
+    let stored = Database::get_reservation(db.connection(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.project(), Some("project2"));
 }
 
 #[test]

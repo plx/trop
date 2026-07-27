@@ -127,6 +127,13 @@ All fallible operations return `Result<T, Error>` or use the type alias `trop::R
 
 The core library includes the SQLite database layer, path handling, configuration loading, port allocation, reservation operations, cleanup, migration, output formatting, and test utilities used by the CLI.
 
+`ReserveOptions` reconciles one exact `ReservationKey`. Compatible calls keep
+the stored port; authorized metadata changes produce an update that preserves
+the creation timestamp. `with_overwrite(true)` re-runs allocation while
+allowing the key to reuse its own port, and `with_force(true)` additionally
+enables both preferred-port availability bypasses and the path and metadata
+permissions. A different key's unique port ownership is never bypassed.
+
 ## Usage Example
 
 ```rust
