@@ -11,7 +11,9 @@ use crate::commands::{
     ShowDataDirCommand, ShowPathCommand, ValidateCommand,
 };
 use crate::error::CliError;
-use crate::invocation::{CommandLineConfig, ConfigRequest, ConfigScope, InvocationContext};
+use crate::invocation::{
+    CommandLineConfig, ConfigRequest, ConfigScope, InvocationContext, ReservationMetadataRequest,
+};
 use crate::utils::GlobalOptions;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -141,6 +143,11 @@ impl Command {
                     command_line.config.project = Some(project.clone());
                     command_line.record(ConfigField::Project);
                 }
+                command_line.reservation_metadata = Some(ReservationMetadataRequest {
+                    clear_project: command.clear_project,
+                    task: command.task.clone(),
+                    clear_task: command.clear_task,
+                });
 
                 let min = command
                     .min

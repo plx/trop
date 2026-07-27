@@ -22,12 +22,20 @@ pub struct ReserveCommand {
     pub tag: Option<String>,
 
     /// Project identifier
-    #[arg(long, value_name = "PROJECT")]
+    #[arg(long, value_name = "PROJECT", conflicts_with = "clear_project")]
     pub project: Option<String>,
 
+    /// Clear stored project metadata
+    #[arg(long, conflicts_with = "project")]
+    pub clear_project: bool,
+
     /// Task identifier
-    #[arg(long, value_name = "TASK", env = "TROP_TASK")]
+    #[arg(long, value_name = "TASK", conflicts_with = "clear_task")]
     pub task: Option<String>,
+
+    /// Clear stored task metadata
+    #[arg(long, conflicts_with = "task")]
+    pub clear_task: bool,
 
     /// Preferred port number
     #[arg(long, value_name = "PORT")]
@@ -128,6 +136,7 @@ impl ReserveCommand {
         // 3. Consume the configuration snapshot resolved before dispatch.
         let effective = context.effective()?;
         let config = effective.config();
+        let metadata = context.reservation_metadata()?;
 
         // 4. Parse and validate port arguments
         let port = self
@@ -141,8 +150,8 @@ impl ReserveCommand {
 
         // 7. Build library ReserveOptions
         let options = ReserveOptions::new(key, port)
-            .with_project(effective.project().map(ToOwned::to_owned))
-            .with_task(self.task)
+            .with_project_intent(metadata.project.clone())
+            .with_task_intent(metadata.task.clone())
             .with_overwrite(self.overwrite)
             .with_ignore_occupied(self.ignore_occupied)
             .with_ignore_exclusions(self.ignore_exclusions)

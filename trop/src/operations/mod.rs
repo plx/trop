@@ -56,5 +56,5 @@ pub use init::{init_database, InitOptions, InitResult};
 pub use migrate::{execute_migrate, MigrateOptions, MigratePlan, MigrateResult, MigrationItem};
 pub use plan::{OperationPlan, PlanAction};
 pub use release::{ReleaseOptions, ReleasePlan};
-pub use reserve::{ReserveOptions, ReservePlan};
+pub use reserve::{MetadataIntent, ReserveOptions, ReservePlan};
 pub use reserve_group::{ReserveGroupOptions, ReserveGroupPlan};

@@ -191,10 +191,17 @@ absolute stored path.
 - `project`: A human-readable name for the *project* associated with the reservation
 - `task`: A human-readable name for the *task* associated with the reservation
 
-Although you *can* supply these values via the `--project` and `--task` flags, convenient defaults have been provided for the "multiple agents in multiple worktrees" scenario:
+For a new reservation, values resolve from explicit inputs before falling back
+to Git:
 
-- `project` defaults to the name of the associated git repo 
-- `task` defaults to the name of the current worktree or branch
+- project: `--project`, `TROP_PROJECT`, `trop.local.yaml`, `trop.yaml`, then
+  the source repository directory name;
+- task: `--task`, `TROP_TASK`, then the linked-worktree directory name or
+  current branch name.
+
+Git discovery is best effort. Non-Git paths, detached `HEAD` for task
+inference, unreadable repository metadata, and invalid inferred identifiers
+simply leave the corresponding field absent.
 
 Both of these fields are optional and have no impact on port-reservation behavior, but can be useful for inspection and debugging.
 
@@ -209,6 +216,11 @@ Project and task are sticky metadata. An explicit change requires
 `--allow-project-change`, `--allow-task-change`, their combined
 `--allow-change` form, or `--force`. An authorized metadata-only change keeps
 the port and creation timestamp while refreshing the last-used timestamp.
+Omitting a field on an existing exact-key request preserves its stored value
+and does not re-run Git inference. Use `--clear-project` or `--clear-task` to
+request an explicit clear; clear requests are protected by the same
+field-specific permissions. Empty values are invalid identifiers rather than
+clearing syntax.
 
 `--overwrite` re-runs normal allocation for that exact key. The key's current
 port is eligible for reuse, a free preferred port wins, and an unavailable

@@ -10,7 +10,13 @@ use crate::config::validator::ConfigValidator;
 use crate::config::{ConfigField, ConfigFileKind, ConfigValueSource, EffectiveConfig};
 use crate::error::Result;
 use std::collections::BTreeSet;
+use std::env;
 use std::path::{Path, PathBuf};
+
+enum TaskOverride {
+    Set(String),
+    Clear,
+}
 
 /// Builder for loading and constructing configuration.
 ///
@@ -32,6 +38,8 @@ pub struct ConfigBuilder {
     skip_files: bool,
     additional_config: Option<Config>,
     cli_config: Option<(Config, BTreeSet<ConfigField>)>,
+    cli_project_clear: bool,
+    cli_task: Option<TaskOverride>,
     project_file: Option<PathBuf>,
 }
 
@@ -46,6 +54,8 @@ impl ConfigBuilder {
             skip_files: false,
             additional_config: None,
             cli_config: None,
+            cli_project_clear: false,
+            cli_task: None,
             project_file: None,
         }
     }
@@ -122,6 +132,26 @@ impl ConfigBuilder {
         I: IntoIterator<Item = ConfigField>,
     {
         self.cli_config = Some((config, explicit_fields.into_iter().collect()));
+        self
+    }
+
+    /// Explicitly clear project metadata at command-line precedence.
+    ///
+    /// This is separate from the ordinary configuration overlay, where an
+    /// absent project inherits the value from lower-precedence sources.
+    #[must_use]
+    pub fn with_cli_project_clear(mut self) -> Self {
+        self.cli_project_clear = true;
+        self
+    }
+
+    /// Set or explicitly clear the runtime task at command-line precedence.
+    ///
+    /// Task is not a YAML field. `Some(value)` overrides `TROP_TASK`; `None`
+    /// explicitly clears it.
+    #[must_use]
+    pub fn with_cli_task(mut self, task: Option<String>) -> Self {
+        self.cli_task = Some(task.map_or(TaskOverride::Clear, TaskOverride::Set));
         self
     }
 
@@ -228,6 +258,14 @@ impl ConfigBuilder {
             for (field, variable) in changes {
                 effective.record(field, ConfigValueSource::Environment { variable });
             }
+            if let Ok(task) = env::var("TROP_TASK") {
+                effective.set_task(
+                    Some(task),
+                    ConfigValueSource::Environment {
+                        variable: "TROP_TASK",
+                    },
+                );
+            }
         }
 
         if let Some(additional) = self.additional_config {
@@ -236,6 +274,18 @@ impl ConfigBuilder {
 
         if let Some((cli_config, fields)) = self.cli_config {
             effective.apply_precise(&cli_config, fields, &ConfigValueSource::CommandLine);
+        }
+        if self.cli_project_clear {
+            effective.set_project(None, ConfigValueSource::CommandLine);
+        }
+        if let Some(task) = self.cli_task {
+            effective.set_task(
+                match task {
+                    TaskOverride::Set(task) => Some(task),
+                    TaskOverride::Clear => None,
+                },
+                ConfigValueSource::CommandLine,
+            );
         }
 
         effective.validate(is_tropfile)?;

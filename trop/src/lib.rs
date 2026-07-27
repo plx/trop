@@ -53,9 +53,9 @@ pub use error::{Error, PortUnavailableReason, Result};
 pub use logging::{init_logger, LogLevel, Logger};
 pub use operations::{
     execute_migrate, init_database, AutocleanResult, AutoreserveOptions, AutoreservePlan,
-    CleanupOperations, ExecutionResult, ExpireResult, InitOptions, InitResult, MigrateOptions,
-    MigratePlan, MigrateResult, MigrationItem, OperationPlan, PlanAction, PlanExecutor,
-    PruneResult, ReleaseOptions, ReleasePlan, ReserveGroupOptions, ReserveGroupPlan,
+    CleanupOperations, ExecutionResult, ExpireResult, InitOptions, InitResult, MetadataIntent,
+    MigrateOptions, MigratePlan, MigrateResult, MigrationItem, OperationPlan, PlanAction,
+    PlanExecutor, PruneResult, ReleaseOptions, ReleasePlan, ReserveGroupOptions, ReserveGroupPlan,
     ReserveOptions, ReservePlan,
 };
 pub use path::{PathProvenance, PathRelationship, PathResolver};

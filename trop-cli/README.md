@@ -97,6 +97,19 @@ supplies a different `--port` preference.
 Explicit project and task changes persist only when authorized by
 `--allow-project-change`, `--allow-task-change`, `--allow-change`, or
 `--force`. Metadata-only updates preserve both the port and creation timestamp.
+Omitting either field preserves the exact key's stored value; omission never
+acts as a clear and does not re-run Git inference for an existing reservation.
+Use `--clear-project` or `--clear-task` for an explicit clear. Those requests
+need the same field-specific permission as a set/change, and the set and clear
+forms for one field are mutually exclusive.
+
+For a new reservation, project precedence is `--project`, `TROP_PROJECT`,
+`trop.local.yaml`, `trop.yaml`, then the source Git repository's directory
+name. Task precedence is `--task`, `TROP_TASK`, then the linked-worktree
+directory name or current branch. Explicit clear flags outrank and suppress
+all lower sources. Git discovery is best effort, so non-Git paths and
+unavailable or invalid repository details leave metadata absent without
+failing reserve.
 
 `--overwrite` re-runs ordinary allocation for the same key, treating its
 current port as available to itself. It prefers `--port` when that candidate
@@ -261,6 +274,7 @@ Other key environment variables:
 - `TROP_DATA_DIR`: Override data directory location (default: `~/.trop`)
 - `TROP_LOG_MODE`: Control logging verbosity (`quiet`, `normal`, `verbose`)
 - `TROP_PROJECT`: Set project identifier
+- `TROP_TASK`: Set task identifier for `trop reserve`
 - `TROP_DISABLE_AUTOINIT`: Disable automatic database initialization
 
 ## Commands

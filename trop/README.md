@@ -134,6 +134,15 @@ allowing the key to reuse its own port, and `with_force(true)` additionally
 enables both preferred-port availability bypasses and the path and metadata
 permissions. A different key's unique port ownership is never bypassed.
 
+Project and task requests use `MetadataIntent::Preserve`, `Set`, or `Clear`.
+`ReserveOptions::new` and the existing `with_project(None)` /
+`with_task(None)` builders select `Preserve`: an existing exact key keeps its
+stored value, while a new reservation uses best-effort Git inference.
+`with_clear_project()` and `with_clear_task()` request explicit removal and
+remain protected by the matching sticky-field permission. Set and clear
+updates keep the stored port unless overwrite or force also requests
+reallocation.
+
 ## Usage Example
 
 ```rust

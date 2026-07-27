@@ -7,6 +7,15 @@
 use gix::bstr::ByteSlice;
 use std::path::Path;
 
+use crate::config::ConfigValidator;
+
+fn normalize_inferred_identifier(field: &str, value: &str) -> Option<String> {
+    let value = value.trim();
+    ConfigValidator::validate_runtime_identifier(field, value)
+        .ok()
+        .map(|()| value.to_string())
+}
+
 /// Infer project name from git repository.
 ///
 /// Returns the repository name extracted from the git directory.
@@ -49,12 +58,28 @@ pub fn infer_project(path: &Path) -> Option<String> {
     // which needs to be resolved to the actual main repository path
     let canonical_common = common_dir.canonicalize().ok()?;
 
-    // Extract directory name from the common dir's parent
-    canonical_common
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .map(String::from)
+    let common_name = canonical_common.file_name()?.to_str()?;
+
+    let repository_name = if common_name == ".git" {
+        canonical_common
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .map(String::from)?
+    } else {
+        // A bare repository's common directory is the repository itself rather
+        // than a `.git` child.
+        common_name.to_string()
+    };
+
+    // Strip the conventional suffix so `/path/to/repo.git` identifies project
+    // `repo`, then discard any candidate that is not a valid identifier.
+    normalize_inferred_identifier(
+        "project",
+        repository_name
+            .strip_suffix(".git")
+            .unwrap_or(&repository_name),
+    )
 }
 
 /// Infer task from git context.
@@ -97,13 +122,15 @@ pub fn infer_task(path: &Path) -> Option<String> {
     let repo = gix::open(std_path).ok()?;
 
     // Check if this is a worktree
-    if is_worktree(&repo) {
+    let task = if is_worktree(&repo) {
         // Use worktree directory name
         extract_worktree_name(&repo)
     } else {
         // Use current branch name
         get_current_branch(&repo)
-    }
+    }?;
+
+    normalize_inferred_identifier("task", &task)
 }
 
 /// Check if the repository is a git worktree.
@@ -166,4 +193,34 @@ fn get_current_branch(repo: &gix::Repository) -> Option<String> {
             None
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_git_project_inference_is_best_effort() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(infer_project(directory.path()), None);
+    }
+
+    #[test]
+    fn non_git_task_inference_is_best_effort() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(infer_task(directory.path()), None);
+    }
+
+    #[test]
+    fn invalid_inferred_identifiers_are_ignored() {
+        assert_eq!(normalize_inferred_identifier("project", "   "), None);
+        assert_eq!(
+            normalize_inferred_identifier("task", &"x".repeat(256)),
+            None
+        );
+        assert_eq!(
+            normalize_inferred_identifier("project", "  valid-project  "),
+            Some("valid-project".to_string())
+        );
+    }
 }

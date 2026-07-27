@@ -40,6 +40,8 @@ static BUILT_IN_OCCUPANCY: OccupancyConfig = OccupancyConfig {
 pub enum ConfigField {
     /// Default project metadata.
     Project,
+    /// Runtime task metadata for single reservations.
+    Task,
     /// Automatic database initialization policy.
     DisableAutoinit,
     /// Automatic stale-path pruning policy.
@@ -87,6 +89,7 @@ pub enum ConfigField {
 impl ConfigField {
     const ALL: &[Self] = &[
         Self::Project,
+        Self::Task,
         Self::DisableAutoinit,
         Self::DisableAutoprune,
         Self::DisableAutoexpire,
@@ -262,6 +265,7 @@ impl LoadedConfigFile {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectiveConfig {
     config: Config,
+    task: Option<String>,
     provenance: BTreeMap<ConfigField, FieldProvenance>,
     loaded_files: Vec<LoadedConfigFile>,
     next_source_order: u64,
@@ -271,6 +275,7 @@ impl EffectiveConfig {
     pub(crate) fn from_defaults(config: Config) -> Self {
         let mut effective = Self {
             config,
+            task: None,
             provenance: BTreeMap::new(),
             loaded_files: Vec::new(),
             next_source_order: 0,
@@ -295,6 +300,16 @@ impl EffectiveConfig {
     pub(crate) fn clear_reservations(&mut self, source: &ConfigValueSource) {
         self.config.reservations = None;
         self.record(ConfigField::Reservations, source.clone());
+    }
+
+    pub(crate) fn set_task(&mut self, task: Option<String>, source: ConfigValueSource) {
+        self.task = task;
+        self.record(ConfigField::Task, source);
+    }
+
+    pub(crate) fn set_project(&mut self, project: Option<String>, source: ConfigValueSource) {
+        self.config.project = project;
+        self.record(ConfigField::Project, source);
     }
 
     pub(crate) fn record_file(&mut self, kind: ConfigFileKind, path: PathBuf) {
@@ -367,6 +382,15 @@ impl EffectiveConfig {
     #[must_use]
     pub fn project(&self) -> Option<&str> {
         self.config.project.as_deref()
+    }
+
+    /// Return the effective runtime task identifier.
+    ///
+    /// Task is intentionally not part of the YAML schema. Its supported
+    /// sources are `TROP_TASK` and the single-reservation command line.
+    #[must_use]
+    pub fn task(&self) -> Option<&str> {
+        self.task.as_deref()
     }
 
     /// Return the effective port configuration.
@@ -474,16 +498,22 @@ impl EffectiveConfig {
     }
 
     pub(crate) fn validate(&self, is_tropfile: bool) -> Result<()> {
-        ConfigValidator::validate(&self.config, is_tropfile).map_err(|error| {
-            let source = match &error {
-                crate::error::Error::Validation { field, .. } => self.validation_source(field),
-                _ => None,
-            };
-            match source {
-                Some(source) => ConfigValidator::annotate(error, source),
-                None => error,
-            }
-        })
+        ConfigValidator::validate(&self.config, is_tropfile)
+            .and_then(|()| {
+                self.task.as_deref().map_or(Ok(()), |task| {
+                    ConfigValidator::validate_runtime_identifier("task", task)
+                })
+            })
+            .map_err(|error| {
+                let source = match &error {
+                    crate::error::Error::Validation { field, .. } => self.validation_source(field),
+                    _ => None,
+                };
+                match source {
+                    Some(source) => ConfigValidator::annotate(error, source),
+                    None => error,
+                }
+            })
     }
 
     fn validation_source(&self, field: &str) -> Option<&ConfigValueSource> {
@@ -509,6 +539,8 @@ impl EffectiveConfig {
             &[ConfigField::Reservations]
         } else if field == "project" {
             &[ConfigField::Project]
+        } else if field == "task" {
+            &[ConfigField::Task]
         } else if field == "maximum_lock_wait_seconds" {
             &[ConfigField::MaximumLockWaitSeconds]
         } else {
@@ -546,6 +578,7 @@ impl EffectiveConfig {
                         changed.push(field);
                     }
                 }
+                ConfigField::Task => {}
                 ConfigField::DisableAutoinit => {
                     if let Some(value) = source_config.disable_autoinit {
                         self.config.disable_autoinit = Some(value);
@@ -749,5 +782,47 @@ impl EffectiveConfig {
                 self.record(changed_field, source.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_command_line_project_clear_has_command_line_provenance() {
+        let mut effective = EffectiveConfig::from_defaults(Config {
+            project: Some("lower-project".to_string()),
+            ..Default::default()
+        });
+        effective.set_project(None, ConfigValueSource::CommandLine);
+
+        assert_eq!(effective.project(), None);
+        assert_eq!(
+            effective
+                .provenance(ConfigField::Project)
+                .map(FieldProvenance::winner),
+            Some(&ConfigValueSource::CommandLine)
+        );
+    }
+
+    #[test]
+    fn command_line_task_clear_overrides_environment_with_provenance() {
+        let mut effective = EffectiveConfig::from_defaults(Config::default());
+        effective.set_task(
+            Some("environment-task".to_string()),
+            ConfigValueSource::Environment {
+                variable: "TROP_TASK",
+            },
+        );
+        effective.set_task(None, ConfigValueSource::CommandLine);
+
+        assert_eq!(effective.task(), None);
+        assert_eq!(
+            effective
+                .provenance(ConfigField::Task)
+                .map(FieldProvenance::winner),
+            Some(&ConfigValueSource::CommandLine)
+        );
     }
 }
