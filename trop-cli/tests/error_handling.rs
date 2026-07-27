@@ -287,9 +287,13 @@ fn every_database_mutating_command_uses_the_timeout_exit_contract() {
     let missing = env.create_dir("prune");
     env.reserve_simple(&missing);
     fs::remove_dir(&missing).unwrap();
-    assert_locked_database_command(&env, "deleting a reservation", |command| {
-        command.arg("prune");
-    });
+    assert_locked_database_command(
+        &env,
+        "starting an immediate database transaction",
+        |command| {
+            command.arg("prune");
+        },
+    );
 
     let env = TestEnv::new();
     let expired = env.create_dir("expire");
@@ -298,17 +302,25 @@ fn every_database_mutating_command_uses_the_timeout_exit_contract() {
         .unwrap()
         .execute("UPDATE reservations SET last_used_at = 0", [])
         .unwrap();
-    assert_locked_database_command(&env, "deleting a reservation", |command| {
-        command.arg("expire").arg("--days").arg("1");
-    });
+    assert_locked_database_command(
+        &env,
+        "starting an immediate database transaction",
+        |command| {
+            command.arg("expire").arg("--days").arg("1");
+        },
+    );
 
     let env = TestEnv::new();
     let missing = env.create_dir("autoclean");
     env.reserve_simple(&missing);
     fs::remove_dir(&missing).unwrap();
-    assert_locked_database_command(&env, "deleting a reservation", |command| {
-        command.arg("autoclean").arg("--days").arg("1");
-    });
+    assert_locked_database_command(
+        &env,
+        "starting an immediate database transaction",
+        |command| {
+            command.arg("autoclean").arg("--days").arg("1");
+        },
+    );
 
     let env = TestEnv::new();
     let source = env.create_dir("source");

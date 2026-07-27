@@ -10,7 +10,9 @@
 
 use assert_cmd::cargo::cargo_bin;
 use std::collections::HashSet;
+use std::fs;
 use std::process::Command;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -448,4 +450,241 @@ reservations:\n  base: 7000\n  services:\n"
         // Group reservation failed - that's OK for this test which is about isolation
         eprintln!("Group reservation command failed, skipping count assertion");
     }
+}
+
+/// Races both cleanup entry points with individual and group reservation
+/// writers in separate processes.
+///
+/// Every command must serialize successfully, cleanup must remove only the
+/// deliberately stale rows, and all reservation writes for existing paths
+/// must remain complete with globally unique ports.
+#[test]
+fn test_cleanup_serializes_with_reserve_and_group_processes() {
+    for _ in 0..3 {
+        run_cleanup_reserve_group_race();
+    }
+}
+
+fn run_cleanup_reserve_group_race() {
+    const CLEANUP_PROCESSES: usize = 4;
+    const RESERVE_PROCESSES: usize = 6;
+    const GROUP_PROCESSES: usize = 3;
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_dir = temp_dir.path().join("data");
+    let init = trop_cmd()
+        .args([
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "init",
+            "--with-config",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "database initialization failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    for index in 0..8 {
+        let output = trop_cmd()
+            .args([
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "reserve",
+                "--path",
+                &format!("/cleanup-load/stale-{index}"),
+                "--allow-unrelated-path",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stale fixture reservation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let reservation_paths = (0..RESERVE_PROCESSES)
+        .map(|index| {
+            let path = temp_dir.path().join(format!("individual-{index}"));
+            fs::create_dir(&path).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+
+    let group_fixtures = (0..GROUP_PROCESSES)
+        .map(|index| {
+            let group_path = temp_dir.path().join(format!("group-{index}"));
+            fs::create_dir(&group_path).unwrap();
+            let config_path = group_path.join("trop.yaml");
+            let base_port = 12000 + index * 10;
+            fs::write(
+                &config_path,
+                format!(
+                    r#"project: cleanup-race-{index}
+ports:
+  min: 10000
+  max: 20000
+occupancy_check:
+  skip: true
+reservations:
+  base: {base_port}
+  services:
+    web:
+      offset: 0
+      env: WEB_PORT
+    api:
+      offset: 1
+      env: API_PORT
+"#
+                ),
+            )
+            .unwrap();
+            (group_path.canonicalize().unwrap(), config_path)
+        })
+        .collect::<Vec<_>>();
+
+    let start = Arc::new(Barrier::new(
+        CLEANUP_PROCESSES + RESERVE_PROCESSES + GROUP_PROCESSES + 1,
+    ));
+    let mut handles = Vec::new();
+
+    for index in 0..CLEANUP_PROCESSES {
+        let start = Arc::clone(&start);
+        let data_dir = data_dir.clone();
+        handles.push(thread::spawn(move || {
+            start.wait();
+            let command = if index % 2 == 0 { "prune" } else { "autoclean" };
+            let output = trop_cmd()
+                .args(["--data-dir", data_dir.to_str().unwrap(), command])
+                .output()
+                .unwrap();
+            (format!("{command}-{index}"), output)
+        }));
+    }
+
+    for (index, path) in reservation_paths.iter().cloned().enumerate() {
+        let start = Arc::clone(&start);
+        let data_dir = data_dir.clone();
+        handles.push(thread::spawn(move || {
+            start.wait();
+            let output = trop_cmd()
+                .args([
+                    "--data-dir",
+                    data_dir.to_str().unwrap(),
+                    "reserve",
+                    "--path",
+                    path.to_str().unwrap(),
+                    "--allow-unrelated-path",
+                ])
+                .output()
+                .unwrap();
+            (format!("reserve-{index}"), output)
+        }));
+    }
+
+    for (index, (_, config_path)) in group_fixtures.iter().cloned().enumerate() {
+        let start = Arc::clone(&start);
+        let data_dir = data_dir.clone();
+        handles.push(thread::spawn(move || {
+            start.wait();
+            let output = trop_cmd()
+                .args([
+                    "--data-dir",
+                    data_dir.to_str().unwrap(),
+                    "reserve-group",
+                    config_path.to_str().unwrap(),
+                    "--allow-unrelated-path",
+                ])
+                .output()
+                .unwrap();
+            (format!("reserve-group-{index}"), output)
+        }));
+    }
+
+    start.wait();
+    for handle in handles {
+        let (operation, output) = handle.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{operation} failed under cleanup contention:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let list = trop_cmd()
+        .args([
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "list",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "final list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_slice(&list.stdout).expect("final list output was not JSON");
+    let rows = rows.as_array().expect("final list output was not an array");
+
+    for path in &reservation_paths {
+        assert!(
+            rows.iter().any(|row| row["path"].as_str() == path.to_str()),
+            "individual reservation disappeared during cleanup: {}",
+            path.display()
+        );
+    }
+    for (path, _) in &group_fixtures {
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["path"].as_str() == path.to_str())
+                .count(),
+            2,
+            "group reservation was incomplete after cleanup contention: {}",
+            path.display()
+        );
+    }
+    assert!(
+        rows.iter().all(|row| {
+            !row["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("/cleanup-load/stale-"))
+        }),
+        "cleanup left a deliberately stale fixture behind"
+    );
+
+    let ports = rows
+        .iter()
+        .map(|row| {
+            row["port"]
+                .as_u64()
+                .expect("reservation port was not numeric")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ports.len(),
+        ports.iter().collect::<HashSet<_>>().len(),
+        "cleanup contention produced duplicate reserved ports"
+    );
+
+    let validation = trop_cmd()
+        .args([
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "assert-data-dir",
+            "--validate",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        validation.status.success(),
+        "database validation failed after cleanup contention: {}",
+        String::from_utf8_lossy(&validation.stderr)
+    );
 }

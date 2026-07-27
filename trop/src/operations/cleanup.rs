@@ -8,9 +8,10 @@
 //!
 //! ## Transactional Semantics
 //!
-//! Cleanup operations process reservations one-by-one. Each individual deletion is atomic
-//! (committed immediately), but the batch operation as a whole is not transactional. If an
-//! error occurs midway through a cleanup, earlier deletions will have been committed.
+//! Each cleanup invocation reads, evaluates, revalidates, and deletes its
+//! candidates inside one `IMMEDIATE` transaction. A live invocation commits
+//! every selected deletion together or rolls them all back. Dry-run uses the
+//! same transaction-scoped selection path and commits no database changes.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -110,8 +111,16 @@ enum ProbedPath {
 /// Pruning removes reservations for paths that no longer exist on the filesystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PruneResult {
+    /// Number of reservations evaluated by this invocation.
+    pub considered_count: usize,
+    /// Number of evaluated reservations preserved.
+    pub preserved_count: usize,
     /// Number of reservations removed (or would be removed in dry-run mode).
     pub removed_count: usize,
+    /// Reservations evaluated by this invocation.
+    pub considered_reservations: Vec<Reservation>,
+    /// Evaluated reservations that were preserved.
+    pub preserved_reservations: Vec<Reservation>,
     /// Reservations that were (or would be) removed.
     pub removed_reservations: Vec<Reservation>,
     /// One captured filesystem decision for every distinct reserved path.
@@ -123,8 +132,16 @@ pub struct PruneResult {
 /// Expiring removes reservations that haven't been used within a configured time threshold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpireResult {
+    /// Number of reservations evaluated by this invocation.
+    pub considered_count: usize,
+    /// Number of evaluated reservations preserved.
+    pub preserved_count: usize,
     /// Number of reservations removed (or would be removed in dry-run mode).
     pub removed_count: usize,
+    /// Reservations evaluated by this invocation.
+    pub considered_reservations: Vec<Reservation>,
+    /// Evaluated reservations that were preserved.
+    pub preserved_reservations: Vec<Reservation>,
     /// Reservations that were (or would be) removed.
     pub removed_reservations: Vec<Reservation>,
 }
@@ -134,15 +151,25 @@ pub struct ExpireResult {
 /// Autoclean combines both pruning and expiring in a single operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutocleanResult {
+    /// Number of reservations evaluated once by the combined invocation.
+    pub considered_count: usize,
+    /// Number of evaluated reservations preserved.
+    pub preserved_count: usize,
     /// Number of reservations pruned.
     pub pruned_count: usize,
     /// Number of reservations expired.
     pub expired_count: usize,
     /// Total number of reservations removed.
     pub total_removed: usize,
+    /// Reservations evaluated once by the combined invocation.
+    pub considered_reservations: Vec<Reservation>,
+    /// Evaluated reservations that were preserved.
+    pub preserved_reservations: Vec<Reservation>,
+    /// One deduplicated set of reservations removed (or selected in dry-run mode).
+    pub removed_reservations: Vec<Reservation>,
     /// Reservations that were pruned.
     pub pruned_reservations: Vec<Reservation>,
-    /// Reservations that were expired.
+    /// Reservations that were expired and were not already selected by prune.
     pub expired_reservations: Vec<Reservation>,
     /// Filesystem decisions captured by the prune portion of the operation.
     pub prune_path_decisions: Vec<PrunePathDecision>,
@@ -153,6 +180,31 @@ pub struct AutocleanResult {
 /// All operations are static methods that work on a database instance.
 /// Operations are transactional - they either complete fully or are rolled back.
 pub struct CleanupOperations;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupReason {
+    Prune,
+    Expire,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedRemoval {
+    reservation: Reservation,
+    reason: CleanupReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CleanupSelection {
+    prune: bool,
+    max_age: Option<Duration>,
+}
+
+struct CleanupExecution {
+    considered_reservations: Vec<Reservation>,
+    preserved_reservations: Vec<Reservation>,
+    removed: Vec<PlannedRemoval>,
+    path_decisions: Vec<PrunePathDecision>,
+}
 
 impl CleanupOperations {
     /// Remove reservations for paths that no longer exist on the filesystem.
@@ -197,41 +249,32 @@ impl CleanupOperations {
     where
         F: Fn(&Path) -> io::Result<ProbedPath>,
     {
-        let all_reservations = Database::list_all_reservations(db.connection())?;
-
-        // Probe each distinct path once so all tags for that path receive the
-        // same decision and reporting never performs a TOCTOU-sensitive recheck.
-        let mut statuses = BTreeMap::new();
-        for reservation in &all_reservations {
-            let path = &reservation.key().path;
-            statuses
-                .entry(path.clone())
-                .or_insert_with(|| Self::classify_path(path, &probe));
-        }
-
-        let to_remove = all_reservations
+        let timeout = db.busy_timeout();
+        let execution = Self::execute_cleanup(
+            db,
+            CleanupSelection {
+                prune: true,
+                max_age: None,
+            },
+            dry_run,
+            probe,
+            || {},
+        )
+        .map_err(|error| error.classify_sqlite_lock(timeout, "pruning reservations"))?;
+        let removed_reservations = execution
+            .removed
             .into_iter()
-            .filter(|reservation| {
-                statuses
-                    .get(&reservation.key().path)
-                    .is_some_and(PrunePathStatus::is_prunable)
-            })
+            .map(|removal| removal.reservation)
             .collect::<Vec<_>>();
-        let removed_count = to_remove.len();
-
-        if !dry_run {
-            for reservation in &to_remove {
-                db.delete_reservation(reservation.key())?;
-            }
-        }
 
         Ok(PruneResult {
-            removed_count,
-            removed_reservations: to_remove,
-            path_decisions: statuses
-                .into_iter()
-                .map(|(path, status)| PrunePathDecision { path, status })
-                .collect(),
+            considered_count: execution.considered_reservations.len(),
+            preserved_count: execution.preserved_reservations.len(),
+            removed_count: removed_reservations.len(),
+            considered_reservations: execution.considered_reservations,
+            preserved_reservations: execution.preserved_reservations,
+            removed_reservations,
+            path_decisions: execution.path_decisions,
         })
     }
 
@@ -277,32 +320,57 @@ impl CleanupOperations {
         config: &CleanupConfig,
         dry_run: bool,
     ) -> Result<ExpireResult> {
+        Self::expire_with_candidate_barrier(db, config, dry_run, || {})
+    }
+
+    fn expire_with_candidate_barrier<F>(
+        db: &mut Database,
+        config: &CleanupConfig,
+        dry_run: bool,
+        after_candidate_discovery: F,
+    ) -> Result<ExpireResult>
+    where
+        F: FnOnce(),
+    {
         // If no expiration configured, return empty result
         let Some(expire_after_days) = config.expire_after_days else {
             return Ok(ExpireResult {
+                considered_count: 0,
+                preserved_count: 0,
                 removed_count: 0,
+                considered_reservations: Vec::new(),
+                preserved_reservations: Vec::new(),
                 removed_reservations: Vec::new(),
             });
         };
 
-        // Calculate the max age duration
         #[allow(clippy::cast_lossless)]
         let max_age = Duration::from_secs(expire_after_days as u64 * SECONDS_PER_DAY);
-
-        // Find expired reservations
-        let to_remove = Database::find_expired_reservations(db.connection(), max_age)?;
-        let removed_count = to_remove.len();
-
-        // If not dry-run, actually delete the reservations
-        if !dry_run {
-            for reservation in &to_remove {
-                db.delete_reservation(reservation.key())?;
-            }
-        }
+        let timeout = db.busy_timeout();
+        let execution = Self::execute_cleanup(
+            db,
+            CleanupSelection {
+                prune: false,
+                max_age: Some(max_age),
+            },
+            dry_run,
+            Self::probe_path,
+            after_candidate_discovery,
+        )
+        .map_err(|error| error.classify_sqlite_lock(timeout, "expiring reservations"))?;
+        let removed_reservations = execution
+            .removed
+            .into_iter()
+            .map(|removal| removal.reservation)
+            .collect::<Vec<_>>();
 
         Ok(ExpireResult {
-            removed_count,
-            removed_reservations: to_remove,
+            considered_count: execution.considered_reservations.len(),
+            preserved_count: execution.preserved_reservations.len(),
+            removed_count: removed_reservations.len(),
+            considered_reservations: execution.considered_reservations,
+            preserved_reservations: execution.preserved_reservations,
+            removed_reservations,
         })
     }
 
@@ -349,20 +417,192 @@ impl CleanupOperations {
         config: &CleanupConfig,
         dry_run: bool,
     ) -> Result<AutocleanResult> {
-        // Run prune first
-        let prune_result = Self::prune(db, dry_run)?;
+        #[allow(clippy::cast_lossless)]
+        let max_age = config
+            .expire_after_days
+            .map(|days| Duration::from_secs(days as u64 * SECONDS_PER_DAY));
+        let timeout = db.busy_timeout();
+        let execution = Self::execute_cleanup(
+            db,
+            CleanupSelection {
+                prune: true,
+                max_age,
+            },
+            dry_run,
+            Self::probe_path,
+            || {},
+        )
+        .map_err(|error| {
+            error.classify_sqlite_lock(timeout, "automatically cleaning reservations")
+        })?;
 
-        // Then run expire
-        let expire_result = Self::expire(db, config, dry_run)?;
+        let mut pruned_reservations = Vec::new();
+        let mut expired_reservations = Vec::new();
+        let mut removed_reservations = Vec::with_capacity(execution.removed.len());
+        for removal in execution.removed {
+            match removal.reason {
+                CleanupReason::Prune => pruned_reservations.push(removal.reservation.clone()),
+                CleanupReason::Expire => expired_reservations.push(removal.reservation.clone()),
+            }
+            removed_reservations.push(removal.reservation);
+        }
 
         Ok(AutocleanResult {
-            pruned_count: prune_result.removed_count,
-            expired_count: expire_result.removed_count,
-            total_removed: prune_result.removed_count + expire_result.removed_count,
-            pruned_reservations: prune_result.removed_reservations,
-            expired_reservations: expire_result.removed_reservations,
-            prune_path_decisions: prune_result.path_decisions,
+            considered_count: execution.considered_reservations.len(),
+            preserved_count: execution.preserved_reservations.len(),
+            pruned_count: pruned_reservations.len(),
+            expired_count: expired_reservations.len(),
+            total_removed: removed_reservations.len(),
+            considered_reservations: execution.considered_reservations,
+            preserved_reservations: execution.preserved_reservations,
+            removed_reservations,
+            pruned_reservations,
+            expired_reservations,
+            prune_path_decisions: execution.path_decisions,
         })
+    }
+
+    fn execute_cleanup<F, B>(
+        db: &mut Database,
+        selection: CleanupSelection,
+        dry_run: bool,
+        probe: F,
+        after_candidate_discovery: B,
+    ) -> Result<CleanupExecution>
+    where
+        F: Fn(&Path) -> io::Result<ProbedPath>,
+        B: FnOnce(),
+    {
+        // Acquire the writer slot before reading candidates. This gives the
+        // entire invocation one linearization point relative to reserve,
+        // reserve-group, and other cleanup writers.
+        let transaction = db.begin_transaction()?;
+        let evaluated_at = Self::captured_evaluation_time();
+        let considered_reservations = Database::list_all_reservations(&transaction)?;
+
+        // Probe each distinct path once inside the transaction so all tags for
+        // that path share one observation. The selected reservation snapshot
+        // below pairs that observation with the row version it justified.
+        let mut statuses = BTreeMap::new();
+        if selection.prune {
+            for reservation in &considered_reservations {
+                let path = &reservation.key().path;
+                statuses
+                    .entry(path.clone())
+                    .or_insert_with(|| Self::classify_path(path, &probe));
+            }
+        }
+
+        let mut preserved_reservations = Vec::new();
+        let mut planned_removals = Vec::new();
+        for reservation in &considered_reservations {
+            let prunable = selection.prune
+                && statuses
+                    .get(&reservation.key().path)
+                    .is_some_and(PrunePathStatus::is_prunable);
+            let expired = selection
+                .max_age
+                .is_some_and(|max_age| Self::is_expired_at(reservation, evaluated_at, max_age));
+
+            // Prune takes reporting precedence when both predicates match.
+            // This makes the combined candidate/result set disjoint while
+            // preserving the historical live autoclean ordering.
+            let reason = if prunable {
+                Some(CleanupReason::Prune)
+            } else if expired {
+                Some(CleanupReason::Expire)
+            } else {
+                None
+            };
+
+            if let Some(reason) = reason {
+                planned_removals.push(PlannedRemoval {
+                    reservation: reservation.clone(),
+                    reason,
+                });
+            } else {
+                preserved_reservations.push(reservation.clone());
+            }
+        }
+
+        after_candidate_discovery();
+
+        let removed = if dry_run {
+            planned_removals
+        } else {
+            let mut removed = Vec::with_capacity(planned_removals.len());
+            for planned in planned_removals {
+                let current = Database::get_reservation(&transaction, planned.reservation.key())?;
+                let Some(current) = current else {
+                    // A database trigger may have removed another selected row
+                    // as part of an earlier guarded delete in this transaction.
+                    // It is still an invocation removal and must be reported.
+                    removed.push(planned);
+                    continue;
+                };
+
+                let still_eligible = match planned.reason {
+                    CleanupReason::Prune => statuses
+                        .get(&current.key().path)
+                        .is_some_and(PrunePathStatus::is_prunable),
+                    CleanupReason::Expire => selection.max_age.is_some_and(|max_age| {
+                        Self::is_expired_at(&current, evaluated_at, max_age)
+                    }),
+                };
+
+                // Revalidate the mutable predicate and the complete persisted
+                // row snapshot immediately before the guarded DELETE. A
+                // changed row is preserved rather than applying stale evidence.
+                if current != planned.reservation || !still_eligible {
+                    preserved_reservations.push(current);
+                    continue;
+                }
+
+                if Database::delete_reservation_if_unchanged(&transaction, &current)? {
+                    removed.push(planned);
+                } else if let Some(current) =
+                    Database::get_reservation(&transaction, planned.reservation.key())?
+                {
+                    preserved_reservations.push(current);
+                } else {
+                    removed.push(planned);
+                }
+            }
+            removed
+        };
+
+        transaction.commit()?;
+
+        Ok(CleanupExecution {
+            considered_reservations,
+            preserved_reservations,
+            removed,
+            path_decisions: statuses
+                .into_iter()
+                .map(|(path, status)| PrunePathDecision { path, status })
+                .collect(),
+        })
+    }
+
+    fn is_expired_at(
+        reservation: &Reservation,
+        evaluated_at: std::time::SystemTime,
+        max_age: Duration,
+    ) -> bool {
+        evaluated_at
+            .duration_since(reservation.last_used_at())
+            .is_ok_and(|age| age > max_age)
+    }
+
+    fn captured_evaluation_time() -> std::time::SystemTime {
+        let now = std::time::SystemTime::now();
+        now.duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| {
+                std::time::SystemTime::UNIX_EPOCH
+                    .checked_add(Duration::from_secs(elapsed.as_secs()))
+            })
+            .unwrap_or(now)
     }
 
     fn probe_path(path: &Path) -> io::Result<ProbedPath> {
@@ -537,11 +777,17 @@ fn windows_error_code(error: &io::Error) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ConfigBuilder;
     use crate::database::test_util::create_test_database;
+    use crate::database::DatabaseConfig;
+    use crate::operations::{PlanExecutor, ReserveOptions, ReservePlan};
     use crate::reservation::ReservationKey;
     use crate::{Port, Reservation};
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::SystemTime;
+    use tempfile::tempdir;
 
     #[test]
     fn test_prune_no_reservations() {
@@ -637,6 +883,37 @@ mod tests {
         // Only the existing path should remain
         let all = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_prune_result_partitions_considered_preserved_and_removed_rows() {
+        let mut db = create_test_database();
+        let existing_path = std::env::current_dir().unwrap();
+        let existing = Reservation::builder(
+            ReservationKey::new(existing_path, None).unwrap(),
+            Port::try_from(5000).unwrap(),
+        )
+        .build()
+        .unwrap();
+        let missing = Reservation::builder(
+            ReservationKey::new(PathBuf::from("/missing-cleanup-result"), None).unwrap(),
+            Port::try_from(5001).unwrap(),
+        )
+        .build()
+        .unwrap();
+        db.create_reservation(&existing).unwrap();
+        db.create_reservation(&missing).unwrap();
+
+        let result = CleanupOperations::prune(&mut db, true).unwrap();
+
+        assert_eq!(result.considered_count, 2);
+        assert_eq!(result.preserved_count, 1);
+        assert_eq!(result.removed_count, 1);
+        assert_eq!(result.considered_reservations.len(), 2);
+        assert_eq!(result.preserved_reservations.len(), 1);
+        assert_eq!(result.preserved_reservations[0].key(), existing.key());
+        assert_eq!(result.removed_reservations.len(), 1);
+        assert_eq!(result.removed_reservations[0].key(), missing.key());
     }
 
     #[test]
@@ -1349,5 +1626,149 @@ mod tests {
 
         let remaining = Database::list_all_reservations(db.connection()).unwrap();
         assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn test_cleanup_delete_failure_rolls_back_every_candidate() {
+        let mut db = create_test_database();
+
+        for (index, path) in [
+            "/cleanup-failure/a",
+            "/cleanup-failure/b",
+            "/cleanup-failure/c",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = ReservationKey::new(PathBuf::from(path), None).unwrap();
+            let port = Port::try_from(5100 + u16::try_from(index).unwrap()).unwrap();
+            db.create_reservation(&Reservation::builder(key, port).build().unwrap())
+                .unwrap();
+        }
+
+        db.connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_second_cleanup_delete
+                 BEFORE DELETE ON reservations
+                 WHEN OLD.path = '/cleanup-failure/b'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected cleanup delete failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error =
+            CleanupOperations::prune_with_probe(&mut db, false, |_| Ok(ProbedPath::NonDirectory))
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected cleanup delete failure"),
+            "unexpected cleanup error: {error}"
+        );
+
+        let remaining = Database::list_all_reservations(db.connection()).unwrap();
+        assert_eq!(
+            remaining.len(),
+            3,
+            "a failed cleanup invocation must not commit earlier deletions"
+        );
+    }
+
+    #[test]
+    fn test_autoclean_deduplicates_overlap_and_matches_live_selection() {
+        let mut db = create_test_database();
+        let old_time = SystemTime::now() - Duration::from_secs(10 * SECONDS_PER_DAY);
+        let key = ReservationKey::new(PathBuf::from("/missing-and-expired"), None).unwrap();
+        let reservation = Reservation::builder(key, Port::try_from(5200).unwrap())
+            .last_used_at(old_time)
+            .build()
+            .unwrap();
+        db.create_reservation(&reservation).unwrap();
+
+        let config = CleanupConfig {
+            expire_after_days: Some(7),
+        };
+        let preview = CleanupOperations::autoclean(&mut db, &config, true).unwrap();
+        let live = CleanupOperations::autoclean(&mut db, &config, false).unwrap();
+
+        assert_eq!(preview.total_removed, 1);
+        assert_eq!(preview.pruned_count, 1);
+        assert_eq!(preview.expired_count, 0);
+        assert_eq!(preview.total_removed, live.total_removed);
+        assert_eq!(preview.removed_reservations.len(), 1);
+        assert_eq!(preview.removed_reservations, live.removed_reservations);
+        assert_eq!(preview.pruned_reservations, live.pruned_reservations);
+        assert_eq!(preview.expired_reservations, live.expired_reservations);
+    }
+
+    #[test]
+    fn test_expire_serializes_replacement_after_candidate_discovery() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("cleanup-race.db");
+        let database_config =
+            DatabaseConfig::new(&database_path).with_busy_timeout(Duration::from_secs(2));
+        let mut cleanup_db = Database::open(database_config.clone()).unwrap();
+        let mut replacement_db = Database::open(database_config).unwrap();
+
+        let key = ReservationKey::new(PathBuf::from("/expire-race"), None).unwrap();
+        let old_reservation = Reservation::builder(key.clone(), Port::try_from(5300).unwrap())
+            .last_used_at(SystemTime::now() - Duration::from_secs(10 * SECONDS_PER_DAY))
+            .build()
+            .unwrap();
+        cleanup_db.create_reservation(&old_reservation).unwrap();
+
+        let reserve_config = ConfigBuilder::new().build().unwrap();
+        let replacement_key = key.clone();
+        let (start_sender, start_receiver) = mpsc::sync_channel(0);
+        let (attempt_sender, attempt_receiver) = mpsc::sync_channel(0);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let replacement_thread = thread::spawn(move || {
+            start_receiver.recv().unwrap();
+            attempt_sender.send(()).unwrap();
+            let result = (|| -> Result<()> {
+                let transaction = replacement_db.begin_transaction()?;
+                let options =
+                    ReserveOptions::new(replacement_key, Some(Port::try_from(5300).unwrap()))
+                        .with_allow_unrelated_path(true)
+                        .with_ignore_occupied(true);
+                let plan = ReservePlan::new(options, &reserve_config).build_plan(&transaction)?;
+                PlanExecutor::new(&transaction).execute(&plan)?;
+                transaction.commit()?;
+                Ok(())
+            })();
+            let _ = done_sender.send(());
+            result
+        });
+
+        let config = CleanupConfig {
+            expire_after_days: Some(7),
+        };
+        CleanupOperations::expire_with_candidate_barrier(
+            &mut cleanup_db,
+            &config,
+            false,
+            move || {
+                start_sender.send(()).unwrap();
+                attempt_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("replacement connection did not start");
+                let _ = done_receiver.recv_timeout(Duration::from_millis(100));
+            },
+        )
+        .unwrap();
+        replacement_thread.join().unwrap().unwrap();
+
+        let surviving_replacement = Database::get_reservation(cleanup_db.connection(), &key)
+            .unwrap()
+            .expect("a replacement racing stale cleanup evidence must survive");
+        assert_eq!(surviving_replacement.port(), Port::try_from(5300).unwrap());
+        assert!(
+            surviving_replacement
+                .last_used_at()
+                .elapsed()
+                .is_ok_and(|age| age < Duration::from_secs(5)),
+            "the surviving row must be the fresh replacement"
+        );
     }
 }

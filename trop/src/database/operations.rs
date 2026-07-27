@@ -299,6 +299,17 @@ const UPDATE_METADATA_AND_LAST_USED: &str = r"
     WHERE path = ? AND tag = ?
 ";
 
+const DELETE_RESERVATION_IF_UNCHANGED: &str = r"
+    DELETE FROM reservations
+    WHERE path = ?
+      AND tag = ?
+      AND port = ?
+      AND project IS ?
+      AND task IS ?
+      AND created_at = ?
+      AND last_used_at = ?
+";
+
 const LIST_RESERVATIONS: &str = r"
     SELECT path, tag, port, project, task, created_at, last_used_at
     FROM reservations
@@ -667,6 +678,33 @@ impl Database {
         let rows_affected = conn.execute(
             DELETE_RESERVATION,
             params![key.path_as_string(), encode_tag(key.tag.as_deref())],
+        )?;
+        Ok(rows_affected > 0)
+    }
+
+    /// Deletes a reservation only if every persisted field still matches the
+    /// supplied snapshot.
+    ///
+    /// Cleanup uses this guard inside its owning transaction so a filesystem
+    /// decision or expiration predicate can never be applied to a refreshed
+    /// or replaced row with the same key.
+    pub(crate) fn delete_reservation_if_unchanged(
+        conn: &Connection,
+        reservation: &Reservation,
+    ) -> Result<bool> {
+        let created_at = systemtime_to_unix_secs(reservation.created_at())?;
+        let last_used_at = systemtime_to_unix_secs(reservation.last_used_at())?;
+        let rows_affected = conn.execute(
+            DELETE_RESERVATION_IF_UNCHANGED,
+            params![
+                reservation.key().path_as_string(),
+                encode_tag(reservation.key().tag.as_deref()),
+                reservation.port().value(),
+                reservation.project(),
+                reservation.task(),
+                created_at,
+                last_used_at,
+            ],
         )?;
         Ok(rows_affected > 0)
     }
@@ -1200,6 +1238,35 @@ mod tests {
 
         let deleted = db.delete_reservation(&key).unwrap();
         assert!(!deleted);
+    }
+
+    #[test]
+    fn test_delete_reservation_if_unchanged_preserves_refreshed_row() {
+        let mut db = create_test_database();
+        let reservation = create_test_reservation("/test/refreshed", 5000);
+        db.create_reservation(&reservation).unwrap();
+        let snapshot = Database::get_reservation(db.connection(), reservation.key())
+            .unwrap()
+            .unwrap();
+
+        let transaction = db.begin_transaction().unwrap();
+        transaction
+            .execute(
+                "UPDATE reservations
+                 SET last_used_at = last_used_at + 1
+                 WHERE path = ? AND tag = ?",
+                params![
+                    snapshot.key().path_as_string(),
+                    encode_tag(snapshot.key().tag.as_deref())
+                ],
+            )
+            .unwrap();
+
+        assert!(!Database::delete_reservation_if_unchanged(&transaction, &snapshot).unwrap());
+        assert!(Database::get_reservation(&transaction, snapshot.key())
+            .unwrap()
+            .is_some());
+        transaction.commit().unwrap();
     }
 
     #[test]

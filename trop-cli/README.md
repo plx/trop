@@ -350,6 +350,12 @@ unsupported operations, and unknown inspection errors keep the reservation and
 emit an actionable warning; `--quiet` suppresses the warning without reporting
 the preserved path as removed.
 
+Each `prune`, `expire`, or `autoclean` invocation selects, revalidates, and
+removes reservations in one atomic database transaction. A failure leaves
+every candidate untouched. `autoclean` reports a reservation that matches both
+prune and expiration only once, and `--dry-run` uses the same deduplicated
+selection as a live invocation against the same snapshot.
+
 ### Configuration
 
 - `trop init` - Initialize data directory and config
