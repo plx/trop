@@ -136,10 +136,15 @@ fn test_toctou_port_availability() {
     if !failures.is_empty() {
         for result in failures {
             let stderr = String::from_utf8_lossy(&result.stderr);
-            // Should fail with clear error message about port exhaustion
+            // Exhaustion is the usual outcome. On Windows, racing exclusive
+            // bind probes can instead report WSAEACCES; the occupancy contract
+            // requires that uncertain result to fail closed with its
+            // actionable probe diagnostic.
             assert!(
                 stderr.contains("No available ports")
                     || stderr.contains("exhausted")
+                    || (stderr.contains("possibly occupied")
+                        && stderr.contains("occupancy probe failed"))
                     || stderr.is_empty(),
                 "Failure should have clear error message, got: {stderr}"
             );
