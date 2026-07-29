@@ -156,7 +156,11 @@ trop release --untagged-only
 
 `--tag` and `--untagged-only` are mutually exclusive. A selector with no match
 succeeds as an idempotent no-op, and either selector can be combined with
-`--recursive` to select matching descendant rows.
+`--recursive` to select matching descendant rows. Recursive selection follows
+path components, so `/work/a` never selects `/work/ab`. Enumeration and all
+deletions run in one immediate transaction, making the release all-or-none and
+serializing concurrent writers before or after it. `--dry-run` uses the same
+transaction-scoped plan without committing it.
 
 The target path must be the current directory, an ancestor, or a descendant.
 Use `--allow-unrelated-path` to bypass only that relationship check, or

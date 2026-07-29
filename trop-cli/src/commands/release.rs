@@ -7,7 +7,10 @@ use crate::error::CliError;
 use crate::invocation::InvocationContext;
 use clap::Args;
 use std::path::PathBuf;
-use trop::{Database, PlanExecutor, ReleaseOptions, ReleasePlan, ReservationKey};
+use trop::{
+    Database, ExecutionResult, OperationPlan, PlanExecutor, ReleaseOptions, ReleasePlan,
+    ReservationKey,
+};
 
 /// Release a port reservation.
 #[derive(Args)]
@@ -41,6 +44,51 @@ pub struct ReleaseCommand {
     pub dry_run: bool,
 }
 
+struct ReleaseExecution {
+    plan: OperationPlan,
+    result: Option<ExecutionResult>,
+}
+
+fn run_release(
+    db: &mut Database,
+    planner: &ReleasePlan,
+    dry_run: bool,
+) -> Result<ReleaseExecution, CliError> {
+    run_release_with_plan_barrier(db, planner, dry_run, || {})
+}
+
+fn run_release_with_plan_barrier<B>(
+    db: &mut Database,
+    planner: &ReleasePlan,
+    dry_run: bool,
+    after_plan: B,
+) -> Result<ReleaseExecution, CliError>
+where
+    B: FnOnce(),
+{
+    // The immediate transaction owns enumeration, planning, and every delete.
+    // Dropping it after a dry-run rolls back without ever exposing a different
+    // selection path from live execution.
+    let tx = db.begin_transaction().map_err(CliError::from)?;
+    let plan = planner.build_plan(&tx).map_err(CliError::from)?;
+    after_plan();
+
+    if dry_run {
+        return Ok(ReleaseExecution { plan, result: None });
+    }
+
+    let mut executor = PlanExecutor::new(&tx);
+    let result = executor.execute(&plan).map_err(CliError::from)?;
+    tx.commit()
+        .map_err(trop::Error::from)
+        .map_err(CliError::from)?;
+
+    Ok(ReleaseExecution {
+        plan,
+        result: Some(result),
+    })
+}
+
 impl ReleaseCommand {
     /// Execute the release command.
     pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
@@ -58,141 +106,177 @@ impl ReleaseCommand {
         // 3. Consume the path permission from the shared effective configuration.
         let allow_unrelated_path = context.effective()?.allow_unrelated_path();
 
-        // 4. Open the database from the shared effective configuration.
+        // 4. Build one selector with the exact tag semantics shared by exact
+        // and recursive release.
+        let all_tags = self.tag.is_none() && !self.untagged_only;
+        let tag = if self.untagged_only { None } else { self.tag };
+        let key = ReservationKey::new(path, tag)
+            .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+        let options = ReleaseOptions::new(key)
+            .with_force(self.force)
+            .with_allow_unrelated_path(allow_unrelated_path);
+        let planner = ReleasePlan::new(options)
+            .with_all_exact_path_tags(all_tags)
+            .with_recursive(self.recursive);
+
+        // 5. Open the database and run the complete selection plus deletion
+        // workflow under one immediate transaction.
         let mut db = context.open_database()?;
+        let execution = run_release(&mut db, &planner, self.dry_run)?;
 
-        // 5. Handle recursive release or single release
-        if self.recursive {
-            if !self.force && !allow_unrelated_path {
-                Database::validate_path_relationship(&path, false).map_err(CliError::from)?;
-            }
-
-            // For recursive release, we need to find all reservations under this path
-            // and release them one by one
-            let all_reservations =
-                Database::list_all_reservations(db.connection()).map_err(CliError::from)?;
-
-            let mut released_count = 0;
-            let mut plans = Vec::new();
-
-            for reservation in all_reservations {
-                // Check if this reservation is under the target path
-                if !reservation.key().path.starts_with(&path) {
-                    continue;
-                }
-
-                // Apply tag filter
-                if self.untagged_only && reservation.key().tag.is_some() {
-                    continue;
-                }
-
-                if let Some(ref tag) = self.tag {
-                    if reservation.key().tag.as_deref() != Some(tag.as_str()) {
-                        continue;
+        if self.dry_run {
+            if !global.quiet {
+                if self.recursive {
+                    eprintln!(
+                        "Dry run - would release {} reservation(s):",
+                        execution.plan.actions.len()
+                    );
+                    for action in &execution.plan.actions {
+                        eprintln!("  - {}", action.description());
                     }
-                }
-
-                // Build release options for this reservation
-                let options = ReleaseOptions::new(reservation.key().clone())
-                    .with_force(self.force)
-                    // Validate the requested recursive root once. Descendant keys
-                    // can be sideways from the CWD even when that root is an ancestor.
-                    .with_allow_unrelated_path(true);
-
-                // Build plan using database connection for reading
-                let plan = ReleasePlan::new(options)
-                    .build_plan(db.connection())
-                    .map_err(CliError::from)?;
-
-                plans.push((reservation.key().clone(), plan));
-            }
-
-            // Execute all plans
-            if self.dry_run {
-                if !global.quiet {
-                    eprintln!("Dry run - would release {} reservation(s):", plans.len());
-                    for (key, plan) in &plans {
-                        eprintln!("  {key}");
-                        for action in &plan.actions {
-                            eprintln!("    - {}", action.description());
-                        }
-                    }
-                }
-            } else {
-                for (_, plan) in plans {
-                    // Each release in its own transaction
-                    let tx = db.begin_transaction().map_err(CliError::from)?;
-                    let mut executor = PlanExecutor::new(&tx);
-                    executor.execute(&plan).map_err(CliError::from)?;
-                    tx.commit()
-                        .map_err(trop::Error::from)
-                        .map_err(CliError::from)?;
-                    released_count += 1;
-                }
-
-                if !global.quiet {
-                    eprintln!("Released {released_count} reservation(s)");
-                }
-            }
-        } else {
-            // Exact release: an omitted filter selects every tag at this path.
-            let release_all_exact_path_tags = self.tag.is_none() && !self.untagged_only;
-            let tag = if self.untagged_only { None } else { self.tag };
-
-            let key = ReservationKey::new(path, tag)
-                .map_err(|e| CliError::InvalidArguments(e.to_string()))?;
-
-            let options = ReleaseOptions::new(key)
-                .with_force(self.force)
-                .with_allow_unrelated_path(allow_unrelated_path);
-
-            // Begin transaction for single release
-            let tx = db.begin_transaction().map_err(CliError::from)?;
-
-            let plan = ReleasePlan::new(options)
-                .with_all_exact_path_tags(release_all_exact_path_tags)
-                .build_plan(&tx)
-                .map_err(CliError::from)?;
-
-            if self.dry_run {
-                if !global.quiet {
+                } else {
                     eprintln!("Dry run - would perform the following actions:");
-                    for (i, action) in plan.actions.iter().enumerate() {
+                    for (i, action) in execution.plan.actions.iter().enumerate() {
                         eprintln!("  {}. {}", i + 1, action.description());
                     }
-                    if !plan.warnings.is_empty() {
-                        eprintln!("Warnings:");
-                        for warning in &plan.warnings {
-                            eprintln!("  - {warning}");
-                        }
+                }
+                if !execution.plan.warnings.is_empty() {
+                    eprintln!("Warnings:");
+                    for warning in &execution.plan.warnings {
+                        eprintln!("  - {warning}");
                     }
                 }
+            }
+        } else if !global.quiet {
+            if self.recursive {
+                eprintln!("Released {} reservation(s)", execution.plan.actions.len());
             } else {
-                let mut executor = PlanExecutor::new(&tx);
-                let result = executor.execute(&plan).map_err(CliError::from)?;
-
-                // Commit transaction
-                tx.commit()
-                    .map_err(trop::Error::from)
-                    .map_err(CliError::from)?;
-
-                if !global.quiet {
-                    if plan.actions.is_empty() {
-                        eprintln!("No reservation found (already released)");
-                    } else {
-                        eprintln!("Released reservation successfully");
-                    }
-
-                    // Print warnings if any
-                    if !result.warnings.is_empty() {
-                        for warning in &result.warnings {
-                            eprintln!("Warning: {warning}");
-                        }
-                    }
+                if execution.plan.actions.is_empty() {
+                    eprintln!("No reservation found (already released)");
+                } else {
+                    eprintln!("Released reservation successfully");
+                }
+            }
+            if let Some(result) = execution.result {
+                for warning in result.warnings {
+                    eprintln!("Warning: {warning}");
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, SystemTime};
+    use tempfile::tempdir;
+    use trop::{DatabaseConfig, Port, Reservation};
+
+    #[test]
+    fn recursive_release_serializes_addition_and_refresh_after_planning() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("recursive-release-race.db");
+        let database_config =
+            DatabaseConfig::new(&database_path).with_busy_timeout(Duration::from_secs(2));
+        let mut release_db = Database::open(database_config.clone()).unwrap();
+        let mut writer_db = Database::open(database_config).unwrap();
+
+        let root_key = ReservationKey::new(directory.path().join("project"), None).unwrap();
+        let refresh_key =
+            ReservationKey::new(directory.path().join("project/refresh"), None).unwrap();
+        let added_key = ReservationKey::new(directory.path().join("project/added"), None).unwrap();
+        let root_port = Port::try_from(5410).unwrap();
+        let refresh_port = Port::try_from(5411).unwrap();
+        let added_port = Port::try_from(5412).unwrap();
+        let stale_time = SystemTime::now() - Duration::from_secs(60);
+
+        release_db
+            .create_reservation(
+                &Reservation::builder(root_key.clone(), root_port)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        release_db
+            .create_reservation(
+                &Reservation::builder(refresh_key.clone(), refresh_port)
+                    .last_used_at(stale_time)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let refreshed_reservation = Reservation::builder(refresh_key.clone(), refresh_port)
+            .build()
+            .unwrap();
+        let added_reservation = Reservation::builder(added_key.clone(), added_port)
+            .build()
+            .unwrap();
+        let (start_sender, start_receiver) = mpsc::sync_channel(0);
+        let (attempt_sender, attempt_receiver) = mpsc::sync_channel(0);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let writer = thread::spawn(move || {
+            start_receiver.recv().unwrap();
+            attempt_sender.send(()).unwrap();
+            let result = (|| -> trop::Result<()> {
+                let transaction = writer_db.begin_transaction()?;
+                Database::create_reservation_simple(&transaction, &refreshed_reservation)?;
+                Database::create_reservation_simple(&transaction, &added_reservation)?;
+                transaction.commit().map_err(trop::Error::from)
+            })();
+            done_sender.send(()).unwrap();
+            result
+        });
+
+        let options = ReleaseOptions::new(root_key.clone()).with_allow_unrelated_path(true);
+        let planner = ReleasePlan::new(options)
+            .with_all_exact_path_tags(true)
+            .with_recursive(true);
+        let execution = run_release_with_plan_barrier(&mut release_db, &planner, false, || {
+            start_sender.send(()).unwrap();
+            attempt_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("writer did not attempt its immediate transaction");
+            assert!(
+                done_receiver
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err(),
+                "writer completed while recursive release still owned the write transaction"
+            );
+        })
+        .unwrap();
+
+        assert_eq!(execution.plan.actions.len(), 2);
+        done_receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("writer did not finish after recursive release committed");
+        writer.join().unwrap().unwrap();
+        assert!(
+            Database::get_reservation(release_db.connection(), &root_key)
+                .unwrap()
+                .is_none(),
+            "the preexisting root must be released"
+        );
+        let refreshed = Database::get_reservation(release_db.connection(), &refresh_key)
+            .unwrap()
+            .expect("the refresh serialized after release must survive");
+        assert!(
+            refreshed
+                .last_used_at()
+                .elapsed()
+                .is_ok_and(|age| age < Duration::from_secs(5)),
+            "the surviving row must be the post-release refresh"
+        );
+        assert!(
+            Database::get_reservation(release_db.connection(), &added_key)
+                .unwrap()
+                .is_some(),
+            "the addition serialized after release must survive"
+        );
     }
 }
