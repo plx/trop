@@ -204,7 +204,9 @@ impl TestEnv {
     ///
     /// Runs `trop release` for the given path.
     pub fn release(&self, path: &Path) {
-        self.command()
+        let mut command = self.command();
+        command
+            .current_dir(&self.temp_path)
             .arg("release")
             .arg("--path")
             .arg(path)
@@ -214,7 +216,9 @@ impl TestEnv {
 
     /// Release a reservation with a tag.
     pub fn release_with_tag(&self, path: &Path, tag: &str) {
-        self.command()
+        let mut command = self.command();
+        command
+            .current_dir(&self.temp_path)
             .arg("release")
             .arg("--path")
             .arg(path)

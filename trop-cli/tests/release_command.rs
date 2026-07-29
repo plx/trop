@@ -10,8 +10,16 @@
 
 mod common;
 
+use assert_cmd::Command;
 use common::TestEnv;
 use predicates::prelude::*;
+use rusqlite::Connection;
+
+fn related_command(env: &TestEnv) -> Command {
+    let mut command = env.command();
+    command.current_dir(env.path());
+    command
+}
 
 // ============================================================================
 // Basic Release Tests
@@ -35,7 +43,7 @@ fn test_release_basic() {
     assert!(list_before.contains(&port.to_string()));
 
     // Release it
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&test_path)
@@ -61,7 +69,7 @@ fn test_release_with_tag() {
     let port_api = env.reserve_with_tag(&test_path, "api");
 
     // Release the "web" tag
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&test_path)
@@ -86,8 +94,7 @@ fn test_release_without_path_uses_cwd() {
     let test_path = env.create_dir("test-project");
 
     // Reserve implicitly so both operations use the canonical CWD identity.
-    let reserve_output = env
-        .command()
+    let reserve_output = related_command(&env)
         .arg("reserve")
         .arg("--allow-unrelated-path")
         .current_dir(&test_path)
@@ -105,7 +112,7 @@ fn test_release_without_path_uses_cwd() {
         .expect("Reserve output is not a valid port number");
 
     // Release from within the directory (using current_dir)
-    let mut cmd = env.command();
+    let mut cmd = related_command(&env);
     cmd.arg("release")
         .current_dir(&test_path)
         .assert()
@@ -130,7 +137,7 @@ fn test_release_untagged_only() {
     let port_tagged = env.reserve_with_tag(&test_path, "web");
 
     // Release untagged only
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&test_path)
@@ -165,7 +172,7 @@ fn test_release_recursive() {
     let port_child2 = env.reserve_simple(&child2);
 
     // Release parent recursively
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&parent)
@@ -197,7 +204,7 @@ fn test_release_recursive_with_tag() {
     let port_child_api = env.reserve_with_tag(&child, "api");
 
     // Release "web" recursively
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&parent)
@@ -230,7 +237,7 @@ fn test_release_non_recursive_preserves_children() {
     let port_child = env.reserve_simple(&child);
 
     // Release parent non-recursively
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&parent)
@@ -262,7 +269,7 @@ fn test_release_dry_run_does_not_release() {
     let port = env.reserve_simple(&test_path);
 
     // Dry-run release
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&test_path)
@@ -287,7 +294,7 @@ fn test_release_dry_run_shows_plan() {
     env.reserve_simple(&test_path);
 
     // Dry-run should show plan on stderr
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&test_path)
@@ -307,8 +314,7 @@ fn test_release_dry_run_with_quiet() {
     env.reserve_simple(&test_path);
 
     // Dry-run with --quiet
-    let output = env
-        .command()
+    let output = related_command(&env)
         .arg("--quiet")
         .arg("release")
         .arg("--path")
@@ -342,7 +348,7 @@ fn test_release_with_force() {
     let port = env.reserve_simple(&test_path);
 
     // Release with --force
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&test_path)
@@ -365,8 +371,7 @@ fn test_release_force_on_nonexistent() {
     let test_path = env.create_dir("test-project");
 
     // Try to release something that doesn't exist with --force
-    let output = env
-        .command()
+    let output = related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&test_path)
@@ -396,7 +401,7 @@ fn test_release_nothing_to_release() {
     let test_path = env.create_dir("test-project");
 
     // Try to release when no reservation exists - should succeed (idempotent)
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&test_path)
@@ -419,10 +424,10 @@ fn test_release_nonexistent_tag() {
     let test_path = env.create_dir("test-project");
 
     // Create untagged reservation
-    env.reserve_simple(&test_path);
+    let port = env.reserve_simple(&test_path);
 
     // Try to release a tag that doesn't exist - should succeed (idempotent)
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&test_path)
@@ -435,6 +440,31 @@ fn test_release_nonexistent_tag() {
                 .or(predicate::str::contains("No reservation"))
                 .or(predicate::str::contains("already released")),
         );
+
+    assert!(env.list().contains(&port.to_string()));
+}
+
+/// An untagged-only selector with no match is an idempotent no-op.
+#[test]
+fn test_release_untagged_only_no_match_preserves_tagged_reservation() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("test-project");
+    let tagged = env.reserve_with_tag(&test_path, "web");
+
+    related_command(&env)
+        .arg("release")
+        .arg("--path")
+        .arg(&test_path)
+        .arg("--untagged-only")
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("not found")
+                .or(predicate::str::contains("No reservation"))
+                .or(predicate::str::contains("already released")),
+        );
+
+    assert!(env.list().contains(&tagged.to_string()));
 }
 
 /// Test that --tag and --untagged-only are mutually exclusive.
@@ -446,7 +476,7 @@ fn test_release_tag_and_untagged_only_conflict() {
     let test_path = env.create_dir("test-project");
 
     // Try to use both --tag and --untagged-only
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&test_path)
@@ -465,10 +495,12 @@ fn test_release_tag_and_untagged_only_conflict() {
 #[test]
 fn test_release_nonexistent_path() {
     let env = TestEnv::new();
-    let fake_path = env.path().join("does-not-exist");
+    let fake_path = std::fs::canonicalize(env.path())
+        .expect("Failed to canonicalize test root")
+        .join("does-not-exist");
 
     // Try to release nonexistent path - should succeed (idempotent)
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&fake_path)
@@ -495,7 +527,7 @@ fn test_release_respects_trop_path_env() {
     let port = env.reserve_simple(&test_path);
 
     // Release using env var for path
-    env.command()
+    related_command(&env)
         .arg("release")
         .env("TROP_PATH", &test_path)
         .assert()
@@ -518,7 +550,7 @@ fn test_cli_path_overrides_env_path_for_release() {
     let port2 = env.reserve_simple(&path2);
 
     // Set env to path1 but use --path for path2
-    env.command()
+    related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&path2)
@@ -549,8 +581,7 @@ fn test_release_success_message() {
     env.reserve_simple(&test_path);
 
     // Release and check output
-    let output = env
-        .command()
+    let output = related_command(&env)
         .arg("release")
         .arg("--path")
         .arg(&test_path)
@@ -582,8 +613,7 @@ fn test_release_quiet_mode() {
     env.reserve_simple(&test_path);
 
     // Release with --quiet
-    let output = env
-        .command()
+    let output = related_command(&env)
         .arg("--quiet")
         .arg("release")
         .arg("--path")
@@ -610,8 +640,7 @@ fn test_release_verbose_mode() {
     env.reserve_simple(&test_path);
 
     // Release with --verbose
-    let output = env
-        .command()
+    let output = related_command(&env)
         .arg("--verbose")
         .arg("release")
         .arg("--path")
@@ -660,35 +689,164 @@ fn test_release_multiple_tags_sequentially() {
     assert!(!list3.contains(&port3.to_string()));
 }
 
-/// Test that releasing all reservations at a path works.
+/// Test that the default exact-path release removes every tag at that path.
 ///
-/// If there are multiple tags at a path, releasing the path without
-/// specifying a tag might release all of them, or might require --recursive
-/// or special flags. This test documents the behavior.
+/// Descendant reservations must remain unless `--recursive` is supplied.
 #[test]
-fn test_release_path_with_multiple_tags() {
+fn test_release_path_without_filter_removes_all_exact_path_tags_only() {
     let env = TestEnv::new();
     let test_path = env.create_dir("test-project");
+    let child_path = env.create_dir("test-project/child");
 
-    // Create multiple tagged reservations
-    env.reserve_with_tag(&test_path, "web");
-    env.reserve_with_tag(&test_path, "api");
+    let untagged = env.reserve_simple(&test_path);
+    let web = env.reserve_with_tag(&test_path, "web");
+    let api = env.reserve_with_tag(&test_path, "api");
+    let child = env.reserve_with_tag(&child_path, "web");
 
-    // Try to release the path (no tag specified)
-    // This might fail (ambiguous) or release all - behavior depends on implementation
-    let output = env
-        .command()
+    env.command()
         .arg("release")
         .arg("--path")
         .arg(&test_path)
-        .output()
-        .unwrap();
+        .current_dir(env.path())
+        .assert()
+        .success();
 
-    // Document the behavior: either succeeds or gives clear error
-    if !output.status.success() {
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(!stderr.is_empty(), "Should explain why it failed");
-    }
+    let list_output = env.list();
+    assert!(!list_output.contains(&untagged.to_string()));
+    assert!(!list_output.contains(&web.to_string()));
+    assert!(!list_output.contains(&api.to_string()));
+    assert!(list_output.contains(&child.to_string()));
+}
+
+/// Releasing a sideways path is rejected before any reservation is changed.
+#[test]
+fn test_release_unrelated_path_is_rejected_without_partial_mutation() {
+    let env = TestEnv::new();
+    let current_path = env.create_dir("current-project");
+    let unrelated_path = env.create_dir("unrelated-project");
+    let untagged = env.reserve_simple(&unrelated_path);
+    let tagged = env.reserve_with_tag(&unrelated_path, "web");
+
+    env.command()
+        .arg("release")
+        .arg("--path")
+        .arg(&unrelated_path)
+        .current_dir(&current_path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrelated"));
+
+    let list_output = env.list();
+    assert!(list_output.contains(&untagged.to_string()));
+    assert!(list_output.contains(&tagged.to_string()));
+}
+
+/// Recursive release applies the same guard to its requested root.
+#[test]
+fn test_release_recursive_unrelated_path_is_rejected_without_mutation() {
+    let env = TestEnv::new();
+    let current_path = env.create_dir("current-project");
+    let unrelated_path = env.create_dir("unrelated-project");
+    let child_path = env.create_dir("unrelated-project/child");
+    let parent = env.reserve_simple(&unrelated_path);
+    let child = env.reserve_simple(&child_path);
+
+    env.command()
+        .arg("release")
+        .arg("--path")
+        .arg(&unrelated_path)
+        .arg("--recursive")
+        .current_dir(&current_path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrelated"));
+
+    let list_output = env.list();
+    assert!(list_output.contains(&parent.to_string()));
+    assert!(list_output.contains(&child.to_string()));
+}
+
+/// The explicit unrelated-path permission bypasses the relationship guard.
+#[test]
+fn test_release_allow_unrelated_path_releases_target() {
+    let env = TestEnv::new();
+    let current_path = env.create_dir("current-project");
+    let unrelated_path = env.create_dir("unrelated-project");
+    let untagged = env.reserve_simple(&unrelated_path);
+    let tagged = env.reserve_with_tag(&unrelated_path, "web");
+
+    env.command()
+        .arg("release")
+        .arg("--path")
+        .arg(&unrelated_path)
+        .arg("--allow-unrelated-path")
+        .current_dir(&current_path)
+        .assert()
+        .success();
+
+    let list_output = env.list();
+    assert!(!list_output.contains(&untagged.to_string()));
+    assert!(!list_output.contains(&tagged.to_string()));
+}
+
+/// The effective configuration permission also bypasses the path guard.
+#[test]
+fn test_release_honors_allow_unrelated_path_environment_config() {
+    let env = TestEnv::new();
+    let current_path = env.create_dir("current-project");
+    let unrelated_path = env.create_dir("unrelated-project");
+    let port = env.reserve_simple(&unrelated_path);
+
+    env.command()
+        .arg("release")
+        .arg("--path")
+        .arg(&unrelated_path)
+        .env("TROP_ALLOW_UNRELATED_PATH", "true")
+        .current_dir(&current_path)
+        .assert()
+        .success();
+
+    assert!(!env.list().contains(&port.to_string()));
+}
+
+/// A late delete failure rolls back every exact-path deletion.
+#[test]
+fn test_release_exact_path_deletion_is_atomic() {
+    let env = TestEnv::new();
+    let test_path = env.create_dir("test-project");
+    let untagged = env.reserve_simple(&test_path);
+    let tagged = env.reserve_with_tag(&test_path, "web");
+
+    let connection =
+        Connection::open(env.data_dir.join("trop.db")).expect("Failed to open test database");
+    connection
+        .execute_batch(
+            "
+            CREATE TRIGGER fail_tagged_release
+            BEFORE DELETE ON reservations
+            WHEN OLD.tag = 'web'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced late exact release failure');
+            END;
+            ",
+        )
+        .expect("Failed to install release failure trigger");
+    drop(connection);
+
+    env.command()
+        .arg("release")
+        .arg("--path")
+        .arg(&test_path)
+        .current_dir(env.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "forced late exact release failure",
+        ));
+
+    let list_output = env.list();
+    assert!(list_output.contains(&untagged.to_string()));
+    assert!(list_output.contains(&tagged.to_string()));
 }
 
 // ============================================================================

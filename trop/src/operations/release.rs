@@ -73,6 +73,7 @@ impl ReleaseOptions {
 /// generating a plan that describes what actions to take.
 pub struct ReleasePlan {
     options: ReleaseOptions,
+    all_exact_path_tags: bool,
 }
 
 impl ReleasePlan {
@@ -91,7 +92,20 @@ impl ReleasePlan {
     /// ```
     #[must_use]
     pub const fn new(options: ReleaseOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            all_exact_path_tags: false,
+        }
+    }
+
+    /// Selects every tagged and untagged reservation at the key's exact path.
+    ///
+    /// The default planner behavior remains an exact-key release. CLI callers
+    /// use this mode when neither `--tag` nor `--untagged-only` is supplied.
+    #[must_use]
+    pub const fn with_all_exact_path_tags(mut self, enabled: bool) -> Self {
+        self.all_exact_path_tags = enabled;
+        self
     }
 
     /// Builds an operation plan for this release request.
@@ -126,12 +140,24 @@ impl ReleasePlan {
             Database::validate_path_relationship(&self.options.key.path, false)?;
         }
 
-        // Step 2: Check if reservation exists
-        if Database::get_reservation(conn, &self.options.key)?.is_some() {
-            // Reservation exists - plan to delete it
+        // Step 2: Select the exact-path set or exact key requested by the caller.
+        if self.all_exact_path_tags {
+            let reservations =
+                Database::get_reservations_by_exact_path(conn, &self.options.key.path)?;
+            if reservations.is_empty() {
+                plan = plan.add_warning(format!(
+                    "No reservations found for {} (already released)",
+                    self.options.key.path.display()
+                ));
+            } else {
+                for reservation in reservations {
+                    plan =
+                        plan.add_action(PlanAction::DeleteReservation(reservation.key().clone()));
+                }
+            }
+        } else if Database::get_reservation(conn, &self.options.key)?.is_some() {
             plan = plan.add_action(PlanAction::DeleteReservation(self.options.key.clone()));
         } else {
-            // Reservation doesn't exist - idempotent, just add a warning
             plan = plan.add_warning(format!(
                 "No reservation found for {} (already released)",
                 self.options.key
@@ -388,6 +414,67 @@ mod tests {
 
         assert_eq!(plan.len(), 1);
         assert!(matches!(plan.actions[0], PlanAction::DeleteReservation(_)));
+    }
+
+    #[test]
+    fn test_plan_release_all_exact_path_tags_preserves_descendants() {
+        let mut db = create_test_database();
+        let exact_path = PathBuf::from("/test/path");
+        let keys = [
+            ReservationKey::new(exact_path.clone(), None).unwrap(),
+            ReservationKey::new(exact_path.clone(), Some("api".to_string())).unwrap(),
+            ReservationKey::new(exact_path.clone(), Some("web".to_string())).unwrap(),
+        ];
+        let child_key =
+            ReservationKey::new(exact_path.join("child"), Some("web".to_string())).unwrap();
+
+        for (key, port) in keys
+            .iter()
+            .cloned()
+            .chain(std::iter::once(child_key.clone()))
+            .zip(8080..)
+        {
+            let reservation = Reservation::builder(key, Port::try_from(port).unwrap())
+                .build()
+                .unwrap();
+            db.create_reservation(&reservation).unwrap();
+        }
+
+        let options = ReleaseOptions::new(keys[0].clone()).with_allow_unrelated_path(true);
+        let plan = ReleasePlan::new(options)
+            .with_all_exact_path_tags(true)
+            .build_plan(db.connection())
+            .unwrap();
+
+        let planned_keys = plan
+            .actions
+            .iter()
+            .map(|action| match action {
+                PlanAction::DeleteReservation(key) => key,
+                other => panic!("unexpected release action: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(planned_keys.len(), keys.len());
+        for key in &keys {
+            assert!(planned_keys.contains(&key));
+        }
+        assert!(!planned_keys.contains(&&child_key));
+    }
+
+    #[test]
+    fn test_plan_release_all_exact_path_tags_is_idempotent_when_empty() {
+        let db = create_test_database();
+        let key = ReservationKey::new(PathBuf::from("/test/path"), None).unwrap();
+        let options = ReleaseOptions::new(key).with_allow_unrelated_path(true);
+
+        let plan = ReleasePlan::new(options)
+            .with_all_exact_path_tags(true)
+            .build_plan(db.connection())
+            .unwrap();
+
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].contains("No reservations found"));
     }
 
     #[test]

@@ -99,6 +99,7 @@ fn test_verbose_flag_works_with_all_commands() {
         .arg("release")
         .arg("--path")
         .arg(&test_path)
+        .current_dir(env.path())
         .assert()
         .success();
 }
@@ -207,6 +208,7 @@ fn test_quiet_flag_works_with_all_commands() {
         .arg("release")
         .arg("--path")
         .arg(&test_path)
+        .current_dir(env.path())
         .output()
         .unwrap();
     assert!(release_out.status.success());

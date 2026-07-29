@@ -338,8 +338,15 @@ impl Command {
                 );
                 ConfigScope::Discover
             }
-            Self::Release(_)
-            | Self::Prune(_)
+            Self::Release(command) => {
+                set_true(
+                    &mut command_line,
+                    command.allow_unrelated_path,
+                    ConfigField::AllowUnrelatedPath,
+                );
+                ConfigScope::Discover
+            }
+            Self::Prune(_)
             | Self::AssertReservation(_)
             | Self::AssertPort(_)
             | Self::Exclude(_)
