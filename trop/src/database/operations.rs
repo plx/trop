@@ -1103,12 +1103,19 @@ impl Database {
     pub fn validate_path_relationship(target_path: &Path, allow_unrelated: bool) -> Result<()> {
         let current_dir = env::current_dir()?;
         let lexical_relationship = PathRelationship::between(target_path, &current_dir);
-        // Preserve lexical hierarchy for explicit and nonexistent paths. When
-        // that comparison is unrelated, compare existing paths physically so
-        // canonical inferred identities remain compatible with the platform's
-        // process-CWD spelling (notably Windows verbatim prefixes).
+        // Preserve lexical hierarchy for explicit paths. When that comparison
+        // is unrelated, canonicalize each path's existing portion and restore
+        // any nonexistent target suffix before comparing them physically.
+        // This keeps canonical inferred identities compatible with the
+        // platform's process-CWD spelling (notably Windows verbatim prefixes
+        // and short names) without requiring the target itself to exist.
         let physically_related = || {
-            let canonical_target = crate::path::canonicalize::canonicalize(target_path).ok()?;
+            let (canonical_target_root, target_remainder) =
+                crate::path::canonicalize::canonicalize_existing(target_path).ok()?;
+            let canonical_target = match target_remainder {
+                Some(path) => canonical_target_root.join(path),
+                None => canonical_target_root,
+            };
             let canonical_current = crate::path::canonicalize::canonicalize(&current_dir).ok()?;
             Some(
                 PathRelationship::between(&canonical_target, &canonical_current)
@@ -1660,6 +1667,25 @@ mod tests {
         assert!(
             result.is_ok(),
             "canonical and process spellings of the current directory must be related: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_path_relationship_canonical_nonexistent_descendant() {
+        use std::os::unix::fs::symlink;
+
+        let _db = create_test_database();
+        let cwd = env::current_dir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cwd_link = temp.path().join("cwd-link");
+        symlink(&cwd, &cwd_link).unwrap();
+        let nonexistent_descendant = cwd_link.join("does-not-exist");
+
+        let result = Database::validate_path_relationship(&nonexistent_descendant, false);
+        assert!(
+            result.is_ok(),
+            "a nonexistent descendant reached through a canonical equivalent must be related: {result:?}"
         );
     }
 
