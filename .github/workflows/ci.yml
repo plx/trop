@@ -56,7 +56,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
@@ -108,7 +108,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Just
-        uses: extractions/setup-just@v3 
+        uses: extractions/setup-just@v4 
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
@@ -135,7 +135,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Just
-        uses: extractions/setup-just@v3 
+        uses: extractions/setup-just@v4 
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
@@ -159,7 +159,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Just
-        uses: extractions/setup-just@v3 
+        uses: extractions/setup-just@v4 
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
@@ -191,7 +191,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
