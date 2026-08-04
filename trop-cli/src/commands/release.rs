@@ -186,10 +186,10 @@ mod tests {
         let mut release_db = Database::open(database_config.clone()).unwrap();
         let mut writer_db = Database::open(database_config).unwrap();
 
-        let root_key = ReservationKey::new(directory.path().join("project"), None).unwrap();
-        let refresh_key =
-            ReservationKey::new(directory.path().join("project/refresh"), None).unwrap();
-        let added_key = ReservationKey::new(directory.path().join("project/added"), None).unwrap();
+        let project_path = directory.path().join("project");
+        let root_key = ReservationKey::new(project_path.clone(), None).unwrap();
+        let refresh_key = ReservationKey::new(project_path.join("refresh"), None).unwrap();
+        let added_key = ReservationKey::new(project_path.join("added"), None).unwrap();
         let root_port = Port::try_from(5410).unwrap();
         let refresh_port = Port::try_from(5411).unwrap();
         let added_port = Port::try_from(5412).unwrap();
