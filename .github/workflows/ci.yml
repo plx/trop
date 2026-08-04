@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install agentic-navigation-guide
         run: cargo install agentic-navigation-guide
@@ -53,10 +53,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
@@ -105,10 +105,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Just
-        uses: extractions/setup-just@v3 
+        uses: extractions/setup-just@v4
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
@@ -132,10 +132,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Just
-        uses: extractions/setup-just@v3 
+        uses: extractions/setup-just@v4
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
@@ -156,10 +156,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Just
-        uses: extractions/setup-just@v3 
+        uses: extractions/setup-just@v4
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
@@ -188,10 +188,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
 
       - name: Install Rust toolchain
         # Version pinned in rust-toolchain.toml; bump both together.
