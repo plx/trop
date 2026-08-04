@@ -456,7 +456,8 @@ mod tests {
             ReservationKey::new(exact_path.clone(), Some("web".to_string())).unwrap(),
         ];
         let child_key =
-            ReservationKey::new(exact_path.join("child"), Some("web".to_string())).unwrap();
+            ReservationKey::new(PathBuf::from("/test/path/child"), Some("web".to_string()))
+                .unwrap();
 
         for (key, port) in keys
             .iter()
@@ -514,7 +515,7 @@ mod tests {
         let selected_keys = [
             ReservationKey::new(root.clone(), None).unwrap(),
             ReservationKey::new(root.clone(), Some("web".to_string())).unwrap(),
-            ReservationKey::new(root.join("child"), Some("api".to_string())).unwrap(),
+            ReservationKey::new(PathBuf::from("/work/a/child"), Some("api".to_string())).unwrap(),
         ];
         let lexical_sibling = ReservationKey::new(PathBuf::from("/work/ab"), None).unwrap();
 
@@ -558,11 +559,11 @@ mod tests {
         let root = PathBuf::from("/work/a");
         let matching_keys = [
             ReservationKey::new(root.clone(), Some("web".to_string())).unwrap(),
-            ReservationKey::new(root.join("child"), Some("web".to_string())).unwrap(),
+            ReservationKey::new(PathBuf::from("/work/a/child"), Some("web".to_string())).unwrap(),
         ];
         let nonmatching_keys = [
             ReservationKey::new(root.clone(), None).unwrap(),
-            ReservationKey::new(root.join("child"), Some("api".to_string())).unwrap(),
+            ReservationKey::new(PathBuf::from("/work/a/child"), Some("api".to_string())).unwrap(),
         ];
 
         for (key, port) in matching_keys
@@ -606,9 +607,10 @@ mod tests {
         let root = PathBuf::from("/work/a");
         let matching_keys = [
             ReservationKey::new(root.clone(), None).unwrap(),
-            ReservationKey::new(root.join("child"), None).unwrap(),
+            ReservationKey::new(PathBuf::from("/work/a/child"), None).unwrap(),
         ];
-        let tagged_key = ReservationKey::new(root.join("child"), Some("web".to_string())).unwrap();
+        let tagged_key =
+            ReservationKey::new(PathBuf::from("/work/a/child"), Some("web".to_string())).unwrap();
 
         for (key, port) in matching_keys
             .iter()
