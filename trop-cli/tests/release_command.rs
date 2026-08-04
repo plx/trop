@@ -282,9 +282,9 @@ fn test_release_recursive_untagged_only() {
 #[test]
 fn test_release_recursive_dry_run_uses_component_aware_selection() {
     let env = TestEnv::new();
-    let parent = env.create_dir("work/a");
-    let child = env.create_dir("work/a/child");
-    let lexical_sibling = env.create_dir("work/ab");
+    let parent = trop::path::normalize::normalize(&env.create_dir("work/a")).unwrap();
+    let child = trop::path::normalize::normalize(&env.create_dir("work/a/child")).unwrap();
+    let lexical_sibling = trop::path::normalize::normalize(&env.create_dir("work/ab")).unwrap();
 
     let parent_port = env.reserve_with_tag(&parent, "web");
     let child_port = env.reserve_with_tag(&child, "web");
