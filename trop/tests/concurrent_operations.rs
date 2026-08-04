@@ -851,3 +851,218 @@ reservations:
         String::from_utf8_lossy(&validation.stderr)
     );
 }
+
+/// Races recursive release with independent reserve and refresh processes.
+///
+/// The commands may serialize in any order, so post-release writers may
+/// survive and pre-release writers may be removed. The fixture rows that have
+/// no competing writer must always be gone, and every surviving row must come
+/// from one complete writer transaction.
+#[test]
+fn test_concurrent_recursive_release_serializes_with_reserve_processes() {
+    for _ in 0..3 {
+        run_recursive_release_reserve_race();
+    }
+}
+
+fn run_recursive_release_reserve_race() {
+    const WRITER_PROCESSES: usize = 6;
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_dir = temp_dir.path().join("data");
+    let root = temp_dir.path().join("recursive-root");
+    let refresh_path = root.join("refresh");
+    fs::create_dir_all(&refresh_path).unwrap();
+    let root = root.canonicalize().unwrap();
+    let refresh_path = refresh_path.canonicalize().unwrap();
+
+    let init = trop_cmd()
+        .args([
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "init",
+            "--with-config",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "database initialization failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    for tag in [None, Some("fixture")] {
+        let mut fixture = trop_cmd();
+        fixture.args([
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "reserve",
+            "--path",
+            root.to_str().unwrap(),
+            "--ignore-occupied",
+            "--allow-unrelated-path",
+        ]);
+        if let Some(tag) = tag {
+            fixture.args(["--tag", tag]);
+        }
+        let output = fixture.output().unwrap();
+        assert!(
+            output.status.success(),
+            "root fixture reservation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let refresh_fixture = trop_cmd()
+        .args([
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "reserve",
+            "--path",
+            refresh_path.to_str().unwrap(),
+            "--tag",
+            "web",
+            "--ignore-occupied",
+            "--allow-unrelated-path",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        refresh_fixture.status.success(),
+        "refresh fixture reservation failed: {}",
+        String::from_utf8_lossy(&refresh_fixture.stderr)
+    );
+
+    let mut writer_keys = vec![(refresh_path.clone(), Some("web".to_string()))];
+    for index in 1..WRITER_PROCESSES {
+        let path = root.join(format!("writer-{index}"));
+        fs::create_dir(&path).unwrap();
+        let tag = (index % 2 == 0).then(|| format!("service-{index}"));
+        writer_keys.push((path.canonicalize().unwrap(), tag));
+    }
+
+    let start = Arc::new(Barrier::new(WRITER_PROCESSES + 2));
+    let mut handles = Vec::new();
+    for (index, (path, tag)) in writer_keys.iter().cloned().enumerate() {
+        let start = Arc::clone(&start);
+        let data_dir = data_dir.clone();
+        handles.push(thread::spawn(move || {
+            start.wait();
+            let mut command = trop_cmd();
+            command.args([
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "--busy-timeout",
+                "10",
+                "reserve",
+                "--path",
+                path.to_str().unwrap(),
+                "--ignore-occupied",
+                "--allow-unrelated-path",
+            ]);
+            if let Some(tag) = tag {
+                command.args(["--tag", &tag]);
+            }
+            (format!("reserve-{index}"), command.output().unwrap())
+        }));
+    }
+
+    let release_start = Arc::clone(&start);
+    let release_data_dir = data_dir.clone();
+    let release_root = root.clone();
+    handles.push(thread::spawn(move || {
+        release_start.wait();
+        let output = trop_cmd()
+            .args([
+                "--data-dir",
+                release_data_dir.to_str().unwrap(),
+                "--busy-timeout",
+                "10",
+                "release",
+                "--path",
+                release_root.to_str().unwrap(),
+                "--recursive",
+                "--allow-unrelated-path",
+            ])
+            .output()
+            .unwrap();
+        ("recursive-release".to_string(), output)
+    }));
+
+    start.wait();
+    for handle in handles {
+        let (operation, output) = handle.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{operation} failed under recursive release contention:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let list = trop_cmd()
+        .args([
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "list",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "final list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_slice(&list.stdout).expect("final list output was not JSON");
+    let rows = rows.as_array().expect("final list output was not an array");
+    let allowed_keys = writer_keys
+        .iter()
+        .map(|(path, tag)| (path.to_string_lossy().into_owned(), tag.clone()))
+        .collect::<HashSet<_>>();
+
+    for row in rows {
+        let path = row["path"]
+            .as_str()
+            .expect("reservation path was not a string")
+            .to_string();
+        let tag = row["tag"].as_str().map(str::to_string);
+        assert!(
+            allowed_keys.contains(&(path.clone(), tag.clone())),
+            "recursive release left a fixture or unexpected row: {path}:{tag:?}"
+        );
+    }
+    assert!(
+        !rows.iter().any(|row| row["path"].as_str() == root.to_str()),
+        "root fixtures without competing writers must always be released"
+    );
+    let ports = rows
+        .iter()
+        .map(|row| {
+            row["port"]
+                .as_u64()
+                .expect("reservation port was not numeric")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ports.len(),
+        ports.iter().collect::<HashSet<_>>().len(),
+        "release/reserve contention produced duplicate reserved ports"
+    );
+
+    let validation = trop_cmd()
+        .args([
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "assert-data-dir",
+            "--validate",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        validation.status.success(),
+        "database validation failed after release/reserve contention: {}",
+        String::from_utf8_lossy(&validation.stderr)
+    );
+}

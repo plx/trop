@@ -102,7 +102,11 @@ Use `--tag <TAG>` to remove only that tagged reservation, or
 `--untagged-only` to remove only the untagged reservation. The two filters are
 mutually exclusive, and a filter with no match succeeds as an idempotent no-op.
 The same filter selects matching rows below the path when combined with
-`--recursive`.
+`--recursive`. Recursive selection is component-aware (`/work/a` does not
+select `/work/ab`), and enumeration plus every deletion share one immediate
+transaction, so concurrent writers serialize before or after an all-or-none
+release. `--dry-run` uses that same transaction-scoped selection and exits
+without committing.
 
 Release follows the standard path guard: the target must be the current
 directory, an ancestor, or a descendant. A sideways unrelated path is rejected

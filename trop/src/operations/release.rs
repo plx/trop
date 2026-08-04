@@ -74,6 +74,7 @@ impl ReleaseOptions {
 pub struct ReleasePlan {
     options: ReleaseOptions,
     all_exact_path_tags: bool,
+    recursive: bool,
 }
 
 impl ReleasePlan {
@@ -95,6 +96,7 @@ impl ReleasePlan {
         Self {
             options,
             all_exact_path_tags: false,
+            recursive: false,
         }
     }
 
@@ -105,6 +107,17 @@ impl ReleasePlan {
     #[must_use]
     pub const fn with_all_exact_path_tags(mut self, enabled: bool) -> Self {
         self.all_exact_path_tags = enabled;
+        self
+    }
+
+    /// Selects reservations at the key path and every component descendant.
+    ///
+    /// Tag selection follows the exact-release contract at every selected
+    /// path: all tags when [`Self::with_all_exact_path_tags`] is enabled,
+    /// otherwise only the key's exact optional tag.
+    #[must_use]
+    pub const fn with_recursive(mut self, enabled: bool) -> Self {
+        self.recursive = enabled;
         self
     }
 
@@ -140,8 +153,25 @@ impl ReleasePlan {
             Database::validate_path_relationship(&self.options.key.path, false)?;
         }
 
-        // Step 2: Select the exact-path set or exact key requested by the caller.
-        if self.all_exact_path_tags {
+        // Step 2: Select the recursive set, exact-path set, or exact key
+        // requested by the caller.
+        if self.recursive {
+            let reservations =
+                Database::get_reservations_by_path_prefix(conn, &self.options.key.path)?;
+            let matching = reservations.into_iter().filter(|reservation| {
+                self.all_exact_path_tags
+                    || reservation.key().tag.as_deref() == self.options.key.tag.as_deref()
+            });
+            for reservation in matching {
+                plan = plan.add_action(PlanAction::DeleteReservation(reservation.key().clone()));
+            }
+            if plan.actions.is_empty() {
+                plan = plan.add_warning(format!(
+                    "No reservations found under {} (already released)",
+                    self.options.key.path.display()
+                ));
+            }
+        } else if self.all_exact_path_tags {
             let reservations =
                 Database::get_reservations_by_exact_path(conn, &self.options.key.path)?;
             if reservations.is_empty() {
@@ -426,7 +456,8 @@ mod tests {
             ReservationKey::new(exact_path.clone(), Some("web".to_string())).unwrap(),
         ];
         let child_key =
-            ReservationKey::new(exact_path.join("child"), Some("web".to_string())).unwrap();
+            ReservationKey::new(PathBuf::from("/test/path/child"), Some("web".to_string()))
+                .unwrap();
 
         for (key, port) in keys
             .iter()
@@ -475,6 +506,160 @@ mod tests {
         assert!(plan.actions.is_empty());
         assert_eq!(plan.warnings.len(), 1);
         assert!(plan.warnings[0].contains("No reservations found"));
+    }
+
+    #[test]
+    fn test_plan_recursive_all_tags_is_component_aware() {
+        let mut db = create_test_database();
+        let root = PathBuf::from("/work/a");
+        let selected_keys = [
+            ReservationKey::new(root.clone(), None).unwrap(),
+            ReservationKey::new(root.clone(), Some("web".to_string())).unwrap(),
+            ReservationKey::new(PathBuf::from("/work/a/child"), Some("api".to_string())).unwrap(),
+        ];
+        let lexical_sibling = ReservationKey::new(PathBuf::from("/work/ab"), None).unwrap();
+
+        for (key, port) in selected_keys
+            .iter()
+            .cloned()
+            .chain(std::iter::once(lexical_sibling.clone()))
+            .zip(8080..)
+        {
+            let reservation = Reservation::builder(key, Port::try_from(port).unwrap())
+                .build()
+                .unwrap();
+            db.create_reservation(&reservation).unwrap();
+        }
+
+        let options = ReleaseOptions::new(selected_keys[0].clone()).with_allow_unrelated_path(true);
+        let plan = ReleasePlan::new(options)
+            .with_all_exact_path_tags(true)
+            .with_recursive(true)
+            .build_plan(db.connection())
+            .unwrap();
+
+        let planned_keys = plan
+            .actions
+            .iter()
+            .map(|action| match action {
+                PlanAction::DeleteReservation(key) => key,
+                other => panic!("unexpected recursive release action: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(planned_keys.len(), selected_keys.len());
+        for key in &selected_keys {
+            assert!(planned_keys.contains(&key));
+        }
+        assert!(!planned_keys.contains(&&lexical_sibling));
+    }
+
+    #[test]
+    fn test_plan_recursive_exact_tag_applies_at_every_path() {
+        let mut db = create_test_database();
+        let root = PathBuf::from("/work/a");
+        let matching_keys = [
+            ReservationKey::new(root.clone(), Some("web".to_string())).unwrap(),
+            ReservationKey::new(PathBuf::from("/work/a/child"), Some("web".to_string())).unwrap(),
+        ];
+        let nonmatching_keys = [
+            ReservationKey::new(root.clone(), None).unwrap(),
+            ReservationKey::new(PathBuf::from("/work/a/child"), Some("api".to_string())).unwrap(),
+        ];
+
+        for (key, port) in matching_keys
+            .iter()
+            .chain(&nonmatching_keys)
+            .cloned()
+            .zip(8080..)
+        {
+            let reservation = Reservation::builder(key, Port::try_from(port).unwrap())
+                .build()
+                .unwrap();
+            db.create_reservation(&reservation).unwrap();
+        }
+
+        let options = ReleaseOptions::new(matching_keys[0].clone()).with_allow_unrelated_path(true);
+        let plan = ReleasePlan::new(options)
+            .with_recursive(true)
+            .build_plan(db.connection())
+            .unwrap();
+
+        let planned_keys = plan
+            .actions
+            .iter()
+            .map(|action| match action {
+                PlanAction::DeleteReservation(key) => key,
+                other => panic!("unexpected recursive release action: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(planned_keys.len(), matching_keys.len());
+        for key in &matching_keys {
+            assert!(planned_keys.contains(&key));
+        }
+        for key in &nonmatching_keys {
+            assert!(!planned_keys.contains(&key));
+        }
+    }
+
+    #[test]
+    fn test_plan_recursive_untagged_applies_at_every_path() {
+        let mut db = create_test_database();
+        let root = PathBuf::from("/work/a");
+        let matching_keys = [
+            ReservationKey::new(root.clone(), None).unwrap(),
+            ReservationKey::new(PathBuf::from("/work/a/child"), None).unwrap(),
+        ];
+        let tagged_key =
+            ReservationKey::new(PathBuf::from("/work/a/child"), Some("web".to_string())).unwrap();
+
+        for (key, port) in matching_keys
+            .iter()
+            .cloned()
+            .chain(std::iter::once(tagged_key.clone()))
+            .zip(8080..)
+        {
+            let reservation = Reservation::builder(key, Port::try_from(port).unwrap())
+                .build()
+                .unwrap();
+            db.create_reservation(&reservation).unwrap();
+        }
+
+        let options = ReleaseOptions::new(matching_keys[0].clone()).with_allow_unrelated_path(true);
+        let plan = ReleasePlan::new(options)
+            .with_recursive(true)
+            .build_plan(db.connection())
+            .unwrap();
+
+        let planned_keys = plan
+            .actions
+            .iter()
+            .map(|action| match action {
+                PlanAction::DeleteReservation(key) => key,
+                other => panic!("unexpected recursive release action: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(planned_keys.len(), matching_keys.len());
+        for key in &matching_keys {
+            assert!(planned_keys.contains(&key));
+        }
+        assert!(!planned_keys.contains(&&tagged_key));
+    }
+
+    #[test]
+    fn test_plan_recursive_is_idempotent_when_selection_is_empty() {
+        let db = create_test_database();
+        let key =
+            ReservationKey::new(PathBuf::from("/test/path"), Some("web".to_string())).unwrap();
+        let options = ReleaseOptions::new(key).with_allow_unrelated_path(true);
+
+        let plan = ReleasePlan::new(options)
+            .with_recursive(true)
+            .build_plan(db.connection())
+            .unwrap();
+
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].contains("No reservations found under"));
     }
 
     #[test]

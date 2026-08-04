@@ -222,6 +222,100 @@ fn test_release_recursive_with_tag() {
     assert!(list_output.contains(&port_child_api.to_string()));
 }
 
+/// Default recursive release removes every tag under a component-aware root.
+#[test]
+fn test_release_recursive_all_tags_preserves_lexical_prefix_sibling() {
+    let env = TestEnv::new();
+    let parent = env.create_dir("work/a");
+    let child = env.create_dir("work/a/child");
+    let lexical_sibling = env.create_dir("work/ab");
+
+    let parent_untagged = env.reserve_simple(&parent);
+    let parent_web = env.reserve_with_tag(&parent, "web");
+    let child_api = env.reserve_with_tag(&child, "api");
+    let sibling = env.reserve_simple(&lexical_sibling);
+
+    related_command(&env)
+        .arg("release")
+        .arg("--path")
+        .arg(&parent)
+        .arg("--recursive")
+        .assert()
+        .success();
+
+    let list_output = env.list();
+    assert!(!list_output.contains(&parent_untagged.to_string()));
+    assert!(!list_output.contains(&parent_web.to_string()));
+    assert!(!list_output.contains(&child_api.to_string()));
+    assert!(list_output.contains(&sibling.to_string()));
+}
+
+/// Recursive untagged-only release preserves every tagged reservation.
+#[test]
+fn test_release_recursive_untagged_only() {
+    let env = TestEnv::new();
+    let parent = env.create_dir("parent");
+    let child = env.create_dir("parent/child");
+
+    let parent_untagged = env.reserve_simple(&parent);
+    let parent_tagged = env.reserve_with_tag(&parent, "web");
+    let child_untagged = env.reserve_simple(&child);
+    let child_tagged = env.reserve_with_tag(&child, "api");
+
+    related_command(&env)
+        .arg("release")
+        .arg("--path")
+        .arg(&parent)
+        .arg("--untagged-only")
+        .arg("--recursive")
+        .assert()
+        .success();
+
+    let list_output = env.list();
+    assert!(!list_output.contains(&parent_untagged.to_string()));
+    assert!(!list_output.contains(&child_untagged.to_string()));
+    assert!(list_output.contains(&parent_tagged.to_string()));
+    assert!(list_output.contains(&child_tagged.to_string()));
+}
+
+/// Recursive dry-run reports the live selection without changing any row.
+#[test]
+fn test_release_recursive_dry_run_uses_component_aware_selection() {
+    let env = TestEnv::new();
+    let parent = trop::path::normalize::normalize(&env.create_dir("work/a")).unwrap();
+    let child = trop::path::normalize::normalize(&env.create_dir("work/a/child")).unwrap();
+    let lexical_sibling = trop::path::normalize::normalize(&env.create_dir("work/ab")).unwrap();
+
+    let parent_port = env.reserve_with_tag(&parent, "web");
+    let child_port = env.reserve_with_tag(&child, "web");
+    let sibling_port = env.reserve_with_tag(&lexical_sibling, "web");
+
+    let output = related_command(&env)
+        .arg("release")
+        .arg("--path")
+        .arg(&parent)
+        .arg("--tag")
+        .arg("web")
+        .arg("--recursive")
+        .arg("--dry-run")
+        .output()
+        .expect("Failed to run recursive release dry-run");
+    assert!(
+        output.status.success(),
+        "recursive dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("Dry-run output was not UTF-8");
+    assert!(stderr.contains(&format!("{}:web", parent.display())));
+    assert!(stderr.contains(&format!("{}:web", child.display())));
+    assert!(!stderr.contains(&format!("{}:web", lexical_sibling.display())));
+
+    let list_output = env.list();
+    assert!(list_output.contains(&parent_port.to_string()));
+    assert!(list_output.contains(&child_port.to_string()));
+    assert!(list_output.contains(&sibling_port.to_string()));
+}
+
 /// Test non-recursive release doesn't affect children.
 ///
 /// Without --recursive, only the exact path should be released,
@@ -847,6 +941,50 @@ fn test_release_exact_path_deletion_is_atomic() {
     let list_output = env.list();
     assert!(list_output.contains(&untagged.to_string()));
     assert!(list_output.contains(&tagged.to_string()));
+}
+
+/// A late recursive delete failure rolls back every earlier deletion.
+#[test]
+fn test_release_recursive_deletion_is_atomic() {
+    let env = TestEnv::new();
+    let parent = env.create_dir("atomic-parent");
+    let child = env.create_dir("atomic-parent/child");
+    let parent_port = env.reserve_simple(&parent);
+    let child_port = env.reserve_with_tag(&child, "fail");
+
+    let connection =
+        Connection::open(env.data_dir.join("trop.db")).expect("Failed to open test database");
+    connection
+        .execute_batch(
+            "
+            CREATE TRIGGER fail_late_recursive_release
+            BEFORE DELETE ON reservations
+            WHEN OLD.tag = 'fail'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced late recursive release failure');
+            END;
+            ",
+        )
+        .expect("Failed to install recursive release failure trigger");
+    drop(connection);
+
+    related_command(&env)
+        .arg("release")
+        .arg("--path")
+        .arg(&parent)
+        .arg("--recursive")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "forced late recursive release failure",
+        ));
+
+    let list_output = env.list();
+    assert!(
+        list_output.contains(&parent_port.to_string()),
+        "an earlier recursive deletion committed despite a later failure"
+    );
+    assert!(list_output.contains(&child_port.to_string()));
 }
 
 // ============================================================================
