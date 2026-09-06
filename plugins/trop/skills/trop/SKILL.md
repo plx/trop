@@ -28,7 +28,7 @@ Read only the references needed for the task.
 | --- | --- |
 | Install, update, or run from source | [Installation](references/installation.md) |
 | Adopt in scripts, task runners, tests, or a monorepo | [Adoption](references/adoption.md) |
-| Define several related ports and export them together | [Groups](references/groups.md) — includes current group-command limitations |
+| Define several related ports and export them together | [Groups](references/groups.md) |
 | Choose ranges, exclusions, local overrides, or data directories | [Configuration](references/configuration.md) |
 | Inspect reservations, diagnose collisions, clean up, or move a directory | [Daily use](references/operations.md) |
 | Validate config and verify the integration | [Validation](references/validation.md) |

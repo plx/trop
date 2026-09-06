@@ -3,6 +3,10 @@
 Check `command -v trop` and `trop --version` first. The agent plugin supplies
 guidance; the executable is installed separately.
 
+Use 0.2.0 or later before evaluating shell exports or loading dotenv output;
+0.1.0 did not safely validate generated variable names. These references follow
+the current repository; smoke-test group reuse when using an older release.
+
 With a Rust toolchain and Cargo:
 
 ```bash

@@ -2,7 +2,7 @@
 
 ## Scope and precedence
 
-For ordinary commands, highest precedence first:
+Highest precedence first:
 
 1. Command-line options
 2. `TROP_*` environment variables
@@ -16,10 +16,11 @@ directory containing either project file. Ancestor tropfiles beyond that point
 are not merged. Check in shared policy in `trop.yaml`; gitignore machine-specific
 `trop.local.yaml`. Keep unrelated repositories' defaults in user config.
 
-Scalars override; port and cleanup settings merge by field; excluded-port lists
-accumulate; `occupancy_check` and `reservations` each replace as a whole. Include
-`min` when overriding a `ports` block. Group commands currently load the selected
-file directly: see [Groups](groups.md) before relying on these merge rules there.
+Scalars override; nested port, cleanup, and occupancy settings merge by field;
+excluded-port lists accumulate. Include `min` when overriding a `ports` block.
+Omitting `reservations` inherits the lower layer; a mapping replaces the whole
+group; `reservations: null` disables group commands without releasing stored ports.
+These rules also apply to [group commands](groups.md).
 
 ## Common settings
 
@@ -60,5 +61,5 @@ an unavailable preference can fall back. Read stdout instead of assuming `8080`.
 
 `TROP_DATA_DIR` (or `--data-dir`) selects the database and user config location.
 All cooperating processes must use the same one. Unknown YAML fields are errors;
-only tropfiles may contain `reservations`. Validate changed files with
+user `config.yaml` cannot define `project` or reservation groups. Validate changed files with
 `trop validate PATH` and consult command help for supported overrides.

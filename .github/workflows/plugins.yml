@@ -20,13 +20,13 @@ jobs:
       CODEX_VERSION: 0.144.1
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 24
 

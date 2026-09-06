@@ -25,15 +25,17 @@ reservations:
       env: DATABASE_PORT
 ```
 
-Offsets are relative to the allocated base and must be unique. One offset-based
-service can omit `offset` (defaults to zero). Specify distinct `env` names starting
-with a letter, containing only letters, digits, and underscores. Otherwise export
-names derive from the uppercased tags.
+Offsets are relative to the allocated base and must be unique, including for
+services with a preferred port. An omitted `offset` defaults to zero. Explicit
+`env` names must match `[A-Za-z_][A-Za-z0-9_]*`, be at most 255 bytes, and be unique
+ignoring ASCII case. Without `env`, names derive from ASCII tags by uppercasing
+letters and replacing hyphens with underscores; other tags need explicit mappings.
 
 Optional `reservations.base` starts the search at that base within `ports`; it
-does not guarantee exact numbers. A service's `preferred` selects an absolute
-port instead of its offset. Prefer offsets for parallel worktrees; an unavailable
-group `preferred` port can fail the entire allocation. Always use returned values.
+does not guarantee exact numbers. A service's `preferred` tries an absolute port
+first (even outside the scan range), then falls back to its offset if that port
+is reserved, excluded, or occupied. Pinned preferences need not follow the offset
+pattern. Always use returned values.
 
 ## Reserve and export
 
@@ -49,11 +51,11 @@ npm run dev:all
 preserves reservation failures; `eval "$(trop autoreserve)"` alone can hide them.
 Only evaluate output from the project's trusted tropfile.
 
-`autoreserve` searches upward for the nearest `trop.yaml` or `trop.local.yaml`.
-To select a file explicitly, use an **absolute** path:
+`autoreserve` searches upward for the nearest `trop.yaml` or `trop.local.yaml`
+and merges both siblings when present. To select a file explicitly:
 
 ```bash
-trop reserve-group "$(pwd -P)/trop.yaml" --format json
+trop reserve-group ./trop.yaml --format json
 ```
 
 | Output | Use |
@@ -63,20 +65,26 @@ trop reserve-group "$(pwd -P)/trop.yaml" --format json
 | `--format dotenv` | Env-name/value lines for tooling that loads env files |
 | `--format human` | Inspection |
 
-## Current CLI limitations
+The containing directory is canonicalized as the owner, so relative, absolute,
+and symlink routes share one group identity. An explicitly named `trop.yaml` or
+`trop.local.yaml` loads both siblings; an arbitrary filename is a standalone
+project source. All use the normal [configuration layers](configuration.md).
 
-Verified against the repository's `0.1.0` implementation; recheck on upgrade:
+## Reuse and changes
 
-- Repeating a group command can **reassign existing ports**, unlike single-port
-  `reserve`. Run it once before starting the service set and pass that result to
-  every consumer. For restart-stable independent services, use tagged `reserve`
-  calls. Do not rerun the group to discover a running service's address.
-- Group allocation reads the selected file itself: include `ports` and the entire
-  `reservations` block there. `autoreserve` selects `trop.local.yaml` when present;
-  a local file with only overrides does not inherit the group from `trop.yaml`.
-- A relative `reserve-group` filename can store a relative reservation owner.
-  Use `autoreserve` or an absolute filename so inspection and cleanup find it.
+Repeated `reserve-group` and `autoreserve` calls reuse a complete compatible group
+and refresh all members together. Partial groups or changed service/port shapes
+fail without mutation. Keep independent tagged reservations in another owning
+directory if they should not belong to the group: compatibility considers the
+whole exact-path tagged set.
 
-Validate the file and exercise allocation and a second invocation in an isolated
-database before putting group commands into a reusable launcher; see
-[Validation](validation.md).
+Omitted project/task values preserve existing metadata. Use the narrow
+`--allow-project-change` or `--allow-task-change` flag for an intentional update.
+For a deliberate group-shape change, inspect the existing reservations before
+using `--force`: it can replace that directory's tagged group and change ports.
+It preserves untagged and descendant reservations and still respects exclusions,
+occupancy, and other keys' ports. Restart affected consumers with the new mapping.
+
+Verify repeated allocation and cross-worktree behavior before relying on a newly
+adopted launcher; see [Validation](validation.md). Older installed releases may
+precede these group-reuse and configuration-overlay fixes.

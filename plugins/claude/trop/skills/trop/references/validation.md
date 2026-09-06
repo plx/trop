@@ -9,8 +9,8 @@ trop validate trop.local.yaml
 
 Validate only files that exist. CI should validate checked-in configs and any
 overrides it generates, not require a developer's local override or user config.
-Preserve the `trop.yaml` / `trop.local.yaml` basename in staged copies: other
-filenames are treated as user config and cannot contain `reservations`.
+`config.yaml` is validated as user configuration; other filenames are project
+configuration. Keep the intended filename when validating staged copies.
 
 Validation checks YAML and semantic constraints; it does not allocate ports,
 check listeners, or prove the application consumes the result correctly.
@@ -39,9 +39,10 @@ overrides. Both fake worktrees intentionally share one temporary database:
 ```
 
 For groups, copy the actual tropfile into each temporary worktree, validate it,
-and run `autoreserve --format json` there. Verify distinct ports and the declared
-offset relationships, then check what a second call does before assuming stable
-reuse. See [current group limitations](groups.md#current-cli-limitations).
+and run `autoreserve --format json` there. Verify distinct ports, declared offset
+relationships for fallback services, and successful preferred-port assignments.
+Repeat with `reserve-group ./trop.yaml` and confirm the same mapping. Add a local
+override that omits `reservations` and confirm the group is inherited.
 
 ## Test the real integration
 
