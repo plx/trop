@@ -366,6 +366,11 @@ cd trop
 cargo install --path trop-cli
 ```
 
+## Agent plugins
+
+This repository provides Claude Code and Codex marketplaces with a `trop` skill
+for adoption and daily use. See [installation and maintenance](plugins/README.md).
+
 ## Testing
 
 The project includes comprehensive test coverage:

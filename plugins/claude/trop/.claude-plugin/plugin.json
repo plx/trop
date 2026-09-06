@@ -1,9 +1,11 @@
 {
   "name": "trop",
   "version": "0.1.0",
-  "description": "Claude Code integration for the trop port reservation CLI.",
+  "description": "Adopt and use trop for coordinated development ports across services and worktrees.",
   "author": {
     "name": "trop contributors"
   },
-  "license": "MIT OR Apache-2.0"
+  "homepage": "https://plx.github.io/trop/",
+  "repository": "https://github.com/plx/trop",
+  "license": "Apache-2.0 OR MIT"
 }

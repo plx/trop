@@ -56,6 +56,15 @@ validate-claude-marketplace:
 # Validate the Claude Code plugin
 validate-claude-plugin:
     claude plugin validate --strict plugins/claude/trop
+    claude plugin validate --strict plugins/claude/trop/skills
+
+# Regenerate the Claude skill from the shared Codex edition
+sync-plugin-skills:
+    python3 plugins/sync-skills.py
+
+# Check that both standalone editions have the same body and references
+validate-plugin-skills:
+    python3 plugins/sync-skills.py --check
 
 # Validate all Claude Code plugin artifacts
 validate-claude: validate-claude-marketplace validate-claude-plugin
@@ -64,26 +73,26 @@ validate-claude: validate-claude-marketplace validate-claude-plugin
 validate-codex-marketplace:
     #!/usr/bin/env bash
     set -euo pipefail
-    codex_home=$(mktemp -d)
-    trap 'rm -rf "$codex_home"' EXIT
-    CODEX_HOME="$codex_home" codex plugin marketplace add "$PWD" --json >/dev/null
-    plugins=$(CODEX_HOME="$codex_home" codex plugin list --marketplace trop --available --json)
-    grep -q '"pluginId": "trop@trop"' <<<"$plugins"
+    plugin_test_home=$(mktemp -d)
+    trap 'rm -rf "$plugin_test_home"' EXIT
+    CODEX_HOME="$plugin_test_home" codex plugin marketplace add "$PWD" --json >/dev/null
+    CODEX_HOME="$plugin_test_home" codex plugin list --marketplace trop --available --json > "$plugin_test_home/plugins.json"
+    python3 -c 'import json, sys; data = json.load(open(sys.argv[1])); assert any(p["pluginId"] == "trop@trop" for p in data["available"]), data' "$plugin_test_home/plugins.json"
 
 # Validate the Codex plugin by installing it into an isolated Codex home
 validate-codex-plugin:
     #!/usr/bin/env bash
     set -euo pipefail
-    codex_home=$(mktemp -d)
-    trap 'rm -rf "$codex_home"' EXIT
-    CODEX_HOME="$codex_home" codex plugin marketplace add "$PWD" --json >/dev/null
-    CODEX_HOME="$codex_home" codex plugin add trop@trop --json >/dev/null
+    plugin_test_home=$(mktemp -d)
+    trap 'rm -rf "$plugin_test_home"' EXIT
+    CODEX_HOME="$plugin_test_home" codex plugin marketplace add "$PWD" --json >/dev/null
+    CODEX_HOME="$plugin_test_home" codex plugin add trop@trop --json >/dev/null
 
 # Validate all Codex plugin artifacts
 validate-codex: validate-codex-marketplace validate-codex-plugin
 
 # Validate both plugin marketplaces and both plugins
-validate-plugins: validate-claude validate-codex
+validate-plugins: validate-plugin-skills validate-claude validate-codex
 
 # Run all checks (Rust format, Clippy, Rust tests, selector tests, and plugins)
 check: fmt-check clippy test test-production-readiness-selector validate-plugins
