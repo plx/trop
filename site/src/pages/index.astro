@@ -15,7 +15,6 @@ const resolveHref = (href: string) =>
   isExternal(href) || href.startsWith("#") ? href : sitePath(href);
 const externalRel = (href: string) => (isExternal(href) ? "noopener noreferrer" : undefined);
 const externalTarget = (href: string) => (isExternal(href) ? "_blank" : undefined);
-const docsHref = siteConfig.docs.pages[0]?.href || "docs/";
 ---
 
 <!doctype html>
@@ -112,13 +111,6 @@ const docsHref = siteConfig.docs.pages[0]?.href || "docs/";
               </svg>
             </button>
           </div>
-          <a
-            class="button button--ghost button--sm"
-            href={resolveHref(docsHref)}
-            data-ds-component="Button"
-            data-ds-variant="ghost"
-            data-ds-size="sm"
-          >Docs</a>
           <button
             class="site-nav__toggle"
             type="button"
@@ -160,12 +152,6 @@ const docsHref = siteConfig.docs.pages[0]?.href || "docs/";
           <p class="hero__lede">{siteConfig.project.tagline}</p>
           <p class="hero__body">{siteConfig.project.description}</p>
 
-          <div class="badge-row" aria-label="Project highlights">
-            {siteConfig.landing.badges.map((badge) => (
-              <span class="badge" data-ds-component="Badge" data-ds-tone="default">{badge}</span>
-            ))}
-          </div>
-
           <div class="hero__actions">
             <a
               class="button button--primary"
@@ -195,29 +181,30 @@ const docsHref = siteConfig.docs.pages[0]?.href || "docs/";
 
         <div
           class="command-card"
+          id="install"
           aria-labelledby="command-card-title"
           data-ds-component="CommandCard"
         >
           <div class="command-card__header">
             <div>
-              <p class="eyebrow" data-ds-component="Eyebrow">Terminal</p>
               <h2 id="command-card-title">{siteConfig.landing.terminal.title}</h2>
             </div>
             <span>{siteConfig.landing.terminal.meta}</span>
           </div>
           <pre class="command-card__body"><code>{siteConfig.landing.terminal.lines.join("\n")}</code></pre>
+          <p>For an npm dev script that accepts <code>--port</code>.</p>
           <button
             class="copy-button"
             type="button"
             data-copy-text={siteConfig.landing.terminal.copy}
-            aria-label={`Copy command: ${siteConfig.landing.terminal.copy}`}
+            aria-label={`Copy install command: ${siteConfig.landing.terminal.copy}`}
             data-ds-component="CopyButton"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <rect x="8" y="8" width="11" height="12" rx="2"></rect>
               <path d="M5 15V6a2 2 0 0 1 2-2h9"></path>
             </svg>
-            <span>Copy</span>
+            <span>Copy install command</span>
             <span class="sr-only" data-copy-status aria-live="polite"></span>
           </button>
         </div>
@@ -225,82 +212,48 @@ const docsHref = siteConfig.docs.pages[0]?.href || "docs/";
 
       <section class="section section-shell model-strip" id="model" aria-labelledby="model-title">
         <div class="section-heading">
-          <p class="eyebrow" data-ds-component="Eyebrow">Reservation model</p>
-          <h2 id="model-title">Same key, same port.</h2>
+          <h2 id="model-title">How reservations work</h2>
           <p>
-            Reservations are keyed by directory and optional tag. Repeated calls return the same port.
+            A directory and an optional tag identify a reservation. Repeated calls return its stored
+            port; another directory or tag gets a separate reservation. Use <code>--tag web</code> or
+            <code>--tag api</code> when one directory needs several ports.
           </p>
-        </div>
-      </section>
-
-      <section class="section section--muted" id="features" aria-labelledby="features-title">
-        <div class="section-shell">
-          <div class="section-heading">
-            <p class="eyebrow" data-ds-component="Eyebrow">What trop provides</p>
-            <h2 id="features-title">Small guarantees for boring local ports</h2>
-          </div>
-          <div class="feature-grid">
-            {siteConfig.landing.features.map((feature, index) => (
-              <article class="feature-card" data-ds-component="FeatureCard">
-                <span class="feature-card__index" aria-hidden="true">{String(index + 1).padStart(2, "0")}</span>
-                <p class="feature-card__eyebrow">{feature.eyebrow}</p>
-                <h3>{feature.title}</h3>
-                <p>{feature.body}</p>
-                <a class="text-link" href={resolveHref(feature.href)}>Learn more</a>
-              </article>
-            ))}
-          </div>
+          <p>
+            Reservations live in a local SQLite database and persist when your server stops.
+            Run <code>trop prune</code> to remove records for deleted directories.
+          </p>
         </div>
       </section>
 
       <section class="section section-shell scope-strip" aria-labelledby="scope-title">
         <div class="scope-panel" data-ds-component="ScopePanel">
           <div>
-            <p class="eyebrow" data-ds-component="Eyebrow">Scope</p>
-            <h2 id="scope-title">Single-user coordination on one machine.</h2>
+            <h2 id="scope-title">One user, one machine</h2>
           </div>
           <div>
-            <p class="scope-panel__label">Non-goals</p>
-            <p>No system-wide enforcement. No multi-user broker. No container orchestration.</p>
+            <p>
+              A reservation records a number; it does not hold a socket open. Programs outside
+              <code>trop</code> can still take the port.
+              <a class="text-link" href={sitePath("guides/scope/")}>Reservation limits</a>
+            </p>
           </div>
         </div>
       </section>
 
       <section class="section section-shell docs-preview" aria-labelledby="docs-title">
         <div class="section-heading">
-          <p class="eyebrow" data-ds-component="Eyebrow">Documentation</p>
-          <h2 id="docs-title">Keep detailed guidance in Starlight.</h2>
+          <h2 id="docs-title">Documentation</h2>
         </div>
         <div class="docs-grid">
           {siteConfig.docs.pages.map((page) => (
             <article class="doc-card" data-ds-component="DocCard">
-              <h3>{page.title}</h3>
+              <h3><a class="text-link" href={resolveHref(page.href)}>{page.title}</a></h3>
               <p>{page.description}</p>
-              <a class="text-link" href={resolveHref(page.href)}>Open page</a>
             </article>
           ))}
         </div>
       </section>
 
-      <section class="section section--muted install-strip" id="install" aria-labelledby="install-title">
-        <div class="section-shell install-strip__inner">
-          <div class="section-heading">
-            <p class="eyebrow" data-ds-component="Eyebrow">Install</p>
-            <h2 id="install-title">Replace the fixed port.</h2>
-            <p>Use <code>trop reserve</code> where a script expects a port.</p>
-          </div>
-          <div
-            class="command-card command-card--compact"
-            aria-label="Install commands"
-            data-ds-component="CommandCard"
-            data-ds-compact="true"
-          >
-            <pre class="command-card__body"><code>$ cargo install trop-cli
-$ trop --version
-$ PORT=$(trop reserve)</code></pre>
-          </div>
-        </div>
-      </section>
     </main>
 
     <footer class="site-footer">

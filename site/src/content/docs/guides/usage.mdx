@@ -2,32 +2,55 @@
 title: "Usage"
 sidebar:
   label: "Usage"
-description: "Basic commands and script patterns for local port reservations."
+description: "Install, reserve ports, and clean up old reservations."
 ---
 
-Install the CLI from Cargo:
+## Install
+
+With Rust and Cargo installed:
 
 ```bash
 cargo install trop-cli
 ```
 
-Reserve a port for the current directory:
+The package is `trop-cli`; the installed command is `trop`.
+
+## Reserve a port
+
+Run this from the directory you want the reservation to belong to:
 
 ```bash
-PORT=$(trop reserve)
+PORT=$(trop reserve) &&
+  npm run dev -- --port "$PORT"
 ```
+
+This Bash/Zsh example assumes an npm dev script that accepts `--port`. Use the returned number wherever your server expects a port argument.
+
+## Tags
 
 Use tags when one worktree has multiple services:
 
-```bash
+```bash wrap
 WEB_PORT=$(trop reserve --tag web)
 API_PORT=$(trop reserve --tag api)
-DB_PORT=$(trop reserve --tag db)
 ```
 
-Repeated calls with the same directory and tag return the same port. This keeps scripts stable across restarts without requiring each process to release a port before it exits.
+Repeating a call with the same directory and tag returns the stored port. An untagged reservation is separate from every tagged reservation at that path.
 
-## Service Groups
+## Inspect and clean up
+
+| Command                           | Effect                                                                          |
+| --------------------------------- | ------------------------------------------------------------------------------- |
+| `trop list`                       | Show the reservations in the database.                                          |
+| `trop list --format json`         | Print the same records as JSON.                                                 |
+| `trop release --tag web`          | Release the `web` reservation for the current directory.                        |
+| `trop release`                    | Release all tags, including the untagged reservation, at the current directory. |
+| `trop prune --dry-run`            | Preview removal of records whose paths no longer resolve to directories.        |
+| `trop expire --days 30 --dry-run` | Preview removal of records unused for 30 days.                                  |
+
+Omit `--dry-run` to apply cleanup. Release leaves descendant directories alone unless you pass `--recursive`. Stopping a server does not release its reservation, and removing a reservation does not stop a server.
+
+## Service groups
 
 For recurring multi-service workflows, define reservations in `trop.yaml`:
 
@@ -35,35 +58,35 @@ For recurring multi-service workflows, define reservations in `trop.yaml`:
 reservations:
   services:
     web:
+      offset: 0
       env: WEB_PORT
     api:
       offset: 1
       env: API_PORT
 ```
 
-Every reservation service must resolve to a portable `export`/`dotenv`
-identifier, regardless of the selected output format. Explicit `env` names must
-be at most 255 bytes and match `[A-Za-z_][A-Za-z0-9_]*`. When `env` is omitted,
-trop accepts ASCII service tags that become valid names after converting ASCII
-letters to uppercase and replacing `-` with `_`; all other tags require an
-explicit valid mapping.
-Resolved names must also be unique when compared without ASCII case.
+This requests two consecutive ports, stored as the `web` and `api` tags for the directory containing the file. The group is reserved in one transaction: either both reservations succeed or neither does.
 
-Reserve the ports and inspect the resulting mapping by choosing one
-non-executable output format:
+From that directory or a subdirectory:
 
 ```bash
 trop autoreserve --format human
-# or
-trop autoreserve --format json
 ```
+
+`autoreserve` searches upward for `trop.yaml` or `.trop.yaml`. Use `trop reserve-group ./trop.yaml --format human` to give an explicit path. Repeated calls reuse a complete, compatible group; a partial or incompatible stored group produces a conflict.
+
+Use `--format json` for a tag-to-port mapping, `--format dotenv` for `VAR=value` lines, or `--format export --shell bash` for shell exports. These commands print output; they do not change the calling shell's environment.
+
+Each `env` name must be at most 255 bytes and match `[A-Za-z_][A-Za-z0-9_]*`. Without `env`, `trop` derives a name from an ASCII tag by converting letters to uppercase and replacing `-` with `_`. Other tags need an explicit valid mapping. Names must be unique ignoring ASCII case. These rules apply to every output format.
+
+## Upgrading from 0.1.0
 
 Version 0.1.0 does not safely validate every generated variable name in
 `export` or `dotenv` output from `autoreserve` and `reserve-group`. Both 0.1.0
 crates are yanked, but yanking does not remove installed binaries or update
 existing locked dependency resolutions. Upgrade the CLI explicitly:
 
-```bash
+```bash wrap
 cargo install trop-cli --version 0.2.0 --locked --force
 ```
 
@@ -72,10 +95,10 @@ Version 0.2.0 rejects invalid identifiers. See
 for affected usage and remediation. Until upgraded, use human or JSON output,
 inspect the result, and set only trusted variables manually.
 
-## Database Schema Upgrades
+## Database schema upgrades
 
 The first writable launch against a schema-v1 database automatically migrates
-it to schema v2 in one durable transaction. Trop checks all legacy rows before
+it to schema v2 in one durable transaction. `trop` checks all legacy rows before
 making changes. Duplicate keys or ports, empty legacy tags, invalid values,
 unexpected SQLite value types, and unsupported layouts stop the migration with
 recovery details; trop never silently chooses or discards a row.
