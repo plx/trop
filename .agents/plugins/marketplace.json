@@ -1,0 +1,20 @@
+{
+  "name": "trop",
+  "interface": {
+    "displayName": "Trop"
+  },
+  "plugins": [
+    {
+      "name": "trop",
+      "source": {
+        "source": "local",
+        "path": "./plugins/trop"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

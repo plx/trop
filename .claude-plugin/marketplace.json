@@ -1,0 +1,13 @@
+{
+  "name": "trop",
+  "description": "Plugins for the trop port reservation CLI.",
+  "owner": {
+    "name": "trop contributors"
+  },
+  "plugins": [
+    {
+      "name": "trop",
+      "source": "./plugins/claude/trop"
+    }
+  ]
+}

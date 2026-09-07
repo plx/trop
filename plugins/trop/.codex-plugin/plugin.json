@@ -1,0 +1,24 @@
+{
+  "name": "trop",
+  "version": "0.1.0",
+  "description": "Adopt and use trop for coordinated development ports across services and worktrees.",
+  "author": {
+    "name": "trop contributors"
+  },
+  "homepage": "https://plx.github.io/trop/",
+  "repository": "https://github.com/plx/trop",
+  "license": "Apache-2.0 OR MIT",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "trop",
+    "shortDescription": "Coordinate development ports with trop",
+    "longDescription": "Install and adopt trop, wire ports into launchers and clients, configure service groups, and inspect reservations across worktrees.",
+    "developerName": "trop contributors",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": [
+      "Adopt trop for this project's development ports.",
+      "Inspect this worktree's trop reservations."
+    ]
+  }
+}
