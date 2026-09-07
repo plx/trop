@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>harbor — alignment review</title>
+<link rel="stylesheet" href="../../styles.css">
+<style>
+*{box-sizing:border-box}body{margin:0;background:var(--surface-page);color:var(--text-strong);font-family:var(--tool-font-sans)}main{max-width:1720px;margin:auto;padding:24px}h1{font:600 30px var(--tool-font-heading);margin:0 0 8px}p{max-width:85ch;color:var(--text-body);line-height:1.5}button,select{font:inherit;min-height:44px;padding:8px 15px;border:1px solid var(--border-strong);border-radius:var(--tool-radius);background:var(--surface-card);color:var(--text-strong);cursor:pointer}button[aria-pressed=true]{background:var(--surface-accent);color:var(--text-on-accent)}button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--text-accent);outline-offset:3px}.controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:22px 0}.controls label{display:flex;align-items:center;gap:10px}input[type=range]{min-width:220px;min-height:44px;accent-color:var(--text-accent)}.pair{display:grid;grid-template-columns:1fr 1fr;gap:20px}.pair figure{margin:0;min-width:0}figcaption{margin:8px 0;font-weight:600}.viewport{position:relative;overflow:hidden;aspect-ratio:1642/958;background:var(--surface-code);border-radius:var(--tool-radius)}.viewport img{display:block;position:absolute;width:100%;height:100%;object-fit:fill}.night{opacity:var(--night,1)}.wipe .after{clip-path:inset(0 0 0 var(--split,50%))}.wipe::after{content:"";position:absolute;top:0;bottom:0;left:var(--split,50%);width:2px;background:var(--surface-accent)}.full{margin-top:24px}.full img{display:block;width:100%}a{color:var(--text-accent)}.native .viewport{aspect-ratio:auto;height:650px;overflow:auto}.native .scene{position:relative;width:1642px;height:958px}.native .viewport img{width:1642px;height:958px}.native .wipe::after{display:none}.muted{color:var(--text-body);font-size:14px}.hidden,[hidden]{display:none!important}table{border-collapse:collapse;margin:22px 0}th,td{text-align:left;padding:9px 18px 9px 0;border-bottom:1px solid var(--border-default)}@media(max-width:900px){.pair{grid-template-columns:1fr}main{padding:16px}input[type=range]{min-width:160px}}
+</style>
+<main>
+<h1>harbor / alignment review</h1>
+<p>Originals on the left; the candidate on the right. Both are <strong>1642 × 958</strong>. The candidate’s day image is byte-for-byte unchanged. Its night rendering uses the daytime drawing for fixed detail, with separate night illumination.</p>
+<div class="controls">
+<button id="transitionMode" aria-pressed="true">Day ↔ night</button>
+<button id="wipeMode" aria-pressed="false">Night before / after wipe</button>
+<button id="dayMode" aria-pressed="false">Day before / after</button>
+<label id="fadeLabel">Night <input id="fade" type="range" min="0" max="100" value="100"><output id="fadeValue">100%</output></label>
+<label id="wipeLabel" class="hidden">Split <input id="wipe" type="range" min="0" max="100" value="50"></label>
+<button id="play" aria-pressed="false">Play transition</button>
+<button id="native" aria-pressed="false">Native pixels</button>
+</div>
+<div class="pair" id="pair">
+<figure><figcaption>Original pair</figcaption><div class="viewport"><div class="scene"><img src="../../assets/harbor-hero-light.png" alt="Original harbor in daylight"><img class="night" src="../../assets/harbor-hero-dark.png" alt="Original harbor at night"></div></div></figure>
+<figure><figcaption>Candidate / shared geometry</figcaption><div class="viewport"><div class="scene"><img src="../../assets/harbor-aligned/harbor-hero-light.png" alt="Candidate harbor in daylight, unchanged"><img class="night" src="../../assets/harbor-aligned/harbor-hero-dark.png" alt="Aligned harbor at night"></div></div></figure>
+</div>
+<figure class="hidden" id="wipeFigure"><figcaption>Original night ← | → aligned night</figcaption><div class="viewport wipe"><div class="scene"><img src="../../assets/harbor-hero-dark.png" alt="Original night"><img class="after" src="../../assets/harbor-aligned/harbor-hero-dark.png" alt="Aligned night"></div></div></figure>
+<p class="muted">Scrub the transition to inspect stationary features. “Native pixels” displays each source pixel at one CSS pixel; scroll inside either image to inspect the right-hand details. Those views scroll together. Night brightness, line contrast, stars, lamps, and reflections intentionally differ.</p>
+<p><strong>Alignment evidence:</strong> all 11 sampled detail patches have their strongest absolute high-pass correlation at a 0, 0 pixel offset. This is a sampled registration check, not an exhaustive proof of every contour. The fixed-detail rendering comes from one master without resampling, warping, or donor linework.</p>
+<p><a href="../../assets/harbor-aligned/harbor-hero-light.png" download>Download aligned day</a> · <a href="../../assets/harbor-aligned/harbor-hero-dark.png" download>Download aligned night</a> · <a href="alignment-metrics.json">Measurement data</a> · <a href="before-after.png">Static before / after</a></p>
+<figure class="full"><figcaption>Enlarged details / original day, original night, aligned night</figcaption><img src="detail-comparison.png" alt="Crane, bollard, and rope comparisons"></figure>
+</main>
+<script>
+const q=s=>document.querySelector(s);let playing=false,frame=0,mode='transition';
+function fade(v){q('#fade').value=v;q('#fadeValue').value=`${Math.round(v)}%`;document.documentElement.style.setProperty('--night',v/100)}
+function stop(){playing=false;cancelAnimationFrame(frame);q('#play').textContent='Play transition';q('#play').setAttribute('aria-pressed','false')}
+function setMode(m){stop();mode=m;for(const [id,key]of [['transitionMode','transition'],['wipeMode','wipe'],['dayMode','day']])q('#'+id).setAttribute('aria-pressed',String(key===m));q('#pair').classList.toggle('hidden',m==='wipe');q('#wipeFigure').classList.toggle('hidden',m!=='wipe');q('#fadeLabel').classList.toggle('hidden',m!=='transition');q('#wipeLabel').classList.toggle('hidden',m!=='wipe');q('#play').hidden=m!=='transition';fade(m==='day'?0:100)}
+q('#transitionMode').onclick=()=>setMode('transition');q('#wipeMode').onclick=()=>setMode('wipe');q('#dayMode').onclick=()=>setMode('day');
+q('#fade').oninput=e=>{stop();fade(+e.target.value)};q('#wipe').oninput=e=>document.documentElement.style.setProperty('--split',e.target.value+'%');
+q('#play').onclick=()=>{if(playing){stop();return}playing=true;q('#play').textContent='Pause transition';q('#play').setAttribute('aria-pressed','true');const start=performance.now();function tick(now){if(!playing)return;fade((1-Math.cos((now-start)/1800*Math.PI))*50);frame=requestAnimationFrame(tick)}frame=requestAnimationFrame(tick)};
+q('#native').onclick=()=>{const enabled=document.body.classList.toggle('native');q('#native').setAttribute('aria-pressed',String(enabled));q('#native').textContent=enabled?'Fit images':'Native pixels'};
+let syncing=false;for(const el of document.querySelectorAll('#pair .viewport'))el.onscroll=()=>{if(syncing)return;syncing=true;for(const other of document.querySelectorAll('#pair .viewport'))if(other!==el){other.scrollTop=el.scrollTop;other.scrollLeft=el.scrollLeft}requestAnimationFrame(()=>syncing=false)};
+</script>
+</html>

@@ -1,0 +1,198 @@
+{
+  "dimensions": [
+    1642,
+    958
+  ],
+  "search_radius_px": 6,
+  "method": "absolute normalized correlation of grayscale high-pass patches",
+  "caveat": "Sampled integer offsets; weak or ambiguous matches require visual inspection.",
+  "regions": {
+    "crane apex": {
+      "bounds": [
+        1305,
+        180,
+        1390,
+        266
+      ],
+      "offset_px": [
+        0,
+        0
+      ],
+      "correlation": 0.97332,
+      "polarity": "opposite",
+      "runner_up_margin": 0.566,
+      "search_boundary": false,
+      "status": "measured"
+    },
+    "crane cables": {
+      "bounds": [
+        1230,
+        225,
+        1290,
+        274
+      ],
+      "offset_px": [
+        0,
+        0
+      ],
+      "correlation": 0.97253,
+      "polarity": "opposite",
+      "runner_up_margin": 0.10818,
+      "search_boundary": false,
+      "status": "measured"
+    },
+    "crane beam": {
+      "bounds": [
+        1100,
+        299,
+        1180,
+        330
+      ],
+      "offset_px": [
+        0,
+        0
+      ],
+      "correlation": 0.95924,
+      "polarity": "opposite",
+      "runner_up_margin": 0.28259,
+      "search_boundary": false,
+      "status": "measured"
+    },
+    "ship bow": {
+      "bounds": [
+        1200,
+        588,
+        1280,
+        630
+      ],
+      "offset_px": [
+        0,
+        0
+      ],
+      "correlation": 0.90306,
+      "polarity": "same",
+      "runner_up_margin": 0.49237,
+      "search_boundary": false,
+      "status": "measured"
+    },
+    "ship containers": {
+      "bounds": [
+        1155,
+        527,
+        1220,
+        560
+      ],
+      "offset_px": [
+        0,
+        0
+      ],
+      "correlation": 0.92357,
+      "polarity": "same",
+      "runner_up_margin": 0.28452,
+      "search_boundary": false,
+      "status": "measured"
+    },
+    "buoy": {
+      "bounds": [
+        689,
+        668,
+        731,
+        739
+      ],
+      "offset_px": [
+        0,
+        0
+      ],
+      "correlation": 0.99406,
+      "polarity": "opposite",
+      "runner_up_margin": 0.48561,
+      "search_boundary": false,
+      "status": "measured"
+    },
+    "bollard face": {
+      "bounds": [
+        1290,
+        744,
+        1362,
+        796
+      ],
+      "offset_px": [
+        0,
+        0
+      ],
+      "correlation": 0.88582,
+      "polarity": "same",
+      "runner_up_margin": 0.42423,
+      "search_boundary": false,
+      "status": "measured"
+    },
+    "bollard rim": {
+      "bounds": [
+        1282,
+        699,
+        1386,
+        729
+      ],
+      "offset_px": [
+        0,
+        0
+      ],
+      "correlation": 0.66164,
+      "polarity": "same",
+      "runner_up_margin": 0.30434,
+      "search_boundary": false,
+      "status": "measured"
+    },
+    "rope": {
+      "bounds": [
+        1435,
+        837,
+        1525,
+        880
+      ],
+      "offset_px": [
+        0,
+        0
+      ],
+      "correlation": 0.95482,
+      "polarity": "same",
+      "runner_up_margin": 0.41805,
+      "search_boundary": false,
+      "status": "measured"
+    },
+    "quay stones": {
+      "bounds": [
+        1080,
+        876,
+        1190,
+        942
+      ],
+      "offset_px": [
+        0,
+        0
+      ],
+      "correlation": 0.98312,
+      "polarity": "same",
+      "runner_up_margin": 0.2845,
+      "search_boundary": false,
+      "status": "measured"
+    },
+    "far shoreline": {
+      "bounds": [
+        180,
+        598,
+        335,
+        625
+      ],
+      "offset_px": [
+        0,
+        0
+      ],
+      "correlation": 0.82063,
+      "polarity": "opposite",
+      "runner_up_margin": 0.35533,
+      "search_boundary": false,
+      "status": "measured"
+    }
+  }
+}
