@@ -131,23 +131,41 @@ for (const path of collectSourceFiles(join(siteRoot, "src"))) {
   }
 }
 
-const requiredComponents = [
-  "Badge",
-  "Button",
-  "CommandCard",
-  "CopyButton",
-  "DocCard",
-  "Eyebrow",
-  "FeatureCard",
-  "ScopePanel",
-  "ThemeToggle",
-];
+// The landing page uses a subset of the kit. Check every primitive it uses;
+// do not require content merely to exhibit the full component inventory.
+const componentRecipes = {
+  Badge: "badge",
+  Button: "button",
+  CommandCard: "command-card",
+  CopyButton: "copy-button",
+  DocCard: "doc-card",
+  Eyebrow: "eyebrow",
+  FeatureCard: "feature-card",
+  ScopePanel: "scope-panel",
+  ThemeToggle: "theme-toggle",
+};
 const landingPage = read(landingPagePath);
-for (const component of requiredComponents) {
-  if (!landingPage.includes(`data-ds-component="${component}"`)) {
-    failures.push(
-      `${relativeToRepository(landingPagePath)}: missing ${component} design-system primitive`,
-    );
+// Landing primitives use literal class and annotation attributes in Astro.
+for (const [element] of landingPage.matchAll(/<[a-z][^>]*>/g)) {
+  const classes = (element.match(/\bclass="([^"]*)"/)?.[1] ?? "").split(/\s+/);
+  const annotation = element.match(/\bdata-ds-component="([^"]*)"/)?.[1];
+  for (const [component, recipe] of Object.entries(componentRecipes)) {
+    if (classes.includes(recipe) && annotation !== component) {
+      failures.push(
+        `${relativeToRepository(landingPagePath)}: .${recipe} needs a ${component} annotation`,
+      );
+    }
+  }
+  if (annotation) {
+    const recipe =
+      componentRecipes[
+        /** @type {keyof typeof componentRecipes} */ (annotation)
+      ];
+    if (!recipe || !classes.includes(recipe)) {
+      failures.push(
+        `${relativeToRepository(landingPagePath)}: ${annotation} needs its established class recipe`,
+      );
+    }
   }
 }
 

@@ -2,27 +2,26 @@
 title: "Overview"
 sidebar:
   label: "Overview"
-description: "What trop reserves, why it exists, and where it fits."
+description: "How directory and tag pairs identify a reservation."
 ---
 
-`trop` is a small Rust CLI for reserving localhost ports in development worktrees. It is meant to replace hardcoded port numbers in scripts with stable, directory-aware reservations.
+`trop` assigns port numbers to directories. It is useful when you run development servers in several worktrees and want each one to keep its own port.
 
 ```bash
-PORT=$(trop reserve)
-npm run dev -- --port "$PORT"
+PORT=$(trop reserve) &&
+  npm run dev -- --port "$PORT"
 ```
 
-The main guarantee is idempotence: the same worktree and tag get the same reservation on repeated calls, while different worktrees can reserve independently.
-
-## Use Cases
-
-- Running several development worktrees at the same time.
-- Giving concurrent local agents stable ports without a shared spreadsheet.
-- Replacing fixed ports in `just`, `npm`, `cargo`, or shell scripts.
-- Cleaning up stale reservations after a worktree is removed.
+This example assumes an npm dev script that accepts `--port`. `trop reserve` prints the port to stdout; diagnostics go to stderr. The `&&` starts the server only if the reservation succeeds.
 
 ## Model
 
-Reservations are keyed by a directory and optional tag. `trop` stores reservations locally and coordinates concurrent callers with a SQLite-backed lock model.
+A reservation is a record in a local SQLite database, keyed by a directory and an optional tag:
 
-The tool is intentionally local. It coordinates one user account on one machine; it does not try to enforce system-wide policy or broker ports across users, containers, or hosts.
+- Repeating `trop reserve` in the same directory returns the stored port.
+- A different directory or tag gets a separate reservation.
+- Reservations persist when a server stops. Release or prune them when you no longer need them.
+
+Any directory works; it does not have to be a Git worktree. Concurrent callers coordinate through the same database, stored in `~/.trop` by default.
+
+The record does not hold a socket open or prevent another program from taking the port. See [Scope](../scope/) for the limits, or [Usage](../usage/) for installation and commands.

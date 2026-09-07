@@ -1,59 +1,26 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
+import { siteConfig } from "../src/site.config.mjs";
 
-type DocsPage = {
-  title: string;
-  description: string;
-  slug: string;
-  href: string;
-};
-
-const origin = "http://127.0.0.1:4321";
-const projectTitle = "trop";
-const projectDescription =
-  "A small CLI for stable localhost port numbers per worktree.";
-const basePath: string = "/trop";
+const origin = `http://127.0.0.1:${process.env.TROP_SITE_TEST_PORT || "4321"}`;
+const projectTitle = siteConfig.project.title;
+const projectDescription = siteConfig.project.description;
+const basePath: string = siteConfig.site.basePath;
 const normalizedBasePath = basePath === "/" ? "" : basePath;
-// prettier-ignore
-const docsPages: DocsPage[] = [
-    {
-      "title": "Overview",
-      "description": "What trop reserves, why it exists, and where it fits.",
-      "slug": "guides/overview",
-      "href": "guides/overview/"
-    },
-    {
-      "title": "Usage",
-      "description": "Basic commands and script patterns for local port reservations.",
-      "slug": "guides/usage",
-      "href": "guides/usage/"
-    },
-    {
-      "title": "Configuration",
-      "description": "Port ranges, tags, exclusions, and cleanup behavior.",
-      "slug": "guides/configuration",
-      "href": "guides/configuration/"
-    },
-    {
-      "title": "Scope",
-      "description": "What trop deliberately does and does not attempt to solve.",
-      "slug": "guides/scope",
-      "href": "guides/scope/"
-    }
-  ];
+const docsPages = siteConfig.docs.pages;
 const pagesToCheck = ["/", ...docsPages.map((page) => page.href)];
-const pagesToAudit = ["/", docsPages[0]?.href].filter(Boolean);
-const designSystemComponents = [
-  "Badge",
-  "Button",
-  "CommandCard",
-  "CopyButton",
-  "DocCard",
-  "Eyebrow",
-  "FeatureCard",
-  "ScopePanel",
-  "ThemeToggle",
-];
+const pagesToAudit = pagesToCheck;
+const componentRecipes: Record<string, string> = {
+  Badge: "badge",
+  Button: "button",
+  CommandCard: "command-card",
+  CopyButton: "copy-button",
+  DocCard: "doc-card",
+  Eyebrow: "eyebrow",
+  FeatureCard: "feature-card",
+  ScopePanel: "scope-panel",
+  ThemeToggle: "theme-toggle",
+};
 
 function sitePath(path = "/"): string {
   const cleanPath = path.startsWith("/") ? path : `/${path}`;
@@ -168,16 +135,22 @@ test.describe("rendered site", () => {
     ]);
   });
 
-  test("renders every landing primitive from the design-system contract", async ({
+  test("uses design-system recipes for the rendered landing primitives", async ({
     page,
   }) => {
     await page.goto(sitePath("/"));
 
-    for (const component of designSystemComponents) {
-      await expect(
-        page.locator(`[data-ds-component="${component}"]`),
-        `${component} should be represented on the landing page`,
-      ).not.toHaveCount(0);
+    const primitives = page.locator("[data-ds-component]");
+    expect(await primitives.count()).toBeGreaterThan(0);
+    for (const primitive of await primitives.all()) {
+      const component = (await primitive.getAttribute("data-ds-component"))!;
+      expect(
+        componentRecipes,
+        `Unknown component: ${component}`,
+      ).toHaveProperty(component);
+      await expect(primitive).toHaveClass(
+        new RegExp(`(^|\\s)${componentRecipes[component]}(\\s|$)`),
+      );
     }
 
     const foundations = await page.evaluate(() => {
@@ -303,7 +276,7 @@ test.describe("rendered site", () => {
     await page.goto(sitePath("/"));
 
     const copyButton = page.getByRole("button", {
-      name: "Copy command: cargo install trop-cli",
+      name: "Copy install command: cargo install trop-cli",
     });
     await copyButton.click();
     await expect(copyButton.locator("span:not(.sr-only)")).toHaveText("Copied");

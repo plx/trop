@@ -2,7 +2,9 @@ import { defineConfig, devices } from "@playwright/test";
 
 const basePath: string = "/trop";
 const normalizedBasePath = basePath === "/" ? "" : basePath;
-const localSiteUrl = `http://127.0.0.1:4321${normalizedBasePath}/`;
+const testPort = process.env.TROP_SITE_TEST_PORT || "4321";
+const origin = `http://127.0.0.1:${testPort}`;
+const localSiteUrl = `${origin}${normalizedBasePath}/`;
 const dotReporter = ["dot"] as const;
 const htmlReporter = ["html", { open: "never" }] as const;
 const listReporter = ["list"] as const;
@@ -18,11 +20,11 @@ export default defineConfig({
     ? [dotReporter, htmlReporter]
     : [listReporter, htmlReporter],
   use: {
-    baseURL: "http://127.0.0.1:4321",
+    baseURL: origin,
     trace: "on-first-retry",
   },
   webServer: {
-    command: "npm run dev -- --host 127.0.0.1",
+    command: `npm run dev -- --host 127.0.0.1 --port ${testPort}`,
     url: localSiteUrl,
     // Astro 7 auto-detects AI-agent environments and starts `astro dev` in the
     // background, so the foreground process exits immediately and Playwright

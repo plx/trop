@@ -1,9 +1,10 @@
 # trop Design System
 
 Design system for **trop** — a niche, open-source Rust CLI for managing local
-port reservations while doing agentic coding. trop replaces hardcoded port
-numbers in dev scripts with sticky, directory-aware, idempotent reservations so
-that concurrent worktrees and multiple local agents never collide.
+port reservations for local development. trop replaces hardcoded port numbers
+in dev scripts with stored reservations for each directory and optional tag.
+Callers coordinate through one local database; reservations do not prevent
+other programs from binding the ports.
 
 This project packages trop's visual language — its nautical/harbor motif, cool
 paper palette, three-family type system, and the handful of UI primitives that

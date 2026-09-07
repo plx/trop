@@ -2,28 +2,61 @@
 title: "Configuration"
 sidebar:
   label: "Configuration"
-description: "Port ranges, tags, exclusions, and cleanup behavior."
+description: "YAML settings, port ranges, exclusions, and defaults."
 ---
 
-`trop` is designed to work with little configuration. The main knobs are tags, ranges, exclusions, and project-level reservation groups.
+No configuration file is required for `trop reserve`. The default allocation range is 5000–7000.
 
-## Tags
+## Project configuration
 
-Use tags to reserve distinct ports for separate services in the same directory:
+Put settings in `trop.yaml` at the project root:
 
-```bash
-trop reserve --tag web
-trop reserve --tag api
+```yaml
+ports:
+  min: 5000
+  max: 7000
+
+excluded_ports:
+  - 5432
+  - "6000..6010"
+
+cleanup:
+  expire_after_days: 30
 ```
 
-## Exclusions
+Exclusion ranges include both endpoints. Exclusions keep known service ports out of new allocations; they do not move existing reservations.
 
-When a port or range should never be assigned, add it to the exclusion set so `trop` can avoid conflicts with non-`trop` services.
+Check a file before using it:
+
+```bash
+trop validate ./trop.yaml
+```
+
+To define several tagged ports together, add a `reservations` mapping as shown in [Service groups](../usage/#service-groups).
+
+## Setting precedence
+
+From highest to lowest:
+
+1. Command-line flags
+2. Environment variables
+3. `trop.local.yaml` at the project boundary
+4. `trop.yaml` at the project boundary
+5. `config.yaml` in the data directory (`~/.trop` by default)
+6. Built-in defaults
+
+Omitted settings inherit from the next source. Exclusions accumulate across files. A `reservations` mapping replaces the whole inherited group; `reservations: null` clears the configured group without deleting stored reservations.
+
+Use `--data-dir` or `TROP_DATA_DIR` to select another data directory. Callers must use the same database to coordinate.
 
 ## Cleanup
 
-Reservations are associated with directories. When a worktree is deleted, stale reservations can be pruned without wiring teardown hooks into every development script.
+When `trop reserve` runs out of candidates, it prunes reservations whose directories are gone, expires unused reservations according to the configured age, and retries once. The default expiration threshold is 30 days.
 
-## Project Metadata
+Set `disable_autoprune: true` or `disable_autoexpire: true` to disable the corresponding automatic step. These settings do not schedule background cleanup. You can also [run cleanup explicitly](../usage/#inspect-and-clean-up).
 
-Reservations can also carry `project` and `task` metadata. These fields do not affect allocation behavior, but they make inspection and debugging easier in multi-worktree workflows.
+## Project metadata
+
+`project` and `task` label reservations for inspection. The directory and tag still identify the reservation. You can set `project` in `trop.yaml`, or pass `--project` and `--task` when reserving.
+
+For the remaining options, use `trop --help` and `trop reserve --help`.

@@ -16,6 +16,15 @@ This directory is a consumer of the canonical design system in
 - Preserve light, dark, and system modes, keyboard focus, reduced motion,
   44-pixel interaction targets, and the `/trop` deployment base path.
 
+## Content
+
+Write the site as a project README and command guide. Explain the reservation
+model, show usable commands, and state the limits accurately. A reservation
+records a port number; it does not hold a socket open.
+
+Use only the components the content needs. Do not add badges, feature cards,
+repeated headings, or sections to fill out the design-system inventory.
+
 ## Validation
 
 Run `npm run check:design-system` for the fast boundary check and

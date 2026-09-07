@@ -14,7 +14,7 @@ export const siteConfig = {
     "packageName": "trop-site",
     "category": "Rust CLI",
     "tagline": "Port reservations for worktrees",
-    "description": "A small CLI for stable localhost port numbers per worktree.",
+    "description": "trop assigns a port number to a directory and remembers it for the next run. Use it in dev scripts when you run several worktrees at once.",
     "installCommand": "cargo install trop-cli"
   },
   "site": {
@@ -31,7 +31,7 @@ export const siteConfig = {
         "href": "guides/overview/"
       },
       {
-        "label": "Model",
+        "label": "Reservations",
         "href": "#model"
       },
       {
@@ -47,14 +47,6 @@ export const siteConfig = {
       {
         "label": "Docs",
         "href": "guides/overview/"
-      },
-      {
-        "label": "Model",
-        "href": "#model"
-      },
-      {
-        "label": "Install",
-        "href": "#install"
       },
       {
         "label": "GitHub",
@@ -73,46 +65,15 @@ export const siteConfig = {
       "label": "Read docs",
       "href": "guides/overview/"
     },
-    "badges": [
-      "Rust",
-      "CLI",
-      "SQLite",
-      "Worktrees"
-    ],
-    "features": [
-      {
-        "eyebrow": "Idempotent",
-        "title": "Same directory, same port",
-        "body": "Run trop reserve again from the same worktree and get the same number.",
-        "href": "guides/overview/"
-      },
-      {
-        "eyebrow": "Tagged",
-        "title": "Tags split services",
-        "body": "Use --tag web, --tag api, or similar names when one worktree needs multiple ports.",
-        "href": "guides/usage/"
-      },
-      {
-        "eyebrow": "Concurrent",
-        "title": "SQLite coordinates callers",
-        "body": "Concurrent invocations share a local SQLite database.",
-        "href": "guides/configuration/"
-      },
-      {
-        "eyebrow": "Cleanup",
-        "title": "Prune deleted worktrees",
-        "body": "Remove reservations whose directories no longer exist.",
-        "href": "guides/scope/"
-      }
-    ],
     "terminal": {
-      "title": "shell",
-      "meta": "quick start",
+      "title": "Install and use",
+      "meta": "Bash / Zsh",
       "copy": "cargo install trop-cli",
       "lines": [
-        "$ cargo install trop-cli",
-        "$ PORT=$(trop reserve)",
-        "$ npm run dev -- --port $PORT"
+        "cargo install trop-cli",
+        "",
+        "PORT=$(trop reserve) &&",
+        "  npm run dev -- --port \"$PORT\""
       ]
     }
   },
@@ -143,25 +104,25 @@ export const siteConfig = {
     "pages": [
       {
         "title": "Overview",
-        "description": "What trop reserves, why it exists, and where it fits.",
+        "description": "How directory and tag pairs identify a reservation.",
         "slug": "guides/overview",
         "href": "guides/overview/"
       },
       {
         "title": "Usage",
-        "description": "Basic commands and script patterns for local port reservations.",
+        "description": "Install, reserve ports, and clean up old reservations.",
         "slug": "guides/usage",
         "href": "guides/usage/"
       },
       {
         "title": "Configuration",
-        "description": "Port ranges, tags, exclusions, and cleanup behavior.",
+        "description": "YAML settings, port ranges, exclusions, and defaults.",
         "slug": "guides/configuration",
         "href": "guides/configuration/"
       },
       {
         "title": "Scope",
-        "description": "What trop deliberately does and does not attempt to solve.",
+        "description": "What a reservation guarantees, and what it cannot enforce.",
         "slug": "guides/scope",
         "href": "guides/scope/"
       }

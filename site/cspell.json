@@ -6,6 +6,8 @@
     "api",
     "Astro",
     "astro",
+    "autoexpire",
+    "autoprune",
     "autoreserve",
     "AxeBuilder",
     "baseURL",
