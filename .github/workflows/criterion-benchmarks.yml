@@ -1,0 +1,93 @@
+name: Criterion benchmarks
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  benchmark-pr:
+    if: github.event_name == 'pull_request'
+    name: Benchmark comparison (PR)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CRITERION_BASELINE: base
+      CRITERION_CURRENT: pr
+      CRITERION_REGRESSION_THRESHOLD: '0.10'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: criterion
+
+      - name: Reset Criterion output
+        run: rm -rf "$CARGO_TARGET_DIR/criterion"
+
+      - name: Run benchmarks on base commit
+        run: |
+          BASE_SHA=${{ github.event.pull_request.base.sha }}
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git worktree add --detach ../base "$BASE_SHA"
+          pushd ../base
+          cargo bench --workspace -- --save-baseline "$CRITERION_BASELINE"
+          popd
+          git worktree remove ../base --force
+
+      - name: Run benchmarks on PR commit
+        run: cargo bench --workspace -- --baseline "$CRITERION_BASELINE" --save-baseline "$CRITERION_CURRENT"
+
+      - name: Compare benchmark results
+        run: python3 ci/criterion_compare.py "$CARGO_TARGET_DIR/criterion"
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-pr-${{ github.run_id }}
+          path: ${{ env.CARGO_TARGET_DIR }}/criterion
+
+  benchmark-main:
+    if: github.event_name != 'pull_request'
+    name: Benchmark snapshot
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: criterion
+
+      - name: Reset Criterion output
+        run: rm -rf "$CARGO_TARGET_DIR/criterion"
+
+      - name: Run benchmarks
+        run: cargo bench --workspace -- --save-baseline main
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-main-${{ github.run_id }}
+          path: ${{ env.CARGO_TARGET_DIR }}/criterion
