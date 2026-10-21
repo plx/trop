@@ -396,8 +396,9 @@ impl Database {
         operation: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
         let timeout_millis =
-            conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u64>(0))?;
-        let timeout = Duration::from_millis(timeout_millis);
+            conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))?;
+        // SQLite clamps negative busy timeouts to zero, so this never truncates.
+        let timeout = Duration::from_millis(u64::try_from(timeout_millis).unwrap_or(0));
 
         if !conn.is_autocommit() {
             return Self::with_savepoint(conn, savepoint_name, operation).map_err(|error| {

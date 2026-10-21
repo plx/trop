@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, DatabaseName, Transaction, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior, MAIN_DB};
 
 use crate::error::{Error, Result};
 
@@ -159,7 +159,7 @@ enum MigrationPhase {
 /// Returns a typed migration error when the database is read-only, or a
 /// database error when schema creation, validation, or commit fails.
 pub fn initialize_schema(conn: &Connection) -> Result<()> {
-    if conn.is_readonly(DatabaseName::Main)? {
+    if conn.is_readonly(MAIN_DB)? {
         return Err(Error::MigrationRequired {
             found: 0,
             target: CURRENT_SCHEMA_VERSION,
@@ -296,7 +296,7 @@ fn check_schema_compatibility_with_observer(
             action: "no ordered migration is available for this older schema version".into(),
         });
     }
-    if conn.is_readonly(DatabaseName::Main)? {
+    if conn.is_readonly(MAIN_DB)? {
         return Err(Error::MigrationRequired {
             found: version,
             target: CURRENT_SCHEMA_VERSION,
