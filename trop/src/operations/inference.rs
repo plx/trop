@@ -146,7 +146,7 @@ pub fn infer_task(path: &Path) -> Option<String> {
 /// `true` if this is a worktree, `false` otherwise
 fn is_worktree(repo: &gix::Repository) -> bool {
     // Check if .git is a file (indicates worktree)
-    repo.work_dir()
+    repo.workdir()
         .and_then(|wd| wd.join(".git").metadata().ok())
         .is_some_and(|m| m.is_file())
 }
@@ -164,7 +164,7 @@ fn is_worktree(repo: &gix::Repository) -> bool {
 /// - `Some(String)` containing the worktree directory name
 /// - `None` if extraction fails
 fn extract_worktree_name(repo: &gix::Repository) -> Option<String> {
-    repo.work_dir()
+    repo.workdir()
         .and_then(|wd| wd.file_name())
         .and_then(|n| n.to_str())
         .map(std::string::ToString::to_string)

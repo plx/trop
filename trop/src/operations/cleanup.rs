@@ -865,7 +865,11 @@ mod tests {
 
         let result = CleanupOperations::prune(&mut db, false).unwrap();
         assert_eq!(result.removed_count, 0);
-        assert!(result.removed_reservations.is_empty());
+        assert!(
+            result.removed_reservations.is_empty(),
+            "unexpected removals: {:?}",
+            result.removed_reservations
+        );
     }
 
     #[test]
@@ -1048,9 +1052,11 @@ mod tests {
                 status: PrunePathStatus::NotDirectory,
             }]
         );
-        assert!(Database::list_all_reservations(db.connection())
-            .unwrap()
-            .is_empty());
+        let remaining = Database::list_all_reservations(db.connection()).unwrap();
+        assert!(
+            remaining.is_empty(),
+            "unexpected reservations: {remaining:?}"
+        );
     }
 
     #[test]
@@ -1096,7 +1102,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.removed_count, 0);
-        assert!(result.removed_reservations.is_empty());
+        assert!(
+            result.removed_reservations.is_empty(),
+            "unexpected removals: {:?}",
+            result.removed_reservations
+        );
         assert_eq!(
             Database::list_all_reservations(db.connection())
                 .unwrap()
@@ -1114,7 +1124,10 @@ mod tests {
                 panic!("expected an uninspectable decision for {name}");
             };
             assert_eq!(error.kind, expected_kind);
-            assert!(!error.message.is_empty());
+            assert!(
+                !error.message.is_empty(),
+                "error message should not be empty"
+            );
             if !matches!(name, "loop" | "broken-mount") {
                 assert!(error.message.contains("simulated"));
             }

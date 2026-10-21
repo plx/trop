@@ -1176,7 +1176,10 @@ mod tests {
             PortRange::new(Port::try_from(5500).unwrap(), Port::try_from(5999).unwrap()).unwrap();
 
         let occupied_in_range = checker.find_occupied_ports(&range, &config).unwrap();
-        assert!(occupied_in_range.is_empty());
+        assert!(
+            occupied_in_range.is_empty(),
+            "unexpected occupied ports: {occupied_in_range:?}"
+        );
     }
 
     #[test]
@@ -1349,7 +1352,11 @@ mod tests {
 
         assert!(report.was_skipped());
         assert!(!report.is_occupied());
-        assert!(report.occupied_probes.is_empty());
+        assert!(
+            report.occupied_probes.is_empty(),
+            "unexpected occupied probes: {:?}",
+            report.occupied_probes
+        );
     }
 
     #[test]

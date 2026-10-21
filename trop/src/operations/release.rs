@@ -393,14 +393,14 @@ mod tests {
                 .build_plan(db.connection())
                 .unwrap();
             assert_eq!(plan1.len(), 0);
-            assert!(!plan1.warnings.is_empty());
+            assert!(!plan1.warnings.is_empty(), "must have at least one warning");
 
             // Second release - should produce identical result
             let plan2 = ReleasePlan::new(options)
                 .build_plan(db.connection())
                 .unwrap();
             assert_eq!(plan2.len(), 0);
-            assert!(!plan2.warnings.is_empty());
+            assert!(!plan2.warnings.is_empty(), "must have at least one warning");
         }
     }
 
@@ -503,7 +503,11 @@ mod tests {
             .build_plan(db.connection())
             .unwrap();
 
-        assert!(plan.actions.is_empty());
+        assert!(
+            plan.actions.is_empty(),
+            "unexpected actions: {:?}",
+            plan.actions
+        );
         assert_eq!(plan.warnings.len(), 1);
         assert!(plan.warnings[0].contains("No reservations found"));
     }
@@ -657,7 +661,11 @@ mod tests {
             .build_plan(db.connection())
             .unwrap();
 
-        assert!(plan.actions.is_empty());
+        assert!(
+            plan.actions.is_empty(),
+            "unexpected actions: {:?}",
+            plan.actions
+        );
         assert_eq!(plan.warnings.len(), 1);
         assert!(plan.warnings[0].contains("No reservations found under"));
     }

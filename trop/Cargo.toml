@@ -25,7 +25,7 @@ home = { workspace = true }
 socket2 = "0.6"
 netstat2 = "0.11"
 sysinfo = { version = "0.33", default-features = false, features = ["system", "user"] }
-gix = { version = "0.68", default-features = false, features = ["revision"] }
+gix = { version = "0.89", default-features = false, features = ["revision", "sha1"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -37,7 +37,7 @@ windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Network
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 proptest = "1.0"
-criterion = "0.5"
+criterion = "0.8"
 serial_test = "3.2"
 mockall = "0.13"
 assert_cmd = "2.0"
