@@ -450,10 +450,13 @@ mod tests {
             .format_export(var_name, value)
             .unwrap();
 
-        assert!(!bash_export.is_empty());
-        assert!(!zsh_export.is_empty());
-        assert!(!fish_export.is_empty());
-        assert!(!ps_export.is_empty());
+        assert!(!bash_export.is_empty(), "bash export should not be empty");
+        assert!(!zsh_export.is_empty(), "zsh export should not be empty");
+        assert!(!fish_export.is_empty(), "fish export should not be empty");
+        assert!(
+            !ps_export.is_empty(),
+            "PowerShell export should not be empty"
+        );
 
         // All should contain the variable name
         assert!(bash_export.contains(var_name));
@@ -656,7 +659,7 @@ mod tests {
         // Should produce valid export format
         let shell = detected.unwrap();
         let export = shell.format_export("PORT", "8080").unwrap();
-        assert!(!export.is_empty());
+        assert!(!export.is_empty(), "export should not be empty");
         assert!(export.contains("PORT"));
         assert!(export.contains("8080"));
     }

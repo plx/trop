@@ -961,7 +961,10 @@ mod tests {
             .is_err());
 
         let reservations = Database::list_all_reservations(db.connection()).unwrap();
-        assert!(reservations.is_empty());
+        assert!(
+            reservations.is_empty(),
+            "unexpected reservations: {reservations:?}"
+        );
     }
 
     #[test]
@@ -1502,9 +1505,11 @@ mod tests {
                 "Expected a precise validation error containing {expected:?}, got {error}"
             );
         }
-        assert!(Database::list_all_reservations(db.connection())
-            .unwrap()
-            .is_empty());
+        let remaining = Database::list_all_reservations(db.connection()).unwrap();
+        assert!(
+            remaining.is_empty(),
+            "unexpected reservations: {remaining:?}"
+        );
     }
 
     #[test]
@@ -1700,9 +1705,11 @@ mod tests {
             ),
             "Expected a precise complete-pattern exhaustion error, got {error}"
         );
-        assert!(Database::list_all_reservations(db.connection())
-            .unwrap()
-            .is_empty());
+        let remaining = Database::list_all_reservations(db.connection()).unwrap();
+        assert!(
+            remaining.is_empty(),
+            "unexpected reservations: {remaining:?}"
+        );
     }
 
     #[test]

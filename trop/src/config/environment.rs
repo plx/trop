@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn test_parse_excluded_ports_empty() {
         let result = EnvironmentConfig::parse_excluded_ports("").unwrap();
-        assert!(result.is_empty());
+        assert!(result.is_empty(), "unexpected exclusions: {result:?}");
     }
 
     #[test]

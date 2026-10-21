@@ -292,7 +292,7 @@ impl ConfigLoader {
             field: format!("{}", path.display()),
             message: format!("Invalid YAML: {error}"),
         };
-        let config = serde_yaml::from_str(&contents).map_err(&invalid_yaml)?;
+        let config = serde_yaml::from_str(&contents).map_err(invalid_yaml)?;
         let presence: ReservationPresence =
             serde_yaml::from_str(&contents).map_err(invalid_yaml)?;
 

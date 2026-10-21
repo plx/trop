@@ -1587,7 +1587,11 @@ mod tests {
             .execute(&plan)
             .unwrap();
         assert_eq!(result.port, Some(first_port));
-        assert!(result.warnings.is_empty());
+        assert!(
+            result.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            result.warnings
+        );
 
         let stored = Database::get_reservation(planning_db.connection(), &target_key)
             .unwrap()
