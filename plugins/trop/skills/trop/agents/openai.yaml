@@ -1,0 +1,4 @@
+interface:
+  display_name: "trop"
+  short_description: "Reserve stable ports without collisions"
+  default_prompt: "Use $trop to replace hardcoded development ports in this repository."
