@@ -34,7 +34,7 @@ criterion = "0.8"
 
 [build-dependencies]
 clap = { workspace = true, features = ["derive", "env"] }
-clap_mangen = "0.2"  # Compatible with clap 4.5
+clap_mangen = "0.3"  # Compatible with clap 4.5
 
 [[bench]]
 name = "cli_bench"
