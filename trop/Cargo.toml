@@ -39,7 +39,7 @@ tempfile = { workspace = true }
 proptest = "1.0"
 criterion = "0.8"
 serial_test = "3.2"
-mockall = "0.13"
+mockall = "0.15"
 assert_cmd = "2.0"
 
 [[bench]]
