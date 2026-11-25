@@ -24,14 +24,17 @@ impl TestEnv {
     /// Helper to migrate reservations with minimal arguments.
     ///
     /// This is a convenience method that runs `trop migrate` with the given
-    /// source and destination paths.
+    /// source and destination paths, from the test environment's root
+    /// directory (every source and destination lies below it, so the
+    /// unrelated-path guard permits them).
     ///
     /// # Returns
     ///
     /// The Command object for further assertions.
     fn migrate(&self, from: &std::path::Path, to: &std::path::Path) -> Command {
         let mut cmd = self.command();
-        cmd.arg("migrate")
+        cmd.current_dir(&self.temp_path)
+            .arg("migrate")
             .arg("--from")
             .arg(from)
             .arg("--to")
