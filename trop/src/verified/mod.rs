@@ -34,4 +34,10 @@
 //!
 //! Run `just verify` to check the proofs (requires `just install-verus`).
 
+pub mod allocation;
+pub mod exclusions;
+pub mod group;
+pub mod occupancy;
 pub mod port;
+pub mod port_bounds;
+pub mod sticky;
