@@ -35,6 +35,7 @@
 //! Run `just verify` to check the proofs (requires `just install-verus`).
 
 pub mod allocation;
+pub mod civil_time;
 pub mod cleanup;
 pub mod cli;
 pub mod config;
@@ -46,6 +47,7 @@ pub mod expiry;
 pub mod group;
 pub mod identifier;
 pub mod inference;
+pub mod json;
 pub mod migrate;
 pub mod occupancy;
 pub mod path;
@@ -57,7 +59,11 @@ pub mod render;
 pub mod reserve;
 pub mod schema_version;
 pub mod shell;
+pub mod sort;
+pub mod sql_schema;
 pub mod sticky;
 pub mod storage;
+pub mod symlink;
 pub mod text;
 pub mod verbosity;
+pub mod wal;
