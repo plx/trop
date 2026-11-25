@@ -159,33 +159,21 @@ impl ConfigValidator {
     /// Validate string identifiers (project, task, tags).
     ///
     /// Checks that the identifier is non-empty after trimming, contains no
-    /// null bytes, and is not longer than 255 characters.
+    /// null bytes, and is not longer than 255 UTF-8 bytes after trimming.
     fn validate_identifier(field: &str, value: &str) -> Result<()> {
-        let trimmed = value.trim();
+        use crate::identifier::IdentifierError;
 
-        if trimmed.is_empty() {
-            return Err(Error::Validation {
+        crate::identifier::check_identifier(value)
+            .map(|_| ())
+            .map_err(|error| Error::Validation {
                 field: field.into(),
-                message: "Cannot be empty or only whitespace".into(),
-            });
-        }
-
-        // Additional checks for security/safety
-        if trimmed.contains('\0') {
-            return Err(Error::Validation {
-                field: field.into(),
-                message: "Cannot contain null bytes".into(),
-            });
-        }
-
-        if trimmed.len() > 255 {
-            return Err(Error::Validation {
-                field: field.into(),
-                message: "Cannot exceed 255 characters".into(),
-            });
-        }
-
-        Ok(())
+                message: match error {
+                    IdentifierError::Blank => "Cannot be empty or only whitespace",
+                    IdentifierError::ContainsNul => "Cannot contain null bytes",
+                    IdentifierError::TooLong => "Cannot exceed 255 bytes",
+                }
+                .into(),
+            })
     }
 
     pub(crate) fn validate_runtime_identifier(field: &str, value: &str) -> Result<()> {
@@ -358,10 +346,15 @@ impl ConfigValidator {
 
             // Resolve every output identifier during configuration validation.
             // Explicit names and implicit derivations use the same shared grammar.
+            // Implicit names derive from the trimmed tag, the value allocation
+            // and output use.
             if let Some(env) = service.env.as_deref() {
                 Self::validate_env_var_name("reservations.services.env", env)?;
             }
-            let variable_name = EnvironmentVariableName::resolve(tag, service.env.as_deref())?;
+            let variable_name = EnvironmentVariableName::resolve(
+                crate::identifier::trim_identifier(tag),
+                service.env.as_deref(),
+            )?;
 
             if !seen_env_vars.insert(variable_name.collision_key()) {
                 return Err(Error::Validation {

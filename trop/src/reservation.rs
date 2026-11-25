@@ -46,9 +46,15 @@ pub struct ReservationKey {
 impl ReservationKey {
     /// Creates a new reservation key.
     ///
+    /// A provided tag is trimmed of leading and trailing Unicode whitespace,
+    /// and the trimmed value is stored. Tags follow the same rule as project
+    /// and task identifiers.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the tag is provided but is empty after trimming whitespace.
+    /// Returns an error if the tag is provided and, after trimming whitespace,
+    /// it is empty, contains a NUL character, or is longer than 255 UTF-8
+    /// bytes (checked in that order).
     ///
     /// # Examples
     ///
@@ -71,22 +77,46 @@ impl ReservationKey {
     /// // Invalid: whitespace-only tag
     /// let key = ReservationKey::new(PathBuf::from("/path"), Some("  ".to_string()));
     /// assert!(key.is_err());
+    ///
+    /// // Invalid: longer than 255 bytes
+    /// let key = ReservationKey::new(PathBuf::from("/path"), Some("a".repeat(256)));
+    /// assert!(key.is_err());
     /// ```
     pub fn new(path: PathBuf, tag: Option<String>) -> Result<Self, ValidationError> {
         let tag = match tag {
-            Some(t) => {
-                let trimmed = t.trim();
-                if trimmed.is_empty() {
-                    return Err(ValidationError {
-                        field: "tag".into(),
-                        message: "tag must be non-empty after trimming whitespace".into(),
-                    });
-                }
-                Some(trimmed.to_string())
-            }
+            Some(t) => Some(
+                crate::identifier::check_identifier(&t)
+                    .map_err(tag_validation_error)?
+                    .to_owned(),
+            ),
             None => None,
         };
 
+        Ok(Self { path, tag })
+    }
+
+    /// Rebuilds a key from a stored database row.
+    ///
+    /// Stored tags may have been written by earlier versions of trop, which
+    /// did not limit tag length, so this only requires the canonical stored
+    /// form (non-empty and already trimmed) and keeps every such row
+    /// readable. Unlike [`Self::new`], it neither trims nor applies the
+    /// NUL and length limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tag is provided but is empty or not already
+    /// trimmed.
+    #[doc(hidden)]
+    pub fn from_stored(path: PathBuf, tag: Option<String>) -> Result<Self, ValidationError> {
+        if let Some(tag) = &tag {
+            if !crate::identifier::is_canonical_identifier(tag) {
+                return Err(ValidationError {
+                    field: "tag".into(),
+                    message: "stored tag must be non-empty and already trimmed".into(),
+                });
+            }
+        }
         Ok(Self { path, tag })
     }
 
@@ -100,7 +130,7 @@ impl ReservationKey {
     ///
     /// Returns an error if:
     /// - Path normalization fails
-    /// - The tag is provided but is empty after trimming whitespace
+    /// - The tag is provided but violates the tag rule (see [`Self::new`])
     ///
     /// # Examples
     ///
@@ -134,7 +164,7 @@ impl ReservationKey {
     /// Returns an error if:
     /// - Path normalization fails
     /// - Path canonicalization fails, including when the inferred path does not exist
-    /// - The tag is provided but is empty after trimming whitespace
+    /// - The tag is provided but violates the tag rule (see [`Self::new`])
     ///
     /// # Examples
     ///
@@ -380,7 +410,7 @@ impl ReservationBuilder {
     /// The project string will be trimmed of leading/trailing whitespace.
     #[must_use]
     pub fn project(mut self, project: Option<String>) -> Self {
-        self.project = project.map(|p| p.trim().to_string());
+        self.project = project.map(|p| crate::identifier::trim_identifier(&p).to_owned());
         self
     }
 
@@ -389,7 +419,7 @@ impl ReservationBuilder {
     /// The task string will be trimmed of leading/trailing whitespace.
     #[must_use]
     pub fn task(mut self, task: Option<String>) -> Self {
-        self.task = task.map(|t| t.trim().to_string());
+        self.task = task.map(|t| crate::identifier::trim_identifier(&t).to_owned());
         self
     }
 
@@ -478,6 +508,21 @@ impl ReservationBuilder {
     }
 }
 
+/// Maps a rejected tag to its validation error.
+fn tag_validation_error(error: crate::identifier::IdentifierError) -> ValidationError {
+    use crate::identifier::IdentifierError;
+
+    let message = match error {
+        IdentifierError::Blank => "tag must be non-empty after trimming whitespace",
+        IdentifierError::ContainsNul => "tag must not contain null bytes",
+        IdentifierError::TooLong => "tag must not exceed 255 bytes after trimming whitespace",
+    };
+    ValidationError {
+        field: "tag".into(),
+        message: message.into(),
+    }
+}
+
 /// Error type for validation failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationError {
@@ -543,6 +588,89 @@ mod tests {
         let result =
             ReservationKey::new(PathBuf::from("/path/to/project"), Some("   ".to_string()));
         assert!(result.is_err());
+    }
+
+    /// Regression: tags used to bypass the shared identifier length limit.
+    #[test]
+    fn test_reservation_key_rejects_tag_over_255_bytes() {
+        let path = PathBuf::from("/path/to/project");
+        let err = ReservationKey::new(path.clone(), Some("a".repeat(256))).unwrap_err();
+        assert_eq!(err.field, "tag");
+        assert!(err.message.contains("255 bytes"), "{}", err.message);
+
+        // Bytes, not characters: 128 two-byte characters are 256 bytes.
+        assert!(ReservationKey::new(path.clone(), Some("é".repeat(128))).is_err());
+        assert!(ReservationKey::new(path, Some("é".repeat(127))).is_ok());
+    }
+
+    /// Regression: tags used to bypass the shared identifier NUL check.
+    #[test]
+    fn test_reservation_key_rejects_tag_with_nul() {
+        let path = PathBuf::from("/path/to/project");
+        for tag in ["web\0", "\0", " we\0b ", "\0 "] {
+            let err = ReservationKey::new(path.clone(), Some(tag.to_string())).unwrap_err();
+            assert_eq!(err.field, "tag");
+            assert!(err.message.contains("null"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn test_reservation_key_tag_rule_boundaries() {
+        let path = PathBuf::from("/path");
+        let maximal = "a".repeat(255);
+        let key =
+            ReservationKey::new(path.clone(), Some(format!("\u{3000} {maximal}\u{a0}"))).unwrap();
+        assert_eq!(key.tag.as_deref(), Some(maximal.as_str()));
+
+        // Blank is reported before NUL and length.
+        let err = ReservationKey::new(path.clone(), Some("\u{2003}\t".to_string())).unwrap_err();
+        assert!(err.message.contains("non-empty"), "{}", err.message);
+        // NUL is reported before length.
+        let err =
+            ReservationKey::new(path.clone(), Some(format!("\0{}", "a".repeat(300)))).unwrap_err();
+        assert!(err.message.contains("null"), "{}", err.message);
+
+        // Unicode whitespace is trimmed exactly like `str::trim`; other
+        // invisible characters (zero-width space) are kept.
+        let key = ReservationKey::new(path, Some("\u{200b}web\u{85}".to_string())).unwrap();
+        assert_eq!(key.tag.as_deref(), Some("\u{200b}web"));
+    }
+
+    /// Stored rows stay readable: the stored-row constructor accepts any
+    /// canonical tag, including legacy tags the write-side rule now rejects.
+    #[test]
+    fn test_reservation_key_from_stored_is_lenient_but_canonical() {
+        let path = PathBuf::from("/path");
+        for tag in ["web".to_string(), "a".repeat(300), "we\0b".to_string()] {
+            let key = ReservationKey::from_stored(path.clone(), Some(tag.clone())).unwrap();
+            assert_eq!(key.tag, Some(tag));
+        }
+        assert_eq!(
+            ReservationKey::from_stored(path.clone(), None).unwrap().tag,
+            None
+        );
+        for tag in ["", " web", "web ", "\u{3000}"] {
+            assert!(ReservationKey::from_stored(path.clone(), Some(tag.to_string())).is_err());
+        }
+    }
+
+    #[test]
+    fn test_reservation_builder_trims_unicode_whitespace() {
+        let key = ReservationKey::new(PathBuf::from("/path"), None).unwrap();
+        let port = Port::try_from(8080).unwrap();
+        let reservation = Reservation::builder(key.clone(), port)
+            .project(Some("\u{3000}my-project\u{a0}".to_string()))
+            .task(Some("\u{2028}task\n".to_string()))
+            .build()
+            .unwrap();
+        assert_eq!(reservation.project(), Some("my-project"));
+        assert_eq!(reservation.task(), Some("task"));
+
+        let err = Reservation::builder(key, port)
+            .project(Some("\u{2009}".to_string()))
+            .build()
+            .unwrap_err();
+        assert_eq!(err.field, "project");
     }
 
     #[test]
