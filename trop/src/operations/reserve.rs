@@ -2,6 +2,14 @@
 //!
 //! This module implements the reservation planning logic, including
 //! idempotency checks, sticky field protection, and path validation.
+//!
+//! The decisions are made by the verified kernels `verified::reserve` (the
+//! reserve policy, metadata-intent resolution, the existing-reservation
+//! decision, deferred reconciliation, and the cleanup-then-retry control)
+//! and `verified::allocation` (the preferred-port fallback). This module is
+//! the glue: it converts options and stored rows into kernel inputs, and it
+//! performs the database, allocator, cleanup, and git effects each decision
+//! calls for. See `docs/verification.md`.
 
 use crate::config::{CleanupConfig, Config, ConfigValidator};
 use crate::database::Database;
@@ -10,10 +18,15 @@ use crate::port::allocator::{
     allocator_from_config, AllocationOptions, AllocationResult, PortAllocator,
 };
 use crate::port::occupancy::OccupancyCheckConfig;
+use crate::verified::allocation::{self as allocation_kernel, Attempt, Fallback};
+use crate::verified::reserve::{
+    self as kernel, AllocationRelaxations, CleanupSwitches, DeferredStep, ExistingDecision, Intent,
+    MetadataPermissions, ReserveFlags, ReservePolicy, Retry, StoredRow,
+};
 use crate::{AutomaticCleanupStatus, Port, PortExhaustionDetails, Reservation, ReservationKey};
 use rusqlite::Connection;
 
-use super::cleanup::CleanupOperations;
+use super::cleanup::{AutocleanResult, CleanupOperations};
 use super::plan::{OperationPlan, PlanAction};
 
 /// The requested operation for one optional reservation metadata field.
@@ -44,20 +57,47 @@ impl MetadataIntent {
         value.map_or(Self::Preserve, Self::Set)
     }
 
-    fn resolve_existing(&self, existing: Option<&str>) -> Option<String> {
+    /// The kernel intent: the same operation, with a `Set` value trimmed.
+    ///
+    /// Trimming is `str::trim` (trusted). The idempotence lemma of
+    /// `verified::reserve` relies on trimming a trimmed value changing
+    /// nothing, which `trimmed_intent_values_are_fixed_points` pins.
+    fn kernel_intent(&self) -> Intent<&str> {
         match self {
-            Self::Preserve => existing.map(ToOwned::to_owned),
-            Self::Set(value) => Some(value.trim().to_string()),
-            Self::Clear => None,
+            Self::Preserve => Intent::Preserve,
+            Self::Set(value) => Intent::Set(value.trim()),
+            Self::Clear => Intent::Clear,
         }
     }
 
-    fn resolve_new(&self, inferred: Option<String>) -> Option<String> {
-        match self {
-            Self::Preserve => inferred,
-            Self::Set(value) => Some(value.trim().to_string()),
-            Self::Clear => None,
+    /// The kernel intent over the UTF-8 bytes of the trimmed value.
+    fn kernel_bytes(&self) -> Intent<&[u8]> {
+        match self.kernel_intent() {
+            Intent::Preserve => Intent::Preserve,
+            Intent::Set(value) => Intent::Set(value.as_bytes()),
+            Intent::Clear => Intent::Clear,
         }
+    }
+
+    /// Resolves the intent against an existing reservation's stored value
+    /// (verified `resolve`).
+    fn resolve_existing(&self, existing: Option<&str>) -> Option<String> {
+        kernel::resolve(&self.kernel_intent(), existing).map(ToOwned::to_owned)
+    }
+
+    /// Resolves the intent for a new reservation. `infer` (git discovery)
+    /// runs only when the intent can use the inferred value: the verified
+    /// `uses_fallback` is `false` exactly for explicit intents, which
+    /// resolve alike whatever was inferred
+    /// (`lemma_explicit_intent_ignores_fallback`).
+    fn resolve_new(&self, infer: impl FnOnce() -> Option<String>) -> Option<String> {
+        let intent = self.kernel_intent();
+        let inferred = if kernel::uses_fallback(&intent) {
+            infer()
+        } else {
+            None
+        };
+        kernel::resolve(&intent, inferred.as_deref()).map(ToOwned::to_owned)
     }
 
     fn validate(&self, field: &str) -> Result<()> {
@@ -288,9 +328,10 @@ impl ReserveOptions {
     /// Retains deferred Git inference for compatibility with earlier callers.
     ///
     /// Planning performs best-effort inference from the reservation's target
-    /// path only when a new reservation is created. Existing reservations keep
-    /// their stored metadata, so this method deliberately leaves all intents
-    /// unchanged. The `path` argument is retained for source compatibility.
+    /// path only when a new reservation is created, and only for a field the
+    /// request leaves unset. Existing reservations keep their stored
+    /// metadata, so this method deliberately leaves all intents unchanged.
+    /// The `path` argument is retained for source compatibility.
     ///
     /// # Arguments
     ///
@@ -379,11 +420,57 @@ impl<'a> ReservePlan<'a> {
         }
     }
 
+    /// The request's flags, field for field, as the kernels take them.
+    const fn flags(&self) -> ReserveFlags {
+        let options = &self.options;
+        ReserveFlags {
+            force: options.force,
+            overwrite: options.overwrite,
+            allow_unrelated_path: options.allow_unrelated_path,
+            permissions: MetadataPermissions {
+                allow_project_change: options.allow_project_change,
+                allow_task_change: options.allow_task_change,
+            },
+            relaxations: AllocationRelaxations {
+                ignore_occupied: options.ignore_occupied,
+                ignore_exclusions: options.ignore_exclusions,
+            },
+            cleanup: CleanupSwitches {
+                disable_autoprune: options.disable_autoprune,
+                disable_autoexpire: options.disable_autoexpire,
+            },
+        }
+    }
+
+    /// The effective checks of this request (verified `reserve_policy`).
+    const fn policy(&self) -> ReservePolicy {
+        kernel::reserve_policy(self.flags())
+    }
+
+    /// The requested preferred port: an explicit port wins over the
+    /// configured hint (verified `choose_preferred`).
+    fn preferred_port(&self) -> Option<Port> {
+        kernel::choose_preferred(self.options.port, self.options.preferred_port)
+    }
+
+    /// Decides what this request does to the stored reservation `existing`
+    /// (verified `decide_existing`).
+    fn decide_existing(&self, existing: &Reservation) -> ExistingDecision {
+        kernel::decide_existing(
+            existing.project().map(str::as_bytes),
+            existing.task().map(str::as_bytes),
+            &self.options.project.kernel_bytes(),
+            &self.options.task.kernel_bytes(),
+            self.flags(),
+        )
+    }
+
     /// Builds an operation plan for this reserve request.
     ///
     /// This method performs all validation and determines what actions
-    /// are needed. It may perform cleanup operations if allocation fails
-    /// due to exhaustion and cleanup is enabled.
+    /// are needed. When automatic allocation finds the range exhausted and
+    /// automatic cleanup is enabled, the plan defers allocation to
+    /// execution, which cleans up once and retries once.
     ///
     /// # Errors
     ///
@@ -411,73 +498,35 @@ impl<'a> ReservePlan<'a> {
     /// let plan = ReservePlan::new(options, &config).build_plan(db.connection()).unwrap();
     /// ```
     pub fn build_plan(&self, conn: &Connection) -> Result<OperationPlan> {
-        let mut plan = OperationPlan::new(format!("Reserve port for {}", self.options.key));
+        let plan = OperationPlan::new(format!("Reserve port for {}", self.options.key));
 
         self.options.project.validate("project")?;
         self.options.task.validate("task")?;
 
         // Step 1: Validate path relationship
-        if !self.options.force && !self.options.allow_unrelated_path {
+        if self.policy().check_path_relationship {
             Database::validate_path_relationship(&self.options.key.path, false)?;
         }
 
         // Step 2: Check for existing reservation
         if let Some(existing) = Database::get_reservation(conn, &self.options.key)? {
-            let project = self.options.project.resolve_existing(existing.project());
-            let task = self.options.task.resolve_existing(existing.task());
-
-            // Reservation exists - validate every requested sticky-field change
-            // before planning any write.
-            self.validate_sticky_fields(&existing, project.as_deref(), task.as_deref())?;
-
-            if self.options.overwrite || self.options.force {
-                return match self.allocate_port(conn, Some(&self.options.key))? {
-                    AllocationResult::Allocated(port) => {
-                        let replacement = self.updated_reservation(
-                            &existing,
-                            port,
-                            project.clone(),
-                            task.clone(),
-                        )?;
-                        Ok(plan.add_action(PlanAction::UpdateReservation(replacement)))
-                    }
-                    AllocationResult::Exhausted { .. } => self.plan_cleanup_retry(
-                        conn,
-                        plan,
-                        project,
-                        task,
-                        Some(existing.created_at()),
-                        Some(&self.options.key),
-                    ),
-                    AllocationResult::PreferredUnavailable { .. } => unreachable!(),
-                };
-            }
-
-            if Self::metadata_changed(&existing, project.as_deref(), task.as_deref()) {
-                let update = self.updated_reservation(&existing, existing.port(), project, task)?;
-                plan = plan.add_action(PlanAction::UpdateReservation(update));
-                return Ok(plan);
-            }
-
-            // A compatible request without overwrite keeps the stable port and
-            // only refreshes its last-used timestamp. An explicit preferred
-            // port remains a hint and does not relocate an existing key.
-            plan = plan.add_action(PlanAction::UpdateLastUsed(self.options.key.clone()));
-            return Ok(plan);
+            return self.plan_existing(conn, plan, &existing);
         }
 
+        // Git inference runs only for a field the request leaves to it.
+        let path = &self.options.key.path;
         let project = self
             .options
             .project
-            .resolve_new(super::inference::infer_project(&self.options.key.path));
+            .resolve_new(|| super::inference::infer_project(path));
         let task = self
             .options
             .task
-            .resolve_new(super::inference::infer_task(&self.options.key.path));
+            .resolve_new(|| super::inference::infer_task(path));
 
         // Step 3: Determine port (unified allocation with fallback)
         match self.allocate_port(conn, None)? {
-            AllocationResult::Allocated(port) => {
+            Fallback::Allocated(port) => {
                 // Step 4: Create the new reservation
                 let reservation = Reservation::builder(self.options.key.clone(), port)
                     .project(project)
@@ -485,10 +534,55 @@ impl<'a> ReservePlan<'a> {
                     .build()?;
                 Ok(plan.add_action(PlanAction::CreateReservation(reservation)))
             }
-            AllocationResult::Exhausted { .. } => {
-                self.plan_cleanup_retry(conn, plan, project, task, None, None)
+            Fallback::Exhausted => self.plan_cleanup_retry(conn, plan, project, task, None, None),
+        }
+    }
+
+    /// Plans the request against the reservation already stored under its
+    /// key, as the verified `decide_existing` decides. Every sticky-field
+    /// change is validated (project before task) before any write is
+    /// planned.
+    fn plan_existing(
+        &self,
+        conn: &Connection,
+        plan: OperationPlan,
+        existing: &Reservation,
+    ) -> Result<OperationPlan> {
+        let project = self.options.project.resolve_existing(existing.project());
+        let task = self.options.task.resolve_existing(existing.task());
+
+        match self.decide_existing(existing) {
+            ExistingDecision::StickyProject => {
+                Err(sticky_project_error(existing, project.as_deref()))
             }
-            AllocationResult::PreferredUnavailable { .. } => unreachable!(),
+            ExistingDecision::StickyTask => Err(sticky_task_error(existing, task.as_deref())),
+            ExistingDecision::Reallocate => match self
+                .allocate_port(conn, Some(&self.options.key))?
+            {
+                Fallback::Allocated(port) => {
+                    let replacement = self.updated_reservation(existing, port, project, task)?;
+                    Ok(plan.add_action(PlanAction::UpdateReservation(replacement)))
+                }
+                Fallback::Exhausted => self.plan_cleanup_retry(
+                    conn,
+                    plan,
+                    project,
+                    task,
+                    Some(existing.created_at()),
+                    Some(&self.options.key),
+                ),
+            },
+            ExistingDecision::UpdateMetadata => {
+                let update = self.updated_reservation(existing, existing.port(), project, task)?;
+                Ok(plan.add_action(PlanAction::UpdateReservation(update)))
+            }
+            // A compatible request without overwrite keeps the stable port and
+            // only refreshes its last-used timestamp. An explicit preferred
+            // port remains a hint and does not relocate an existing key. The
+            // refresh reports the stored port.
+            ExistingDecision::Touch => {
+                Ok(plan.add_action(PlanAction::UpdateLastUsed(self.options.key.clone())))
+            }
         }
     }
 
@@ -496,25 +590,22 @@ impl<'a> ReservePlan<'a> {
         &self,
         conn: &Connection,
         replaced_key: Option<&ReservationKey>,
-    ) -> Result<AllocationResult> {
+    ) -> Result<Fallback<Port>> {
         let allocator = allocator_from_config(self.config)?;
-        let allocation_options = self.allocation_options();
         let occupancy_config = self.occupancy_config();
-
-        let allocate = |options: &AllocationOptions| match replaced_key {
-            Some(key) => allocator.allocate_single_replacing(conn, options, &occupancy_config, key),
-            None => allocator.allocate_single(conn, options, &occupancy_config),
+        let relaxations = self.policy().allocation;
+        let attempt = |preferred: Option<Port>| {
+            single_attempt(
+                &allocator,
+                conn,
+                preferred,
+                relaxations,
+                &occupancy_config,
+                replaced_key,
+            )
         };
-
-        allocate_with_fallback(&allocation_options, &allocate)
-    }
-
-    fn allocation_options(&self) -> AllocationOptions {
-        AllocationOptions {
-            preferred: self.options.port.or(self.options.preferred_port),
-            ignore_occupied: self.options.ignore_occupied || self.options.force,
-            ignore_exclusions: self.options.ignore_exclusions || self.options.force,
-        }
+        // The same oracle answers the request and the fallback request.
+        allocation_kernel::allocate_with_fallback(self.preferred_port(), attempt, attempt)
     }
 
     fn plan_cleanup_retry(
@@ -526,14 +617,13 @@ impl<'a> ReservePlan<'a> {
         created_at: Option<std::time::SystemTime>,
         ignored_key: Option<&ReservationKey>,
     ) -> Result<OperationPlan> {
-        let prune = !self.options.disable_autoprune;
-        let expire = !self.options.disable_autoexpire;
-        if !prune && !expire {
+        let cleanup = self.policy().cleanup;
+        if !cleanup.retry_possible() {
             let allocator = allocator_from_config(self.config)?;
             let occupancy_config = self.occupancy_config();
             let blockers = allocator.exhaustion_blockers(conn, &occupancy_config, ignored_key)?;
             let details = PortExhaustionDetails::new(
-                AutomaticCleanupStatus::new(false, prune, expire, 0, 0),
+                AutomaticCleanupStatus::new(false, cleanup.prune, cleanup.expire, 0, 0),
                 blockers,
             );
             return Err(Error::PortExhausted {
@@ -563,10 +653,6 @@ impl<'a> ReservePlan<'a> {
         }
     }
 
-    fn metadata_changed(existing: &Reservation, project: Option<&str>, task: Option<&str>) -> bool {
-        project != existing.project() || task != existing.task()
-    }
-
     fn updated_reservation(
         &self,
         existing: &Reservation,
@@ -580,50 +666,56 @@ impl<'a> ReservePlan<'a> {
             .created_at(existing.created_at())
             .build()?)
     }
+}
 
-    /// Validates that sticky fields aren't being changed without permission.
-    fn validate_sticky_fields(
-        &self,
-        existing: &Reservation,
-        project: Option<&str>,
-        task: Option<&str>,
-    ) -> Result<()> {
-        // Check project field
-        if !can_change_field(
-            project,
+/// The error for a project change without permission.
+fn sticky_project_error(existing: &Reservation, project: Option<&str>) -> Error {
+    Error::StickyFieldChange {
+        field: "project".to_string(),
+        details: format!(
+            "Cannot change project from {:?} to {:?} without --force or --allow-project-change",
             existing.project(),
-            self.options.force,
-            self.options.allow_project_change,
-        ) {
-            return Err(Error::StickyFieldChange {
-                field: "project".to_string(),
-                details: format!(
-                    "Cannot change project from {:?} to {:?} without --force or --allow-project-change",
-                    existing.project(),
-                    project
-                ),
-            });
-        }
-
-        // Check task field
-        if !can_change_field(
-            task,
-            existing.task(),
-            self.options.force,
-            self.options.allow_task_change,
-        ) {
-            return Err(Error::StickyFieldChange {
-                field: "task".to_string(),
-                details: format!(
-                    "Cannot change task from {:?} to {:?} without --force or --allow-task-change",
-                    existing.task(),
-                    task
-                ),
-            });
-        }
-
-        Ok(())
+            project
+        ),
     }
+}
+
+/// The error for a task change without permission.
+fn sticky_task_error(existing: &Reservation, task: Option<&str>) -> Error {
+    Error::StickyFieldChange {
+        field: "task".to_string(),
+        details: format!(
+            "Cannot change task from {:?} to {:?} without --force or --allow-task-change",
+            existing.task(),
+            task
+        ),
+    }
+}
+
+/// One single-port allocation, as the fallback kernel's oracle: the
+/// allocator's result with the port kept as a `Port`.
+fn single_attempt(
+    allocator: &PortAllocator,
+    conn: &Connection,
+    preferred: Option<Port>,
+    relaxations: AllocationRelaxations,
+    occupancy_config: &OccupancyCheckConfig,
+    replaced_key: Option<&ReservationKey>,
+) -> Result<Attempt<Port>> {
+    let options = AllocationOptions {
+        preferred,
+        ignore_occupied: relaxations.ignore_occupied,
+        ignore_exclusions: relaxations.ignore_exclusions,
+    };
+    let result = match replaced_key {
+        Some(key) => allocator.allocate_single_replacing(conn, &options, occupancy_config, key),
+        None => allocator.allocate_single(conn, &options, occupancy_config),
+    }?;
+    Ok(match result {
+        AllocationResult::Allocated(port) => Attempt::Allocated(port),
+        AllocationResult::PreferredUnavailable { .. } => Attempt::PreferredUnavailable,
+        AllocationResult::Exhausted { .. } => Attempt::Exhausted,
+    })
 }
 
 fn reconcile_deferred_key(
@@ -633,59 +725,84 @@ fn reconcile_deferred_key(
     reserve_plan: &ReservePlan<'_>,
 ) -> Result<DeferredKeyReconciliation> {
     let options = &deferred.options;
-    let Some(existing) = Database::get_reservation(conn, &options.key)? else {
-        let (project, task) = if deferred.existing_at_planning {
-            (
-                options
-                    .project
-                    .resolve_new(super::inference::infer_project(&options.key.path)),
-                options
-                    .task
-                    .resolve_new(super::inference::infer_task(&options.key.path)),
-            )
-        } else {
-            (
-                placeholder.project().map(ToOwned::to_owned),
-                placeholder.task().map(ToOwned::to_owned),
-            )
-        };
-        return Ok(DeferredKeyReconciliation::Allocate(
-            PendingDeferredAllocation {
-                project,
-                task,
-                created_at: None,
-                ignored_key: None,
-            },
-        ));
+    let current = Database::get_reservation(conn, &options.key)?;
+    let stored = current.as_ref().map(|existing| StoredRow {
+        reservation: existing,
+        project: existing.project().map(str::as_bytes),
+        task: existing.task().map(str::as_bytes),
+    });
+    let step = kernel::deferred_step(
+        stored,
+        &options.project.kernel_bytes(),
+        &options.task.kernel_bytes(),
+        reserve_plan.flags(),
+        deferred.existing_at_planning,
+    );
+
+    let (existing, decision) = match step {
+        DeferredStep::AllocateFresh { reinfer } => {
+            let (project, task) = if reinfer {
+                let path = &options.key.path;
+                (
+                    options
+                        .project
+                        .resolve_new(|| super::inference::infer_project(path)),
+                    options
+                        .task
+                        .resolve_new(|| super::inference::infer_task(path)),
+                )
+            } else {
+                (
+                    placeholder.project().map(ToOwned::to_owned),
+                    placeholder.task().map(ToOwned::to_owned),
+                )
+            };
+            return Ok(DeferredKeyReconciliation::Allocate(
+                PendingDeferredAllocation {
+                    project,
+                    task,
+                    created_at: None,
+                    ignored_key: None,
+                },
+            ));
+        }
+        DeferredStep::Existing(existing, decision) => (existing, decision),
     };
 
     let project = options.project.resolve_existing(existing.project());
     let task = options.task.resolve_existing(existing.task());
-    reserve_plan.validate_sticky_fields(&existing, project.as_deref(), task.as_deref())?;
-
-    if options.overwrite || options.force {
-        return Ok(DeferredKeyReconciliation::Allocate(
+    match decision {
+        ExistingDecision::StickyProject => Err(sticky_project_error(existing, project.as_deref())),
+        ExistingDecision::StickyTask => Err(sticky_task_error(existing, task.as_deref())),
+        ExistingDecision::Reallocate => Ok(DeferredKeyReconciliation::Allocate(
             PendingDeferredAllocation {
                 project,
                 task,
                 created_at: Some(existing.created_at()),
                 ignored_key: Some(options.key.clone()),
             },
-        ));
+        )),
+        ExistingDecision::UpdateMetadata => {
+            let update =
+                reserve_plan.updated_reservation(existing, existing.port(), project, task)?;
+            Database::create_reservation_simple(conn, &update)?;
+            Ok(DeferredKeyReconciliation::Complete(
+                AutomaticReserveOutcome {
+                    port: existing.port(),
+                    warning: None,
+                },
+            ))
+        }
+        ExistingDecision::Touch => {
+            Database::update_last_used_simple(conn, &options.key)?;
+            Ok(DeferredKeyReconciliation::Complete(
+                AutomaticReserveOutcome {
+                    port: existing.port(),
+                    warning: None,
+                },
+            ))
+        }
     }
-
-    if ReservePlan::metadata_changed(&existing, project.as_deref(), task.as_deref()) {
-        let update = reserve_plan.updated_reservation(&existing, existing.port(), project, task)?;
-        Database::create_reservation_simple(conn, &update)?;
-    } else {
-        Database::update_last_used_simple(conn, &options.key)?;
-    }
-    Ok(DeferredKeyReconciliation::Complete(
-        AutomaticReserveOutcome {
-            port: existing.port(),
-            warning: None,
-        },
-    ))
 }
 
 fn port_exhausted_error(
@@ -735,46 +852,51 @@ where
             DeferredKeyReconciliation::Allocate(pending) => pending,
         };
         let allocator = allocator_from_config(full_config)?;
-        let allocation_options = reserve_plan.allocation_options();
-        let allocate = |options: &AllocationOptions| match pending.ignored_key {
-            Some(ref ignored_key) => {
-                allocator.allocate_single_replacing(conn, options, occupancy_config, ignored_key)
-            }
-            None => allocator.allocate_single(conn, options, occupancy_config),
-        };
-
-        if let AllocationResult::Allocated(port) =
-            allocate_with_fallback(&allocation_options, &allocate)?
-        {
-            return persist_deferred_outcome(conn, &options.key, &pending, port, None);
-        }
-
-        let prune = !options.disable_autoprune;
-        let expire = !options.disable_autoexpire;
-        if !prune && !expire {
-            return Err(port_exhausted_error(
+        let policy = reserve_plan.policy();
+        let preferred = reserve_plan.preferred_port();
+        let ignored_key = pending.ignored_key.as_ref();
+        let attempt = |preferred: Option<Port>| {
+            single_attempt(
                 &allocator,
                 conn,
+                preferred,
+                policy.allocation,
                 occupancy_config,
-                pending.ignored_key.as_ref(),
-                AutomaticCleanupStatus::new(false, prune, expire, 0, 0),
-            )?);
-        }
-
-        let default_cleanup = CleanupConfig {
-            expire_after_days: Some(30),
+                ignored_key,
+            )
         };
-        let cleanup_config = full_config.cleanup.as_ref().unwrap_or(&default_cleanup);
-        let cleanup = CleanupOperations::automatic_cleanup_in_connection(
-            conn,
-            cleanup_config,
-            prune,
-            expire,
-            after_candidate_discovery,
-        )?;
+        let allocate = || allocation_kernel::allocate_with_fallback(preferred, attempt, attempt);
+        let cleanup = || {
+            let default_cleanup = CleanupConfig {
+                expire_after_days: Some(30),
+            };
+            let cleanup_config = full_config.cleanup.as_ref().unwrap_or(&default_cleanup);
+            CleanupOperations::automatic_cleanup_in_connection(
+                conn,
+                cleanup_config,
+                policy.cleanup.prune,
+                policy.cleanup.expire,
+                after_candidate_discovery,
+            )
+        };
 
-        match allocate_with_fallback(&allocation_options, &allocate)? {
-            AllocationResult::Allocated(port) => persist_deferred_outcome(
+        // The verified kernel runs the first allocation, and only after an
+        // exhausted one with cleanup enabled the single cleanup, and only
+        // after a successful cleanup the single retry (the same allocation).
+        match kernel::allocate_with_cleanup_retry(
+            policy.cleanup.retry_possible(),
+            allocate,
+            cleanup,
+            allocate,
+        )? {
+            Retry::Allocated {
+                port,
+                cleanup: None,
+            } => persist_deferred_outcome(conn, &options.key, &pending, port, None),
+            Retry::Allocated {
+                port,
+                cleanup: Some(cleanup),
+            } => persist_deferred_outcome(
                 conn,
                 &options.key,
                 &pending,
@@ -785,20 +907,13 @@ where
                     cleanup.pruned_count, cleanup.expired_count
                 )),
             ),
-            AllocationResult::Exhausted { .. } => Err(port_exhausted_error(
+            Retry::Exhausted { cleanup } => Err(port_exhausted_error(
                 &allocator,
                 conn,
                 occupancy_config,
-                pending.ignored_key.as_ref(),
-                AutomaticCleanupStatus::new(
-                    true,
-                    prune,
-                    expire,
-                    cleanup.pruned_count,
-                    cleanup.expired_count,
-                ),
+                ignored_key,
+                cleanup_status(policy, cleanup.as_ref()),
             )?),
-            AllocationResult::PreferredUnavailable { .. } => unreachable!(),
         }
     };
 
@@ -808,6 +923,26 @@ where
         "automatic cleanup and reserve retry",
         execute,
     )
+}
+
+/// The typed cleanup diagnostics of a terminal exhaustion: attempted exactly
+/// when a cleanup ran, with its counts (zero when it did not run).
+fn cleanup_status(
+    policy: ReservePolicy,
+    cleanup: Option<&AutocleanResult>,
+) -> AutomaticCleanupStatus {
+    match cleanup {
+        Some(cleanup) => AutomaticCleanupStatus::new(
+            true,
+            policy.cleanup.prune,
+            policy.cleanup.expire,
+            cleanup.pruned_count,
+            cleanup.expired_count,
+        ),
+        None => {
+            AutomaticCleanupStatus::new(false, policy.cleanup.prune, policy.cleanup.expire, 0, 0)
+        }
+    }
 }
 
 fn persist_deferred_outcome(
@@ -845,56 +980,22 @@ fn persist_deferred_reservation(
     Database::create_reservation_simple(conn, &builder.build()?)
 }
 
-fn allocate_with_fallback(
-    allocation_options: &AllocationOptions,
-    allocate: &(impl Fn(&AllocationOptions) -> Result<AllocationResult> + ?Sized),
-) -> Result<AllocationResult> {
-    match allocate(allocation_options)? {
-        AllocationResult::PreferredUnavailable { .. } => {
-            let fallback_options = AllocationOptions {
-                preferred: None,
-                ignore_occupied: allocation_options.ignore_occupied,
-                ignore_exclusions: allocation_options.ignore_exclusions,
-            };
-            allocate(&fallback_options)
-        }
-        result => Ok(result),
-    }
-}
-
-/// Generic helper to check if a sticky field can be changed.
-///
-/// This function encapsulates the common logic for validating sticky field changes:
-/// - If force or the field-specific allow flag is set, allow the change
-/// - Otherwise, only allow if the value isn't actually changing
-///
-/// # Arguments
-///
-/// * `new_value` - The new value being proposed (as `Option<&String>`)
-/// * `existing_value` - The existing value in the database (as `Option<&str>`)
-/// * `force` - Whether the force flag is set (overrides all checks)
-/// * `allow_change` - Whether the field-specific allow flag is set
-///
-/// # Returns
-///
-/// `true` if the change is allowed, `false` otherwise
+/// The sticky-field rule (a delegate to the verified
+/// `verified::sticky::can_change_field`, which `decide_existing` applies to
+/// each field); kept for the property tests below.
+#[cfg(all(test, feature = "property-tests"))]
 fn can_change_field(
     new_value: Option<&str>,
     existing_value: Option<&str>,
     force: bool,
     allow_change: bool,
 ) -> bool {
-    // If force or specific allow flag is set, allow change
-    if force || allow_change {
-        return true;
-    }
-
-    // Otherwise, only allow if the value isn't actually changing
-    match (new_value, existing_value) {
-        (None, None) => true,
-        (Some(new), Some(old)) => new == old,
-        _ => false, // One is Some, other is None - this is a change
-    }
+    crate::verified::sticky::can_change_field(
+        new_value.map(str::as_bytes),
+        existing_value.map(str::as_bytes),
+        force,
+        allow_change,
+    )
 }
 
 #[cfg(test)]
@@ -1952,5 +2053,478 @@ mod tests {
         let result = ReservePlan::new(options, &config).build_plan(db.connection());
 
         assert!(result.is_ok());
+    }
+
+    // ---------------------------------------------------------------------
+    // Glue of the verified `verified::reserve` kernel
+    // ---------------------------------------------------------------------
+
+    use crate::config::OccupancyConfig;
+    use crate::verified::reserve::{allocate_with_cleanup_retry, reserve_policy};
+    use std::cell::Cell;
+
+    /// The decision table as it was hand-written before it moved into the
+    /// verified kernel (`build_plan`'s existing-key branch). `flags` holds
+    /// force, overwrite, allow-project-change, and allow-task-change.
+    fn legacy_decision(
+        stored_project: Option<&str>,
+        stored_task: Option<&str>,
+        project: &MetadataIntent,
+        task: &MetadataIntent,
+        (force, overwrite, allow_project, allow_task): (bool, bool, bool, bool),
+    ) -> (ExistingDecision, Option<String>, Option<String>) {
+        fn resolve(intent: &MetadataIntent, existing: Option<&str>) -> Option<String> {
+            match intent {
+                MetadataIntent::Preserve => existing.map(ToOwned::to_owned),
+                MetadataIntent::Set(value) => Some(value.trim().to_string()),
+                MetadataIntent::Clear => None,
+            }
+        }
+        fn can_change(new: Option<&str>, old: Option<&str>, force: bool, allow: bool) -> bool {
+            if force || allow {
+                return true;
+            }
+            match (new, old) {
+                (None, None) => true,
+                (Some(new), Some(old)) => new == old,
+                _ => false,
+            }
+        }
+        let p = resolve(project, stored_project);
+        let t = resolve(task, stored_task);
+        let decision = if !can_change(p.as_deref(), stored_project, force, allow_project) {
+            ExistingDecision::StickyProject
+        } else if !can_change(t.as_deref(), stored_task, force, allow_task) {
+            ExistingDecision::StickyTask
+        } else if overwrite || force {
+            ExistingDecision::Reallocate
+        } else if p.as_deref() != stored_project || t.as_deref() != stored_task {
+            ExistingDecision::UpdateMetadata
+        } else {
+            ExistingDecision::Touch
+        };
+        (decision, p, t)
+    }
+
+    fn stored_values() -> Vec<Option<&'static str>> {
+        vec![None, Some("alpha"), Some("beta"), Some("ünïcode")]
+    }
+
+    fn intents() -> Vec<MetadataIntent> {
+        vec![
+            MetadataIntent::Preserve,
+            MetadataIntent::Clear,
+            MetadataIntent::set("alpha"),
+            MetadataIntent::set("  alpha\t"),
+            MetadataIntent::set("beta"),
+            MetadataIntent::set("\u{3000}ünïcode\u{a0}"),
+        ]
+    }
+
+    /// Differential test: the kernel decision and the glue's resolved
+    /// metadata agree with the previous hand-written rules on every
+    /// combination of stored values, intents (including values that need
+    /// trimming and non-ASCII values), and the four deciding flags.
+    #[test]
+    fn existing_decision_matches_the_previous_rules() {
+        let key = ReservationKey::new(PathBuf::from("/test/differential"), None).unwrap();
+        let config = create_test_config();
+        let mut cases = 0;
+        for stored_project in stored_values() {
+            for stored_task in stored_values() {
+                let existing = Reservation::builder(key.clone(), Port::try_from(5000).unwrap())
+                    .project(stored_project.map(ToOwned::to_owned))
+                    .task(stored_task.map(ToOwned::to_owned))
+                    .build()
+                    .unwrap();
+                for project in intents() {
+                    for task in intents() {
+                        for bits in 0u8..16 {
+                            let (force, overwrite, allow_project, allow_task) =
+                                (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+                            let options = ReserveOptions::new(key.clone(), None)
+                                .with_project_intent(project.clone())
+                                .with_task_intent(task.clone())
+                                .with_force(force)
+                                .with_overwrite(overwrite)
+                                .with_allow_project_change(allow_project)
+                                .with_allow_task_change(allow_task);
+                            let planner = ReservePlan::new(options, &config);
+                            let expected = legacy_decision(
+                                stored_project,
+                                stored_task,
+                                &project,
+                                &task,
+                                (force, overwrite, allow_project, allow_task),
+                            );
+                            let actual = (
+                                planner.decide_existing(&existing),
+                                project.resolve_existing(existing.project()),
+                                task.resolve_existing(existing.task()),
+                            );
+                            assert_eq!(
+                                actual, expected,
+                                "stored {stored_project:?}/{stored_task:?}, \
+                                 intents {project:?}/{task:?}, flags {bits:04b}"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 4 * 4 * 6 * 6 * 16);
+    }
+
+    /// Pins the trusted `str::trim` fact behind the kernel's idempotence
+    /// lemma (`lemma_repeat_request_touches`): an explicit value is stored
+    /// trimmed, and trimming it again (the reservation builder trims)
+    /// changes nothing, so the stored value equals the requested one.
+    #[test]
+    fn trimmed_intent_values_are_fixed_points() {
+        let key = ReservationKey::new(PathBuf::from("/test/trim"), None).unwrap();
+        for raw in [
+            "plain",
+            "  padded  ",
+            "\t\ttabs\n",
+            "\u{3000}ideographic\u{2003}",
+            "\u{a0}nbsp\u{a0}",
+            "inner  space",
+            "ünïcode",
+        ] {
+            let intent = MetadataIntent::set(raw);
+            let Intent::Set(trimmed) = intent.kernel_intent() else {
+                panic!("a set intent must stay a set intent");
+            };
+            assert_eq!(trimmed.trim(), trimmed);
+            let stored = Reservation::builder(key.clone(), Port::try_from(5000).unwrap())
+                .project(Some(trimmed.to_string()))
+                .build()
+                .unwrap();
+            assert_eq!(stored.project(), Some(trimmed));
+            assert_eq!(
+                intent.resolve_existing(stored.project()).as_deref(),
+                Some(trimmed)
+            );
+        }
+    }
+
+    /// Regression: explicit metadata used to trigger git discovery anyway.
+    /// Inference now runs only for a field the request leaves to it.
+    #[test]
+    fn explicit_metadata_skips_git_inference() {
+        let discoveries = || super::super::inference::DISCOVERIES.with(Cell::get);
+        let config = Config {
+            occupancy_check: Some(OccupancyConfig {
+                skip: Some(true),
+                ..OccupancyConfig::default()
+            }),
+            ..create_test_config()
+        };
+        let directory = tempdir().unwrap();
+        let cases = [
+            (MetadataIntent::set("p"), MetadataIntent::set("t"), 0),
+            (MetadataIntent::Clear, MetadataIntent::Clear, 0),
+            (MetadataIntent::set("p"), MetadataIntent::Preserve, 1),
+            (MetadataIntent::Preserve, MetadataIntent::Clear, 1),
+            (MetadataIntent::Preserve, MetadataIntent::Preserve, 2),
+        ];
+        for (index, (project, task, expected)) in cases.into_iter().enumerate() {
+            let db = create_test_database();
+            let path = directory.path().join(format!("case-{index}"));
+            std::fs::create_dir(&path).unwrap();
+            let key = ReservationKey::new(path, None).unwrap();
+            let options = ReserveOptions::new(key, None)
+                .with_project_intent(project.clone())
+                .with_task_intent(task.clone())
+                .with_allow_unrelated_path(true);
+            let before = discoveries();
+            let plan = ReservePlan::new(options, &config)
+                .build_plan(db.connection())
+                .unwrap();
+            assert_eq!(
+                discoveries() - before,
+                expected,
+                "intents {project:?}/{task:?}"
+            );
+            let [PlanAction::CreateReservation(reservation)] = plan.actions.as_slice() else {
+                panic!("expected one creation, got {:?}", plan.actions);
+            };
+            let explicit = |intent: &MetadataIntent| match intent {
+                MetadataIntent::Set(value) => Some(value.clone()),
+                _ => None,
+            };
+            assert_eq!(
+                reservation.project().map(ToOwned::to_owned),
+                explicit(&project)
+            );
+            assert_eq!(reservation.task().map(ToOwned::to_owned), explicit(&task));
+        }
+    }
+
+    #[test]
+    fn explicit_intents_never_evaluate_inference() {
+        for intent in [MetadataIntent::set(" value "), MetadataIntent::Clear] {
+            let resolved = intent.resolve_new(|| panic!("inference must not run"));
+            let expected = match &intent {
+                MetadataIntent::Set(_) => Some("value".to_string()),
+                _ => None,
+            };
+            assert_eq!(resolved, expected);
+        }
+        assert_eq!(
+            MetadataIntent::Preserve.resolve_new(|| Some("inferred".into())),
+            Some("inferred".to_string())
+        );
+    }
+
+    #[test]
+    fn reserve_policy_matches_the_flag_semantics() {
+        for bits in 0u16..512 {
+            let bit = |n: u16| bits & (1 << n) != 0;
+            let key = ReservationKey::new(PathBuf::from("/test/policy"), None).unwrap();
+            let options = ReserveOptions::new(key, None)
+                .with_force(bit(0))
+                .with_overwrite(bit(1))
+                .with_allow_unrelated_path(bit(2))
+                .with_allow_project_change(bit(3))
+                .with_allow_task_change(bit(4))
+                .with_ignore_occupied(bit(5))
+                .with_ignore_exclusions(bit(6))
+                .with_disable_autoprune(bit(7))
+                .with_disable_autoexpire(bit(8));
+            let config = create_test_config();
+            let planner = ReservePlan::new(options.clone(), &config);
+            let policy = reserve_policy(planner.flags());
+            assert_eq!(
+                policy.check_path_relationship,
+                !options.force && !options.allow_unrelated_path
+            );
+            assert_eq!(
+                policy.reallocate_existing,
+                options.overwrite || options.force
+            );
+            assert_eq!(
+                policy.allocation.ignore_occupied,
+                options.ignore_occupied || options.force
+            );
+            assert_eq!(
+                policy.allocation.ignore_exclusions,
+                options.ignore_exclusions || options.force
+            );
+            assert_eq!(policy.cleanup.prune, !options.disable_autoprune);
+            assert_eq!(policy.cleanup.expire, !options.disable_autoexpire);
+            assert_eq!(
+                policy.cleanup.retry_possible(),
+                !options.disable_autoprune || !options.disable_autoexpire
+            );
+        }
+    }
+
+    #[test]
+    fn preferred_port_prefers_the_explicit_port() {
+        let key = ReservationKey::new(PathBuf::from("/test/preferred"), None).unwrap();
+        let config = create_test_config();
+        let explicit = Port::try_from(6000).unwrap();
+        let hint = Port::try_from(6001).unwrap();
+        for (port, preferred, expected) in [
+            (None, None, None),
+            (Some(explicit), None, Some(explicit)),
+            (None, Some(hint), Some(hint)),
+            (Some(explicit), Some(hint), Some(explicit)),
+        ] {
+            let options = ReserveOptions::new(key.clone(), port).with_preferred_port(preferred);
+            assert_eq!(
+                ReservePlan::new(options, &config).preferred_port(),
+                expected
+            );
+        }
+    }
+
+    /// The fallback kernel over a scripted allocator, passed as both oracles
+    /// as production does: at most two requests, the second without a
+    /// preference and only after a given preference was reported
+    /// unavailable; a contract violation is exhaustion, not a panic.
+    #[test]
+    fn fallback_asks_again_only_after_an_unavailable_preference() {
+        let wanted = Some(Port::try_from(6000).unwrap());
+        let scanned = Port::try_from(5000).unwrap();
+        let script = |preferred: Option<Port>, first: Attempt<Port>, second: Attempt<Port>| {
+            let calls = Cell::new(Vec::new());
+            let outcome = {
+                let attempt = |requested: Option<Port>| -> Result<Attempt<Port>> {
+                    let mut seen = calls.take();
+                    seen.push(requested);
+                    let answer = if seen.len() == 1 { &first } else { &second };
+                    let answer = match answer {
+                        Attempt::Allocated(port) => Attempt::Allocated(*port),
+                        Attempt::PreferredUnavailable => Attempt::PreferredUnavailable,
+                        Attempt::Exhausted => Attempt::Exhausted,
+                    };
+                    calls.set(seen);
+                    Ok(answer)
+                };
+                allocation_kernel::allocate_with_fallback(preferred, attempt, attempt).unwrap()
+            };
+            (outcome, calls.take())
+        };
+
+        let (outcome, calls) = script(wanted, Attempt::Allocated(scanned), Attempt::Exhausted);
+        assert!(matches!(outcome, Fallback::Allocated(port) if port == scanned));
+        assert_eq!(calls, vec![wanted]);
+
+        let (outcome, calls) = script(
+            wanted,
+            Attempt::PreferredUnavailable,
+            Attempt::Allocated(scanned),
+        );
+        assert!(matches!(outcome, Fallback::Allocated(port) if port == scanned));
+        assert_eq!(calls, vec![wanted, None]);
+
+        let (outcome, calls) = script(wanted, Attempt::PreferredUnavailable, Attempt::Exhausted);
+        assert!(matches!(outcome, Fallback::Exhausted));
+        assert_eq!(calls, vec![wanted, None]);
+
+        // The allocator contract forbids this; it is reported as exhaustion.
+        let (outcome, calls) = script(
+            wanted,
+            Attempt::PreferredUnavailable,
+            Attempt::PreferredUnavailable,
+        );
+        assert!(matches!(outcome, Fallback::Exhausted));
+        assert_eq!(calls, vec![wanted, None]);
+
+        // Without a preference there is never a second request, even when
+        // the oracle (in violation of its contract) reports one unavailable.
+        let (outcome, calls) = script(None, Attempt::Exhausted, Attempt::Allocated(scanned));
+        assert!(matches!(outcome, Fallback::Exhausted));
+        assert_eq!(calls, vec![None]);
+
+        let (outcome, calls) = script(
+            None,
+            Attempt::PreferredUnavailable,
+            Attempt::Allocated(scanned),
+        );
+        assert!(matches!(outcome, Fallback::Exhausted));
+        assert_eq!(calls, vec![None]);
+
+        let (outcome, calls) = script(None, Attempt::Allocated(scanned), Attempt::Exhausted);
+        assert!(matches!(outcome, Fallback::Allocated(port) if port == scanned));
+        assert_eq!(calls, vec![None]);
+    }
+
+    /// The retry kernel over scripted oracles: cleanup runs at most once,
+    /// only after an exhausted first allocation and only when possible; the
+    /// retry runs at most once, only after a successful cleanup.
+    #[test]
+    fn cleanup_retry_runs_cleanup_at_most_once() {
+        let port = Port::try_from(5000).unwrap();
+        let run = |possible: bool, first: Fallback<Port>, cleaned: bool, second: Fallback<Port>| {
+            let calls = Cell::new(Vec::new());
+            let log = |call: &'static str| {
+                let mut seen = calls.take();
+                seen.push(call);
+                calls.set(seen);
+            };
+            let answer = |fallback: &Fallback<Port>| match fallback {
+                Fallback::Allocated(port) => Fallback::Allocated(*port),
+                Fallback::Exhausted => Fallback::Exhausted,
+            };
+            let outcome = {
+                let allocate = || -> Result<Fallback<Port>> {
+                    log("allocate");
+                    Ok(answer(&first))
+                };
+                let cleanup = || -> Result<(usize, usize)> {
+                    log("cleanup");
+                    if cleaned {
+                        Ok((1, 2))
+                    } else {
+                        Err(Error::Validation {
+                            field: "cleanup".into(),
+                            message: "scripted failure".into(),
+                        })
+                    }
+                };
+                let retry = || -> Result<Fallback<Port>> {
+                    log("retry");
+                    Ok(answer(&second))
+                };
+                allocate_with_cleanup_retry(possible, allocate, cleanup, retry)
+            };
+            (outcome, calls.take())
+        };
+
+        for possible in [false, true] {
+            let (outcome, calls) = run(
+                possible,
+                Fallback::Allocated(port),
+                true,
+                Fallback::Exhausted,
+            );
+            assert!(matches!(
+                outcome,
+                Ok(Retry::Allocated { cleanup: None, .. })
+            ));
+            assert_eq!(calls, vec!["allocate"]);
+        }
+
+        let (outcome, calls) = run(false, Fallback::Exhausted, true, Fallback::Allocated(port));
+        assert!(matches!(outcome, Ok(Retry::Exhausted { cleanup: None })));
+        assert_eq!(calls, vec!["allocate"]);
+
+        let (outcome, calls) = run(true, Fallback::Exhausted, true, Fallback::Allocated(port));
+        assert!(matches!(
+            outcome,
+            Ok(Retry::Allocated { port: allocated, cleanup: Some((1, 2)) }) if allocated == port
+        ));
+        assert_eq!(calls, vec!["allocate", "cleanup", "retry"]);
+
+        let (outcome, calls) = run(true, Fallback::Exhausted, true, Fallback::Exhausted);
+        assert!(matches!(
+            outcome,
+            Ok(Retry::Exhausted {
+                cleanup: Some((1, 2))
+            })
+        ));
+        assert_eq!(calls, vec!["allocate", "cleanup", "retry"]);
+
+        // A failed cleanup is the result; there is no retry.
+        let (outcome, calls) = run(true, Fallback::Exhausted, false, Fallback::Allocated(port));
+        assert!(matches!(outcome, Err(Error::Validation { .. })));
+        assert_eq!(calls, vec!["allocate", "cleanup"]);
+    }
+
+    #[test]
+    fn cleanup_status_reports_counts_only_after_a_cleanup() {
+        let key = ReservationKey::new(PathBuf::from("/test/status"), None).unwrap();
+        let config = create_test_config();
+        let planner = ReservePlan::new(
+            ReserveOptions::new(key, None).with_disable_autoexpire(true),
+            &config,
+        );
+        let policy = planner.policy();
+        let skipped = cleanup_status(policy, None);
+        assert!(!skipped.attempted());
+        assert!(skipped.prune_enabled());
+        assert!(!skipped.expire_enabled());
+        assert_eq!((skipped.pruned(), skipped.expired()), (0, 0));
+
+        let cleanup = AutocleanResult {
+            considered_count: 4,
+            preserved_count: 1,
+            pruned_count: 2,
+            expired_count: 1,
+            total_removed: 3,
+            considered_reservations: Vec::new(),
+            preserved_reservations: Vec::new(),
+            removed_reservations: Vec::new(),
+            pruned_reservations: Vec::new(),
+            expired_reservations: Vec::new(),
+            prune_path_decisions: Vec::new(),
+        };
+        let ran = cleanup_status(policy, Some(&cleanup));
+        assert!(ran.attempted());
+        assert_eq!((ran.pruned(), ran.expired()), (2, 1));
     }
 }

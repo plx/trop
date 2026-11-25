@@ -27,7 +27,11 @@
 //! (`port_availability`, `allocate_single_ignoring`,
 //! `find_next_available_ignoring`, `find_next_allocatable`,
 //! `exhaustion_blockers`) and `PortAvailability` (an alias of
-//! [`Availability`]).
+//! [`Availability`]). The caller-side preferred-then-scan fallback
+//! ([`allocate_with_fallback`], generic over two single-use allocation
+//! oracles, with a verified call discipline) is glued in
+//! `crate::operations::reserve`, whose oracle wraps
+//! `PortAllocator::allocate_single`.
 
 use vstd::prelude::*;
 
@@ -1094,6 +1098,180 @@ pub proof fn lemma_preferred_without_flags_is_scan_check<
     ensures
         classified(p, preferred_checks(false, false), range, reserved, excluded, occupied, r)
             == classified(p, scan_checks(), range, reserved, excluded, occupied, r),
+{
+}
+
+
+// ---------------------------------------------------------------------------
+// Preferred port, then the scan: the caller-side fallback
+// ---------------------------------------------------------------------------
+
+/// One single-port allocation attempt, as a caller observes it (the port
+/// type is generic so production glue keeps its own `Port`).
+pub enum Attempt<P> {
+    /// This port may be handed out.
+    Allocated(P),
+    /// The preferred port is unavailable.
+    PreferredUnavailable,
+    /// No port of the range is available.
+    Exhausted,
+}
+
+/// The outcome of a single allocation with fallback: it cannot represent
+/// "preferred port unavailable", so callers need no unreachable arm.
+pub enum Fallback<P> {
+    /// This port may be handed out.
+    Allocated(P),
+    /// No port is available.
+    Exhausted,
+}
+
+/// The allocator, asked for `preferred`, reported it unavailable: the
+/// condition under which `allocate_with_fallback` makes the fallback
+/// request.
+pub open spec fn fell_back<P, E, A: FnOnce(Option<P>) -> Result<Attempt<P>, E>>(
+    preferred: Option<P>,
+    request: A,
+) -> bool {
+    preferred is Some && request.ensures((preferred,), Ok::<Attempt<P>, E>(Attempt::PreferredUnavailable))
+}
+
+/// The call discipline of `allocate_with_fallback`, stated as the oracles'
+/// preconditions (a body that calls an oracle out of turn does not verify
+/// against oracles whose preconditions are exactly these):
+///
+/// - the request asks for `preferred`;
+/// - the fallback request may run only after the request reported a given
+///   preference unavailable (`fell_back`), and it asks for no preference.
+///
+/// Each oracle is an `FnOnce`, so each runs at most once. Ordinary Rust
+/// closures have no preconditions, so production glue meets these.
+pub open spec fn fallback_discipline<
+    P,
+    E,
+    A: FnOnce(Option<P>) -> Result<Attempt<P>, E>,
+    S: FnOnce(Option<P>) -> Result<Attempt<P>, E>,
+>(preferred: Option<P>, request: A, fallback: S) -> bool {
+    &&& request.requires((preferred,))
+    &&& fell_back(preferred, request) ==> fallback.requires((None::<P>,))
+}
+
+/// `r` is a correct result of the preferred-then-scan fallback over the
+/// allocation oracles `request` (asked for `preferred`) and `fallback`
+/// (asked for no preference):
+///
+/// - `Allocated(p)`: the request allocated `p`, or it reported the
+///   preference unavailable and the fallback request allocated `p`;
+/// - `Exhausted`: the request reported the range exhausted, or the fallback
+///   request did, or an oracle violated its contract by reporting a
+///   preference unavailable when none was given (which
+///   `lemma_allocator_keeps_fallback_contract` rules out for
+///   `allocate_single`);
+/// - an error is an oracle's error, unchanged, from the request or from the
+///   fallback request.
+pub open spec fn fallen_back<
+    P,
+    E,
+    A: FnOnce(Option<P>) -> Result<Attempt<P>, E>,
+    S: FnOnce(Option<P>) -> Result<Attempt<P>, E>,
+>(preferred: Option<P>, request: A, fallback: S, r: Result<Fallback<P>, E>) -> bool {
+    match r {
+        Ok(Fallback::Allocated(p)) => request.ensures(
+            (preferred,),
+            Ok::<Attempt<P>, E>(Attempt::Allocated(p)),
+        ) || (fell_back(preferred, request) && fallback.ensures(
+            (None::<P>,),
+            Ok::<Attempt<P>, E>(Attempt::Allocated(p)),
+        )),
+        Ok(Fallback::Exhausted) => request.ensures(
+            (preferred,),
+            Ok::<Attempt<P>, E>(Attempt::Exhausted),
+        ) || (preferred is None && request.ensures(
+            (preferred,),
+            Ok::<Attempt<P>, E>(Attempt::PreferredUnavailable),
+        )) || (fell_back(preferred, request) && (fallback.ensures(
+            (None::<P>,),
+            Ok::<Attempt<P>, E>(Attempt::Exhausted),
+        ) || fallback.ensures((None::<P>,), Ok::<Attempt<P>, E>(Attempt::PreferredUnavailable)))),
+        Err(e) => request.ensures((preferred,), Err::<Attempt<P>, E>(e)) || (fell_back(
+            preferred,
+            request,
+        ) && fallback.ensures((None::<P>,), Err::<Attempt<P>, E>(e))),
+    }
+}
+
+/// Allocates the preferred port, or — when the allocator reports it
+/// unavailable — whatever the allocator finds with no preference (see
+/// `fallen_back`). The call discipline is verified (`fallback_discipline`):
+/// at most one request for `preferred` and at most one fallback request,
+/// which asks for no preference and runs only after a given preference was
+/// reported unavailable. The ignore flags are the caller's business (the
+/// oracles close over them). Production passes the same allocation closure
+/// as both oracles.
+pub fn allocate_with_fallback<
+    P,
+    E,
+    A: FnOnce(Option<P>) -> Result<Attempt<P>, E>,
+    S: FnOnce(Option<P>) -> Result<Attempt<P>, E>,
+>(preferred: Option<P>, request: A, fallback: S) -> (r: Result<Fallback<P>, E>)
+    requires
+        // Only the oracles' own (conditional) preconditions: see
+        // `fallback_discipline`.
+        fallback_discipline(preferred, request, fallback),
+    ensures
+        fallen_back(preferred, request, fallback, r),
+{
+    let had_preference = preferred.is_some();
+    match request(preferred)? {
+        Attempt::Allocated(p) => Ok(Fallback::Allocated(p)),
+        Attempt::Exhausted => Ok(Fallback::Exhausted),
+        Attempt::PreferredUnavailable => {
+            if !had_preference {
+                // A contract violation of the oracle: reported as exhaustion
+                // rather than a panic.
+                return Ok(Fallback::Exhausted);
+            }
+            match fallback(None)? {
+                Attempt::Allocated(p) => Ok(Fallback::Allocated(p)),
+                Attempt::Exhausted | Attempt::PreferredUnavailable => Ok(Fallback::Exhausted),
+            }
+        },
+    }
+}
+
+/// `allocate_single` keeps the fallback oracle's contract: without a
+/// preference it never reports a preferred port unavailable, and with one it
+/// never reports the range exhausted. So, over the production allocator,
+/// `allocate_with_fallback` answers `Exhausted` only when the scan without
+/// preference found every port of the range unavailable.
+pub proof fn lemma_allocator_keeps_fallback_contract<
+    E,
+    R: Fn(u16) -> Result<bool, E>,
+    X: Fn(u16) -> bool,
+    O: Fn(u16) -> Result<bool, E>,
+>(
+    range: PortSpan,
+    preferred: Option<u16>,
+    ignore_exclusions: bool,
+    ignore_occupied: bool,
+    reserved: R,
+    excluded: X,
+    occupied: O,
+    r: Result<SingleOutcome, ScanFailure<E>>,
+)
+    requires
+        allocated(range, preferred, ignore_exclusions, ignore_occupied, reserved, excluded, occupied, r),
+    ensures
+        preferred is None ==> !(r matches Ok(SingleOutcome::PreferredUnavailable(..))),
+        preferred is Some ==> !(r matches Ok(SingleOutcome::Exhausted)),
+        (preferred is None && r matches Ok(SingleOutcome::Exhausted)) ==> forall|q: u16|
+            range.spec_min() <= q <= range.spec_max() ==> #[trigger] blocked(
+                q,
+                range,
+                reserved,
+                excluded,
+                occupied,
+            ),
 {
 }
 

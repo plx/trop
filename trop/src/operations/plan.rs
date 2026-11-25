@@ -32,6 +32,10 @@ pub enum PlanAction {
     UpdateReservation(Reservation),
 
     /// Update the `last_used_at` timestamp for a reservation.
+    ///
+    /// Execution fails if no reservation is stored under the key. The action
+    /// reports the port the reservation holds when it is refreshed (a dry
+    /// run reads the stored port); a failed read is an error.
     UpdateLastUsed(ReservationKey),
 
     /// Delete a reservation.

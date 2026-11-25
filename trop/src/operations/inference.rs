@@ -5,9 +5,28 @@
 //! git worktrees.
 
 use gix::bstr::ByteSlice;
+use std::ffi::OsStr;
 use std::path::Path;
 
 use crate::config::ConfigValidator;
+use crate::verified::inference::{self as kernel, NameSource};
+
+// Counts git discoveries made by this thread (test instrumentation: it
+// shows that explicit metadata skips inference).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Discovers the repository containing `path` and opens it.
+fn discover(path: &Path) -> Option<gix::Repository> {
+    #[cfg(test)]
+    DISCOVERIES.with(|count| count.set(count.get() + 1));
+    // Use gix to discover repository - returns (Path, Trust)
+    let (repo_path, _trust) = gix::discover::upwards(path).ok()?;
+    let std_path: &Path = repo_path.as_ref();
+    gix::open(std_path).ok()
+}
 
 fn normalize_inferred_identifier(field: &str, value: &str) -> Option<String> {
     let value = value.trim();
@@ -43,12 +62,8 @@ fn normalize_inferred_identifier(field: &str, value: &str) -> Option<String> {
 /// ```
 #[must_use]
 pub fn infer_project(path: &Path) -> Option<String> {
-    // Use gix to discover repository - returns (Path, Trust)
-    let (repo_path, _trust) = gix::discover::upwards(path).ok()?;
-    let std_path: &Path = repo_path.as_ref();
-
-    // Open repo to check if it's a worktree
-    let repo = gix::open(std_path).ok()?;
+    // Open the repository (a worktree's common dir is the main repository).
+    let repo = discover(path)?;
 
     // Get the common dir (main repo location for worktrees, same as git_dir for regular repos)
     let common_dir = repo.common_dir();
@@ -59,27 +74,39 @@ pub fn infer_project(path: &Path) -> Option<String> {
     let canonical_common = common_dir.canonicalize().ok()?;
 
     let common_name = canonical_common.file_name()?.to_str()?;
+    let parent_name = canonical_common
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str);
 
-    let repository_name = if common_name == ".git" {
-        canonical_common
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .map(String::from)?
-    } else {
-        // A bare repository's common directory is the repository itself rather
-        // than a `.git` child.
-        common_name.to_string()
+    // Discard any candidate that is not a valid identifier.
+    normalize_inferred_identifier("project", repository_name(common_name, parent_name)?)
+}
+
+/// The repository name for a canonical common directory whose last
+/// component is `common_name` and whose parent's is `parent_name`.
+///
+/// The verified kernel picks the name - the parent's when the common
+/// directory is `.git`, the common directory's own for a bare repository -
+/// and the length left after stripping one `.git` suffix, so
+/// `/path/to/repo.git` identifies project `repo`. The length sits next to an
+/// ASCII byte, so it is a character boundary.
+fn repository_name<'a>(common_name: &'a str, parent_name: Option<&'a str>) -> Option<&'a str> {
+    let name =
+        kernel::repository_name_prefix(common_name.as_bytes(), parent_name.map(str::as_bytes))?;
+    let selected = match name.source {
+        NameSource::CommonDirectory => common_name,
+        NameSource::ParentDirectory => parent_name?,
     };
+    selected.get(..name.len)
+}
 
-    // Strip the conventional suffix so `/path/to/repo.git` identifies project
-    // `repo`, then discard any candidate that is not a valid identifier.
-    normalize_inferred_identifier(
-        "project",
-        repository_name
-            .strip_suffix(".git")
-            .unwrap_or(&repository_name),
-    )
+/// The branch a HEAD reference names: the reference without `refs/heads/`
+/// (slashes inside the name kept), or `None` for any other reference. The
+/// verified kernel finds where the name starts.
+fn branch_name(head_ref: &str) -> Option<&str> {
+    let start = kernel::branch_name_start(head_ref.as_bytes())?;
+    head_ref.get(start..)
 }
 
 /// Infer task from git context.
@@ -114,12 +141,8 @@ pub fn infer_project(path: &Path) -> Option<String> {
 /// ```
 #[must_use]
 pub fn infer_task(path: &Path) -> Option<String> {
-    // Discover repository - returns (Path, Trust)
-    let (repo_path, _trust) = gix::discover::upwards(path).ok()?;
-
-    // Open the repository to get more information
-    let std_path: &Path = repo_path.as_ref();
-    let repo = gix::open(std_path).ok()?;
+    // Discover and open the repository.
+    let repo = discover(path)?;
 
     // Check if this is a worktree
     let task = if is_worktree(&repo) {
@@ -187,7 +210,7 @@ fn get_current_branch(repo: &gix::Repository) -> Option<String> {
     repo.head_name().ok().flatten().and_then(|name| {
         let bstr = name.as_bstr();
         if let Ok(s) = bstr.to_str() {
-            s.strip_prefix("refs/heads/").map(String::from)
+            branch_name(s).map(String::from)
         } else {
             log::debug!("Branch name contains non-UTF8 characters: {bstr:?}");
             None
@@ -209,6 +232,47 @@ mod tests {
     fn non_git_task_inference_is_best_effort() {
         let directory = tempfile::tempdir().unwrap();
         assert_eq!(infer_task(directory.path()), None);
+    }
+
+    #[test]
+    fn repository_names_follow_the_git_directory_rules() {
+        // A `.git` common directory names its parent.
+        assert_eq!(repository_name(".git", Some("repo")), Some("repo"));
+        assert_eq!(repository_name(".git", Some("repo.git")), Some("repo"));
+        // Exactly one suffix is stripped.
+        assert_eq!(
+            repository_name(".git", Some("repo.git.git")),
+            Some("repo.git")
+        );
+        assert_eq!(repository_name("repo.git.git", None), Some("repo.git"));
+        // A bare repository names itself; its parent is irrelevant.
+        assert_eq!(repository_name("repo.git", Some("ignored")), Some("repo"));
+        assert_eq!(repository_name("repo", None), Some("repo"));
+        // No usable parent name: no project.
+        assert_eq!(repository_name(".git", None), None);
+        // Suffix-only and short names.
+        assert_eq!(repository_name(".git", Some(".git")), Some(""));
+        assert_eq!(repository_name("git", None), Some("git"));
+        assert_eq!(repository_name("", None), Some(""));
+        assert_eq!(repository_name("x.GIT", None), Some("x.GIT"));
+        // Non-ASCII names are cut on a character boundary.
+        assert_eq!(repository_name("répo.git", None), Some("répo"));
+        assert_eq!(repository_name(".git", Some("仓库.git")), Some("仓库"));
+        assert_eq!(repository_name("é", None), Some("é"));
+    }
+
+    #[test]
+    fn branch_names_keep_slashes_and_reject_other_refs() {
+        assert_eq!(branch_name("refs/heads/main"), Some("main"));
+        assert_eq!(branch_name("refs/heads/feature/x"), Some("feature/x"));
+        assert_eq!(branch_name("refs/heads/é/ü"), Some("é/ü"));
+        assert_eq!(branch_name("refs/heads/"), Some(""));
+        assert_eq!(branch_name("refs/heads"), None);
+        assert_eq!(branch_name("refs/tags/v1"), None);
+        assert_eq!(branch_name("refs/remotes/origin/main"), None);
+        assert_eq!(branch_name("HEAD"), None);
+        assert_eq!(branch_name(""), None);
+        assert_eq!(branch_name("REFS/HEADS/main"), None);
     }
 
     #[test]

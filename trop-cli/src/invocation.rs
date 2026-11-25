@@ -324,7 +324,8 @@ impl InvocationContext {
         })
     }
 
-    fn database_path(&self) -> Result<PathBuf, CliError> {
+    /// The selected database file (`trop.db` in the data directory).
+    pub(crate) fn database_path(&self) -> Result<PathBuf, CliError> {
         Ok(self.data_dir()?.join("trop.db"))
     }
 }
