@@ -1218,89 +1218,21 @@ pub proof fn lemma_config_group_consequences(base: Option<u16>, s: Seq<ServiceEn
     }
 }
 
-/// The UTF-8 encoding of a non-NUL char has no zero byte.
-proof fn lemma_scalar_bytes_nonzero(c: char)
-    requires
-        c != '\0',
-    ensures
-        forall|k: int|
-            0 <= k < vstd::utf8::encode_scalar(c as u32).len()
-                ==> #[trigger] vstd::utf8::encode_scalar(c as u32)[k] != 0u8,
-{
-    broadcast use vstd::utf8::char_is_scalar, vstd::utf8::char_u32_cast;
-
-    let v = c as u32;
-    let bytes = vstd::utf8::encode_scalar(v);
-    assert(v != 0);
-    if vstd::utf8::has_width_1_encoding(v) {
-        assert((v & 0x7F) as u8 != 0u8) by (bit_vector)
-            requires
-                v != 0,
-                v <= 0x7F,
-        ;
-    } else {
-        let b1 = ((v >> 6) & 0x1F) as u8;
-        let b2 = ((v >> 12) & 0x0F) as u8;
-        let b3 = ((v >> 18) & 0x7) as u8;
-        let (c1, c2, c3) = ((v & 0x3F) as u8, ((v >> 6) & 0x3F) as u8, ((v >> 12) & 0x3F) as u8);
-        assert(0xC0u8 | b1 != 0u8) by (bit_vector);
-        assert(0xE0u8 | b2 != 0u8) by (bit_vector);
-        assert(0xF0u8 | b3 != 0u8) by (bit_vector);
-        assert(0x80u8 | c1 != 0u8) by (bit_vector);
-        assert(0x80u8 | c2 != 0u8) by (bit_vector);
-        assert(0x80u8 | c3 != 0u8) by (bit_vector);
-    }
-}
-
-/// A string without NUL encodes to bytes without 0, and a non-empty string
-/// to a non-empty byte string.
-proof fn lemma_utf8_of_identifier(t: Seq<char>)
-    requires
-        !identifier::contains_nul(t),
-    ensures
-        !vstd::utf8::encode_utf8(t).contains(0u8),
-        t.len() > 0 ==> vstd::utf8::encode_utf8(t).len() > 0,
-    decreases t.len(),
-{
-    if t.len() > 0 {
-        let head = vstd::utf8::encode_scalar(t[0] as u32);
-        let rest = t.drop_first();
-        assert(t[0] != '\0');
-        assert(!identifier::contains_nul(rest)) by {
-            if identifier::contains_nul(rest) {
-                let i = choose|i: int| 0 <= i < rest.len() && rest[i] == '\0';
-                assert(t[i + 1] == '\0');
-            }
-        }
-        lemma_scalar_bytes_nonzero(t[0]);
-        lemma_utf8_of_identifier(rest);
-        let enc = vstd::utf8::encode_utf8(t);
-        assert(enc == head + vstd::utf8::encode_utf8(rest));
-        assert(head.len() > 0);
-        if enc.contains(0u8) {
-            let k = choose|k: int| 0 <= k < enc.len() && enc[k] == 0u8;
-            if k < head.len() {
-                assert(head[k] == 0u8);
-            } else {
-                assert(vstd::utf8::encode_utf8(rest)[k - head.len()] == 0u8);
-            }
-        }
-    }
-}
-
-/// `r` is what reserve-group's request validation sees for the configured
-/// service `e`: the bytes of its trimmed tag, its defaulted offset, and its
-/// preferred port (`build_group_request`).
+/// `r` is what reserve-group's request validation receives for the
+/// configured service `e` (`build_group_request`): its tag as written (the
+/// request validation trims it), its defaulted offset, and its preferred
+/// port.
 pub open spec fn requested_as(e: ServiceEntry, r: super::group::RawService) -> bool {
-    &&& r.tag@ == vstd::utf8::encode_utf8(tag_key(e))
+    &&& r.tag@ == e.tag@
     &&& r.offset == Some(effective_offset(e))
     &&& r.preferred == e.preferred
 }
 
-/// Every non-empty configuration group that validates is accepted by
-/// reserve-group's request validation (`super::group::group_shape_valid`):
-/// its trimmed tags are valid identifiers and distinct as bytes, every
-/// service has an offset, and offsets and preferred ports are distinct.
+/// Every non-empty configuration group that validates passes reserve-group's
+/// request validation (`super::group::group_request_valid`, which
+/// `validate_group_request` accepts exactly): every tag passes the
+/// identifier rule, every service has an offset, no preferred port is 0,
+/// and trimmed tags, offsets, and preferred ports are pairwise distinct.
 pub proof fn lemma_valid_config_group_is_valid_request(
     base: Option<u16>,
     s: Seq<ServiceEntry>,
@@ -1312,24 +1244,19 @@ pub proof fn lemma_valid_config_group_is_valid_request(
         r.len() == s.len(),
         forall|i: int| 0 <= i < s.len() ==> #[trigger] requested_as(s[i], r[i]),
     ensures
-        super::group::group_shape_valid(r),
+        super::group::group_request_valid(r),
 {
-    assert forall|i: int| 0 <= i < r.len() implies #[trigger] super::group::service_well_formed(
+    assert forall|i: int| 0 <= i < r.len() implies #[trigger] super::group::request_service_ok(
         r[i],
     ) by {
         assert(service_valid(s[i]) && requested_as(s[i], r[i]));
-        let t = tag_key(s[i]);
-        assert(identifier::identifier_verdict(s[i].tag@) == Ok::<
-            Seq<char>,
-            identifier::IdentifierError,
-        >(t));
-        lemma_utf8_of_identifier(t);
     }
     assert forall|i: int, j: int| 0 <= i < r.len() && 0 <= j < r.len() && i != j implies !(
-    #[trigger] super::group::services_clash(r[i], r[j])) by {
+    #[trigger] super::group::requests_clash(r[i], r[j])) by {
         assert(!services_collide(s[i], s[j]));
         assert(requested_as(s[i], r[i]) && requested_as(s[j], r[j]));
-        lemma_utf8_injective(tag_key(s[i]), tag_key(s[j]));
+        assert(super::group::tag_key(r[i]) == tag_key(s[i]));
+        assert(super::group::tag_key(r[j]) == tag_key(s[j]));
     }
 }
 
