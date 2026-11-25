@@ -105,7 +105,8 @@ pub(crate) fn component_kind(component: Component<'_>) -> CompKind {
 /// `/`, or `/` followed by non-empty segments other than `.` and `..` (so no
 /// `//` and no trailing `/`); it accepts exactly the fixed points of
 /// normalization. Elsewhere it checks that the path is absolute and that
-/// resolving `.` and `..` leaves its components unchanged.
+/// resolving `.` and `..` and re-spelling the components leaves it
+/// byte-for-byte unchanged.
 #[cfg(unix)]
 pub(crate) fn is_canonical_absolute(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
@@ -116,9 +117,13 @@ pub(crate) fn is_canonical_absolute(path: &Path) -> bool {
 /// [`normalize::normalize`] produces.
 ///
 /// Outside Unix this checks that the path is absolute and that resolving `.`
-/// and `..` leaves its components unchanged.
+/// and `..` with the verified component stack, and re-spelling the
+/// components as `normalize` does, leaves it byte-for-byte unchanged (so `/`
+/// for `\`, `.`, repeated separators, and a trailing separator are all
+/// rejected, as `normalize` never produces them).
 #[cfg(not(unix))]
 pub(crate) fn is_canonical_absolute(path: &Path) -> bool {
     path.is_absolute()
-        && normalize::resolve_components(path).is_ok_and(|resolved| resolved.as_path() == path)
+        && normalize::resolve_components(path)
+            .is_ok_and(|resolved| resolved.as_os_str() == path.as_os_str())
 }

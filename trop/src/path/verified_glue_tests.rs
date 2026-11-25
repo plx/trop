@@ -8,7 +8,7 @@
 //! behavior change is pinned and every other behavior is shown unchanged.
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::canonicalize::canonicalize_existing;
 use super::normalize::{expand_tilde, normalize, resolve_components};
@@ -201,9 +201,26 @@ fn same_outcome(new: &crate::Result<PathBuf>, old: &crate::Result<PathBuf>) -> b
     }
 }
 
-/// Tilde forms whose expansion this package deliberately changed.
+/// Tilde forms whose expansion this package deliberately changed: `~`
+/// followed by two or more separators (the legacy code joined an absolute
+/// remainder, which replaced the home directory), and, where backslash is not
+/// a separator, `~\` (no longer home-relative). The separators are those
+/// `expand_tilde` uses: `/`, plus `\` on Windows.
 fn is_changed_tilde_form(path: &str) -> bool {
-    path.starts_with("~//") || (cfg!(unix) && path.starts_with("~\\"))
+    let backslash_is_sep = cfg!(windows);
+    let is_sep = |byte: u8| byte == b'/' || (backslash_is_sep && byte == b'\\');
+    match path.as_bytes() {
+        [b'~', b'\\', ..] if !backslash_is_sep => true,
+        [b'~', first, second, ..] => is_sep(*first) && is_sep(*second),
+        _ => false,
+    }
+}
+
+/// The leading root/prefix components of a path (its anchor).
+fn anchor(path: &Path) -> Vec<Component<'_>> {
+    path.components()
+        .take_while(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -303,7 +320,9 @@ fn between_matches_legacy_without_dots_and_with_equal_anchors() {
     for left in &inputs {
         for right in &inputs {
             let (p1, p2) = (Path::new(left), Path::new(right));
-            if p1.is_absolute() != p2.is_absolute()
+            // Compare anchors rather than `is_absolute()`: on Windows `/a` is
+            // rooted but not absolute.
+            if anchor(p1) != anchor(p2)
                 || left.split('/').any(|piece| piece == "." || piece == "..")
                 || right.split('/').any(|piece| piece == "." || piece == "..")
             {
@@ -366,6 +385,11 @@ fn canonical_recognizer_accepts_exactly_the_fixed_points_of_normalize() {
 /// The Windows-portable stored-path predicate of `database::operations`
 /// (`slash_rooted_path_is_lexically_normal`), as a reference for the
 /// kernel's `backslash_forbidden` mode.
+///
+/// This is a copy: the original is private to `database::operations`, which
+/// this package does not touch. When the storage package makes that function
+/// delegate to `is_canonical_abs_path`, this test should move next to it and
+/// call the real function (or be dropped), so the two cannot drift apart.
 fn slash_rooted_reference(path: &str) -> bool {
     path == "/"
         || path.strip_prefix('/').is_some_and(|suffix| {
@@ -407,6 +431,81 @@ fn between_is_a_hierarchy_relation_on_small_paths() {
             assert_eq!(
                 PathRelationship::is_within(pa, pb),
                 PathRelationship::contains(pb, pa)
+            );
+            // The within/contains kernels agree with `between`.
+            assert_eq!(
+                PathRelationship::is_within(pa, pb),
+                matches!(
+                    forward,
+                    PathRelationship::Descendant | PathRelationship::Same
+                ),
+                "{a:?} within {b:?}"
+            );
+            assert_eq!(
+                PathRelationship::contains(pa, pb),
+                matches!(forward, PathRelationship::Ancestor | PathRelationship::Same),
+                "{a:?} contains {b:?}"
+            );
+        }
+    }
+}
+
+// `between` never treats a `..` it cannot resolve as a named child: a path is
+// an ancestor of another only if the other one, resolved, extends it by
+// named components. Checked here against `normalize`'s resolution, which
+// rejects exactly the paths with such a `..`.
+#[test]
+fn between_ancestors_extend_by_names_on_small_paths() {
+    let inputs = generated_paths(&["", "a", "b", ".", ".."], 3);
+    for a in &inputs {
+        for b in &inputs {
+            let (pa, pb) = (Path::new(a), Path::new(b));
+            if PathRelationship::between(pa, pb) != PathRelationship::Ancestor {
+                continue;
+            }
+            match (resolve_components(pa), resolve_components(pb)) {
+                (Ok(ra), Ok(rb)) => {
+                    assert!(rb.starts_with(&ra), "{a:?} vs {b:?}");
+                    assert!(
+                        rb.strip_prefix(&ra)
+                            .unwrap()
+                            .components()
+                            .all(|c| matches!(c, Component::Normal(_))),
+                        "{a:?} vs {b:?}"
+                    );
+                    assert_ne!(ra, rb, "{a:?} vs {b:?}");
+                }
+                // Both contain the same unresolvable `..` (equal heads).
+                (Err(_), Err(_)) => {}
+                (left, right) => panic!("{a:?} vs {b:?}: {left:?} vs {right:?}"),
+            }
+        }
+    }
+}
+
+// The kernel's `tilde_join` agrees with `PathBuf::push` of a relative path
+// (the trusted model behind `expand_tilde` on Unix) for unusual home
+// directories, independently of the real `$HOME`.
+#[test]
+#[cfg(unix)]
+fn tilde_join_matches_pathbuf_push() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let homes = [
+        "", "/", "//", "/h", "/h/", "/h//", "h", "h/", "/h/.", "/h/..", "/h\\", "\\", "/h/x y",
+    ];
+    let rests = [
+        "", "a", "a/", "a//b", ".", "..", "\\", " ", "\\a", "a\\", "a/./b", "~", "C:x",
+    ];
+    for home in homes {
+        for rest in rests {
+            let expected = Path::new(home).join(rest);
+            let joined = crate::verified::path::tilde_join(home.as_bytes(), rest.as_bytes());
+            assert_eq!(
+                OsStr::from_bytes(&joined),
+                expected.as_os_str(),
+                "{home:?} + {rest:?}"
             );
         }
     }

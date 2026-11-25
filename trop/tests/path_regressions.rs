@@ -73,6 +73,43 @@ fn relative_path_is_never_an_ancestor_of_an_absolute_one() {
     );
 }
 
+/// A `..` that cannot be resolved used to be compared as if it were a named
+/// child: `../..` was a descendant of `..` (it is its parent), and `/..` a
+/// descendant of `/`. Such a `..` now belongs to the path's head, so paths
+/// that differ in it are unrelated.
+#[test]
+fn unresolvable_parent_is_never_a_named_child() {
+    for (left, right) in [("..", "."), ("..", ""), ("../..", ".."), ("/..", "/")] {
+        assert_eq!(
+            PathRelationship::between(Path::new(left), Path::new(right)),
+            PathRelationship::Unrelated,
+            "{left:?} vs {right:?}"
+        );
+        assert!(
+            !PathRelationship::is_within(Path::new(left), Path::new(right)),
+            "{left:?} within {right:?}"
+        );
+        assert!(
+            !PathRelationship::contains(Path::new(right), Path::new(left)),
+            "{right:?} contains {left:?}"
+        );
+    }
+    assert_eq!(
+        PathRelationship::between(Path::new("../a"), Path::new("..")),
+        PathRelationship::Descendant
+    );
+}
+
+/// On Windows, `~/C:x` used to expand to the drive-relative `C:x`: joining a
+/// remainder with a drive prefix replaces the home directory.
+#[test]
+#[cfg(windows)]
+fn tilde_followed_by_a_drive_is_rejected_on_windows() {
+    for input in [r"~/C:x", r"~\C:\x"] {
+        assert!(expand_tilde(Path::new(input)).is_err(), "{input}");
+    }
+}
+
 /// `NormalizedPath::new` used to accept any absolute path, including
 /// spellings that normalization never produces.
 #[test]

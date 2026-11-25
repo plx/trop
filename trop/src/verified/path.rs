@@ -343,9 +343,13 @@ pub open spec fn keep(ps: Seq<Seq<u8>>) -> Seq<Seq<u8>>
     }
 }
 
-/// The segments of `s`: its pieces without empty and `.` pieces. On Unix
-/// this models `Path::components()` minus the leading root (`..` segments
-/// are kept).
+/// The segments of `s`: its pieces without empty and `.` pieces (`..`
+/// segments are kept). For an absolute `s` (starting with `/`) this models
+/// Unix `Path::components()` minus the leading root. For a relative `s`,
+/// `std` would also yield a leading `CurDir` for `./...`, which `segs`
+/// drops; `normalize_unix` only takes the segments of the absolute joined
+/// path, so the production glue relies on the model for absolute strings
+/// only.
 pub open spec fn segs(s: Seq<u8>) -> Seq<Seq<u8>> {
     keep(pieces(s))
 }
@@ -1865,12 +1869,17 @@ pub open spec fn named_from(kinds: Seq<CompKind>, k: int) -> bool {
 /// one), and the search cannot step further up (`m == 0`, or the component
 /// before it is not a named one). Each prefix length is asked at most once,
 /// from longest to shortest.
+///
+/// The oracle's precondition is only granted for prefix lengths `k` whose
+/// remainder `kinds[k..]` is all named components, so the search provably
+/// never probes a prefix above a root, prefix, `.` or `..` component.
 pub fn deepest_existing_prefix<F: Fn(usize) -> bool>(kinds: &[CompKind], present: &F) -> (r: Result<
     usize,
     usize,
 >)
     requires
-        forall|k: usize| k <= kinds.len() ==> #[trigger] present.requires((k,)),
+        forall|k: usize|
+            k <= kinds.len() && named_from(kinds@, k as int) ==> #[trigger] present.requires((k,)),
     ensures
         r matches Ok(k) ==> k <= kinds.len() && present.ensures((k,), true) && absent_above(
             *present,
@@ -1887,7 +1896,10 @@ pub fn deepest_existing_prefix<F: Fn(usize) -> bool>(kinds: &[CompKind], present
     loop
         invariant
             k <= kinds.len(),
-            forall|k: usize| k <= kinds.len() ==> #[trigger] present.requires((k,)),
+            forall|k: usize|
+                k <= kinds.len() && named_from(kinds@, k as int) ==> #[trigger] present.requires(
+                    (k,),
+                ),
             absent_above(*present, k as int, kinds.len() as int),
             named_from(kinds@, k as int),
         decreases k,
@@ -1931,6 +1943,11 @@ pub enum Resolution<T, E> {
 /// and never fall back to the normalized path: a failure is an error, with a
 /// warning exactly when the path does not exist and warnings are enabled.
 ///
+/// The oracle's precondition is only granted for implicit provenance
+/// (`implicit ==> canonicalize.requires(())`), so a body that consulted the
+/// oracle for an explicit path would fail verification: the explicit branch
+/// provably never calls it.
+///
 /// `canonicalize` returns the canonical path, or the error paired with
 /// whether it means "not found".
 pub fn resolve_by_provenance<T, E, F: Fn() -> Result<T, (E, bool)>>(
@@ -1939,7 +1956,7 @@ pub fn resolve_by_provenance<T, E, F: Fn() -> Result<T, (E, bool)>>(
     canonicalize: &F,
 ) -> (r: Resolution<T, E>)
     requires
-        canonicalize.requires(()),
+        implicit ==> canonicalize.requires(()),
     ensures
         !implicit <==> r is Normalized,
         r matches Resolution::Canonical(c) ==> canonicalize.ensures((), Ok::<T, (E, bool)>(c)),

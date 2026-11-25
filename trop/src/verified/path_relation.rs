@@ -8,9 +8,12 @@
 //!   within/contains partial order) is proved once, for any element type.
 //! - `path_relationship` decides `PathRelationship::between`: both paths
 //!   are first resolved lexically (`spec_lex_resolve`: `.` dropped, `..`
-//!   cancels the preceding name, `..` at the root stays at the root), and
-//!   paths with different anchors (relative vs. rooted, different prefixes)
-//!   are unrelated (`spec_between`).
+//!   cancels the preceding name and is kept when there is none to cancel).
+//!   A resolved path is a *head* (its root/prefix and any `..` that could not
+//!   be resolved) followed by names; paths with different heads (relative
+//!   vs. rooted, different prefixes, a different number of unresolvable
+//!   `..`) are unrelated (`spec_between`), and otherwise the names decide.
+//!   `path_is_within` and `path_contains` decide the derived predicates.
 //! - On canonical absolute byte strings (see `super::path`),
 //!   `spec_component_prefix` is the byte-level test that agrees with
 //!   segment-prefix (`lemma_component_prefix_iff_segs`), and
@@ -210,10 +213,14 @@ pub open spec fn kinds_of(ts: Seq<(CompKind, Seq<u8>)>) -> Seq<CompKind> {
     ts.map_values(|t: (CompKind, Seq<u8>)| t.0)
 }
 
-/// Lexical resolution (like POSIX `normpath`), as the indices of the
-/// surviving components: `.` is dropped; `..` cancels a preceding named
-/// component, is absorbed by the root (`/..` is `/`), and is kept otherwise
-/// (a leading `..` of a relative path, or after a drive prefix).
+/// Lexical resolution, as the indices of the surviving components: `.` is
+/// dropped; `..` cancels a preceding named component and is kept when there
+/// is none (at the root, at the start of a relative path, after a drive
+/// prefix, or after another kept `..`). The first kept `..` is exactly where
+/// the strict resolution `super::path::spec_resolve` (which backs
+/// `resolve_components`) fails, so the two agree whenever the strict
+/// resolution succeeds (`lemma_lex_resolve_agrees_with_strict`). A kept `..` is part of the
+/// path's head, never treated as a name (see `spec_between`).
 pub open spec fn spec_lex_resolve(ks: Seq<CompKind>) -> Seq<int>
     decreases ks.len(),
 {
@@ -225,8 +232,6 @@ pub open spec fn spec_lex_resolve(ks: Seq<CompKind>) -> Seq<int>
             CompKind::Cur => st,
             CompKind::Parent => if st.len() > 0 && ks[st.last()] is Normal {
                 st.drop_last()
-            } else if st.len() > 0 && ks[st.last()] is Root {
-                st
             } else {
                 st.push(ks.len() - 1)
             },
@@ -245,34 +250,37 @@ pub open spec fn lex_resolved(ts: Seq<(CompKind, Seq<u8>)>) -> Seq<(CompKind, Se
     select(ts, spec_lex_resolve(kinds_of(ts)))
 }
 
-/// The number of leading anchor tokens of `ts` from index `i` on.
-pub open spec fn anchor_count_from(ts: Seq<(CompKind, Seq<u8>)>, i: int) -> nat
+/// The number of leading tokens of `ts`, from index `i` on, that are not
+/// named components.
+pub open spec fn head_len_from(ts: Seq<(CompKind, Seq<u8>)>, i: int) -> nat
     decreases ts.len() - i,
 {
-    if 0 <= i < ts.len() && super::path::is_anchor(ts[i].0) {
-        1 + anchor_count_from(ts, i + 1)
+    if 0 <= i < ts.len() && !(ts[i].0 is Normal) {
+        1 + head_len_from(ts, i + 1)
     } else {
         0
     }
 }
 
-/// The length of the leading anchor run (prefix and/or root) of `ts`.
-pub open spec fn anchor_count(ts: Seq<(CompKind, Seq<u8>)>) -> nat {
-    anchor_count_from(ts, 0)
+/// The length of the head of `ts`: its leading run of components that are
+/// not named. For a resolved path (`lex_resolved`) the head is the root
+/// and/or prefix followed by the `..` components that could not be resolved
+/// (`lemma_lex_resolved_shape`).
+pub open spec fn head_len(ts: Seq<(CompKind, Seq<u8>)>) -> nat {
+    head_len_from(ts, 0)
 }
 
-/// `x` and `y` have the same anchor: both relative, both rooted at the same
-/// root, or both on the same prefix.
-pub open spec fn same_anchor(x: Seq<(CompKind, Seq<u8>)>, y: Seq<(CompKind, Seq<u8>)>) -> bool {
-    anchor_count(x) == anchor_count(y) && x.take(anchor_count(x) as int) == y.take(
-        anchor_count(y) as int,
-    )
+/// `x` and `y` have the same head: the same anchor (both relative, both
+/// rooted, the same prefix) and the same unresolvable `..` components.
+pub open spec fn same_head(x: Seq<(CompKind, Seq<u8>)>, y: Seq<(CompKind, Seq<u8>)>) -> bool {
+    head_len(x) == head_len(y) && x.take(head_len(x) as int) == y.take(head_len(y) as int)
 }
 
 /// The relation between resolved token sequences: `spec_rel` when the
-/// anchors agree, `Unrelated` otherwise.
+/// heads agree (so only the names after the head can differ), `Unrelated`
+/// otherwise.
 pub open spec fn spec_lexical_rel(x: Seq<(CompKind, Seq<u8>)>, y: Seq<(CompKind, Seq<u8>)>) -> Rel {
-    if same_anchor(x, y) {
+    if same_head(x, y) {
         spec_rel(x, y)
     } else {
         Rel::Unrelated
@@ -285,25 +293,52 @@ pub open spec fn spec_between(a: Seq<(CompKind, Seq<u8>)>, b: Seq<(CompKind, Seq
     spec_lexical_rel(lex_resolved(a), lex_resolved(b))
 }
 
+/// `PathRelationship::is_within(a, b)`: `a` is `b` or lies below it.
+pub open spec fn between_within(a: Seq<(CompKind, Seq<u8>)>, b: Seq<(CompKind, Seq<u8>)>) -> bool {
+    spec_between(a, b) is Descendant || spec_between(a, b) is Same
+}
+
+/// `PathRelationship::contains(a, b)`: `a` is `b` or lies above it.
+pub open spec fn between_contains(a: Seq<(CompKind, Seq<u8>)>, b: Seq<(CompKind, Seq<u8>)>) -> bool {
+    spec_between(a, b) is Ancestor || spec_between(a, b) is Same
+}
+
+/// The shape `std` gives a component list: roots and prefixes occur only as
+/// a leading run.
+pub open spec fn anchors_lead(ks: Seq<CompKind>) -> bool {
+    forall|i: int, j: int|
+        0 <= i < j < ks.len() && super::path::is_anchor(#[trigger] ks[j]) ==> super::path::is_anchor(
+            #[trigger] ks[i],
+        )
+}
+
+/// No named component is followed by a component of another kind.
+pub open spec fn names_closed(ks: Seq<CompKind>) -> bool {
+    forall|i: int, j: int| 0 <= i < j < ks.len() && #[trigger] ks[i] is Normal ==> #[trigger] ks[j] is Normal
+}
+
+/// Every component after the head of `x` is a named component.
+pub open spec fn names_after_head(x: Seq<(CompKind, Seq<u8>)>) -> bool {
+    forall|j: int| head_len(x) <= j < x.len() ==> #[trigger] x[j].0 is Normal
+}
+
 // ---------------------------------------------------------------------------
 // Lemmas
 // ---------------------------------------------------------------------------
 
-/// The anchor run never exceeds the sequence.
-pub proof fn lemma_anchor_count_bound(ts: Seq<(CompKind, Seq<u8>)>, i: int)
+/// The head never exceeds the sequence, consists of non-named components,
+/// and is followed by a named component (if anything).
+pub proof fn lemma_head_len_bound(ts: Seq<(CompKind, Seq<u8>)>, i: int)
     requires
         0 <= i <= ts.len(),
     ensures
-        i + anchor_count_from(ts, i) <= ts.len(),
-        forall|j: int|
-            i <= j < i + anchor_count_from(ts, i) ==> super::path::is_anchor(#[trigger] ts[j].0),
-        i + anchor_count_from(ts, i) < ts.len() ==> !super::path::is_anchor(
-            ts[i + anchor_count_from(ts, i)].0,
-        ),
+        i + head_len_from(ts, i) <= ts.len(),
+        forall|j: int| i <= j < i + head_len_from(ts, i) ==> !(#[trigger] ts[j].0 is Normal),
+        i + head_len_from(ts, i) < ts.len() ==> ts[i + head_len_from(ts, i)].0 is Normal,
     decreases ts.len() - i,
 {
-    if i < ts.len() && super::path::is_anchor(ts[i].0) {
-        lemma_anchor_count_bound(ts, i + 1);
+    if i < ts.len() && !(ts[i].0 is Normal) {
+        lemma_head_len_bound(ts, i + 1);
     }
 }
 
@@ -353,6 +388,160 @@ pub proof fn lemma_lex_resolve_agrees_with_strict(ks: Seq<CompKind>)
         let prev = ks.drop_last();
         assert(super::path::spec_resolve(prev) is Some);
         lemma_lex_resolve_agrees_with_strict(prev);
+    }
+}
+
+/// Lexical resolution keeps a `..` exactly when the strict resolution
+/// (`super::path::spec_resolve`, which backs `resolve_components`) fails: a
+/// path's head contains an unresolvable `..` if and only if
+/// `resolve_components` rejects it.
+pub proof fn lemma_lex_resolve_keeps_parent_iff_strict_fails(ks: Seq<CompKind>)
+    ensures
+        (super::path::spec_resolve(ks) is None) <==> (exists|j: int|
+            0 <= j < spec_lex_resolve(ks).len() && (ks[#[trigger] spec_lex_resolve(ks)[j]] is Parent)),
+    decreases ks.len(),
+{
+    if ks.len() > 0 {
+        let n = ks.len() as int;
+        let prev = ks.drop_last();
+        lemma_lex_resolve_keeps_parent_iff_strict_fails(prev);
+        lemma_lex_resolve_bounds(prev);
+        let st = spec_lex_resolve(prev);
+        let r = spec_lex_resolve(ks);
+        assert forall|j: int| 0 <= j < st.len() implies ks[#[trigger] st[j]] == prev[st[j]] by {
+            assert(0 <= st[j] < prev.len());
+        }
+        let pops = ks.last() is Parent && st.len() > 0 && ks[st.last()] is Normal;
+        if super::path::spec_resolve(prev) is None {
+            let j = choose|j: int| 0 <= j < st.len() && (prev[#[trigger] st[j]] is Parent);
+            assert(ks[st[j]] is Parent);
+            if pops {
+                assert(j != st.len() - 1);
+                assert(r == st.drop_last());
+            }
+            assert(0 <= j < r.len() && r[j] == st[j]);
+            assert(ks[r[j]] is Parent);
+        } else {
+            lemma_lex_resolve_agrees_with_strict(prev);
+            assert(forall|j: int| 0 <= j < st.len() ==> !(prev[#[trigger] st[j]] is Parent));
+            if ks.last() is Parent && !pops {
+                assert(super::path::spec_resolve(ks) is None);
+                assert(r == st.push(n - 1));
+                assert(r[r.len() - 1] == n - 1);
+                assert(ks[r[r.len() - 1]] is Parent);
+            } else {
+                assert(super::path::spec_resolve(ks) is Some);
+                assert forall|j: int| 0 <= j < r.len() implies !(ks[#[trigger] r[j]] is Parent) by {
+                    if j < st.len() {
+                        assert(r[j] == st[j]);
+                    } else {
+                        assert(r[j] == n - 1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// For `std`-shaped input (anchors only as a leading run), no named
+/// component of the resolved kinds is followed by one of another kind.
+proof fn lemma_lex_resolve_closed(ks: Seq<CompKind>)
+    requires
+        anchors_lead(ks),
+    ensures
+        names_closed(super::path::select_kinds(ks, spec_lex_resolve(ks))),
+    decreases ks.len(),
+{
+    if ks.len() > 0 {
+        let n = ks.len() as int;
+        let prev = ks.drop_last();
+        assert(anchors_lead(prev)) by {
+            assert forall|i: int, j: int|
+                0 <= i < j < prev.len() && super::path::is_anchor(
+                    #[trigger] prev[j],
+                ) implies super::path::is_anchor(#[trigger] prev[i]) by {
+                assert(prev[i] == ks[i] && prev[j] == ks[j]);
+            }
+        }
+        lemma_lex_resolve_closed(prev);
+        lemma_lex_resolve_bounds(prev);
+        let st = spec_lex_resolve(prev);
+        let sp = super::path::select_kinds(prev, st);
+        let so = super::path::select_kinds(ks, st);
+        assert(so =~= sp) by {
+            assert forall|j: int| 0 <= j < st.len() implies so[j] == sp[j] by {
+                assert(0 <= st[j] < prev.len());
+            }
+        }
+        let r = spec_lex_resolve(ks);
+        let x = super::path::select_kinds(ks, r);
+        let k = ks.last();
+        if k is Cur {
+            assert(x =~= so);
+        } else if k is Parent && st.len() > 0 && ks[st.last()] is Normal {
+            assert(x =~= so.drop_last());
+            assert forall|i: int, j: int|
+                0 <= i < j < x.len() && #[trigger] x[i] is Normal implies #[trigger] x[j] is Normal by {
+                assert(x[i] == sp[i] && x[j] == sp[j]);
+            }
+        } else {
+            assert(r == st.push(n - 1));
+            assert(x =~= so.push(k));
+            // Nothing kept so far is named when a non-named component is
+            // pushed: for `..` the top is not named (and names are closed);
+            // for an anchor, every earlier component is an anchor.
+            assert forall|i: int| 0 <= i < sp.len() && !(k is Normal) implies !(
+            #[trigger] sp[i] is Normal) by {
+                if k is Parent {
+                    assert(sp[sp.len() - 1] == ks[st.last()]);
+                    if i < sp.len() - 1 && sp[i] is Normal {
+                        assert(sp[sp.len() - 1] is Normal);
+                    }
+                } else {
+                    assert(super::path::is_anchor(ks[n - 1]));
+                    assert(0 <= st[i] < prev.len());
+                    assert(super::path::is_anchor(ks[st[i]]));
+                }
+            }
+            assert forall|i: int, j: int|
+                0 <= i < j < x.len() && #[trigger] x[i] is Normal implies #[trigger] x[j] is Normal by {
+                assert(x[i] == sp[i]);
+                if j < sp.len() {
+                    assert(x[j] == sp[j]);
+                } else {
+                    assert(x[j] == k);
+                }
+            }
+        }
+    }
+}
+
+/// The shape of a resolved `std`-shaped path: a head (root and/or prefix,
+/// then the `..` components that could not be resolved) followed by named
+/// components only.
+pub proof fn lemma_lex_resolved_shape(ts: Seq<(CompKind, Seq<u8>)>)
+    requires
+        anchors_lead(kinds_of(ts)),
+    ensures
+        names_after_head(lex_resolved(ts)),
+{
+    let ks = kinds_of(ts);
+    let idx = spec_lex_resolve(ks);
+    let x = lex_resolved(ts);
+    lemma_lex_resolve_closed(ks);
+    lemma_lex_resolve_bounds(ks);
+    lemma_head_len_bound(x, 0);
+    let sel = super::path::select_kinds(ks, idx);
+    assert forall|j: int| 0 <= j < x.len() implies #[trigger] x[j].0 == sel[j] by {
+        assert(0 <= idx[j] < ks.len());
+    }
+    let h = head_len(x) as int;
+    assert forall|j: int| h <= j < x.len() implies #[trigger] x[j].0 is Normal by {
+        assert(x[h].0 == sel[h]);
+        assert(x[j].0 == sel[j]);
+        if j > h {
+            assert(sel[h] is Normal);
+        }
     }
 }
 
@@ -411,13 +600,72 @@ pub proof fn lemma_between_ancestor_transitive(
     lemma_rel_ancestor_transitive(lex_resolved(a), lex_resolved(b), lex_resolved(c));
 }
 
-/// `between` is `Same` exactly when the resolved sequences are equal, and
-/// `within`/`contains` built on it form a partial order on resolved paths.
+/// `between` is `Same` exactly when the resolved sequences are equal.
 pub proof fn lemma_between_same_iff(a: Seq<(CompKind, Seq<u8>)>, b: Seq<(CompKind, Seq<u8>)>)
     ensures
         (spec_between(a, b) is Same) <==> lex_resolved(a) == lex_resolved(b),
 {
     lemma_rel_cases(lex_resolved(a), lex_resolved(b));
+}
+
+/// `Ancestor` and `Descendant` mean what they say: for `std`-shaped paths
+/// the deeper resolved path is the shallower one followed by at least one
+/// named component (never by a `..`, a root or a prefix).
+pub proof fn lemma_between_strict_extension_is_named(
+    a: Seq<(CompKind, Seq<u8>)>,
+    b: Seq<(CompKind, Seq<u8>)>,
+)
+    requires
+        anchors_lead(kinds_of(a)),
+        anchors_lead(kinds_of(b)),
+    ensures
+        spec_between(a, b) is Ancestor ==> is_prefix_of(lex_resolved(a), lex_resolved(b))
+            && lex_resolved(a).len() < lex_resolved(b).len() && (forall|i: int|
+            lex_resolved(a).len() <= i < lex_resolved(b).len() ==> (#[trigger] lex_resolved(
+                b,
+            )[i]).0 is Normal),
+        spec_between(a, b) is Descendant ==> is_prefix_of(lex_resolved(b), lex_resolved(a))
+            && lex_resolved(b).len() < lex_resolved(a).len() && (forall|i: int|
+            lex_resolved(b).len() <= i < lex_resolved(a).len() ==> (#[trigger] lex_resolved(
+                a,
+            )[i]).0 is Normal),
+{
+    let x = lex_resolved(a);
+    let y = lex_resolved(b);
+    lemma_lex_resolved_shape(a);
+    lemma_lex_resolved_shape(b);
+    lemma_head_len_bound(x, 0);
+    lemma_head_len_bound(y, 0);
+    lemma_rel_cases(x, y);
+}
+
+/// `within` and `contains` built on `between` (what `is_within` and
+/// `contains` compute) are converses of each other, and `within` is a
+/// partial order on paths up to lexical resolution: reflexive, antisymmetric
+/// (mutually within means the same resolved path), and transitive. It holds
+/// exactly when the heads agree and the resolved `b` is a prefix of the
+/// resolved `a`.
+pub proof fn lemma_between_within_partial_order(
+    a: Seq<(CompKind, Seq<u8>)>,
+    b: Seq<(CompKind, Seq<u8>)>,
+    c: Seq<(CompKind, Seq<u8>)>,
+)
+    ensures
+        between_within(b, a) <==> between_contains(a, b),
+        between_within(b, a) <==> same_head(lex_resolved(a), lex_resolved(b)) && is_prefix_of(
+            lex_resolved(a),
+            lex_resolved(b),
+        ),
+        between_within(a, a),
+        between_within(a, b) && between_within(b, a) ==> lex_resolved(a) == lex_resolved(b),
+        between_within(c, b) && between_within(b, a) ==> between_within(c, a),
+{
+    let x = lex_resolved(a);
+    let y = lex_resolved(b);
+    let z = lex_resolved(c);
+    lemma_within_partial_order(x, y, z);
+    lemma_within_partial_order(y, x, z);
+    lemma_between_flip(a, b);
 }
 
 /// A path with no anchor (relative, including the empty path) is unrelated
@@ -440,14 +688,19 @@ pub proof fn lemma_between_relative_vs_rooted(
     lemma_lex_resolve_bounds(ka);
     let ra = lex_resolved(a);
     let rb = lex_resolved(b);
-    if ra.len() > 0 {
-        assert(ra[0] == a[spec_lex_resolve(ka)[0]]);
-    }
-    assert(anchor_count(ra) == 0);
     assert(kb[0] == b[0].0);
     lemma_lex_resolve_keeps_first_anchor(kb);
     assert(rb[0] == b[0]);
-    assert(anchor_count(rb) >= 1);
+    assert(head_len(rb) >= 1);
+    lemma_head_len_bound(ra, 0);
+    lemma_head_len_bound(rb, 0);
+    if head_len(ra) == head_len(rb) {
+        assert(ra[0] == a[spec_lex_resolve(ka)[0]]);
+        assert(ra.take(head_len(ra) as int)[0] == ra[0]);
+        assert(rb.take(head_len(rb) as int)[0] == rb[0]);
+    }
+    assert(!same_head(ra, rb));
+    assert(!same_head(rb, ra));
 }
 
 // ---------------------------------------------------------------------------
@@ -488,7 +741,6 @@ fn lex_resolve_tokens(ts: &[PathToken]) -> (kept: Vec<usize>)
                             before,
                         ).drop_last());
                     };
-                } else if n > 0 && matches!(ts[stack[n - 1]].kind, CompKind::Root) {
                 } else {
                     stack.push(i);
                     proof {
@@ -561,21 +813,21 @@ fn token_eq(a: &PathToken, b: &PathToken) -> (eq: bool)
     true
 }
 
-/// The number of leading anchors of the resolved sequence `select(ts, idx)`.
-fn count_anchors(ts: &[PathToken], idx: &[usize]) -> (count: usize)
+/// The head length of the resolved sequence `select(ts, idx)`.
+fn count_head(ts: &[PathToken], idx: &[usize]) -> (count: usize)
     requires
         forall|j: int| 0 <= j < idx.len() ==> #[trigger] idx[j] < ts.len(),
     ensures
-        count as int == anchor_count(select(tok_views(ts@), super::path::usize_ints(idx@))),
+        count as int == head_len(select(tok_views(ts@), super::path::usize_ints(idx@))),
 {
     let ghost x = select(tok_views(ts@), super::path::usize_ints(idx@));
     let mut i: usize = 0;
-    while i < idx.len() && matches!(ts[idx[i]].kind, CompKind::Prefix | CompKind::Root)
+    while i < idx.len() && !matches!(ts[idx[i]].kind, CompKind::Normal)
         invariant
             i <= idx.len(),
             x == select(tok_views(ts@), super::path::usize_ints(idx@)),
             forall|j: int| 0 <= j < idx.len() ==> #[trigger] idx[j] < ts.len(),
-            anchor_count_from(x, 0) == i + anchor_count_from(x, i as int),
+            head_len_from(x, 0) == i + head_len_from(x, i as int),
         decreases idx.len() - i,
     {
         proof {
@@ -637,7 +889,7 @@ fn common_prefix_len(a: &[PathToken], ia: &[usize], b: &[PathToken], ib: &[usize
 }
 
 /// Decides `spec_between`: the relationship between two paths given as
-/// component tokens, after lexical resolution, with anchors compared.
+/// component tokens, after lexical resolution, with heads compared.
 pub fn path_relationship(a: &[PathToken], b: &[PathToken]) -> (r: Rel)
     ensures
         r == spec_between(tok_views(a@), tok_views(b@)),
@@ -649,12 +901,12 @@ pub fn path_relationship(a: &[PathToken], b: &[PathToken]) -> (r: Rel)
     proof {
         assert(x == lex_resolved(tok_views(a@)));
         assert(y == lex_resolved(tok_views(b@)));
-        lemma_anchor_count_bound(x, 0);
-        lemma_anchor_count_bound(y, 0);
+        lemma_head_len_bound(x, 0);
+        lemma_head_len_bound(y, 0);
         lemma_rel_cases(x, y);
     }
-    let ca = count_anchors(a, &ia);
-    let cb = count_anchors(b, &ib);
+    let ca = count_head(a, &ia);
+    let cb = count_head(b, &ib);
     let common = common_prefix_len(a, &ia, b, &ib);
     proof {
         if ca == cb {
@@ -695,6 +947,22 @@ pub fn path_relationship(a: &[PathToken], b: &[PathToken]) -> (r: Rel)
     } else {
         Rel::Unrelated
     }
+}
+
+/// Decides `between_within`: `path` is `dir` or lies below it.
+pub fn path_is_within(path: &[PathToken], dir: &[PathToken]) -> (within: bool)
+    ensures
+        within == between_within(tok_views(path@), tok_views(dir@)),
+{
+    matches!(path_relationship(path, dir), Rel::Descendant | Rel::Same)
+}
+
+/// Decides `between_contains`: `path` is `other` or lies above it.
+pub fn path_contains(path: &[PathToken], other: &[PathToken]) -> (contains: bool)
+    ensures
+        contains == between_contains(tok_views(path@), tok_views(other@)),
+{
+    matches!(path_relationship(path, other), Rel::Ancestor | Rel::Same)
 }
 
 // ===========================================================================

@@ -73,7 +73,10 @@ impl NormalizedPath {
     /// The path must already be in the form [`normalize`](crate::path::normalize::normalize)
     /// produces. On Unix that is `/` or `/a/b/c`: absolute, with no `.` or
     /// `..` component, no empty component (`//`), and no trailing separator.
-    /// Elsewhere it must be absolute and contain no `.` or `..` component.
+    /// Elsewhere it must be absolute and spelled exactly as resolving its
+    /// `.` and `..` components and joining them with the platform separator
+    /// would spell it (so no `.` or `..`, no `/` for `\`, no repeated or
+    /// trailing separator).
     ///
     /// # Errors
     ///

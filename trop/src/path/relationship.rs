@@ -4,14 +4,19 @@
 //! two paths, such as whether one is an ancestor or descendant of the other.
 //!
 //! The relationship is decided by the verified kernel
-//! `verified::path_relation::path_relationship`, which proves it is a
-//! well-behaved hierarchy relation (reflexive, flip-symmetric, transitive).
+//! `verified::path_relation` (`path_relationship`, `path_is_within`,
+//! `path_contains`). It proves the relation is reflexive and flip-symmetric,
+//! that `Ancestor` is transitive, that `is_within`/`contains` form a partial
+//! order, and that an ancestor's descendants extend it by named components
+//! only.
 
 use std::ffi::OsStr;
 use std::path::{Component, Path};
 
 use crate::path::component_kind;
-use crate::verified::path_relation::{path_relationship, PathToken, Rel};
+use crate::verified::path_relation::{
+    path_contains, path_is_within, path_relationship, PathToken, Rel,
+};
 
 /// Relationship between two paths.
 ///
@@ -63,15 +68,22 @@ impl PathRelationship {
     ///
     /// Both paths are compared component by component after lexical
     /// resolution: repeated and trailing separators and `.` components are
-    /// ignored, a `..` cancels the preceding named component, and a `..` at
-    /// the root stays at the root (`/a/b/..` is the same as `/a`, and `/..`
-    /// is `/`). A leading `..` of a relative path is kept. Paths with
-    /// different anchors (a relative path, including the empty path, versus
-    /// a rooted one, or different Windows prefixes) are `Unrelated`.
+    /// ignored, and a `..` cancels the preceding named component (`/a/b/..`
+    /// is the same as `/a`).
+    ///
+    /// A `..` with no named component to cancel (at the root, at the start
+    /// of a relative path, or after a drive prefix: exactly where
+    /// [`resolve_components`](crate::path::normalize::resolve_components)
+    /// fails) is kept as part of the path's *head*, together with its root or
+    /// prefix. Two paths are related only when their heads agree, so a
+    /// relative path (including the empty path) is `Unrelated` to a rooted
+    /// one, `/..` is `Unrelated` to `/`, and `../..` is `Unrelated` to `..`.
+    /// With equal heads, the named components decide.
     ///
     /// The relation is reflexive (`between(p, p)` is `Same`), flip-symmetric
     /// (`between(a, b)` is `Ancestor` exactly when `between(b, a)` is
-    /// `Descendant`), and `Ancestor` is transitive.
+    /// `Descendant`), and `Ancestor` is transitive. `Ancestor` means the
+    /// second path is the first followed by one or more named components.
     ///
     /// # Examples
     ///
@@ -169,8 +181,7 @@ impl PathRelationship {
     /// ```
     #[must_use]
     pub fn is_within(path: &Path, directory: &Path) -> bool {
-        let rel = Self::between(path, directory);
-        matches!(rel, Self::Descendant | Self::Same)
+        path_is_within(&path_tokens(path), &path_tokens(directory))
     }
 
     /// Check if a path contains another path (ancestor or same).
@@ -189,8 +200,7 @@ impl PathRelationship {
     /// ```
     #[must_use]
     pub fn contains(path: &Path, other: &Path) -> bool {
-        let rel = Self::between(path, other);
-        matches!(rel, Self::Ancestor | Self::Same)
+        path_contains(&path_tokens(path), &path_tokens(other))
     }
 
     /// Get a human-readable description of the relationship.
@@ -242,9 +252,10 @@ impl PathRelationship {
 /// A path's components as kernel tokens: each component's kind and an
 /// equality key.
 ///
-/// `std` compares named components byte-wise and Windows prefixes by their
-/// parsed form (so `c:` equals `C:`), so a prefix is keyed by its parsed
-/// `Prefix` value and every other component by its bytes.
+/// `std` compares named components by their `OsStr` encoding and Windows
+/// prefixes by their parsed form (so `c:` equals `C:`), so a prefix is keyed
+/// by its parsed `Prefix` value and every other component by its encoded
+/// bytes.
 fn path_tokens(path: &Path) -> Vec<PathToken> {
     path.components()
         .map(|component| PathToken {
@@ -261,6 +272,10 @@ fn component_key(component: Component<'_>) -> Vec<u8> {
     }
 }
 
+// Each `os_str_key` is an injective encoding of the `OsStr`, so key equality
+// is `OsStr` equality. (`OsStr::as_encoded_bytes` would serve every platform
+// at once, but it is newer than the crate's minimum supported Rust version.)
+
 /// The bytes of a Unix `OsStr`.
 #[cfg(unix)]
 fn os_str_key(value: &OsStr) -> Vec<u8> {
@@ -268,11 +283,20 @@ fn os_str_key(value: &OsStr) -> Vec<u8> {
     value.as_bytes().to_vec()
 }
 
-/// The UTF-16 code units of a Windows `OsStr`, as little-endian bytes.
+/// The UTF-16 code units of a Windows `OsStr`, as little-endian bytes
+/// (fixed-width, so injective).
 #[cfg(windows)]
 fn os_str_key(value: &OsStr) -> Vec<u8> {
     use std::os::windows::ffi::OsStrExt;
     value.encode_wide().flat_map(u16::to_le_bytes).collect()
+}
+
+/// Other platforms: the `Debug` spelling, which quotes the string and escapes
+/// backslashes and every byte or code unit that is not valid Unicode, so
+/// distinct values never share a spelling.
+#[cfg(not(any(unix, windows)))]
+fn os_str_key(value: &OsStr) -> Vec<u8> {
+    format!("{value:?}").into_bytes()
 }
 
 #[cfg(test)]
@@ -447,12 +471,76 @@ mod tests {
             ("/a/b/../c", "/a", PathRelationship::Descendant),
             ("/a/b/..", "/a/b", PathRelationship::Ancestor),
             ("/a/../b", "/a", PathRelationship::Unrelated),
-            ("/..", "/", PathRelationship::Same),
-            ("/../a", "/a", PathRelationship::Same),
             ("a/..", "", PathRelationship::Same),
             ("../a", "../a/b", PathRelationship::Ancestor),
+            ("../a/..", "..", PathRelationship::Same),
+            ("a/../..", "..", PathRelationship::Same),
             ("../a", "a", PathRelationship::Unrelated),
             ("./a", "a", PathRelationship::Same),
+        ];
+        for (left, right, expected) in cases {
+            assert_eq!(
+                PathRelationship::between(Path::new(left), Path::new(right)),
+                expected,
+                "{left} vs {right}"
+            );
+        }
+    }
+
+    // A `..` that cannot be resolved belongs to the path's head: it is never
+    // compared as if it were a named child component. (It used to be, so
+    // `../..` was reported as a descendant of `..`, and `/..` of `/`.)
+    #[test]
+    fn test_unresolvable_parent_components_are_part_of_the_head() {
+        let cases = [
+            ("..", ".", PathRelationship::Unrelated),
+            ("..", "", PathRelationship::Unrelated),
+            ("../..", "..", PathRelationship::Unrelated),
+            ("../../a", "../a", PathRelationship::Unrelated),
+            ("/..", "/", PathRelationship::Unrelated),
+            ("/../a", "/a", PathRelationship::Unrelated),
+            ("/..", "/..", PathRelationship::Same),
+            ("/../a", "/../a/b", PathRelationship::Ancestor),
+            ("../..", "../../a", PathRelationship::Ancestor),
+            ("..", "../a", PathRelationship::Ancestor),
+        ];
+        for (left, right, expected) in cases {
+            assert_eq!(
+                PathRelationship::between(Path::new(left), Path::new(right)),
+                expected,
+                "{left} vs {right}"
+            );
+        }
+        assert!(!PathRelationship::is_within(
+            Path::new(".."),
+            Path::new(".")
+        ));
+        assert!(!PathRelationship::is_within(Path::new(".."), Path::new("")));
+        assert!(!PathRelationship::is_within(
+            Path::new("../.."),
+            Path::new("..")
+        ));
+        assert!(!PathRelationship::contains(
+            Path::new("/"),
+            Path::new("/..")
+        ));
+        assert!(PathRelationship::is_within(
+            Path::new("../a"),
+            Path::new("..")
+        ));
+    }
+
+    // Windows prefixes are compared in their parsed form, and a `..` right
+    // after a drive-relative prefix belongs to the head.
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_prefixes() {
+        let cases = [
+            (r"C:\a", r"c:\a\b", PathRelationship::Ancestor),
+            (r"C:\a", r"D:\a", PathRelationship::Unrelated),
+            (r"C:\a", r"\a", PathRelationship::Unrelated),
+            ("C:..", "C:", PathRelationship::Unrelated),
+            (r"C:..\a", "C:..", PathRelationship::Descendant),
         ];
         for (left, right, expected) in cases {
             assert_eq!(

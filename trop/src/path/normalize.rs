@@ -24,7 +24,9 @@ use crate::verified::path::{classify_tilde, resolve_component_kinds, CompKind, T
 /// Every separator after `~` is skipped, so `~//etc` names `etc` under the
 /// home directory (never `/etc`). On Unix a backslash is an ordinary filename
 /// byte, so `~\x` is not a tilde form and is returned unchanged; on Windows
-/// `~\x` is home-relative.
+/// `~\x` is home-relative, and a remainder that starts with a drive prefix
+/// (`~/C:x`) is rejected, because joining it would replace the home
+/// directory.
 ///
 /// # Errors
 ///
@@ -32,6 +34,7 @@ use crate::verified::path::{classify_tilde, resolve_component_kinds, CompKind, T
 /// - The path contains invalid UTF-8
 /// - The home directory cannot be determined
 /// - The path uses `~user` syntax (not supported)
+/// - On Windows, the part after `~/` starts with a drive prefix
 ///
 /// # Examples
 ///
@@ -74,7 +77,24 @@ pub fn expand_tilde(path: &Path) -> Result<PathBuf> {
         // `rest_start` is past every separator that follows `~`. Those bytes
         // are ASCII, so it is a char boundary, and the rest never starts with
         // a separator.
-        TildeForm::HomeRelative { rest_start } => Ok(join_home(&home, &path_str[rest_start..])),
+        TildeForm::HomeRelative { rest_start } => {
+            let rest = &path_str[rest_start..];
+            // Without a leading separator the rest can only replace the home
+            // directory on `join` by starting with a prefix (`C:x` on
+            // Windows); std never parses a prefix on Unix.
+            if matches!(
+                Path::new(rest).components().next(),
+                Some(Component::Prefix(_))
+            ) {
+                return Err(Error::InvalidPath {
+                    path: path.to_path_buf(),
+                    reason: "The path after '~' names a drive; use ~/path relative to the home \
+                             directory"
+                        .to_string(),
+                });
+            }
+            Ok(join_home(&home, rest))
+        }
         TildeForm::NotTilde | TildeForm::UserSyntax => Err(Error::InvalidPath {
             path: path.to_path_buf(),
             reason: "~user syntax is not supported; use ~ or ~/path".to_string(),
@@ -263,6 +283,31 @@ mod tests {
     fn test_expand_tilde_user_syntax_not_supported() {
         let result = expand_tilde(Path::new("~user/path"));
         assert!(result.is_err());
+    }
+
+    // On Windows a drive prefix right after the separators that follow `~`
+    // would make `join` replace the home directory, so it is rejected.
+    #[test]
+    #[cfg(windows)]
+    fn test_expand_tilde_rejects_a_drive_prefix_on_windows() {
+        for input in [r"~/C:x", r"~\C:\x", r"~//D:", r"~\/c:"] {
+            assert!(
+                matches!(
+                    expand_tilde(Path::new(input)),
+                    Err(Error::InvalidPath { .. })
+                ),
+                "{input}"
+            );
+        }
+    }
+
+    // On Unix `C:` is an ordinary name, so it stays under the home directory.
+    #[test]
+    #[cfg(unix)]
+    fn test_expand_tilde_drive_like_name_on_unix() {
+        let home = home::home_dir().unwrap();
+        assert_eq!(expand_tilde(Path::new("~/C:x")).unwrap(), home.join("C:x"));
+        assert_eq!(expand_tilde(Path::new("~//C:")).unwrap(), home.join("C:"));
     }
 
     #[test]
