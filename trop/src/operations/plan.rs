@@ -5,7 +5,7 @@
 
 use crate::port::group::{GroupAllocationRequest, GroupReconciliationPolicy};
 use crate::port::occupancy::OccupancyCheckConfig;
-use crate::{Reservation, ReservationKey};
+use crate::{Port, Reservation, ReservationKey};
 
 /// A single action to be taken during plan execution.
 ///
@@ -32,6 +32,9 @@ pub enum PlanAction {
     UpdateReservation(Reservation),
 
     /// Update the `last_used_at` timestamp for a reservation.
+    ///
+    /// Execution fails if no reservation is stored under the key, and the
+    /// action reports the reservation's port.
     UpdateLastUsed(ReservationKey),
 
     /// Delete a reservation.
@@ -105,6 +108,12 @@ pub struct OperationPlan {
 
     /// Warnings to communicate to the user.
     pub warnings: Vec<String>,
+
+    /// The stored port of each reservation the plan refreshes, recorded at
+    /// planning time: the port an `UpdateLastUsed` action reports. Plans
+    /// assembled by hand have none recorded; the executor then reads the
+    /// stored port and propagates any error.
+    refreshed_ports: Vec<(ReservationKey, Port)>,
 }
 
 impl OperationPlan {
@@ -125,7 +134,25 @@ impl OperationPlan {
             description: description.into(),
             actions: Vec::new(),
             warnings: Vec::new(),
+            refreshed_ports: Vec::new(),
         }
+    }
+
+    /// Adds an `UpdateLastUsed` action for `key` and records `port`, the
+    /// reservation's stored port at planning time, as the port it reports.
+    #[must_use]
+    pub(crate) fn add_refresh(mut self, key: ReservationKey, port: Port) -> Self {
+        self.refreshed_ports.push((key.clone(), port));
+        self.actions.push(PlanAction::UpdateLastUsed(key));
+        self
+    }
+
+    /// The port recorded at planning time for refreshing `key`, if any.
+    pub(crate) fn recorded_refresh_port(&self, key: &ReservationKey) -> Option<Port> {
+        self.refreshed_ports
+            .iter()
+            .find(|(recorded, _)| recorded == key)
+            .map(|(_, port)| *port)
     }
 
     /// Adds an action to the plan.

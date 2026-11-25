@@ -7,7 +7,11 @@ use crate::error::CliError;
 use crate::invocation::InvocationContext;
 use clap::Args;
 use std::path::PathBuf;
-use trop::{PlanExecutor, Port, ReservationKey, ReserveOptions, ReservePlan};
+use std::time::Duration;
+use trop::{
+    Config, Database, DatabaseConfig, PlanExecutor, Port, ReservationKey, ReserveOptions,
+    ReservePlan,
+};
 
 /// Reserve a port for a directory.
 #[derive(Args)]
@@ -162,14 +166,10 @@ impl ReserveCommand {
             .with_disable_autoprune(effective.disable_autoprune())
             .with_disable_autoexpire(effective.disable_autoexpire());
 
-        // 8. Handle dry-run mode
+        // 8. Handle dry-run mode: plan exactly as a live run would, without
+        // mutating (or creating) anything.
         if self.dry_run {
-            // In dry-run mode, just print what would happen without opening database
-            if !global.quiet {
-                eprintln!("Dry run - would perform the following actions:");
-                eprintln!("  1. Reserve port");
-            }
-            return Ok(());
+            return dry_run(context, options, config, global.quiet);
         }
 
         // 8. Open database
@@ -206,6 +206,73 @@ impl ReserveCommand {
 
         Ok(())
     }
+}
+
+/// Runs `reserve --dry-run`.
+///
+/// When the database exists, the plan is built exactly as a live run builds
+/// it, inside a read transaction on a read-only connection that is rolled
+/// back, and the dry-run executor reports it: the planned actions go to
+/// stderr (unless quiet) and the port a live run would report goes to
+/// stdout. Planning errors (an unrelated path, a sticky-field change, an
+/// exhausted range without automatic cleanup) fail the dry run exactly as
+/// they fail a live run. A missing database is never created: the dry run
+/// says so and succeeds.
+fn dry_run(
+    context: &InvocationContext,
+    options: ReserveOptions,
+    config: &Config,
+    quiet: bool,
+) -> Result<(), CliError> {
+    let db_path = context.data_dir()?.join("trop.db");
+    if !db_path.exists() {
+        if !quiet {
+            eprintln!("Dry run - would perform the following actions:");
+            eprintln!("  1. Reserve port");
+            eprintln!(
+                "No database exists yet at {}; a live run would create it.",
+                db_path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let timeout = Duration::from_secs(context.effective()?.maximum_lock_wait_seconds());
+    let db = Database::open(
+        DatabaseConfig::new(&db_path)
+            .with_busy_timeout(timeout)
+            .read_only(),
+    )
+    .map_err(CliError::from)?;
+    // A deferred (read) transaction gives planning one consistent snapshot;
+    // dropping it rolls back, and the read-only connection cannot write.
+    let tx = db
+        .connection()
+        .unchecked_transaction()
+        .map_err(trop::Error::from)
+        .map_err(CliError::from)?;
+    let plan = ReservePlan::new(options, config)
+        .build_plan(&tx)
+        .map_err(CliError::from)?;
+    let result = PlanExecutor::new(&tx)
+        .dry_run()
+        .execute(&plan)
+        .map_err(CliError::from)?;
+    drop(tx);
+
+    if !quiet {
+        eprintln!("Dry run - would perform the following actions:");
+        for (i, action) in result.actions_taken.iter().enumerate() {
+            eprintln!("  {}. {action}", i + 1);
+        }
+        for warning in &result.warnings {
+            eprintln!("Warning: {warning}");
+        }
+    }
+    if let Some(port) = result.port {
+        println!("{}", port.value());
+    }
+    Ok(())
 }
 
 /// Parse a port number from a string, validating it's in the valid range (1-65535).

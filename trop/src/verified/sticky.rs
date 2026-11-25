@@ -9,8 +9,10 @@
 //! byte equality of UTF-8 encodings coincides with `String` equality.
 //!
 //! Production glue: `crate::port::group` (group refresh and forced
-//! replacement). `can_change_field` states the single-reservation rule of
-//! `crate::operations::reserve` so both paths can share one definition.
+//! replacement). `can_change_field` is the single-reservation rule as well:
+//! `super::reserve::decide_existing` applies it to each field, and
+//! `super::reserve::lemma_decision_matches_group_row` proves that both
+//! paths accept, reject, and store alike.
 
 use vstd::prelude::*;
 
