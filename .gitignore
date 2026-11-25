@@ -35,3 +35,6 @@ __pycache__/
 /site/node_modules/
 /site/dist/
 /site/.astro/
+
+# Z3 profiler output written by `cargo verus ... --profile`
+.verus-solver-log/
