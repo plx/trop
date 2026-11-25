@@ -99,6 +99,21 @@ pub proof fn lemma_ascii_upper_seq_eq_iff(a: Seq<u8>, b: Seq<u8>)
     }
 }
 
+/// `eq_ignore_ascii_case` is an equivalence relation (reflexive, symmetric,
+/// transitive): it is equality of the folded keys.
+pub proof fn lemma_eq_ignore_ascii_case_equivalence(a: Seq<u8>, b: Seq<u8>, c: Seq<u8>)
+    ensures
+        eq_ignore_ascii_case(a, a),
+        eq_ignore_ascii_case(a, b) ==> eq_ignore_ascii_case(b, a),
+        eq_ignore_ascii_case(b, a) && eq_ignore_ascii_case(b, c) ==> eq_ignore_ascii_case(a, c),
+{
+    lemma_ascii_upper_seq_eq_iff(a, a);
+    lemma_ascii_upper_seq_eq_iff(a, b);
+    lemma_ascii_upper_seq_eq_iff(b, a);
+    lemma_ascii_upper_seq_eq_iff(b, c);
+    lemma_ascii_upper_seq_eq_iff(a, c);
+}
+
 // ---------------------------------------------------------------------------
 // ASCII case folding over chars
 // ---------------------------------------------------------------------------
@@ -462,6 +477,42 @@ pub fn ascii_uppercase(s: &str) -> (upper: String)
         assert(s@.subrange(0, n) =~= s@);
     }
     upper
+}
+
+/// `u8::to_ascii_uppercase`.
+pub const fn upper_byte(b: u8) -> (u: u8)
+    ensures
+        u == ascii_upper(b),
+{
+    if b'a' <= b && b <= b'z' {
+        b - 0x20
+    } else {
+        b
+    }
+}
+
+/// `<[u8]>::eq_ignore_ascii_case`: equal lengths and byte-wise equal after
+/// ASCII uppercasing.
+pub fn eq_ignore_ascii_case_bytes(a: &[u8], b: &[u8]) -> (r: bool)
+    ensures
+        r == eq_ignore_ascii_case(a@, b@),
+{
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len()
+        invariant
+            0 <= i <= a.len() == b.len(),
+            forall|j: int| 0 <= j < i ==> ascii_upper(#[trigger] a@[j]) == ascii_upper(b@[j]),
+        decreases a.len() - i,
+    {
+        if upper_byte(a[i]) != upper_byte(b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// The string whose `char`s have the given bytes as code points. For ASCII
