@@ -14,6 +14,9 @@ use crate::port::group::{
     GroupAllocationRequest, GroupReconciliationPolicy, ServiceAllocationRequest,
 };
 use crate::port::occupancy::OccupancyCheckConfig;
+use crate::verified::group::{
+    config_service_offset, group_scan_bounds, ConfiguredPorts, GroupScanBounds, ScanBoundsError,
+};
 use crate::{PathResolver, Port};
 use rusqlite::Connection;
 
@@ -343,18 +346,26 @@ impl ReserveGroupPlan {
     }
 
     /// Builds a `GroupAllocationRequest` from the reservation group.
+    ///
+    /// Services are taken in tag order (the configuration stores them in a
+    /// `HashMap`), so the request and any validation error it produces are
+    /// deterministic. The request's project, task, and tags are validated by
+    /// `GroupAllocationRequest::normalized` with the same identifier rules
+    /// as a single reservation.
     fn build_group_request(
         &self,
         group: &crate::config::ReservationGroup,
     ) -> Result<GroupAllocationRequest> {
-        let mut services = Vec::new();
+        let mut definitions = group.services.iter().collect::<Vec<_>>();
+        definitions.sort_unstable_by_key(|(tag, _)| *tag);
 
-        for (tag, service_def) in &group.services {
+        let mut services = Vec::with_capacity(definitions.len());
+        for (tag, service_def) in definitions {
             let preferred = service_def.preferred.map(Port::try_from).transpose()?;
 
             services.push(ServiceAllocationRequest {
                 tag: tag.clone(),
-                offset: Some(service_def.offset.unwrap_or(0)),
+                offset: Some(config_service_offset(service_def.offset)),
                 preferred,
             });
         }
@@ -369,55 +380,59 @@ impl ReserveGroupPlan {
     }
 
     /// Returns configuration adjusted so `reservations.base` is the group scan start.
+    ///
+    /// The bounds are decided by the verified kernel
+    /// `verified::group::group_scan_bounds`: the scan runs from the base to the
+    /// configured maximum, and the base must lie inside the configured range.
     fn config_with_group_base_as_scan_start(
         &self,
         group: &crate::config::ReservationGroup,
     ) -> Result<Config> {
-        let Some(base) = group.base else {
-            return Ok(self.config.clone());
-        };
+        let configured = self.config.ports.as_ref().map(|ports| ConfiguredPorts {
+            min: ports.min,
+            max: ports.max,
+            max_offset: ports.max_offset,
+        });
 
-        let mut config = self.config.clone();
-        let ports = config.ports.as_mut().ok_or_else(|| Error::Validation {
-            field: "ports".to_string(),
-            message: "Port configuration is required when reservations.base is set".to_string(),
-        })?;
-
-        let max = if let Some(max) = ports.max {
-            max
-        } else if let Some(max_offset) = ports.max_offset {
-            ports
-                .min
-                .checked_add(max_offset)
-                .ok_or_else(|| Error::Validation {
+        match group_scan_bounds(group.base, configured) {
+            Ok(GroupScanBounds::Unchanged) => Ok(self.config.clone()),
+            Ok(GroupScanBounds::Rebased { min, max }) => {
+                let mut config = self.config.clone();
+                if let Some(ports) = config.ports.as_mut() {
+                    ports.min = min;
+                    ports.max = Some(max);
+                    ports.max_offset = None;
+                }
+                Ok(config)
+            }
+            Err(ScanBoundsError::MissingPorts) => Err(Error::Validation {
+                field: "ports".to_string(),
+                message: "Port configuration is required when reservations.base is set".to_string(),
+            }),
+            Err(ScanBoundsError::MaxOffsetOverflow) => {
+                let (min, max_offset) = configured
+                    .map(|ports| (ports.min, ports.max_offset.unwrap_or_default()))
+                    .unwrap_or_default();
+                Err(Error::Validation {
                     field: "ports.max_offset".to_string(),
                     message: format!(
-                        "Offset {max_offset} would overflow when added to min port {}",
-                        ports.min
+                        "Offset {max_offset} would overflow when added to min port {min}"
                     ),
-                })?
-        } else {
-            return Err(Error::Validation {
+                })
+            }
+            Err(ScanBoundsError::MissingMax) => Err(Error::Validation {
                 field: "ports".to_string(),
                 message: "Either max or max_offset must be specified".to_string(),
-            });
-        };
-
-        if base < ports.min || base > max {
-            return Err(Error::Validation {
-                field: "reservations.base".to_string(),
-                message: format!(
-                    "Base port {base} must be within port range {}..{max}",
-                    ports.min
-                ),
-            });
+            }),
+            Err(ScanBoundsError::BaseOutOfRange { max }) => {
+                let base = group.base.unwrap_or_default();
+                let min = configured.map(|ports| ports.min).unwrap_or_default();
+                Err(Error::Validation {
+                    field: "reservations.base".to_string(),
+                    message: format!("Base port {base} must be within port range {min}..{max}"),
+                })
+            }
         }
-
-        ports.min = base;
-        ports.max = Some(max);
-        ports.max_offset = None;
-
-        Ok(config)
     }
 }
 
@@ -780,5 +795,185 @@ reservations:
             .unwrap_err();
 
         assert!(matches!(err, Error::Validation { field, .. } if field == "reservations.base"));
+    }
+
+    fn planner_with_ports(dir: &TempDir, ports: &str) -> ReserveGroupPlan {
+        let config_content = format!("project: test\nports:\n{ports}\n");
+        let config_path = create_test_config_file(dir, &config_content);
+        ReserveGroupPlan::new(ReserveGroupOptions::new(config_path)).unwrap()
+    }
+
+    fn group_with_base(base: Option<u16>) -> ReservationGroup {
+        let mut services = HashMap::new();
+        services.insert(
+            "web".to_string(),
+            ServiceDefinition {
+                offset: Some(0),
+                preferred: None,
+                env: None,
+            },
+        );
+        ReservationGroup { base, services }
+    }
+
+    /// Regression: the group task follows the same identifier rules as a
+    /// single reservation's task (no NUL bytes, at most 255 bytes).
+    #[test]
+    fn test_reserve_group_validates_task_like_reserve() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r"
+project: test-project
+ports:
+  min: 5000
+  max: 7000
+reservations:
+  services:
+    web:
+      offset: 0
+";
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let db = create_test_database();
+
+        for (task, message) in [
+            ("x".repeat(300), "Cannot exceed 255 characters"),
+            ("dev\0task".to_string(), "Cannot contain null bytes"),
+        ] {
+            let options = ReserveGroupOptions::new(config_path.clone())
+                .with_allow_unrelated_path(true)
+                .with_task(Some(task.clone()));
+            let planner = ReserveGroupPlan::new(options).unwrap();
+            let single = ConfigValidator::validate_runtime_identifier("task", &task)
+                .expect_err("single reserve rejects this task");
+
+            match planner.build_plan(db.connection()) {
+                Err(Error::Validation {
+                    field,
+                    message: actual,
+                }) => {
+                    assert_eq!(field, "task");
+                    assert_eq!(actual, message);
+                    assert!(
+                        matches!(&single, Error::Validation { message, .. } if *message == actual),
+                        "group and single-reservation task errors differ: {single:?}"
+                    );
+                }
+                other => panic!("expected a task validation error, got {other:?}"),
+            }
+        }
+
+        // A 255-byte task (after trimming) is accepted, trimmed.
+        let task = "t".repeat(255);
+        let options = ReserveGroupOptions::new(config_path)
+            .with_allow_unrelated_path(true)
+            .with_task(Some(format!(" {task} ")));
+        let plan = ReserveGroupPlan::new(options)
+            .unwrap()
+            .build_plan(db.connection())
+            .unwrap();
+        match &plan.actions[0] {
+            PlanAction::AllocateGroup { request, .. } => {
+                assert_eq!(request.task.as_deref(), Some(task.as_str()));
+            }
+            _ => panic!("Expected AllocateGroup action"),
+        }
+    }
+
+    /// Regression: services are built in tag order, not `HashMap` order, so
+    /// the request (and the first validation error) is deterministic.
+    #[test]
+    fn test_build_group_request_orders_services_by_tag() {
+        let tags = [
+            "kappa", "alpha", "zeta", "delta", "beta", "theta", "eta", "gamma", "iota", "epsilon",
+        ];
+        let mut services = HashMap::new();
+        for (offset, tag) in (0u16..).zip(tags) {
+            services.insert(
+                tag.to_string(),
+                ServiceDefinition {
+                    offset: Some(offset),
+                    preferred: None,
+                    env: None,
+                },
+            );
+        }
+        let group = ReservationGroup {
+            base: None,
+            services,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let planner = planner_with_ports(&temp_dir, "  min: 5000\n  max: 7000");
+        let request = planner.build_group_request(&group).unwrap();
+
+        let mut expected = tags.map(str::to_string).to_vec();
+        expected.sort();
+        let actual = request
+            .services
+            .iter()
+            .map(|service| service.tag.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_group_scan_bounds_at_range_edges() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // No base: the configuration is unchanged (max_offset kept).
+        let planner = planner_with_ports(&temp_dir, "  min: 5000\n  max_offset: 100");
+        let config = planner
+            .config_with_group_base_as_scan_start(&group_with_base(None))
+            .unwrap();
+        let ports = config.ports.unwrap();
+        assert_eq!(
+            (ports.min, ports.max, ports.max_offset),
+            (5000, None, Some(100))
+        );
+
+        // Base at either edge of a max_offset range: max comes from the
+        // configured min, never from the base.
+        for base in [5000, 5100] {
+            let config = planner
+                .config_with_group_base_as_scan_start(&group_with_base(Some(base)))
+                .unwrap();
+            let ports = config.ports.unwrap();
+            assert_eq!(
+                (ports.min, ports.max, ports.max_offset),
+                (base, Some(5100), None)
+            );
+        }
+
+        // One past either edge is rejected.
+        for base in [4999, 5101] {
+            let err = planner
+                .config_with_group_base_as_scan_start(&group_with_base(Some(base)))
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::Validation { field, message }
+                    if field == "reservations.base"
+                        && *message == format!("Base port {base} must be within port range 5000..5100")),
+                "unexpected error: {err:?}"
+            );
+        }
+
+        // The whole port domain.
+        let planner = planner_with_ports(&temp_dir, "  min: 1\n  max: 65535");
+        let config = planner
+            .config_with_group_base_as_scan_start(&group_with_base(Some(65535)))
+            .unwrap();
+        let ports = config.ports.unwrap();
+        assert_eq!((ports.min, ports.max), (65535, Some(65535)));
+    }
+
+    #[test]
+    fn test_group_scan_bounds_reports_missing_ports() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = create_test_config_file(&temp_dir, "project: test\n");
+        let planner = ReserveGroupPlan::new(ReserveGroupOptions::new(config_path)).unwrap();
+
+        let err = planner
+            .config_with_group_base_as_scan_start(&group_with_base(Some(5000)))
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation { field, .. } if field == "ports"));
     }
 }
