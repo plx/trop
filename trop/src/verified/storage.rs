@@ -26,11 +26,12 @@
 //!   (`lemma_encoded_record_round_trips`); a decodable row's key is storable
 //!   and its tag re-encodes to the stored text
 //!   (`lemma_decoded_row_re_encodes`). The `sticky` flag is not part of the
-//!   row: it is not persisted. `StoredKey` and `StoredRow` have private
-//!   fields, so every bound key comes from `encode_storage_key` and every
-//!   inserted row from `encode_record`; the `UPDATE` statements' other
-//!   values (timestamps, and the metadata update's project and task) are
-//!   checked by the glue.
+//!   row: it is not persisted. `StoredKey`, `StoredRow` and
+//!   `StoredMetadataUpdate` have private fields, so every bound key comes
+//!   from `encode_storage_key`, every inserted row from `encode_record`, and
+//!   every metadata update (project, task and last use) from
+//!   `encode_metadata_update`. The last-use-only `UPDATE` binds a
+//!   `StoredKey` and an `encode_unix_secs` result.
 //! - Lookups: `lookup_key` is the key's exact text (storable or not), and
 //!   among rows whose tag decodes it matches exactly the rows holding the
 //!   requested key; there is no lookup when no row can hold the key (no

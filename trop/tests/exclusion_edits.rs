@@ -484,9 +484,10 @@ fn excluded_ports_in_reads_documents_exactly_as_the_loader_does() {
 
 /// The fallback for documents that are not YAML mappings applies only to a
 /// document with no entries. A mapping holding a key or value `serde_yaml`
-/// cannot read as a YAML value is read by the loader (which reads such an
-/// entry as absent) but refused by the rewrite as invalid YAML: rewriting it
-/// would drop its entries, and the document's tag with them. (Review
+/// cannot read as a YAML value is read by the loader (for example,
+/// `cleanup: !!bool` reads as an empty `cleanup` section) but refused by the
+/// rewrite as invalid YAML: rewriting it would drop its entries, and the
+/// document's tag with them. (Review
 /// finding: a document whose keys `serde_yaml` cannot read, such as
 /// `!!int project:`, was rewritten as `excluded_ports:` alone.)
 #[test]

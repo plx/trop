@@ -260,6 +260,29 @@ fn empty_or_relative_home_is_not_used() {
     assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
 }
 
+/// `HOME=relhome` used to expand `~/x` to `relhome/x`, which normalization
+/// then resolved under the current directory. A relative home directory is
+/// now refused for `~` expansion, as it is for the data directory, and
+/// nothing is reserved or created.
+#[test]
+fn relative_home_is_not_used_for_tilde_expansion() {
+    let env = TestEnv::new();
+    for home in ["relhome", "."] {
+        let output = env
+            .command()
+            .current_dir(&env.temp_path)
+            .env("HOME", home)
+            .args(["reserve", "--allow-unrelated-path", "--path", "~/x"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "HOME={home:?}: {output:?}");
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(text.contains("Cannot determine home directory"), "{text}");
+        assert!(stdout(&output).is_empty(), "{output:?}");
+    }
+    assert!(!env.temp_path.join("relhome").exists());
+}
+
 // ============================================================================
 // (e) Table cells are escaped
 // ============================================================================

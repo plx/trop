@@ -676,6 +676,49 @@ fn test_assert_data_dir_validate_inaccessible_database_is_internal_error_even_wh
     }
 }
 
+/// A data-directory path that holds a regular file, or that lies below one,
+/// is neither a present nor an absent data directory: with or without
+/// `--not` and `--validate`, the assertion is an internal error rather than
+/// a verdict. (`Path::exists` used to call the first present and the second
+/// absent, so `--not` succeeded below a file and the plain assertion
+/// succeeded on a file.)
+#[test]
+fn test_assert_data_dir_on_a_non_directory_is_internal_error() {
+    let env = TestEnv::new();
+    let file = env.temp_path.join("plain-file");
+    fs::write(&file, "not a directory").unwrap();
+    for data_dir in [file.clone(), file.join("below")] {
+        for flags in [
+            &[][..],
+            &["--not"],
+            &["--validate"],
+            &["--validate", "--not"],
+        ] {
+            let output = env
+                .command_bare()
+                .current_dir(&env.temp_path)
+                .arg("assert-data-dir")
+                .arg("--data-dir")
+                .arg(&data_dir)
+                .args(flags)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(6),
+                "{} {flags:?}: {output:?}",
+                data_dir.display()
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("cannot access the selected data directory"),
+                "{stderr}"
+            );
+        }
+    }
+    assert_eq!(fs::read_to_string(&file).unwrap(), "not a directory");
+}
+
 /// Test assert-data-dir with --not flag.
 ///
 /// Useful for checking that trop is NOT initialized in a fresh environment.

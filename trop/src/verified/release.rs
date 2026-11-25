@@ -30,8 +30,9 @@
 //!   physical fallback permitted it; otherwise it names the first refused
 //!   key. With either flag, the fallback is never consulted.
 //!
-//! Production glue: `crate::operations::release`, `crate::operations::migrate`
-//! (the guard), and `trop-cli`'s `release` command (the tag table).
+//! Production glue: `crate::operations::release`, `crate::operations::migrate`,
+//! `crate::operations::reserve` and `crate::operations::reserve_group` (the
+//! guard), and `trop-cli`'s `release` command (the tag table).
 
 use vstd::prelude::*;
 

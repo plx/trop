@@ -4,7 +4,8 @@
 //! inside a transaction that is rolled back) and reports what the live run
 //! would: the same failures with the same exit codes and messages, and the
 //! same port on stdout. It never changes the database, and it never creates
-//! one.
+//! one: without a database it plans against the empty one a live run would
+//! create.
 
 mod common;
 
@@ -200,19 +201,85 @@ fn quiet_dry_run_prints_only_the_port() {
     assert_eq!(parse_port(&stdout(&output)), port);
 }
 
-/// A dry run never creates the data directory or the database; it says that
-/// no database exists.
+/// Without a database, a dry run plans against the empty database a live
+/// run would create: it prints the port the live run then takes, says that
+/// no database exists, and creates neither the data directory nor the
+/// database.
 #[test]
 fn dry_run_without_a_database_creates_nothing() {
     let env = TestEnv::new();
     let path = env.create_dir("nothing");
     let output = reserve(&env, &path, &["--dry-run"]);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).is_empty());
+    let predicted = parse_port(&stdout(&output));
+    assert!(stderr(&output).contains("Dry run - would perform the following actions:"));
+    assert!(stderr(&output).contains(&format!("on port {predicted}")));
     assert!(stderr(&output).contains("No database exists yet"));
     assert!(
         !env.data_dir.exists(),
         "a dry run created the data directory"
+    );
+
+    let live = reserve(&env, &path, &[]);
+    assert!(live.status.success(), "{}", stderr(&live));
+    assert_eq!(parse_port(&stdout(&live)), predicted);
+}
+
+/// Regression: without a database, a dry run used to exit 0 without
+/// planning, so it accepted an unrelated path that the live run rejects.
+#[test]
+fn dry_run_without_a_database_rejects_an_unrelated_path_like_a_live_run() {
+    let env = TestEnv::new();
+    let sideways = Path::new("/nonexistent/sideways");
+    let dry = reserve(&env, sideways, &["--dry-run"]);
+    assert!(
+        !env.data_dir.exists(),
+        "a dry run created the data directory"
+    );
+    let live = reserve(&env, sideways, &[]);
+    assert_same_failure(&dry, &live);
+}
+
+/// Without a database, a dry run whose data directory a live run could not
+/// create (below, or in place of, a regular file) fails with the live run's
+/// exit code, prints no port, and creates nothing.
+#[test]
+fn dry_run_without_a_creatable_data_directory_fails_like_a_live_run() {
+    let env = TestEnv::new();
+    let path = env.create_dir("blocked");
+    let obstruction = env.temp_path.join("plain-file");
+    std::fs::write(&obstruction, "not a directory").unwrap();
+
+    for data_dir in [obstruction.join("data"), obstruction.clone()] {
+        let run = |args: &[&str]| {
+            env.command_bare()
+                .current_dir(&env.temp_path)
+                .arg("--data-dir")
+                .arg(&data_dir)
+                .arg("reserve")
+                .arg("--path")
+                .arg(&path)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let what = format!("--data-dir {}", data_dir.display());
+        let dry = run(&["--dry-run"]);
+        let live = run(&[]);
+        assert!(!dry.status.success(), "{what}: dry run succeeded");
+        assert!(!live.status.success(), "{what}: live run succeeded");
+        assert_eq!(dry.status.code(), live.status.code(), "{what}: exit codes");
+        assert!(stdout(&dry).is_empty(), "{what}: {}", stdout(&dry));
+        assert!(
+            stderr(&dry).contains("I/O error"),
+            "{what}: {}",
+            stderr(&dry)
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&obstruction).unwrap(),
+        "not a directory",
+        "the obstruction is left alone"
     );
 }
 

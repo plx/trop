@@ -1,6 +1,8 @@
 //! Regression tests: opening and validation report a schema-version verdict
 //! of the verified `schema_version` kernel with one message table, so the
-//! same corrupt or newer metadata gives the same error text either way.
+//! same verdict gives the same error text either way. The readers' verdicts
+//! differ only for a malformed first row followed by a second row, where
+//! their checks run in a different order.
 //! (Before, the two had separate, drifted tables: for example
 //! "schema_version must be TEXT, found INTEGER" when opening and
 //! "expected TEXT, found INTEGER" when validating.)
@@ -102,6 +104,44 @@ fn open_and_validate_report_the_same_schema_version_row_count_corruption() {
             "{what}: {opened}"
         );
     }
+}
+
+/// The one documented difference between the readers
+/// (`lemma_readers_differ_only_on_a_malformed_first_of_several_rows`): a
+/// malformed text first row followed by a second row is a second row to
+/// opening and a syntax error to validation. Both refuse it, each with the
+/// message table's text for its own verdict.
+#[test]
+fn open_and_validate_differ_only_in_the_order_of_their_checks() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("trop.db");
+    drop(Database::open(DatabaseConfig::new(&path)).unwrap());
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE metadata;
+             CREATE TABLE metadata (key TEXT NOT NULL, value);
+             INSERT INTO metadata VALUES ('schema_version', 'abc');
+             INSERT INTO metadata VALUES ('schema_version', '2');",
+        )
+        .unwrap();
+
+    let opened = corruption_details(
+        Database::open(DatabaseConfig::new(&path)).map(|_| ()),
+        "open",
+    );
+    let validated = corruption_details(Database::validate(&DatabaseConfig::new(&path)), "validate");
+    assert!(
+        opened.starts_with(
+            "table=metadata, field=value, key=\"schema_version\": \
+             exactly one schema_version row is required."
+        ),
+        "{opened}"
+    );
+    assert!(
+        validated.contains("schema_version must be a base-10 signed integer"),
+        "{validated}"
+    );
 }
 
 /// Regression: metadata row diagnostics named the key twice

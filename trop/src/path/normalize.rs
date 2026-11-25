@@ -28,11 +28,17 @@ use crate::verified::path::{classify_tilde, resolve_component_kinds, CompKind, T
 /// (`~/C:x`) is rejected, because joining it would replace the home
 /// directory.
 ///
+/// The home directory must be absolute. A relative one (for example
+/// `HOME=relhome`) is treated as undeterminable, as the data-directory rule
+/// treats it: expanding against it would resolve `~/x` under whatever the
+/// current directory is. With an absolute home directory every expansion is
+/// absolute (the verified `lemma_tilde_join_segments`).
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The path contains invalid UTF-8
-/// - The home directory cannot be determined
+/// - The home directory cannot be determined, or is not absolute
 /// - The path uses `~user` syntax (not supported)
 /// - On Windows, the part after `~/` starts with a drive prefix
 ///
@@ -66,11 +72,15 @@ pub fn expand_tilde(path: &Path) -> Result<PathBuf> {
         return Ok(path.to_path_buf());
     }
 
-    // Get home directory using the home crate
-    let home = home::home_dir().ok_or_else(|| Error::InvalidPath {
-        path: path.to_path_buf(),
-        reason: "Cannot determine home directory".to_string(),
-    })?;
+    // Get home directory using the home crate. A relative one is unusable:
+    // the expansion would be relative too, and normalization would resolve
+    // it against the current directory.
+    let home = home::home_dir()
+        .filter(|home| home.is_absolute())
+        .ok_or_else(|| Error::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "Cannot determine home directory (it must be an absolute path)".to_string(),
+        })?;
 
     match form {
         TildeForm::HomeOnly => Ok(home),
