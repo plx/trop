@@ -9,13 +9,19 @@
 //!   tasks: the trimmed value must be non-blank, contain no NUL, and be at
 //!   most 255 UTF-8 bytes, with errors reported in exactly that precedence.
 //! - `is_canonical` characterizes stored identifiers (non-empty and already
-//!   trimmed), and the stored-tag sentinel lemmas prove that the schema-v2
-//!   encoding of an optional tag (`None` as the empty string) is injective
-//!   and round-trips for every tag the writers can produce.
+//!   trimmed); `is_canonical_identifier` decides it.
+//! - The stored-tag sentinel section is SPECIFICATION ONLY: it proves that
+//!   the schema-v2 encoding of an optional tag (`None` as the empty string)
+//!   is injective and round-trips on valid tags, but no executable kernel
+//!   function encodes or decodes stored tags yet. The database code does that
+//!   itself, so these lemmas are not yet a property of the shipped storage
+//!   layer.
 //!
 //! Production glue: `crate::identifier` (`trim_identifier`,
-//! `check_identifier`, `is_canonical_identifier`), used by `ReservationKey`,
-//! `ReservationBuilder` and `ConfigValidator`.
+//! `check_identifier`, `is_canonical_identifier`), used by `ReservationKey`
+//! (`new` trims, `new_validated` applies the identifier rule),
+//! `ReservationBuilder` (setters trim, `build` requires canonical project and
+//! task) and `ConfigValidator`.
 
 use vstd::prelude::*;
 
@@ -483,7 +489,8 @@ pub proof fn lemma_valid_identifier_has_no_nul(s: Seq<char>)
 }
 
 // ---------------------------------------------------------------------------
-// Schema-v2 stored-tag sentinel
+// Schema-v2 stored-tag sentinel (specification only: no exec code here
+// encodes or decodes stored tags; the database layer does that unverified)
 // ---------------------------------------------------------------------------
 
 /// A domain tag is valid when absent, or canonical when present.

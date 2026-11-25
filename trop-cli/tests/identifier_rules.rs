@@ -3,7 +3,8 @@
 //! `--tag` values follow the same rule as project and task identifiers: after
 //! trimming Unicode whitespace they must be non-empty, contain no NUL, and be
 //! at most 255 UTF-8 bytes. Violations are invalid arguments (exit code 4)
-//! and persist nothing.
+//! and persist nothing. Rows stored before the rule applied to tags stay
+//! readable and addressable.
 
 mod common;
 
@@ -110,4 +111,114 @@ fn reserve_rejects_blank_tag() {
 
     assert_eq!(output.status.code(), Some(4), "{output:?}");
     assert_eq!(env.reservation_count(), 0);
+}
+
+/// Reservations whose tags an earlier trop stored without a length limit stay
+/// usable: listing, unrelated reservations, migration, and release by tag all
+/// still work. Only NEW reservations must satisfy the identifier rule.
+#[test]
+fn legacy_overlong_tag_rows_stay_usable() {
+    let env = TestEnv::new();
+    let project = env.create_dir("project");
+    let destination = env.temp_path.join("moved");
+    let other = env.create_dir("other");
+    let legacy_tag = "t".repeat(300);
+
+    // Create the database with an untagged reservation, then add the legacy
+    // row at the same stored path, as an earlier trop could have written it.
+    let output = env
+        .command()
+        .current_dir(&env.temp_path)
+        .args(["reserve", "--port", "47231", "--ignore-occupied"])
+        .arg("--allow-unrelated-path")
+        .arg("--path")
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let connection = rusqlite::Connection::open(env.data_dir.join("trop.db")).unwrap();
+    let stored_path: String = connection
+        .query_row("SELECT path FROM reservations", [], |row| row.get(0))
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO reservations (path, tag, port, project, task, created_at, last_used_at)
+             VALUES (?1, ?2, 47232, NULL, NULL, 1, 2)",
+            rusqlite::params![stored_path, legacy_tag],
+        )
+        .unwrap();
+    drop(connection);
+
+    let output = env
+        .command()
+        .current_dir(&env.temp_path)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains(&legacy_tag));
+
+    // Unrelated reservations are unaffected by the legacy row.
+    let output = env
+        .command()
+        .current_dir(&env.temp_path)
+        .args(["reserve", "--port", "47233", "--ignore-occupied"])
+        .arg("--allow-unrelated-path")
+        .arg("--path")
+        .arg(&other)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    // A new reservation with the legacy tag text is still rejected.
+    let output = env
+        .command()
+        .current_dir(&env.temp_path)
+        .args(["reserve", "--ignore-occupied", "--allow-unrelated-path"])
+        .arg("--path")
+        .arg(&project)
+        .arg("--tag")
+        .arg(&legacy_tag)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+
+    // Migration rebuilds the legacy key without re-validating it.
+    let output = env
+        .command()
+        .current_dir(&env.temp_path)
+        .arg("migrate")
+        .arg("--from")
+        .arg(&project)
+        .arg("--to")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(env.reservation_count(), 3);
+
+    // The legacy reservation can still be released by its tag.
+    let output = env
+        .command()
+        .current_dir(&env.temp_path)
+        .args(["release", "--allow-unrelated-path"])
+        .arg("--path")
+        .arg(&destination)
+        .arg("--tag")
+        .arg(&legacy_tag)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(env.reservation_count(), 2);
+    let connection = rusqlite::Connection::open(env.data_dir.join("trop.db")).unwrap();
+    let remaining_tags: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM reservations WHERE tag <> ''",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_tags, 0);
 }

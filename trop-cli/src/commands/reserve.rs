@@ -129,8 +129,9 @@ impl ReserveCommand {
         // 1. Resolve path (use CWD if not specified, canonicalize if implicit)
         let path = context.resolve_path(self.path.as_deref())?;
 
-        // 2. Build ReservationKey
-        let key = ReservationKey::new(path, self.tag)
+        // 2. Build ReservationKey; a new reservation's tag must satisfy the
+        // shared identifier rule (non-blank, no NUL, at most 255 bytes).
+        let key = ReservationKey::new_validated(path, self.tag)
             .map_err(|e| CliError::InvalidArguments(e.to_string()))?;
 
         // 3. Consume the configuration snapshot resolved before dispatch.

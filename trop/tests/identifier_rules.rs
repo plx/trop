@@ -120,48 +120,116 @@ fn identifier_error_precedence() {
     }
 }
 
-/// Reservation tags follow the same rule as project and task identifiers.
+/// Tags of new reservations follow the same rule as project and task
+/// identifiers, and report it with the same messages.
 #[test]
-fn reservation_key_tags_follow_the_identifier_rule() {
+fn validated_reservation_key_tags_follow_the_identifier_rule() {
     let path = PathBuf::from("/project");
-    assert!(ReservationKey::new(path.clone(), Some("a".repeat(256))).is_err());
-    assert!(ReservationKey::new(path.clone(), Some("web\0".to_string())).is_err());
-    assert!(ReservationKey::new(path.clone(), Some(" \u{2003} ".to_string())).is_err());
-    let key = ReservationKey::new(path, Some(format!(" {} ", "a".repeat(255)))).unwrap();
+    let cases = [
+        ("a".repeat(256), "Cannot exceed 255 bytes"),
+        ("é".repeat(128), "Cannot exceed 255 bytes"),
+        ("web\0".to_string(), "Cannot contain null bytes"),
+        (
+            format!("\0{}", "a".repeat(300)),
+            "Cannot contain null bytes",
+        ),
+    ];
+    for (tag, expected) in cases {
+        let error = ReservationKey::new_validated(path.clone(), Some(tag.clone())).unwrap_err();
+        assert_eq!(error.field, "tag");
+        assert_eq!(error.message, expected);
+        // A project with the same text fails for the same reason.
+        let config = Config {
+            project: Some(tag),
+            ..Config::default()
+        };
+        let (_, message) = validation_message(ConfigValidator::validate(&config, true));
+        assert_eq!(message, expected);
+    }
+    let error =
+        ReservationKey::new_validated(path.clone(), Some(" \u{2003} ".to_string())).unwrap_err();
+    assert_eq!(
+        error.message,
+        "tag must be non-empty after trimming whitespace"
+    );
+
+    let key = ReservationKey::new_validated(path, Some(format!(" {} ", "a".repeat(255)))).unwrap();
     assert_eq!(key.tag.map(|tag| tag.len()), Some(255));
 
-    let error: Error = ReservationKey::new(PathBuf::from("/project"), Some("a".repeat(256)))
-        .unwrap_err()
-        .into();
+    let error: Error =
+        ReservationKey::new_validated(PathBuf::from("/project"), Some("a".repeat(256)))
+            .unwrap_err()
+            .into();
     assert!(matches!(error, Error::Validation { ref field, .. } if field == "tag"));
 }
 
-/// Rows written before tags were limited to 255 bytes must stay readable:
-/// stored keys are rebuilt with the lenient `ReservationKey::from_stored`
-/// (canonical form only), never with the write-side `ReservationKey::new`.
-///
-/// Ignored until database row decoding (`trop/src/database/operations.rs`,
-/// owned by the storage work package) switches its `ReservationKey::new`
-/// call to `ReservationKey::from_stored`.
+/// Inserts a row with `tag` directly, as an earlier trop (which did not limit
+/// tag length) could have written it.
+fn insert_legacy_row(conn: &rusqlite::Connection, path: &str, tag: &str, port: i64) {
+    conn.execute(
+        "INSERT INTO reservations (path, tag, port, project, task, created_at, last_used_at)
+         VALUES (?1, ?2, ?3, NULL, NULL, 1, 2)",
+        rusqlite::params![path, tag, port],
+    )
+    .unwrap();
+}
+
+/// Rows written before tags of new reservations were limited to 255 bytes
+/// must stay readable, addressable, and valid: stored keys are rebuilt with
+/// the lenient `ReservationKey::new`, never with `new_validated`.
 #[test]
-#[ignore = "pending: database row decoding must call ReservationKey::from_stored"]
 fn legacy_rows_with_overlong_tags_remain_readable() {
-    use rusqlite::{params, Connection};
     use trop::database::{Database, DatabaseConfig};
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("trop.db");
     drop(Database::open(DatabaseConfig::new(&path)).unwrap());
-    let conn = Connection::open(&path).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
     let legacy_tag = "t".repeat(300);
-    conn.execute(
-        "INSERT INTO reservations (path, tag, port, project, task, created_at, last_used_at)
-         VALUES (?1, ?2, ?3, NULL, NULL, 1, 2)",
-        params!["/project", legacy_tag, 5000_i64],
-    )
-    .unwrap();
+    insert_legacy_row(&conn, "/project", &legacy_tag, 5000);
+    insert_legacy_row(&conn, "/project", "nul\0tag", 5001);
 
     let reservations = Database::list_all_reservations(&conn).unwrap();
+    assert_eq!(reservations.len(), 2);
+    let mut tags = reservations
+        .iter()
+        .map(|reservation| reservation.key().tag.clone().unwrap())
+        .collect::<Vec<_>>();
+    tags.sort();
+    assert_eq!(tags, vec!["nul\0tag".to_string(), legacy_tag.clone()]);
+
+    // Lookups by the legacy tag still find the row.
+    let key = ReservationKey::new(PathBuf::from("/project"), Some(legacy_tag)).unwrap();
+    let found = Database::get_reservation(&conn, &key).unwrap().unwrap();
+    assert_eq!(found.port().value(), 5000);
+    drop(conn);
+
+    // Whole-database validation and reopening still accept the rows.
+    Database::validate(&DatabaseConfig::new(&path)).unwrap();
+    let db = Database::open(DatabaseConfig::new(&path)).unwrap();
+    db.verify_integrity().unwrap();
+}
+
+/// A published-v1 database holding a legacy overlong tag still migrates to
+/// the current schema: migration validates every row through the same
+/// lenient stored-row decoding.
+#[test]
+fn v1_database_with_overlong_tag_migrates() {
+    use trop::database::{get_schema_version, Database, DatabaseConfig};
+
+    const PUBLISHED_V1_SCHEMA: &str = include_str!("fixtures/published-v1-schema.sql");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("published-v1.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(PUBLISHED_V1_SCHEMA).unwrap();
+    let legacy_tag = "v".repeat(300);
+    insert_legacy_row(&conn, "/project", &legacy_tag, 5000);
+    drop(conn);
+
+    let db = Database::open(DatabaseConfig::new(&path)).unwrap();
+    assert_eq!(get_schema_version(db.connection()).unwrap(), 2);
+    let reservations = Database::list_all_reservations(db.connection()).unwrap();
     assert_eq!(reservations.len(), 1);
     assert_eq!(
         reservations[0].key().tag.as_deref(),

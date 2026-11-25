@@ -42,6 +42,19 @@ pub(crate) fn is_canonical_identifier(value: &str) -> bool {
     identifier_kernel::is_canonical_identifier(value)
 }
 
+/// Constant diagnostics for the identifier rule; they never echo the input.
+///
+/// Shared by configuration validation (projects, tasks, service tags) and by
+/// [`crate::ReservationKey::new_validated`], so the same rule is reported in
+/// the same words everywhere.
+pub(crate) const fn identifier_error_message(error: IdentifierError) -> &'static str {
+    match error {
+        IdentifierError::Blank => "Cannot be empty or only whitespace",
+        IdentifierError::ContainsNul => "Cannot contain null bytes",
+        IdentifierError::TooLong => "Cannot exceed 255 bytes",
+    }
+}
+
 /// A portable, validated environment-variable identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct EnvironmentVariableName(String);
@@ -119,8 +132,46 @@ fn non_convertible_service_tag() -> Error {
     }
 }
 
+/// Pre-kernel implementations, kept as independent differential oracles for
+/// the kernels (they do not call any kernel).
+#[cfg(test)]
+mod reference {
+    use crate::verified::env_name::EnvNameError;
+
+    /// The pre-kernel environment-variable grammar.
+    pub(super) fn reference_parse(name: &str) -> Result<(), EnvNameError> {
+        if name.is_empty() {
+            return Err(EnvNameError::Empty);
+        }
+        if name.len() > 255 {
+            return Err(EnvNameError::TooLong);
+        }
+        let bytes = name.as_bytes();
+        if !bytes[0].is_ascii_alphabetic() && bytes[0] != b'_' {
+            return Err(EnvNameError::BadFirst);
+        }
+        if !bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            return Err(EnvNameError::BadRest);
+        }
+        Ok(())
+    }
+
+    /// The pre-kernel tag derivation.
+    pub(super) fn reference_derive(tag: &str) -> Option<String> {
+        if !tag.is_ascii() {
+            return None;
+        }
+        let derived = tag.to_ascii_uppercase().replace('-', "_");
+        reference_parse(&derived).ok().map(|()| derived)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::reference::{reference_derive, reference_parse};
     use super::*;
 
     /// The 25 code points of Unicode's `White_Space` property, exactly as the
@@ -275,36 +326,6 @@ mod tests {
         );
         // Interior whitespace and control characters other than NUL are kept.
         assert_eq!(check_identifier(" a b\nc "), Ok("a b\nc"));
-    }
-
-    /// The pre-kernel environment-variable grammar, kept as an oracle.
-    fn reference_parse(name: &str) -> std::result::Result<(), EnvNameError> {
-        if name.is_empty() {
-            return Err(EnvNameError::Empty);
-        }
-        if name.len() > 255 {
-            return Err(EnvNameError::TooLong);
-        }
-        let bytes = name.as_bytes();
-        if !bytes[0].is_ascii_alphabetic() && bytes[0] != b'_' {
-            return Err(EnvNameError::BadFirst);
-        }
-        if !bytes[1..]
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        {
-            return Err(EnvNameError::BadRest);
-        }
-        Ok(())
-    }
-
-    /// The pre-kernel tag derivation, kept as an oracle.
-    fn reference_derive(tag: &str) -> Option<String> {
-        if !tag.is_ascii() {
-            return None;
-        }
-        let derived = tag.to_ascii_uppercase().replace('-', "_");
-        reference_parse(&derived).ok().map(|()| derived)
     }
 
     #[test]
@@ -472,6 +493,7 @@ mod tests {
 
 #[cfg(all(test, feature = "property-tests"))]
 mod proptests {
+    use super::reference::{reference_derive, reference_parse};
     use super::*;
     use proptest::prelude::*;
 
@@ -527,13 +549,26 @@ mod proptests {
 
         #[test]
         fn env_name_derivation_agrees_with_reference(tag in "[a-zA-Z0-9_\\- $.é]{0,260}") {
-            let expected = if tag.is_ascii() {
-                let derived = tag.to_ascii_uppercase().replace('-', "_");
-                EnvironmentVariableName::parse(&derived).ok().map(EnvironmentVariableName::into_string)
-            } else {
-                None
-            };
-            prop_assert_eq!(env_name::derive_env_name(&tag), expected);
+            prop_assert_eq!(env_name::derive_env_name(&tag), reference_derive(&tag));
+        }
+
+        #[test]
+        fn env_name_grammar_agrees_with_reference(
+            name in prop_oneof![
+                "[a-zA-Z0-9_]{0,260}",
+                "[a-zA-Z_][a-zA-Z0-9_]{250,258}",
+                "[a-zA-Z0-9_\\- $=.;`'\"\n\r\t\u{0}\u{1b}é端]{0,260}",
+                any::<String>(),
+            ]
+        ) {
+            let verdict = env_name::check_env_name(&name);
+            prop_assert_eq!(verdict, reference_parse(&name));
+            prop_assert_eq!(
+                EnvironmentVariableName::parse(&name).is_ok(),
+                verdict.is_ok()
+            );
+            let resolved = EnvironmentVariableName::resolve("ignored tag", Some(&name));
+            prop_assert_eq!(resolved.ok().map(EnvironmentVariableName::into_string), verdict.ok().map(|()| name.clone()));
         }
     }
 }

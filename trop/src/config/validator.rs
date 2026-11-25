@@ -161,18 +161,11 @@ impl ConfigValidator {
     /// Checks that the identifier is non-empty after trimming, contains no
     /// null bytes, and is not longer than 255 UTF-8 bytes after trimming.
     fn validate_identifier(field: &str, value: &str) -> Result<()> {
-        use crate::identifier::IdentifierError;
-
         crate::identifier::check_identifier(value)
             .map(|_| ())
             .map_err(|error| Error::Validation {
                 field: field.into(),
-                message: match error {
-                    IdentifierError::Blank => "Cannot be empty or only whitespace",
-                    IdentifierError::ContainsNul => "Cannot contain null bytes",
-                    IdentifierError::TooLong => "Cannot exceed 255 bytes",
-                }
-                .into(),
+                message: crate::identifier::identifier_error_message(error).into(),
             })
     }
 
@@ -312,7 +305,10 @@ impl ConfigValidator {
         for (tag, service) in &group.services {
             // Validate tag
             Self::validate_identifier("reservations.services.tag", tag)?;
-            if !seen_tags.insert(tag.trim()) {
+            // Uniqueness and the implicit environment-variable name both use
+            // the trimmed tag, the value allocation and output use.
+            let trimmed_tag = crate::identifier::trim_identifier(tag);
+            if !seen_tags.insert(trimmed_tag) {
                 return Err(Error::Validation {
                     field: "reservations.services.tag".into(),
                     message: "Service tags must be unique after trimming whitespace".into(),
@@ -346,15 +342,11 @@ impl ConfigValidator {
 
             // Resolve every output identifier during configuration validation.
             // Explicit names and implicit derivations use the same shared grammar.
-            // Implicit names derive from the trimmed tag, the value allocation
-            // and output use.
             if let Some(env) = service.env.as_deref() {
                 Self::validate_env_var_name("reservations.services.env", env)?;
             }
-            let variable_name = EnvironmentVariableName::resolve(
-                crate::identifier::trim_identifier(tag),
-                service.env.as_deref(),
-            )?;
+            let variable_name =
+                EnvironmentVariableName::resolve(trimmed_tag, service.env.as_deref())?;
 
             if !seen_env_vars.insert(variable_name.collision_key()) {
                 return Err(Error::Validation {
@@ -947,7 +939,7 @@ mod property_tests {
     // PROPERTY TESTS FOR IDENTIFIER VALIDATION
     // ==================================================================================
 
-    /// Property: Non-empty strings without null bytes and <= 255 chars should validate
+    /// Property: Non-empty strings without null bytes and <= 255 bytes should validate
     ///
     /// Mathematical Property: For all strings s where:
     /// - s.trim().len() > 0
@@ -1000,7 +992,7 @@ mod property_tests {
         }
     }
 
-    /// Property: Strings longer than 255 characters should fail
+    /// Property: Strings longer than 255 bytes should fail
     ///
     /// Mathematical Property: For all strings s where s.trim().len() > 255,
     /// validate_identifier(s) returns Err.
@@ -1009,7 +1001,7 @@ mod property_tests {
         fn prop_too_long_identifiers_rejected(extra_chars in 1usize..=50) {
             let s = "a".repeat(255 + extra_chars);
             let result = ConfigValidator::validate_identifier("test", &s);
-            prop_assert!(result.is_err(), "Identifier longer than 255 chars should fail");
+            prop_assert!(result.is_err(), "Identifier longer than 255 bytes should fail");
         }
     }
 
