@@ -116,9 +116,9 @@ trusted base too, and names the specific facts.
   without a database (with auto-init enabled) checks that the database's
   directory could be created (`check_database_directory_creatable`,
   unverified), and every group dry run checks the busy timeout before it
-  opens its snapshot (the check is the verified `config::busy_timeout_ok`;
-  that it runs there, and its copy of `Database::open`'s message, are
-  glue);
+  opens its snapshot through `DatabaseConfig::check_busy_timeout`, the check
+  `Database::open` runs (the verified `config::busy_timeout_ok`, with the
+  same validation error); that it runs there is glue;
 - the oracle closures production code passes to oracle-generic kernels. They
   must not panic on the inputs they are given. The kernels' specifications
   are relative to the closures' answers, so they do not assume the closures
@@ -522,16 +522,21 @@ Every result is specified relative to the oracles' answers
   port was found available. Failures propagate.
 - `Availability::blocker` (behind `unavailable_reason`) is `None` exactly
   for `Available`, so the `expect` in `group.rs` is unreachable.
-- `reserved_by_other` (`held_by_other`): the ownership rule of the
-  reservation check. A port blocks exactly when a key other than the one
-  being replaced holds it; the replaced key's own port and an unheld port
-  never block. `lemma_other_holder_always_blocks`: under a consistent
-  snapshot, a port for which the reservation oracle answered "reserved"
-  (the answer `reserved_by_other` gives for an `OtherKey` holder) is
-  classified `Reserved` under every combination of ignore flags (`--force`
-  included), or `Excluded` outside the scope; it is never `Available`, and
-  no probe error is reported for it. This is the kernel side of the
-  README's "No flag can take a port owned by another reservation key".
+- `reserved_by_other` (`held_by_other`): the reservation check's answer for
+  the holder class the glue reports. An `OtherKey` holder blocks; a
+  `ReplacedKey` holder and `Nobody` never block. Which stored reservation
+  counts as the replaced key (the same path *and* the same tag) is the
+  trusted glue comparison in `is_reserved_by_other` (see "Trusted for these
+  kernels"), not this kernel. `lemma_other_holder_always_blocks`: under a
+  consistent snapshot, a port for which the reservation oracle answered
+  "reserved" (the answer `reserved_by_other` gives for an `OtherKey` holder)
+  is classified `Reserved` under every combination of ignore flags
+  (`--force` included), or `Excluded` outside the scope; it is never
+  `Available`, and no probe error is reported for it. The lemma does not tie
+  `Holder` to the oracle closure; that the oracle answers "reserved" for
+  every port another key holds is that glue comparison. This is the kernel
+  side of the README's "No flag can take a port owned by another reservation
+  key".
 - The kernels consult an oracle only at a valid port (`1..=65535`): their
   precondition grants the oracles' preconditions nowhere else. This makes
   the glue's `Port` reconstruction sound.
@@ -845,8 +850,9 @@ Bugs fixed (fix-reserve-group):
 - `ReserveGroupPlan::dry_run` / `AutoreservePlan::dry_run` with a busy
   timeout above `i32::MAX` ms panicked inside rusqlite (existing database) or
   ignored it (no database). Now `open_dry_run_snapshot` first rejects such a
-  timeout with the validation error `Database::open` reports (the verified
-  `config::busy_timeout_ok`), with or without a database file. Pinned by
+  timeout by calling `DatabaseConfig::check_busy_timeout`, the check
+  `Database::open` runs (the verified `config::busy_timeout_ok`, with the
+  same validation error), with or without a database file. Pinned by
   `dry_run_rejects_a_busy_timeout_sqlite_cannot_store_like_a_live_run`
   (`trop/tests/group_dry_run.rs`).
 - `reserve-group --dry-run` / `autoreserve --dry-run` with an uncreatable
@@ -1338,9 +1344,15 @@ Bugs fixed with this kernel:
   and the port, and never creates, initializes, or migrates a database. With
   auto-init disabled, a missing database fails as in a live run. A dry run
   says when it cannot predict the outcome: a database that is uninitialized
-  or needs migration, or an allocation deferred to automatic cleanup. Opening
-  a WAL database read-only may leave `trop.db-wal`/`trop.db-shm` behind; the
+  or needs migration, or an allocation deferred to automatic cleanup (a live
+  run cleans up and, only if that freed anything, retries once). Opening a
+  WAL database read-only may leave `trop.db-wal`/`trop.db-shm` behind; the
   contents never change.
+- The reserve dry-run message and the plan descriptions said a live run
+  would retry after cleanup unconditionally; they now say it retries only
+  if the cleanup freed anything. Pinned by
+  `dry_run_of_a_deferred_allocation_says_it_cannot_predict_the_outcome`
+  (`trop-cli/tests/reserve_dry_run.rs`).
 
 Trusted: the char-to-byte step from `identifier::lemma_trimmed_idempotent`
 to the byte-level `norm` of `lemma_repeat_request_touches`, exercised by
@@ -1434,8 +1446,10 @@ Glue:
   nominated `trop.yaml`/`trop.local.yaml` through the same `load_level`;
   precedence constants; `ReservationOverlay::{code, from_code}`.
 - `trop/src/database/config.rs`: `MAX_BUSY_TIMEOUT_MILLISECONDS`/`SECONDS` come
-  from the kernel, and `validate_busy_timeout` calls `busy_timeout_ok(as_secs,
-  subsec_nanos)`.
+  from the kernel, and `DatabaseConfig::check_busy_timeout` calls
+  `busy_timeout_ok(as_secs, subsec_nanos)`. `Database::open` and
+  `Database::validate` (through `validate_busy_timeout`) and the group dry
+  run's `open_dry_run_snapshot` all call it.
 
 Numbers:
 - `exclusions::parse_unsigned(s, max)` generalizes the exclusion parser and is
@@ -1525,8 +1539,8 @@ Files:
 - `check_placement`: a user file may name neither a project (checked first) nor
   a group, and its `reservations: null` is inert. Other files keep their
   overlay.
-- `kind_for_precedence`: 1 is User, 3 is Local, anything else is Project. User
-  < Project < Local.
+- `kind_for_precedence` (`spec_kind_for_precedence`): 1 is User, 3 is Local,
+  anything else is Project. User < Project < Local.
 - `lemma_group_winner` (model): `group_winner` is the last `Replace` with
   only `Inherit` after it.
 - `first_config_level` returns the nearest level at which the oracle reported
@@ -1537,11 +1551,18 @@ Files:
   `trop.local.yaml` iff `has_local`), each once (the length is the number
   present), in strictly ascending `level_file_precedence`. So a level's
   `trop.yaml` (precedence 2) is loaded before its `trop.local.yaml`
-  (precedence 3), and the later file overlays the earlier one.
-  `lemma_level_file_kinds`: `trop.yaml`'s precedence is neither the user's
-  nor the local one (so `kind_for_precedence` reads it as Project), and
-  `trop.local.yaml`'s is the local one. `lemma_precedence_order` only checks
-  the constants: user < project < local.
+  (precedence 3), the order `ConfigLoader::discover_project_configs`
+  returns. The overlay order is not decided here: the loader functions the
+  builder calls (`load_all_effective`, `load_with_project_file`) re-sort the
+  loaded sources by precedence in glue (`sort_by_key`) before the builder
+  overlays them in that order, which puts `trop.local.yaml` over
+  `trop.yaml`. `lemma_level_file_kinds` relates the two kernels production
+  composes: `kind_for_precedence` maps the precedence `level_file_precedence`
+  gives `trop.yaml` to Project and the one it gives `trop.local.yaml` to
+  Local, and no level file's to User. Passing the precedence from the
+  loader's source to the builder's `kind_for_precedence` call is glue.
+  `lemma_precedence_order` only checks the constants: user < project <
+  local.
 
 Not proved:
 - `.trop.yaml` discovery (out of scope).
@@ -1601,6 +1622,22 @@ Glue:
   - Every `Keep(i)` names an existing, unmarked entry, and exactly one step
     writes the new value.
   - A tag on the whole document is kept.
+  - A document whose only content is an empty plain scalar with a core tag
+    (`!!null`, `!!str`, `!!int`, ...) is not a mapping, but the loader reads
+    it as a mapping with no entries. The glue rewrites it as an untagged
+    empty mapping (a core tag names the scalar's type; any other tag, as in
+    `--- !foo`, is kept). `trop exclude` used to fail on such a file with
+    "Invalid YAML" or "not a YAML mapping". This applies only when the root
+    has no entries, counted through `serde_yaml`'s `deserialize_map`, the
+    call behind the loader's `deserialize_struct` (`root_has_no_entries`). A
+    mapping holding a key or value `serde_yaml` cannot read as a `Value` is
+    refused as invalid YAML although the loader reads it, because its
+    entries could not be kept. Examples: `cleanup: !!bool` (which the loader
+    reads as an empty `cleanup` section), `!!int project:`, `project:`
+    followed by `!!null allow_change:`. Pinned by
+    `rewrite_refuses_mappings_whose_entries_it_cannot_read` and
+    `excluded_ports_in_reads_documents_exactly_as_the_loader_does`
+    (`trop/tests/exclusion_edits.rs`).
 - What the plan does to a document:
   - With distinct keys, the rewritten document is `doc.update(f, (key, value))`
     (`lemma_rewrite_replaces_in_place`), or `doc.push((key, value))` when the
@@ -1633,8 +1670,10 @@ Glue:
     (`serde_yaml::from_str` into `Config`, plus the absent/null/set state of
     `reservations`, as in `ConfigLoader`'s private `ReservationPresence`),
     with no special cases. A document with no content (empty, comments
-    only, `---`) is the default configuration in both; an explicit null
-    document (`null`, `~`, a tagged null) is rejected by both. Previously
+    only, `---`), or whose only content is an empty plain scalar with a tag
+    (`!!null`, `!!str`, `--- !foo`), is the default configuration in both;
+    an explicit null scalar (`null`, `~`, tagged or not: `!!null null`,
+    `!!null ~`, `!foo null`) is rejected by both. Previously
     `read_configuration` mapped every null document to the default
     configuration, so `compact-exclusions` reported "No exclusions to
     compact" for a file the loader rejects. Pinned by
@@ -1655,6 +1694,9 @@ Glue:
   - Non-canonical scalar spellings. A string-typed value written as an unquoted
     non-string scalar (`project: 0x10`) would change meaning when re-emitted,
     so check 3 refuses the write and the file is left alone.
+  - Not rewritable: a mapping the loader reads although `serde_yaml` cannot
+    read one of its keys or values as a `Value` (see the plan).
+    `trop exclude` fails with "Invalid YAML" and leaves the file alone.
 - Not proved:
   - The composition with the loader (`load(rewrite(doc))`). Check 3 covers it
     at run time.
@@ -1784,10 +1826,16 @@ to the existing errors. Opening, `get_schema_version` and the post-lock
 recheck render the kernel's verdicts through one message table in
 `trop/src/database/migrations.rs`: `version_corruption` (a `Corruption`
 verdict) and `unsupported_version` (a newer version). Validation
-(`schema_version_verdict` in `trop/src/database/validation.rs`) still
-renders them itself, with the same wording. That opening and validation
-report the same text for the same metadata is glue, pinned by
-`trop/tests/schema_version_messages.rs`.
+(`schema_version_verdict` in `trop/src/database/validation.rs`) calls the
+same two functions, so opening, the post-lock recheck and validation report
+the same text for the same metadata by construction.
+`trop/tests/schema_version_messages.rs` pins the texts for type and
+row-count corruption and for a newer version, the text opening reports for
+a missing metadata table ("the metadata table is missing although a
+reservations table exists"; validation first reports the table's missing
+columns), and that `validate_metadata_rows`' diagnostics name the key once
+(`key="other"`, no longer `key=key="other"`;
+`metadata_row_diagnostics_name_the_key_once`).
 
 - `parse_i32_decimal` parses exactly `i32::from_str`'s grammar and range.
 - `classify_for_open`: a database is initialized only when neither table
@@ -1934,7 +1982,8 @@ from `crate::path::relationship::path_tokens`, the same tokens
 `PathRelationship::between` uses. The target is passed as its stored
 identity: `stored_target` gives its tokens when
 `storage::classify_stored_path(text, storage_platform(path))` is
-`Canonical`, and `None` otherwise.
+`Canonical`, and `None` otherwise. This gate is unverified glue (see
+"Trusted").
 
 - `tag_selector` implements the specification's table:
   - `--tag` with `--untagged-only` is an error;
@@ -1952,20 +2001,24 @@ identity: `stored_target` gives its tokens when
   fallback; a failure names the first refused selected row. So a recursive
   release can no longer delete a reservation sideways of the working directory
   without an override.
-- The target is given by its stored identity (`target_view`):
-  - its tokens when it is spelled as a stored key's path, that is, when the
-    storage kernel's write-side path check accepts it (on Unix, exactly the
-    canonical absolute spellings, decided by the verified recognizer);
+- The target reaches the kernel as an optional token sequence
+  (`target_view`); the kernel never sees its text. The glue `stored_target`
+  passes:
+  - its tokens when the target is spelled as a stored key's path, that is,
+    when the storage kernel's write-side path check accepts it (on Unix,
+    exactly the canonical absolute spellings, decided by the verified
+    recognizer);
   - `None` otherwise, including a path that is not UTF-8.
 
-  `row_selected` requires a stored identity. So a target spelled any other
-  way (`/w/a/`, `/w/./a`, `/w//a`, `/w/a/.`) selects nothing in every mode
-  (exact key, all tags, recursive) and with every selector
-  (`lemma_unstored_target_selects_nothing`). The release then reports it as
-  already released. This is the exact-text identity that
-  `storage::lookup_key` uses. Before this change, the exact-key and all-tags
-  queries found nothing for `/w/a/`, while recursive mode deleted the `/w/a`
-  rows.
+  `row_selected` requires `Some`, so a `None` target selects nothing in
+  every mode (exact key, all tags, recursive) and with every selector
+  (`lemma_unstored_target_selects_nothing`, which follows from
+  `row_selected`'s definition). With the glue's gate, a target spelled any
+  other way (`/w/a/`, `/w/./a`, `/w//a`, `/w/a/.`) therefore selects
+  nothing. The release then reports it as already released. This is the
+  exact-text identity that `storage::lookup_key` uses. Before this change,
+  the exact-key and all-tags queries found nothing for `/w/a/`, while
+  recursive mode deleted the `/w/a` rows.
 - Selection lemmas:
   - non-recursive ⊆ recursive;
   - `--tag` / `--untagged-only` ⊆ all tags;
@@ -1983,16 +2036,19 @@ The SQL queries only produce candidates; the kernel selects among them.
 Recursive mode uses the prefix query, all-tags mode the exact-path query, and
 exact-key mode the key's own row. For a canonical target, stored-text
 equality and token equality coincide, so every candidate query returns a
-superset of the rows the kernel selects. For any other target the kernel
-selects nothing. The queries still run for a non-canonical target, so a
-corrupt row stored under that exact text is reported as before. The tag is
-compared as stored. A struct-literal `Some("")` tag selects nothing, since
-decoded rows never carry it (and `storage::lookup_key` finds nothing for
-it).
+superset of the rows the kernel selects. For any other target the glue
+passes `None`, and the kernel selects nothing. The queries still run for a
+non-canonical target, so a corrupt row stored under that exact text is
+reported as before. The tag is compared as stored. A struct-literal
+`Some("")` tag selects nothing, since decoded rows never carry it (and
+`storage::lookup_key` finds nothing for it).
 
 Trusted:
 - token equality and prefix coincide with `Path` component equality and
   `Path::starts_with` (`test_path_tokens_agree_with_std`);
+- `stored_target`'s gate: the kernel receives `None` exactly for a target
+  not spelled as a stored key's path (pinned by
+  `test_noncanonical_target_selects_nothing_in_every_mode`);
 - for a canonical target, the candidate queries return a superset of the
   selected rows (pinned by
   `test_noncanonical_target_selects_nothing_in_every_mode` and the
@@ -2708,7 +2764,10 @@ and nanoseconds. trop-cli's `format_timestamp` calls it for `trop list` and
     dates.
 - `civil_from_instant(before_epoch, secs, nanos)`:
   - It is total for every `u64` second count and `u32` nanosecond count, in
-    both directions, with no overflow.
+    both directions, with no overflow. The Unix times the kernel converts
+    (`supported_seconds`) are `|s| <= 2^65`, which over-approximates the
+    floors of `Duration`-sized instants (within about `2^64` s of the
+    epoch).
   - The result is valid: month in `1..=12`, day in `1..=days_in_month`, hour
     below 24, minute and second below 60.
   - It is an exact inverse: `days_from_civil * 86400 + h*3600 + m*60 + s` is
@@ -2720,7 +2779,10 @@ and nanoseconds. trop-cli's `format_timestamp` calls it for `trop list` and
   - The year is zero-padded to four digits, with `+` above 9999 and `-` below
     0. The other fields are two digits.
   - `format_unix_instant` returns a `String` whose UTF-8 bytes are
-    `civil_text(utc_civil(floor_unix_seconds(..)))`.
+    `civil_text(utc_civil(floor_unix_seconds(..)))`. Its ensures also state
+    that `utc_civil(floor_unix_seconds(..))` is valid and has that Unix
+    second, so the `choose` in `utc_civil` has a witness and callers can
+    unfold the text with the `civil_text` lemmas.
 - Text lemmas:
   - `lemma_civil_text_ascii`.
   - `lemma_civil_text_shape`: for years `0..=9999` the text is 19 bytes.
@@ -2775,7 +2837,11 @@ Glue: `trop/src/output/formatters.rs` (`JsonFormatter`). It passes the map's
     entries, in order. The output is valid JSON and loses nothing.
   - `lemma_port_map_reads_back`.
 - `render_port_map_pretty`: renders the entries in `render::canonical_order` of
-  their UTF-8 key bytes (`BTreeMap<String, _>` order).
+  their UTF-8 key bytes (`BTreeMap<String, _>` order). The order comes from
+  `render::sort_order`, an `O(n^2)` insertion sort, negligible at group
+  sizes (the former `BTreeMap` path was `O(n log n)`).
+  - `lemma_sorted_entries_members`: the sorted entries are exactly the input
+    entries.
   - `lemma_sorted_keys_increase`: for distinct keys, the keys strictly
     increase.
   - `lemma_render_order_independent`: the text depends only on the map, not on
