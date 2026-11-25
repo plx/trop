@@ -6,7 +6,6 @@
 //! - Partial canonicalization for non-existent paths
 //! - Symlink loop detection
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -14,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::path::component_kind;
 use crate::verified::path::{deepest_existing_prefix, CompKind};
+use crate::verified::symlink::{follow_links, Followed, LinkStep};
 
 /// Attempt to canonicalize a path by following symlinks.
 ///
@@ -52,7 +52,16 @@ pub fn canonicalize(path: &Path) -> Result<PathBuf> {
 /// Canonicalize a path with symlink loop detection.
 ///
 /// This function provides more control over canonicalization by detecting
-/// symlink loops and limiting the depth of symlink following.
+/// symlink loops and limiting the depth of symlink following: it follows at
+/// most `max_depth` symbolic links starting at `path` itself (a relative link
+/// target is joined to the link's parent directory), then canonicalizes the
+/// final, non-link path with the operating system. A chain of exactly
+/// `max_depth` links resolves, and `max_depth == 0` accepts a path that is
+/// not a link. Symbolic links in parent directories are resolved by the
+/// operating system, which applies its own limit.
+///
+/// If the chain ends at a path that does not exist, that path is returned
+/// as-is.
 ///
 /// # Errors
 ///
@@ -71,65 +80,97 @@ pub fn canonicalize(path: &Path) -> Result<PathBuf> {
 /// let canonical = canonicalize_safe(Path::new("/tmp"), 40).unwrap();
 /// ```
 pub fn canonicalize_safe(path: &Path, max_depth: usize) -> Result<PathBuf> {
-    let mut visited = HashSet::new();
-    let mut current = path.to_path_buf();
-    let mut depth = 0;
+    // The verified follower decides the depth bound and loop detection.
+    match follow_symlinks(path, max_depth, &Error::Io) {
+        Followed::Resolved(current) => fs::canonicalize(&current).map_err(|e| match e.kind() {
+            ErrorKind::NotFound => Error::PathNotFound { path: current },
+            ErrorKind::PermissionDenied => Error::PermissionDenied { path: current },
+            _ => Error::Io(e),
+        }),
+        Followed::Missing(current) => Ok(current),
+        Followed::Loop(state) => Err(Error::SymlinkLoop { path: state }),
+        Followed::TooDeep => Err(too_many_symlinks(path, max_depth)),
+        Followed::Failed(_, error) => Err(error),
+    }
+}
 
-    loop {
-        // Check for loops
-        if !visited.insert(current.clone()) {
-            return Err(Error::SymlinkLoop {
-                path: current.clone(),
-            });
-        }
+/// Canonicalizes an existing path like [`canonicalize`], but follows at most
+/// `max_depth` symbolic links at the path itself, and reports a symlink loop
+/// there as `SymlinkLoop` (see [`canonicalize_safe`]). Errors name `path`,
+/// exactly as [`canonicalize`]'s do; a chain ending at a path that does not
+/// exist is `PathNotFound`.
+pub(crate) fn canonicalize_bounded(path: &Path, max_depth: usize) -> Result<PathBuf> {
+    let io_error = |error: std::io::Error| match error.kind() {
+        ErrorKind::NotFound => Error::PathNotFound {
+            path: path.to_path_buf(),
+        },
+        ErrorKind::PermissionDenied => Error::PermissionDenied {
+            path: path.to_path_buf(),
+        },
+        _ => Error::Io(error),
+    };
+    match follow_symlinks(path, max_depth, &io_error) {
+        Followed::Resolved(current) => fs::canonicalize(current).map_err(io_error),
+        Followed::Missing(_) => Err(Error::PathNotFound {
+            path: path.to_path_buf(),
+        }),
+        Followed::Loop(state) => Err(Error::SymlinkLoop { path: state }),
+        Followed::TooDeep => Err(too_many_symlinks(path, max_depth)),
+        Followed::Failed(_, error) => Err(error),
+    }
+}
 
-        // Check depth
-        if depth >= max_depth {
-            return Err(Error::InvalidPath {
-                path: path.to_path_buf(),
-                reason: format!("Too many symlinks (max {max_depth})"),
-            });
-        }
+fn too_many_symlinks(path: &Path, max_depth: usize) -> Error {
+    Error::InvalidPath {
+        path: path.to_path_buf(),
+        reason: format!("Too many symlinks (max {max_depth})"),
+    }
+}
 
-        // Try to read the symlink
-        match fs::read_link(&current) {
-            Ok(target) => {
-                // It's a symlink - resolve it
-                current = if target.is_absolute() {
-                    target
-                } else {
-                    // Relative symlink - resolve relative to parent
-                    current
-                        .parent()
-                        .ok_or_else(|| Error::InvalidPath {
-                            path: current.clone(),
-                            reason: "Symlink has no parent directory".to_string(),
-                        })?
-                        .join(target)
-                };
-                depth += 1;
-            }
-            Err(e) if e.kind() == ErrorKind::InvalidInput => {
-                // Not a symlink - use fs::canonicalize to handle any parent symlinks
-                return fs::canonicalize(&current).map_err(|e| match e.kind() {
-                    ErrorKind::NotFound => Error::PathNotFound {
-                        path: current.clone(),
-                    },
-                    ErrorKind::PermissionDenied => Error::PermissionDenied {
-                        path: current.clone(),
-                    },
-                    _ => Error::Io(e),
-                });
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                // Path doesn't exist - return as-is
-                return Ok(current);
-            }
-            Err(e) => {
-                // Other error
-                return Err(Error::Io(e));
-            }
-        }
+/// Follows symbolic links from `path`, at most `max_depth` of them (verified
+/// kernel `follow_links`: `TooDeep` only when exactly `max_depth` links were
+/// followed and the path reached is a link again; `Loop` exactly when a path
+/// repeats). I/O errors other than "not found" are mapped by `io_error`.
+fn follow_symlinks(
+    path: &Path,
+    max_depth: usize,
+    io_error: &dyn Fn(std::io::Error) -> Error,
+) -> Followed<PathBuf, Error> {
+    let (followed, _) = follow_links(
+        path.to_path_buf(),
+        max_depth,
+        &|current: &PathBuf| link_step(current, io_error),
+        &|a: &PathBuf, b: &PathBuf| a == b,
+    );
+    followed
+}
+
+/// Inspects one path for the symlink follower: a symbolic link (to its
+/// target, joined lexically to the link's parent directory when relative, so
+/// the operating system still resolves `..` physically), not a link,
+/// missing, or an error.
+fn link_step(
+    current: &Path,
+    io_error: &dyn Fn(std::io::Error) -> Error,
+) -> LinkStep<PathBuf, Error> {
+    match fs::symlink_metadata(current) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match fs::read_link(current) {
+            Ok(target) if target.is_absolute() => LinkStep::Link(target),
+            Ok(target) => current.parent().map_or_else(
+                || {
+                    LinkStep::Failed(Error::InvalidPath {
+                        path: current.to_path_buf(),
+                        reason: "Symlink has no parent directory".to_string(),
+                    })
+                },
+                |parent| LinkStep::Link(parent.join(target)),
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => LinkStep::Missing,
+            Err(error) => LinkStep::Failed(io_error(error)),
+        },
+        Ok(_) => LinkStep::NotLink,
+        Err(error) if error.kind() == ErrorKind::NotFound => LinkStep::Missing,
+        Err(error) => LinkStep::Failed(io_error(error)),
     }
 }
 
@@ -357,5 +398,118 @@ mod tests {
         // Should fail with insufficient depth
         let result = canonicalize_safe(&current, 2);
         assert!(result.is_err());
+    }
+
+    /// A chain `link{n-1} -> ... -> link0 -> target` of `n` links to a
+    /// directory, returning the last link and the canonical target.
+    #[cfg(unix)]
+    fn link_chain(dir: &Path, n: usize) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::symlink;
+
+        let target = dir.join("target");
+        fs::create_dir(&target).unwrap();
+        let mut current = target.clone();
+        for i in 0..n {
+            let link = dir.join(format!("link{i}"));
+            symlink(&current, &link).unwrap();
+            current = link;
+        }
+        (current, fs::canonicalize(&target).unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_safe_follows_exactly_max_depth_links() {
+        let dir = tempdir().unwrap();
+        let (start, target) = link_chain(dir.path(), 5);
+
+        // Before the verified follower, the depth was checked before reading
+        // each link, so exactly `max_depth` links failed.
+        assert_eq!(canonicalize_safe(&start, 5).unwrap(), target);
+        assert!(matches!(
+            canonicalize_safe(&start, 4),
+            Err(Error::InvalidPath { ref reason, .. }) if reason == "Too many symlinks (max 4)"
+        ));
+    }
+
+    #[test]
+    fn canonicalize_safe_with_zero_depth_accepts_a_directory() {
+        // Before the verified follower, `max_depth == 0` rejected every path.
+        let dir = tempdir().unwrap();
+        assert_eq!(
+            canonicalize_safe(dir.path(), 0).unwrap(),
+            fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_safe_with_zero_depth_rejects_a_link() {
+        let dir = tempdir().unwrap();
+        let (start, _) = link_chain(dir.path(), 1);
+        assert!(matches!(
+            canonicalize_safe(&start, 0),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(canonicalize_safe(&start, 1).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_safe_reports_a_self_loop_at_any_depth() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let link = dir.path().join("self");
+        symlink(&link, &link).unwrap();
+        // One link followed reaches the same path again.
+        assert!(matches!(
+            canonicalize_safe(&link, 1),
+            Err(Error::SymlinkLoop { ref path }) if *path == link
+        ));
+        assert!(matches!(
+            canonicalize_safe(&link, 0),
+            Err(Error::InvalidPath { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_safe_joins_relative_targets_to_the_link_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("real")).unwrap();
+        fs::create_dir(dir.path().join("links")).unwrap();
+        symlink("../real", dir.path().join("links").join("rel")).unwrap();
+        assert_eq!(
+            canonicalize_safe(&dir.path().join("links").join("rel"), 1).unwrap(),
+            fs::canonicalize(dir.path().join("real")).unwrap()
+        );
+        // A dangling relative link ends at its (missing) target, returned as
+        // joined to the link's directory.
+        symlink("missing", dir.path().join("links").join("dangling")).unwrap();
+        assert_eq!(
+            canonicalize_safe(&dir.path().join("links").join("dangling"), 1).unwrap(),
+            dir.path().join("links").join("missing")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_bounded_maps_errors_like_canonicalize() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert!(matches!(
+            canonicalize_bounded(&missing, 40),
+            Err(Error::PathNotFound { ref path }) if *path == missing
+        ));
+        let (start, target) = link_chain(dir.path(), 3);
+        assert_eq!(canonicalize_bounded(&start, 3).unwrap(), target);
+        assert!(canonicalize_bounded(&start, 2).is_err());
+        assert_eq!(
+            canonicalize_bounded(dir.path(), 0).unwrap(),
+            canonicalize(dir.path()).unwrap()
+        );
     }
 }

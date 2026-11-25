@@ -10,9 +10,14 @@ use crate::path::types::{PathProvenance, ResolvedPath};
 use crate::path::{canonicalize, normalize};
 use crate::verified::path::{resolve_by_provenance, Resolution};
 
-/// Canonicalizes `path`, pairing a failure with whether it means "not found".
-fn canonicalize_reporting_not_found(path: &Path) -> std::result::Result<PathBuf, (Error, bool)> {
-    canonicalize::canonicalize(path).map_err(|error| {
+/// Canonicalizes `path`, following at most `max_symlink_depth` symbolic
+/// links at the path itself, and pairs a failure with whether it means
+/// "not found".
+fn canonicalize_reporting_not_found(
+    path: &Path,
+    max_symlink_depth: usize,
+) -> std::result::Result<PathBuf, (Error, bool)> {
+    canonicalize::canonicalize_bounded(path, max_symlink_depth).map_err(|error| {
         let not_found = error.is_not_found();
         (error, not_found)
     })
@@ -47,7 +52,8 @@ fn canonicalize_reporting_not_found(path: &Path) -> std::result::Result<PathBuf,
 pub struct PathResolver {
     /// Whether to warn before rejecting a non-existent inferred path.
     warn_on_nonexistent: bool,
-    /// Maximum symlink depth for safe canonicalization.
+    /// Maximum number of symbolic links followed at a canonicalized path
+    /// itself (verified kernel `follow_links`).
     max_symlink_depth: usize,
 }
 
@@ -97,7 +103,12 @@ impl PathResolver {
     /// Configure the maximum symlink depth.
     ///
     /// This limits how many symlinks will be followed during canonicalization
-    /// to prevent infinite loops.
+    /// to prevent infinite loops: at most `depth` symbolic links are
+    /// followed at the canonicalized path itself (a chain of exactly `depth`
+    /// links resolves; with `0` only a path that is not a link does), and a
+    /// path that links back to itself is reported as a symlink loop. Links in
+    /// parent directories are resolved by the operating system, which applies
+    /// its own limit. The default is 40.
     ///
     /// # Examples
     ///
@@ -150,7 +161,7 @@ impl PathResolver {
         let resolution = resolve_by_provenance(
             provenance == PathProvenance::Implicit,
             self.warn_on_nonexistent,
-            &|| canonicalize_reporting_not_found(&normalized),
+            &|| canonicalize_reporting_not_found(&normalized, self.max_symlink_depth),
         );
         let (resolved, canonicalized) = match resolution {
             Resolution::Normalized => (normalized, false),
@@ -242,7 +253,7 @@ impl PathResolver {
     /// ```
     pub fn resolve_canonical(&self, path: &Path) -> Result<ResolvedPath> {
         let normalized = normalize::normalize(path)?;
-        let canonical = canonicalize::canonicalize(&normalized)?;
+        let canonical = canonicalize::canonicalize_bounded(&normalized, self.max_symlink_depth)?;
 
         Ok(ResolvedPath::new(
             canonical,
@@ -283,6 +294,76 @@ mod tests {
     fn test_resolver_with_max_symlink_depth() {
         let resolver = PathResolver::new().with_max_symlink_depth(100);
         assert_eq!(resolver.max_symlink_depth, 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn max_symlink_depth_bounds_implicit_and_forced_canonicalization() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        // Before the option was wired in, it was stored but had no effect.
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        symlink(&target, &first).unwrap();
+        symlink(&first, &second).unwrap();
+        let canonical_target = fs::canonicalize(&target).unwrap();
+
+        let shallow = PathResolver::new()
+            .with_nonexistent_warning(false)
+            .with_max_symlink_depth(1);
+        assert!(matches!(
+            shallow.resolve_implicit(&second),
+            Err(Error::InvalidPath { ref reason, .. }) if reason == "Too many symlinks (max 1)"
+        ));
+        assert!(shallow.resolve_canonical(&second).is_err());
+        assert_eq!(
+            shallow.resolve_implicit(&first).unwrap().path(),
+            canonical_target
+        );
+        // Explicit paths are never canonicalized, so the bound does not apply.
+        assert!(shallow.resolve_explicit(&second).is_ok());
+
+        let exact = PathResolver::new()
+            .with_nonexistent_warning(false)
+            .with_max_symlink_depth(2);
+        assert_eq!(
+            exact.resolve_implicit(&second).unwrap().path(),
+            canonical_target
+        );
+        assert_eq!(
+            exact.resolve_canonical(&second).unwrap().path(),
+            canonical_target
+        );
+
+        // A directory that is not a link resolves even with depth 0.
+        let none = PathResolver::new()
+            .with_nonexistent_warning(false)
+            .with_max_symlink_depth(0);
+        assert_eq!(
+            none.resolve_implicit(&target).unwrap().path(),
+            canonical_target
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn implicit_symlink_loop_is_reported_as_a_loop() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        symlink(&b, &a).unwrap();
+        symlink(&a, &b).unwrap();
+        let resolver = PathResolver::new().with_nonexistent_warning(false);
+        assert!(matches!(
+            resolver.resolve_implicit(&a),
+            Err(Error::SymlinkLoop { .. })
+        ));
     }
 
     #[test]
