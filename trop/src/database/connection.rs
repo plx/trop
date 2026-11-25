@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
 use crate::error::{sqlite_error_is_lock_contention, Error, Result};
+use crate::verified::wal::{enable_wal, WalAnswer, WalOutcome};
 
 use super::config::DatabaseConfig;
 
@@ -200,45 +201,76 @@ impl Database {
     }
 }
 
+/// Switches the connection to WAL journal mode (verified kernel
+/// `enable_wal`): `PRAGMA journal_mode = WAL` is retried only on lock
+/// contention, only within `timeout`, and only after a pause of at most
+/// 10 ms; each attempt runs with the remaining time as its busy timeout; and
+/// the busy timeout is restored to `timeout` as the last effect on every
+/// exit. The journal mode SQLite reports must be `wal` (`memory` is accepted
+/// for an in-memory database, which cannot use WAL and cannot be shared).
 fn enable_wal_with_retry(conn: &Connection, timeout: Duration) -> rusqlite::Result<()> {
-    let result = enable_wal_with_retry_inner(conn, timeout);
-    let restore_result = set_busy_timeout(conn, timeout);
-
-    match (result, restore_result) {
-        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
-    }
-}
-
-fn enable_wal_with_retry_inner(conn: &Connection, timeout: Duration) -> rusqlite::Result<()> {
     let started = Instant::now();
-    loop {
-        let remaining = timeout.saturating_sub(started.elapsed());
-        set_busy_timeout(conn, remaining)?;
-
-        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
-            row.get::<_, String>(0)
-        }) {
-            Ok(_) => return Ok(()),
-            Err(error) if sqlite_error_is_lock_contention(&error) => {
-                let remaining = timeout.saturating_sub(started.elapsed());
-                if remaining.is_zero() {
-                    return Err(error);
-                }
-
+    let in_memory = is_in_memory(conn);
+    // The kernel threads a ticket through its calls; numbering the calls
+    // ties each answer in its log to one call.
+    let (outcome, _, _) = enable_wal(
+        0_u64,
+        timeout.as_nanos(),
+        in_memory,
+        &|call: u64| (started.elapsed().as_nanos(), call + 1),
+        &|call: u64, millis: u128| {
+            let result = conn.execute_batch(&format!("PRAGMA busy_timeout = {millis}"));
+            (result, call + 1)
+        },
+        &|call: u64| {
+            let answer = match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(mode) => WalAnswer::Mode(mode.into_bytes()),
                 // Simultaneous journal-mode upgrades can deadlock while both
                 // connections hold read locks, causing SQLite to bypass its
-                // busy handler. Drop the completed statement, yield briefly,
-                // and retry within the caller's configured timeout.
-                std::thread::sleep(remaining.min(Duration::from_millis(10)));
-            }
-            Err(error) => return Err(error),
-        }
+                // busy handler, so contention is retried here within the
+                // timeout.
+                Err(error) if sqlite_error_is_lock_contention(&error) => {
+                    WalAnswer::Contention(error)
+                }
+                Err(error) => WalAnswer::Failed(error),
+            };
+            (answer, call + 1)
+        },
+        &|call: u64, nanos: u64| {
+            std::thread::sleep(Duration::from_nanos(nanos));
+            call + 1
+        },
+    );
+    match outcome {
+        WalOutcome::Enabled => Ok(()),
+        WalOutcome::NotWal(mode) => Err(journal_mode_not_wal(&mode)),
+        WalOutcome::TimedOut(error)
+        | WalOutcome::Failed(error)
+        | WalOutcome::BusyTimeoutFailed(error)
+        | WalOutcome::RestoreFailed(error) => Err(error),
     }
 }
 
-fn set_busy_timeout(conn: &Connection, timeout: Duration) -> rusqlite::Result<()> {
-    conn.execute_batch(&format!("PRAGMA busy_timeout = {}", timeout.as_millis()))
+/// Whether `conn` is an in-memory (or temporary) database: rusqlite reports
+/// an empty file name for those. A file name it cannot report (`None`, as
+/// for a name that is not UTF-8) is a file.
+fn is_in_memory(conn: &Connection) -> bool {
+    conn.path().is_some_and(str::is_empty)
+}
+
+/// The error for a database that stayed in another journal mode: trop needs
+/// WAL for safe concurrent access.
+fn journal_mode_not_wal(mode: &[u8]) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+        Some(format!(
+            "cannot enable WAL journal mode: SQLite kept journal mode \"{}\"; \
+             trop requires WAL for concurrent access to an on-disk database",
+            String::from_utf8_lossy(mode)
+        )),
+    )
 }
 
 #[cfg(test)]
@@ -441,5 +473,182 @@ mod tests {
         let error = Database::open(DatabaseConfig::new(&path).with_busy_timeout(Duration::ZERO))
             .unwrap_err();
         assert!(matches!(error, Error::Database(_)));
+    }
+
+    #[test]
+    fn database_that_cannot_use_wal_is_rejected_instead_of_silently_continuing() {
+        // SQLite keeps a temporary database (empty file name) in DELETE mode
+        // and reports "delete" from `PRAGMA journal_mode = WAL`. Before the
+        // reported mode was checked, the switch counted as a success.
+        let conn = Connection::open("").unwrap();
+        let error = enable_wal_with_retry(&conn, Duration::from_secs(1)).unwrap_err();
+        assert!(
+            error.to_string().contains("journal mode \"delete\""),
+            "{error}"
+        );
+        // The busy timeout is restored even though the switch failed.
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 1000);
+
+        let error = Database::open(DatabaseConfig::new("")).unwrap_err();
+        assert!(
+            matches!(error, Error::Database(ref sqlite) if sqlite.to_string().contains("WAL")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_connection_without_a_file_name_is_in_memory() {
+        let dir = tempdir().unwrap();
+        assert!(is_in_memory(&Connection::open_in_memory().unwrap()));
+        assert!(is_in_memory(&Connection::open("").unwrap()));
+        assert!(!is_in_memory(
+            &Connection::open(dir.path().join("file.db")).unwrap()
+        ));
+        // rusqlite cannot report a file name that is not UTF-8 (`None`): it
+        // still names a file, so `memory` must not be accepted for it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let name = std::ffi::OsStr::from_bytes(b"non\xffutf8.db");
+            let conn = Connection::open(dir.path().join(name)).unwrap();
+            assert_eq!(conn.path(), None);
+            assert!(!is_in_memory(&conn));
+            enable_wal_with_retry(&conn, Duration::from_millis(250)).unwrap();
+        }
+    }
+
+    #[test]
+    fn in_memory_database_keeps_memory_journal_mode() {
+        let db = Database::open(DatabaseConfig::new(":memory:")).unwrap();
+        let journal_mode: String = db
+            .connection()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "memory");
+    }
+
+    #[test]
+    fn file_database_reports_wal_after_enabling() {
+        let dir = tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("wal.db")).unwrap();
+        enable_wal_with_retry(&conn, Duration::from_millis(250)).unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 250);
+    }
+
+    /// Drives the verified retry loop with scripted oracles and records the
+    /// effects, as the glue's closures would perform them. Every oracle
+    /// checks that it got the ticket the previous call returned: the calls
+    /// form one chain, in order.
+    fn scripted_run(
+        timeout_nanos: u128,
+        answers: &[&str],
+        clock_step: u128,
+    ) -> (WalOutcome<String>, Vec<String>) {
+        use std::cell::{Cell, RefCell};
+        let effects = RefCell::new(Vec::new());
+        let now = Cell::new(0_u128);
+        let next = Cell::new(0_usize);
+        let calls = Cell::new(0_u32);
+        let take = |ticket: u32| {
+            assert_eq!(ticket, calls.get(), "ticket out of order");
+            calls.set(ticket + 1);
+            ticket + 1
+        };
+        let (outcome, last, _) = enable_wal(
+            0_u32,
+            timeout_nanos,
+            false,
+            &|ticket| {
+                let reading = now.get();
+                now.set(reading + clock_step);
+                (reading, take(ticket))
+            },
+            &|ticket, millis| {
+                effects.borrow_mut().push(format!("busy {millis}"));
+                (Ok(()), take(ticket))
+            },
+            &|ticket| {
+                let answer = answers[next.get().min(answers.len() - 1)];
+                next.set(next.get() + 1);
+                effects.borrow_mut().push(format!("attempt {answer}"));
+                let answer = match answer {
+                    "busy" => WalAnswer::Contention("busy".to_string()),
+                    "error" => WalAnswer::Failed("error".to_string()),
+                    mode => WalAnswer::Mode(mode.as_bytes().to_vec()),
+                };
+                (answer, take(ticket))
+            },
+            &|ticket, nanos| {
+                effects.borrow_mut().push(format!("pause {nanos}"));
+                now.set(now.get() + u128::from(nanos));
+                take(ticket)
+            },
+        );
+        // The ticket handed back is the one the last call returned.
+        assert_eq!(last, calls.get());
+        (outcome, effects.into_inner())
+    }
+
+    #[test]
+    fn wal_retry_pauses_at_most_ten_milliseconds_and_restores_the_timeout_last() {
+        // 25 ms budget, a clock that advances 1 ms per reading.
+        let (outcome, effects) = scripted_run(25_000_000, &["busy", "busy", "WAL"], 1_000_000);
+        assert!(matches!(outcome, WalOutcome::Enabled));
+        assert_eq!(
+            effects,
+            [
+                "busy 25",
+                "attempt busy",
+                "pause 10000000",
+                "busy 13",
+                "attempt busy",
+                "pause 10000000",
+                "busy 1",
+                "attempt WAL",
+                "busy 25",
+            ]
+        );
+    }
+
+    #[test]
+    fn wal_retry_gives_up_at_the_timeout_and_still_restores() {
+        let (outcome, effects) = scripted_run(12_000_000, &["busy"], 1_000_000);
+        assert!(matches!(outcome, WalOutcome::TimedOut(ref e) if e == "busy"));
+        assert_eq!(
+            effects,
+            [
+                "busy 12",
+                "attempt busy",
+                "pause 10000000",
+                "busy 0",
+                "attempt busy",
+                "busy 12",
+            ]
+        );
+        // A zero timeout never pauses.
+        let (outcome, effects) = scripted_run(0, &["busy"], 0);
+        assert!(matches!(outcome, WalOutcome::TimedOut(_)));
+        assert_eq!(effects, ["busy 0", "attempt busy", "busy 0"]);
+    }
+
+    #[test]
+    fn wal_retry_stops_at_the_first_other_error_or_mode() {
+        let (outcome, effects) = scripted_run(25_000_000, &["error"], 0);
+        assert!(matches!(outcome, WalOutcome::Failed(ref e) if e == "error"));
+        assert_eq!(effects, ["busy 25", "attempt error", "busy 25"]);
+        let (outcome, _) = scripted_run(25_000_000, &["delete"], 0);
+        assert!(matches!(outcome, WalOutcome::NotWal(ref m) if m == b"delete"));
+        let (outcome, _) = scripted_run(25_000_000, &["memory"], 0);
+        assert!(matches!(outcome, WalOutcome::NotWal(_)));
     }
 }
