@@ -51,15 +51,30 @@ verify *args:
     set -euo pipefail
     verus_bin="$(./scripts/install-verus.sh --print-path)"
     cd trop-verification
-    PATH="$verus_bin:$PATH" cargo verus verify "$@"
+    # Cargo replays a fresh crate's cached output without running the
+    # verifier (`cargo verus` checks freshness by content checksum), so drop
+    # the harness crate's own build first; dependencies stay cached.
+    cargo clean --quiet --package trop-verification
+    log="$(mktemp)"
+    trap 'rm -f "$log"' EXIT
+    PATH="$verus_bin:$PATH" cargo verus verify "$@" 2>&1 | tee "$log"
+    ../scripts/check-verus-results.sh "$log"
 
 # Verify one kernel module while iterating, e.g. `just verify-module exclusions`
 verify-module module *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    shift # "$1" is the module; the rest are extra verifier arguments
     verus_bin="$(./scripts/install-verus.sh --print-path)"
     cd trop-verification
-    PATH="$verus_bin:$PATH" cargo verus focus -- --verify-module "verified::{{module}}" "$@"
+    # As in `verify`; `cargo verus focus` builds under `<target>/verus-partial`.
+    target_dir="$(cargo metadata --no-deps --format-version 1 \
+        | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+    cargo clean --quiet --package trop-verification --target-dir "$target_dir/verus-partial"
+    log="$(mktemp)"
+    trap 'rm -f "$log"' EXIT
+    PATH="$verus_bin:$PATH" cargo verus focus -- --verify-module "verified::{{module}}" "$@" 2>&1 | tee "$log"
+    ../scripts/check-verus-results.sh "$log"
 
 # Build the project in debug mode
 build:

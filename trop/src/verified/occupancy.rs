@@ -923,10 +923,15 @@ proof fn lemma_fold_done<E, F: Fn(Probe) -> ProbeOutcome<E>>(
 /// Runs the policy's probes in matrix order, failing closed.
 ///
 /// On success, every enabled probe completed and the evidence lists exactly
-/// the probes that found the address in use, in matrix order. On the first
-/// probe failure the fold stops and returns that probe with its error; every
-/// enabled probe before it in matrix order completed. `Free` and `InUse`
-/// outcomes never produce an error.
+/// the probes that found the address in use, in matrix order. On failure it
+/// returns an enabled probe with an error that probe was observed to fail
+/// with, and every enabled probe before it in matrix order has a non-failed
+/// observed outcome. `Free` and `InUse` outcomes never produce an error.
+///
+/// That each probe runs once, so a retry cannot hide an earlier failure, and
+/// that the fold stops at the first failure hold by construction, not by
+/// this specification (a closure is specified by its results, not by its
+/// calls); tests count the calls.
 pub fn run_probe_matrix<E, F: Fn(Probe) -> ProbeOutcome<E>>(flags: OccFlags, run: &F) -> (result:
     Result<MatrixEvidence, (Probe, E)>)
     requires
@@ -1099,9 +1104,14 @@ proof fn lemma_kept_values_local<T>(
 /// the inspection keeps, failing fast.
 ///
 /// On success, every port of the range was inspected without error and the
-/// result is exactly the kept values in ascending port order. On the first
-/// error the scan stops and returns it; every port before the failing one was
-/// inspected without error. An empty range (`hi < lo`) inspects nothing.
+/// result is exactly the kept values in ascending port order. On failure the
+/// error is one the inspection of some port returned, and every port before
+/// that one has an inspection observed without error. An empty range
+/// (`hi < lo`) inspects nothing.
+///
+/// That each port is inspected once, so the error is the first failing
+/// port's, and that the scan stops there hold by construction, not by this
+/// specification; tests count the calls.
 pub fn scan_ports<T, E, F: Fn(u16) -> Result<Option<T>, E>>(lo: u16, hi: u16, inspect: &F) -> (result:
     Result<Vec<T>, E>)
     requires

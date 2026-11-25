@@ -23,21 +23,24 @@
 //!   error is the first failing check in field order, `first_record_error`),
 //!   and `row_decodes` is what `row_to_reservation` accepts once the SQL
 //!   types are right. Every encoded row decodes to the original fields
-//!   (`lemma_encoded_record_round_trips`), and every decodable row is the
-//!   encoding of the fields it decodes to (`lemma_decoded_row_re_encodes`).
-//!   The `sticky` flag is not part of the row: it is not persisted.
-//!   `StoredKey` and `StoredRow` have private fields, so only
-//!   `encode_storage_key` and `encode_record` construct what the write paths
-//!   bind.
+//!   (`lemma_encoded_record_round_trips`); a decodable row's key is storable
+//!   and its tag re-encodes to the stored text
+//!   (`lemma_decoded_row_re_encodes`). The `sticky` flag is not part of the
+//!   row: it is not persisted. `StoredKey` and `StoredRow` have private
+//!   fields, so every bound key comes from `encode_storage_key` and every
+//!   inserted row from `encode_record`; the `UPDATE` statements' other
+//!   values (timestamps, and the metadata update's project and task) are
+//!   checked by the glue.
 //! - Lookups: `lookup_key` is the key's exact text (storable or not), and
 //!   among rows whose tag decodes it matches exactly the rows holding the
 //!   requested key; there is no lookup when no row can hold the key (no
 //!   UTF-8 text, or a `Some("")` tag, which would alias the untagged row).
 //! - Prefix queries: `prefix_query` turns a `Path::starts_with` prefix into
 //!   the canonical SQL key; with the component-prefix post-filter it selects
-//!   exactly the stored paths the `std` model of `starts_with` selects, and
-//!   every selected path starts with the key's bytes, so the byte-prefix SQL
-//!   prefilter never drops a true match (`lemma_prefix_query_exact`).
+//!   exactly the stored paths the `std` model of `starts_with` selects (its
+//!   postcondition), and every selected path starts with the key's bytes (by
+//!   definition; `lemma_prefix_query_exact`), so the byte-prefix SQL
+//!   prefilter never drops a true match.
 //!
 //! Production glue: `crate::database::operations` (`row_to_reservation`, the
 //! write paths, the lookups, `get_reservations_by_path_prefix`, the
@@ -1022,10 +1025,11 @@ pub proof fn lemma_encoded_record_round_trips(f: RecordFields, row: StoredRow)
     super::identifier::lemma_stored_tag_round_trip(opt_chars(f.tag));
 }
 
-/// Round trip, read then write: a row the decoder accepts is the encoding of
-/// the fields it decodes to, and those fields are storable. So the read and
-/// write predicates are the same set, and nothing the decoder accepts would
-/// be refused by the writer.
+/// Read then write: a row the decoder accepts has a storable key, and its
+/// tag re-encodes to the stored tag text (the tag codec bijection). The
+/// port and timestamp facts restate `row_decodes`. This lemma does not state
+/// `encodes(f, row)` or `record_storable(f)` for a decoded record `f`, and
+/// says nothing about project and task beyond `row_decodes`.
 pub proof fn lemma_decoded_row_re_encodes(row: StoredRow, platform: PathPlatform)
     requires
         row_decodes(row, platform),
@@ -1223,13 +1227,15 @@ proof fn lemma_prefix_key(prefix: Seq<u8>, key: Seq<u8>)
     }
 }
 
-/// Exactness and completeness of the prefix query: on stored canonical
-/// paths, `query_selects` is exactly the `starts_with` model, and every
-/// selected path starts with the key's bytes, so the SQL prefilter
-/// `instr(path, key) = 1` (trusted: true exactly when the stored text's
-/// UTF-8 bytes start with the key's bytes; no wildcards, case folding, NUL
-/// truncation or pattern-length limit) never drops a true match. The
-/// post-filter is `canonical_is_component_prefix`.
+/// Every path an `Under(key)` query selects starts with the key's bytes.
+/// This holds by the definition of `spec_component_prefix` (the proof is
+/// empty). Together with the SQL prefilter `instr(path, key) = 1` (trusted:
+/// true exactly when the stored text's UTF-8 bytes start with the key's
+/// bytes; no wildcards, case folding, NUL truncation or pattern-length
+/// limit), the prefilter never drops a selected path. That `query_selects`
+/// is exactly the `starts_with` model on stored canonical paths is
+/// `prefix_query`'s postcondition, not this lemma. The post-filter is
+/// `canonical_is_component_prefix`.
 pub proof fn lemma_prefix_query_exact(q: PrefixQuery, s: Seq<u8>)
     requires
         query_selects(q, s),

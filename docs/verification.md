@@ -48,7 +48,7 @@ trop-verification/        publish = false harness crate; mounts trop/src/verifie
 ## Soundness at the verified/unverified boundary
 
 Verus checks callers *inside* `verus!`, but production callers are
-unverified. Every kernel entry point therefore follows one of two rules:
+unverified. Every kernel entry point therefore follows one of three rules:
 
 1. **Total functions.** No `requires` clause. The specification covers every
    possible input, including values production code should never pass (for
@@ -59,31 +59,97 @@ unverified. Every kernel entry point therefore follows one of two rules:
    `1 <= min <= max`). Rust's privacy rules enforce the invariant for
    unverified code too, so methods on the type may rely on it.
 3. **Oracle closures.** Kernels that interleave decisions with effects
-   (database lookups, OS probes, filesystem checks) are generic over `Fn`
-   closures supplied by production code. Their only `requires` clause states
-   the closure's own precondition (`forall|x| f.requires((x,))`), and every
-   result is specified relative to the answers the closure gave
+   (database lookups, OS probes, filesystem checks) are generic over `Fn` or
+   `FnOnce` closures supplied by production code. Their `requires` clauses
+   state only the closures' own preconditions (`f.requires(..)`), and every
+   result is specified relative to the answers the closures gave
    (`f.ensures`). Closures written in ordinary Rust have no Verus
-   precondition, so this holds trivially; that the closures do not panic is
-   part of the trusted glue.
+   precondition, so an unverified caller always meets these clauses.
+   - The preconditions are rarely `forall|x| f.requires((x,))`. Most are
+     restricted to a domain or made conditional: valid ports only
+     (`allocation::oracles_callable`), the valid ports an exclusion entry
+     covers (`exclusions::callable_on_entry`), prefix lengths followed only
+     by named components (`path::deepest_existing_prefix`), levels or
+     indices below a length (`config::first_config_level`), only for an
+     implicit path (`path::resolve_by_provenance`), only when the
+     unrelated-path guard applies (`release::guard_paths`,
+     `release::select_and_guard`, `migrate::guard_moves`), or only after an
+     earlier answer (`allocation::fallback_discipline`,
+     `reserve::retry_discipline`).
+   - The restriction is load-bearing. A kernel may call a closure only where
+     its precondition is granted, so the proof shows that the kernel never
+     calls it outside that domain. The glue relies on this when an oracle
+     rebuilds a `Port` from the `u16` it receives (`port/allocator.rs`,
+     `port/exclusions.rs`) or indexes with the value it receives
+     (`levels[level]` in `config/loader.rs`, `keys.keys[id]` in
+     `operations/migrate.rs`, `candidates[index]` in
+     `operations/release.rs`, `components[..k]` in
+     `path/canonicalize.rs`).
+   - That the closures do not panic on the inputs they are given is part of
+     the trusted glue.
 
 ## Trusted computing base
 
-A verified property holds for the shipped binary if the following are
-correct; everything else in a kernel is checked:
+A verified property holds for the shipped binary only if the following are
+correct; everything else in a kernel is checked. This is a summary by
+category: the "Trusted" list in each kernel section below is part of the
+trusted base too, and names the specific facts.
 
 - the Verus verifier and the Z3 SMT solver (release pinned in
   `scripts/install-verus.sh`; `vstd` pinned in the workspace `Cargo.toml`);
 - `vstd`'s specifications of the `core`/`std` operations a kernel calls
   (for example `u16::checked_add`);
+- the toolchain skew: those specifications are written for the Rust
+  toolchain the verifier is built with (`VERUS_RUST_TOOLCHAIN` in
+  `scripts/install-verus.sh`, 1.100.0), and Verus resolves them against that
+  toolchain's names and signatures only; their content is trusted
+  (`assume_specification` inside `vstd`). `trop` is built and tested with
+  the toolchain in `rust-toolchain.toml` (1.99.1). The specified operations
+  are assumed to behave as specified in both. A few are checked under the
+  build toolchain by exhaustive tests (`char::is_whitespace`,
+  `char::len_utf8`, `char::escape_default`); most (`str::split_at`,
+  `str::chars`, `Vec::insert`, `String::push`, ...) are not;
 - the `verus!` macro's erasure (it removes ghost code only);
 - the production glue that converts domain types to kernel inputs and back;
-- the oracle closures production code passes to oracle-generic kernels (they
-  must be total; the kernels specify their results relative to the answers
-  the closures give, so the closures' correctness is not assumed);
+- the oracle closures production code passes to oracle-generic kernels. They
+  must not panic on the inputs they are given. The kernels' specifications
+  are relative to the closures' answers, so they do not assume the closures
+  are correct; an end-to-end property does. Some closures also decide rules
+  of their own, which no kernel specification mentions:
+  - the allocator's reservation oracle decides the replacement rule (a port
+    held by the key being replaced never blocks; any other holder does) in
+    `PortAllocator::is_reserved_by_other`, pinned by
+    `test_replacement_ignores_only_the_current_keys_port`. The README's "No
+    flag can take a port owned by another reservation key" rests on it;
+  - the unrelated-path guard's physical fallback
+    (`Database::validate_path_relationship`, called by `reserve`,
+    `reserve-group`, `migrate` and `release`) decides a lexically unrelated
+    path by canonical comparison;
 - the `std`/`core` behavior that glue relies on and kernels do not model,
-  pinned by tests where noted per kernel (for example `str::trim` and
-  `std::path` component splitting);
+  pinned by tests where noted per kernel (for example `str::trim` in the
+  exclusion-text glue, `std::path` component splitting, and the agreement
+  of the kernels' decimal parsers with `from_str`);
+- third-party libraries and SQLite, as each kernel section lists them:
+  `serde_yaml` parsing, emitting and key identification (`config_rewrite`,
+  checked at run time); SQLite's TEXT `=` and `instr`, `typeof` storage
+  classes, `CHECK`/`UNIQUE` constraints, one-snapshot reads within a
+  transaction, and the atomicity of `IMMEDIATE` transactions (`storage`,
+  `schema_version`, `migrate`, the dry runs); rusqlite's value mapping; and
+  chrono's `MAX_UTC` (`storage`);
+- the faithfulness of models that stand in for external systems: the
+  bash/zsh, fish, PowerShell and dotenv lexer models behind the export-line
+  theorems (`shell`, `render`); the Unicode tables (`White_Space` in
+  `identifier`; `Bidi_Control`, `Zl` and `Zp` in `render`), each checked
+  over every scalar value against `std` or an independent table; and
+  `lex_lt` as Rust's `str` order (tested);
+- the platform scope. The byte-level path properties hold on Unix only:
+  lexical normalization and the tilde join (`path`), stored-path canonical
+  form and the prefix query (`storage`), and `rebase_canonical`
+  (`migrate`). Other targets use `std` there instead (`Path::join`,
+  `Path::is_absolute`, `Path::starts_with`, `strip_prefix`), or feed the
+  storage kernel platform facts that `std` decides. Those properties are not
+  claimed for them; the component-kind kernels (`resolve_component_kinds`,
+  `path_relationship`) still decide on every platform;
 - every `assume_specification`, `#[verifier::external_body]`, `assume`, or
   `admit` listed in the table below (currently: none).
 
@@ -116,12 +182,16 @@ Glue: `trop/src/port.rs` (`Port`, `PortRange`, `PortRangeIter`).
 ### `verified::exclusions` — exclusion entries, the excluded-port set, compaction, and exclusion text
 
 Glue: `trop/src/port/exclusions.rs` (`ExclusionManager`, `validate_exclusions`,
-`compact_exclusions`), `trop/src/config/validator.rs`
+`compact_exclusions`, `is_compact`), `trop/src/config/validator.rs`
 (`validate_excluded_ports`), `trop/src/config/schema.rs` (`PortExclusion`'s
-`FromStr`, used by the YAML string form), `trop/src/config/environment.rs`
-(`TROP_EXCLUDED_PORTS`), `trop-cli/src/commands/exclude.rs`, and
-`trop-cli/src/commands/compact_exclusions.rs` (also reached by
-`scan --autocompact`).
+`FromStr`, used by the YAML string form), and `trop/src/config/environment.rs`
+(`TROP_EXCLUDED_PORTS`, through the same `FromStr`). The CLI reaches the
+kernel through `trop::port::exclusions` and through that `FromStr`:
+`trop exclude` parses its argument with `PortExclusion`'s `FromStr`
+(`trop-cli/src/commands/exclude.rs`, `parse_exclusion`);
+`trop-cli/src/commands/compact_exclusions.rs` and `scan --autocompact`
+(`trop-cli/src/commands/scan.rs`) call `compact_exclusions` and `is_compact`;
+the exclusion-list edits below list the rest.
 
 - `validate_entry` / `validate_entries`: an entry is valid exactly when it
   names a non-empty set of valid ports (`lemma_entry_valid_meaning`): a port
@@ -146,9 +216,11 @@ Glue: `trop/src/port/exclusions.rs` (`ExclusionManager`, `validate_exclusions`,
   returns exactly the members in `lo..=hi`, strictly ascending; `len` is the
   set's cardinality (at most 65535, no overflow); `runs` is the set's unique
   canonical list.
-- `parse_u16` accepts exactly the syntax of `u16::from_str` (optional `+`,
-  one or more ASCII digits, value at most 65535) for any bytes, without
-  overflow; `find_range_separator` finds the first `..` (where
+- `parse_u16` accepts exactly `is_u16_text` (an optional `+`, then one or
+  more ASCII digits, value at most 65535) for any bytes, without overflow.
+  That this is also the syntax of `u16::from_str` is not proved (`vstd`
+  does not specify `from_str`); it is trusted and pinned by differential
+  tests. `find_range_separator` finds the first `..` (where
   `split_once("..")` splits). `lemma_decimal_text` and
   `lemma_range_text_roundtrip`: a port's decimal text, and `"start..end"`,
   split and parse back to the same values. Trimming (Unicode whitespace) is
@@ -161,6 +233,12 @@ messages, or to the `InvalidPort` / `InvalidPortRange` errors
 kernel's (valid) members as `Port`; `add_range` passes the range's
 `PortSpan`; `PortExclusion::from_str` splits at the kernel's separator index,
 trims each side with `str::trim`, and parses each side with `parse_u16`.
+
+Trusted (in addition to the base): `str::trim` in `PortExclusion::from_str`
+and `TROP_EXCLUDED_PORTS`, and the agreement of `parse_u16` with
+`u16::from_str`, pinned by differential tests
+(`test_parse_u16_kernel_matches_from_str` in `trop/src/config/schema.rs`,
+`prop_decimal_parsers_match_std` in `trop/src/config/environment.rs`).
 
 #### Exclusion-list edits: `trop exclude`, `scan --autoexclude`, canonical form, reserved-port guard
 
@@ -353,14 +431,18 @@ Glue: `trop/src/port/allocator.rs`:
 - `unavailable_reason`;
 - the oracle closures `reservation_oracle` (database: reserved by a key
   other than the one being replaced), `exclusion_oracle` and
-  `occupancy_oracle`.
+  `occupancy_oracle`. The ownership comparison inside `reservation_oracle`
+  (`is_reserved_by_other`) is glue: no kernel specification mentions the
+  replaced key.
 
 Every result is specified relative to the oracles' answers
 (`oracle.ensures`). The database and the OS are not modeled.
 
 - `classify_port` (`classified`):
   - A port outside the scope (port 0, or outside the range when the range is
-    required) is `Excluded`, and no oracle is consulted.
+    required) is `Excluded`. That no oracle is consulted for it is proved
+    for port 0 only, where the oracles' preconditions are not granted; for
+    a valid port outside the range it holds by construction.
   - `Reserved` requires the reservation oracle to answer "reserved". No
     flag bypasses this.
   - `Excluded` requires "not reserved" and a hit on the exclusion list,
@@ -409,9 +491,29 @@ Every result is specified relative to the oracles' answers
     can be blocked only by a reservation.
   - Without flags, the preferred check equals the scan's classification.
 
+Not proved:
+- Each outcome is justified by *some* answer of each oracle
+  (`answered(o, p, a)` is `o.ensures((p,), Ok(a))`), not by the only one. A
+  body that asked an oracle again after an unfavourable answer and acted on
+  a later "free" would also verify, so "fail closed" holds relative to some
+  answer the oracle gave. Under `deterministic_oracles` the two coincide.
+- Calling each oracle at most once per port, laziness for valid ports
+  outside the range, and stopping a scan at the first failure. These hold
+  by construction and are pinned for the probe by the `RecordingChecker`
+  tests in `trop/src/port/allocator.rs`
+  (`scan_probes_each_candidate_once_in_order_and_skips_blocked_ports`,
+  `scan_errors_stop_at_the_first_failing_candidate`,
+  `probe_failures_on_blocked_ports_do_not_abort_allocation`,
+  `ignored_probe_is_never_run_and_ignored_exclusion_still_probes`). No test
+  counts the reservation and exclusion oracles' calls.
+
 Trusted for these kernels:
 - The oracle closures are total (no panics) on valid ports. The kernels'
   `requires` states only their preconditions.
+- The reservation oracle's ownership rule: a port held by the key being
+  replaced never blocks, and any other holder does
+  (`is_reserved_by_other`), pinned by
+  `test_replacement_ignores_only_the_current_keys_port`.
 - `#[allow(dead_code)]` appears on `ScanFailure::port`, a witness that only
   the specs read. It is not a verification escape. This Verus version cannot
   prove
@@ -469,22 +571,35 @@ owner lookups stay outside the kernel.
   probe ran and completed, `enabled` equals the matrix length, and the evidence
   is exactly the enabled probes observed in use, in matrix order. So a report
   is occupied iff some probe was in use, and an empty matrix means skipped and
-  not occupied. On failure, the returned probe is enabled, its observed outcome
-  was `Failed(error)`, and every enabled probe before it in matrix order
-  completed. Only probe failures produce errors, and collected evidence never
-  hides the first one.
+  not occupied. On failure, the returned probe is enabled, one of its observed
+  outcomes was `Failed(error)`, and every enabled probe before it in matrix
+  order has a non-failed observed outcome. Only probe failures produce
+  errors.
 - `scan_ports` (the default `find_occupied_ports`, the mock's override, and
   `find_occupied_reports`): inspects `lo..=hi` in ascending order. On success
-  it returns exactly the kept values in ascending port order. On error, the
-  error is the first failing port's, and every earlier port was inspected
-  without error. An empty range inspects nothing.
+  it returns exactly the kept values in ascending port order. On error it
+  returns only the error: the inspection of some port in the range returned
+  it, and every port before that one has an inspection observed without
+  error. An empty range inspects nothing.
 - `owner_status`: `Available` iff PID, process name, and user are all known;
   `Unavailable` iff none is; `Partial` otherwise.
 
-Not proved: that no probe or port is inspected after the first failure (Verus
-specifies `Fn` closures by their results, not by the absence of calls; tests
-cover it), and the glue mappings above (covered by exhaustive tests over all
-729 settings and all 32 flag combinations).
+Not proved (Verus specifies `Fn` closures by their results, not by the
+number of calls):
+- That each probe or port runs exactly once. A kernel that retried a failed
+  probe or port and went on after a later success would also verify: the
+  failure would vanish from the report, or a later port's error would be
+  reported instead of the first one's. So "the error is the first failure's"
+  and "collected evidence never hides a failure" hold by construction, not
+  by proof.
+- That nothing runs after the first failure.
+- The glue mappings above (covered by exhaustive tests over all 729 settings
+  and all 32 flag combinations).
+
+The first two are pinned by call-counting tests in
+`trop/src/port/occupancy.rs`
+(`test_failure_on_last_probe_runs_every_earlier_probe_and_fails_closed`,
+`test_default_find_occupied_ports_stops_at_first_failure`).
 
 ### `verified::group` — group requests, offset-pattern search, fresh plans, stored groups, output selection
 
@@ -550,8 +665,11 @@ anything: the kernel does.
   `verified::reserve::allocate_with_cleanup_retry`, the control single
   reservations use.
   - The policy is `verified::reserve::cleanup_policy` of the configuration's
-    `disable_autoprune`/`disable_autoexpire`. `lemma_cleanup_policy_shared`
-    shows it is the same rule as `reserve_policy`.
+    `disable_autoprune`/`disable_autoexpire` (configuration files and
+    environment only: `--disable-autoprune`, `--disable-autoexpire` and
+    `--disable-autoclean` exist only for `trop reserve`). See "Shared cleanup
+    policy" under `verified::reserve` for how far it is the same rule as
+    `reserve_policy`.
   - With prune or expire enabled, exactly one cleanup and one re-plan happen
     before `GroupAllocationFailed`. The cleanup runs only after an exhausted
     first plan, and never when both are disabled.
@@ -567,10 +685,15 @@ anything: the kernel does.
   that fits). Errors name the first failing service in tag order. A
   preferred-only service off its preferred port is a conflict, so `--force` can
   replace the group.
-- `lemma_fresh_plan_is_compatible`: every fresh plan passes
-  `derive_compatible_base` under the same range, with the same ports and base.
-  Repeating `reserve-group`/`autoreserve` therefore refreshes and never
-  conflicts.
+- `lemma_fresh_plan_is_compatible`: every fresh plan passes the
+  shape-compatibility check `derive_compatible_base` under the same range,
+  with the same ports and base. That is one condition of the refresh path,
+  not all of it: no theorem states that `match_stored_tags` accepts the
+  stored rows of a fresh plan, that `plan_group_metadata` passes for
+  unchanged metadata, or that the glue's mapping to `CompatClass` is right.
+  That a repeated `reserve-group`/`autoreserve` refreshes end to end is
+  pinned by `repeating_a_fresh_allocation_refreshes_it_unchanged`
+  (`trop/src/port/group.rs`).
 - `decide_group_reconciliation`: no stored rows means allocate fresh. A
   compatible group is refreshed. Only `--force` replaces a group, and only one
   that conflicts. Other errors are never overridden.
@@ -676,8 +799,9 @@ Glue: `trop/src/identifier.rs` (`trim_identifier`, `check_identifier`,
 - `ReservationBuilder::project` and `task` trim; `build` requires the canonical
   form.
 - `ConfigValidator::validate_identifier` and `validate_runtime_identifier`
-  apply the rule, and `validate_reservation_group` trims each tag once, for
-  uniqueness and for env-name derivation.
+  apply the rule. `validate_reservation_group` delegates to
+  `config::check_config_group`, which applies `check_identifier` to each tag
+  once and uses the trimmed tag for uniqueness and env-name derivation.
 
 Properties:
 - `trimmed(s)` specifies `str::trim`: drop leading, then trailing, Unicode
@@ -699,19 +823,33 @@ Properties:
   `trimmed(s) == s`, equivalently neither its first nor its last char is
   whitespace. `ReservationBuilder::build` decides with it, so every built
   reservation has the form the stored-row readers require.
-- Stored-tag sentinel (specification only). Schema v2 stores `None` as `""`.
-  Decoding inverts encoding for every valid tag, the encoding is injective (a
-  tagged key never aliases the untagged key), and every tag accepted by
-  `check_identifier` round-trips. No exec kernel code encodes or decodes stored
-  tags yet: `database/` does it unverified. Because `ReservationKey` has public
-  fields and derives `Deserialize`, the shipped write path does not enforce
-  `is_valid_tag`.
+- Stored-tag sentinel (the specification of the codec). Schema v2 stores
+  `None` as `""`. Decoding inverts encoding for every valid tag, the encoding
+  is injective (a tagged key never aliases the untagged key), and every tag
+  accepted by `check_identifier` round-trips. The executable codec is in
+  `verified::storage` (`encode_storage_key`, `lookup_key`,
+  `decode_stored_tag`), specified with these definitions. Every reservation
+  write path enforces `is_valid_tag` even though `ReservationKey` has public
+  fields and derives `Deserialize`: it binds only keys that
+  `encode_storage_key` produced (`StoredKey` and `StoredRow` have private
+  fields). Inserts and `delete_reservation_if_unchanged` get theirs from
+  `encode_record`, which calls `encode_storage_key`; the other writes get
+  theirs from `ReservationKey::storage_key`. (The schema v1-to-v2 migration
+  copies rows in SQL instead; its preflight,
+  `schema_version::classify_legacy_row`, blocks every row whose copy the v2
+  decoder would reject.)
 
 ### `verified::env_name` — portable environment-variable names
 
-Glue: `trop/src/identifier.rs` (`EnvironmentVariableName::{parse, resolve,
-collision_key}`, plus `derive_from_tag` in tests). The validator calls
-`resolve` with the trimmed tag.
+Glue: `trop/src/identifier.rs` (`EnvironmentVariableName::{parse,
+resolve}`), called by `trop/src/output/shell.rs` (`parse`, for the name of
+an export line) and `trop/src/output/formatters.rs` (`resolve`, for each
+group entry). `collision_key` and `derive_from_tag` are test-only, as is the
+validator's call to `resolve` (in its reference model). Production
+configuration and rendering call the kernel from other kernels:
+`config::check_config_group` uses `check_env_name`, `resolve_env_name` and
+`env_collision_key`, and `render::render_group` re-checks each name with
+`check_env_name_bytes` and compares names ignoring ASCII case itself.
 
 - `check_env_name` is exactly `env_name_verdict` over the name's UTF-8 bytes:
   `Empty`, then `TooLong` (more than 255 bytes), then `BadFirst`, then
@@ -734,7 +872,11 @@ collision_key}`, plus `derive_from_tag` in tests). The validator calls
 
 ### `verified::text` — ASCII and UTF-8 helpers
 
-Used by `identifier` and `env_name`; no direct production glue.
+No direct production glue. Other kernels use it: `identifier` (the
+char-offset slicing behind `trim`), `env_name` (`string_from_ascii`,
+`ascii_uppercase`), `render`, `shell`, `verbosity` and `schema_version`
+(`upper_byte`, `bytes_equal`, `bytes_eq_ignore_ascii_case`,
+`string_from_ascii`), and `config` (the folding specifications and lemmas).
 
 - ASCII case folding over bytes and over chars is idempotent, and folded keys
   are equal exactly under ASCII-case-insensitive equality.
@@ -743,6 +885,18 @@ Used by `identifier` and `env_name`; no direct production glue.
 - Every char prefix ends on a UTF-8 char boundary, and prefix byte offsets are
   injective. `char_slice` (kernel-internal) slices a `&str` at proved char
   offsets.
+- Exec helpers, each total and exactly its kernel specification:
+  `ascii_uppercase` (`ascii_upper_chars`: each char `a`-`z` mapped to
+  `A`-`Z`, every other char kept), `upper_byte` (`ascii_upper`, the same on
+  bytes), `bytes_equal` (equal byte sequences), `bytes_eq_ignore_ascii_case`
+  (`eq_ignore_ascii_case`: equal lengths, and equal bytes after
+  `ascii_upper`), and `string_from_ascii` (the string of the given code
+  points; the inverse of UTF-8 encoding on ASCII). The first four are
+  written to compute what `str::to_ascii_uppercase`,
+  `u8::to_ascii_uppercase`, `<[u8]>::eq` and `<[u8]>::eq_ignore_ascii_case`
+  compute, but no lemma relates them to those functions (`vstd` specifies
+  none of the three ASCII ones), so that correspondence holds by
+  construction and is not proved.
 
 Trusted-base additions (no new escape hatches): `vstd`'s specs of
 `char::is_whitespace`, `char::len_utf8`, `str::chars` / `Iterator::next`,
@@ -811,6 +965,10 @@ Glue: `trop/src/path/normalize.rs` (`expand_tilde`, `resolve_components`,
   Implicit paths yield the oracle's canonical path or its error, never a
   silent fallback. They warn exactly when the error is "not found" and
   warnings are enabled.
+- `has_parent_segment` (Unix; `storage::prefix_query`): total, and true
+  exactly when some segment is `..` (`has_parent_seg_spec(segs(s))`).
+  `lemma_parent_free_segs`: without a `..` segment every segment is named,
+  and resolving them changes nothing.
 
 ### `verified::path_relation` — path relationships, component prefixes, rebasing
 
@@ -848,7 +1006,8 @@ Glue: `trop/src/path/relationship.rs` (`PathRelationship::between`,
   `/` boundary, so `/a/b` is not a component prefix of `/a/bc`) is
   equivalent to segment prefix. Segment prefix implies byte prefix, so a
   byte-prefix prefilter is complete. `/` is a component prefix of every
-  canonical path.
+  canonical path. `canonical_is_component_prefix` (Unix; the post-filter of
+  `storage`'s prefix query) decides `spec_component_prefix` and is total.
 - `spec_rebase` (moving a subtree between ancestors): it round-trips, is
   injective, preserves `spec_rel`, and preserves canonical form.
 
@@ -881,8 +1040,10 @@ plan_cleanup_retry}`, `single_attempt`, `reconcile_deferred_key`,
 `trop/src/operations/executor.rs` (`PlanExecutor::{reported_port,
 stored_port}` and the `UpdateLastUsed` arm), and
 `trop-cli/src/commands/reserve.rs` (`--dry-run`). The glue copies flags
-field for field, trims `Set` values with `str::trim`, and passes stored values
-as `as_bytes()`. It maps each decision to the historical error, action, or
+field for field, trims `Set` values with the verified
+`verified::identifier::trim` (through `trim_identifier`, the trim the
+reservation builder also applies), and passes stored values as
+`as_bytes()`. It maps each decision to the historical error, action, or
 message. It also performs the database, allocator, cleanup, and git effects.
 Keeping `created_at` and excluding the row's own key when reallocating are
 glue, not kernel outputs.
@@ -909,16 +1070,24 @@ glue, not kernel outputs.
   - Idempotence (`lemma_repeat_request_touches`): once a request has been
     applied, by any writer whose normalization fixes the explicit values (the
     reservation builder trims), repeating it without `--overwrite`/`--force`
-    is a `Touch`. This holds for creates too.
+    is a `Touch`. This holds for creates too. For the production writer the
+    premise is trim idempotence, `identifier::lemma_trimmed_idempotent`; the
+    lemma's `norm` works on bytes and that one on chars, and the step from
+    one to the other is stated, not proved.
   - Agreement with the group path (`lemma_decision_matches_group_row`):
     `trop reserve` and `reserve-group`'s `plan_group_metadata` reject the same
     requests, name the same field first, and store the same metadata.
   Planning (`build_plan`) and deferred execution (`deferred_step`) both call
   it.
-- **`reserve_policy`**: the path check applies unless `--force` or
-  `--allow-unrelated-path` is given. `--force` implies reallocation and both
-  preferred-port relaxations (`lemma_force_dominates`), and the policy is
-  monotone in the permissive flags (`lemma_policy_monotone`).
+- **`reserve_policy`**: its postcondition fixes every field: the path check
+  applies unless `--force` or `--allow-unrelated-path` is given, `--force`
+  implies reallocation and both preferred-port relaxations, and each
+  automatic cleanup is on unless its switch disables it.
+  `lemma_force_dominates` (`--force` dominates) and `lemma_policy_monotone`
+  (monotone in the permissive flags) are stated over `policy_of`, a spec
+  copy of that postcondition. No `ensures` clause says `reserve_policy`
+  returns `policy_of(flags)`, so the lemmas constrain `reserve_policy` only
+  as far as the two copies read alike (checked by eye, not by Verus).
   `CleanupPolicy::retry_possible` (prune or expire) is the one predicate that
   both plan time (defer or fail) and execution (clean up or fail) use.
   `choose_preferred`: an explicit `--port` wins over the configured hint.
@@ -975,7 +1144,8 @@ Bugs fixed with this kernel:
   a WAL database read-only may leave `trop.db-wal`/`trop.db-shm` behind; the
   contents never change.
 
-Trusted: `str::trim` and its idempotence, pinned by
+Trusted: the char-to-byte step from `identifier::lemma_trimmed_idempotent`
+to the byte-level `norm` of `lemma_repeat_request_touches`, exercised by
 `trimmed_intent_values_are_fixed_points`. `str`/byte equality is checked by
 the exhaustive differential test
 `existing_decision_matches_the_previous_rules`.
@@ -989,10 +1159,18 @@ Glue: `trop/src/operations/reserve_group.rs` (`execute_group_allocation` calls
 
 - `cleanup_policy` (`cleanup_of`): each automatic cleanup runs unless its
   switch disables it.
-- `lemma_cleanup_policy_shared`: the cleanup part of `reserve_policy` is
-  exactly `cleanup_of` the same switches. Single and group reservations
-  therefore clean up alike, and a retry is possible unless both cleanups are
-  disabled.
+- `lemma_cleanup_policy_shared` is a definitional identity: `policy_of`'s
+  cleanup field and `cleanup_of` are the same expression, so its proof is
+  empty. It says nothing about the exec `reserve_policy`, which builds its
+  `CleanupPolicy` inline rather than calling `cleanup_policy`; its own
+  postcondition states the same formula, and a retry is possible unless both
+  cleanups are disabled. So single and group reservations clean up alike
+  *for the same switches*. They do not read the same switches: `trop
+  reserve` takes them from the configuration, the environment and its
+  `--disable-autoprune`/`--disable-autoexpire`/`--disable-autoclean` flags,
+  while `reserve-group` and `autoreserve` have no such flags and read
+  `disable_autoprune`/`disable_autoexpire` from the configuration and the
+  environment only.
 
 ### `verified::inference` — project and task names from repository facts
 
@@ -1051,8 +1229,20 @@ Numbers:
   exact for every byte input: an optional `+`, then one or more ASCII digits
   (leading zeros allowed), value `<= max`. It cannot overflow.
 - `parse_u16`, `parse_u32_decimal` and `parse_u64_decimal` are its
-  `u16`/`u32`/`u64` instances. YAML, environment and CLI numbers therefore
-  share one syntax.
+  `u16`/`u32`/`u64` instances. They decide every numeric `TROP_*` variable,
+  so those share this syntax (untrimmed: `TROP_PORT_MIN=" 1"` is rejected).
+  Exclusion text uses the same digit syntax after trimming each side.
+- Not every number goes through it. YAML integer scalars (`ports`,
+  `maximum_lock_wait_seconds`, `cleanup.expire_after_days`, `reservations`
+  base/offset/preferred) are parsed by `serde_yaml`, which also accepts
+  `0x`/`0o`/`0b` and rejects leading zeros (`min: 05000` is a string). On
+  the command line only `trop exclude`'s argument reaches `parse_u16`
+  (through `PortExclusion`'s `FromStr`). `reserve`'s `--port`, `--min` and
+  `--max` are strings parsed by `str::parse::<u32>` and then range-checked
+  (`parse_port_string` in `trop-cli/src/commands/reserve.rs`). The typed
+  arguments (`scan --min`/`--max`, the `port` of `assert-port` and
+  `port-info`, `expire`/`autoclean --days`, `--busy-timeout`) are parsed by
+  `clap` (as an `i64`, then range-checked).
 - `lemma_decimal_text_accepted` (completeness): every value up to `max`, with
   any leading zeros and an optional `+`, parses back to itself.
 
@@ -1105,14 +1295,18 @@ Defaults and flags:
   and denies by default.
 
 Layering:
-- `overlay_leaf` takes the layer's value if it sets one, otherwise the value
-  below, and reports whether the layer set it.
-- The overlay is a monoid with `None` as identity.
-- The fold over the layers equals the highest-precedence layer that sets the
-  leaf, which is the recorded provenance winner, or the default when no layer
-  sets it.
-- Folding is compositional.
-- Accumulated `excluded_ports` exclude exactly the union of the layers' ports.
+- `overlay_leaf` (exec, called by the merger) takes the layer's value if it
+  sets one, otherwise the value below, and reports whether the layer set it.
+- The rest are lemmas about spec-only models (`fold_overlay`,
+  `accumulate_exclusions`, `group_winner`). No exec code is checked against
+  them; the builder and merger implement them unverified (see "Not proved").
+  - The overlay is a monoid with `None` as identity.
+  - In the model, the fold over the layers equals the highest-precedence
+    layer that sets the leaf (the last layer whose overlay reported "set"),
+    or the default when no layer sets it.
+  - Folding is compositional.
+  - In the model, accumulated `excluded_ports` exclude exactly the union of
+    the layers' ports.
 
 Files:
 - `check_placement`: a user file may name neither a project (checked first) nor
@@ -1120,22 +1314,37 @@ Files:
   overlay.
 - `kind_for_precedence`: 1 is User, 3 is Local, anything else is Project. User
   < Project < Local.
-- `lemma_group_winner`: the effective group comes from the last `Replace` with
+- `lemma_group_winner` (model): `group_winner` is the last `Replace` with
   only `Inherit` after it.
 - `first_config_level` returns the nearest level at which the oracle reported
-  `trop.yaml` or `trop.local.yaml`, after it reported neither at every nearer
-  level. `trop.yaml` is loaded before `trop.local.yaml`.
+  `trop.yaml` or `trop.local.yaml`, with what it reported there, after it
+  reported neither at every nearer level. It loads nothing: the glue loads
+  the level's `trop.yaml` before its `trop.local.yaml` (push order, then a
+  stable sort by precedence). `lemma_precedence_order` only checks the
+  constants: user < project < local.
 
 Not proved:
 - `.trop.yaml` discovery (out of scope).
 - The explicit project-file plan and the `is_tropfile` computation.
 - The `project`/`reservations` leaves, which still clone when present.
 - Provenance bookkeeping.
+- That production layering implements the models above. The effective
+  reservation group is chosen by the builder's loop (replace in
+  `merge_config`, clear on `Clear`), not by `group_winner`; exclusions
+  accumulate through `Vec::extend` at three sites, not through
+  `accumulate_exclusions`; the environment layer assigns its scalar leaves
+  directly, not through `overlay_leaf`; and the cleanup leaf still
+  materializes `Some(CleanupConfig { .. })` for an empty source section.
+- That `apply_precise` and `merge_into_observed` agree.
+- The load order of a level's two files (glue, above).
 - The connection's retry timeout and the PRAGMA readback; that glue is outside
   this package.
 
 Trusted:
-- std `from_str` equivalence: differential tests and a proptest.
+- std `from_str` equivalence of `parse_u16`/`parse_u32_decimal`/
+  `parse_u64_decimal`: differential tests and a proptest
+  (`prop_decimal_parsers_match_std`).
+- `serde_yaml`'s parsing of the YAML numeric fields.
 - `Duration::as_millis` semantics: boundary test.
 - `Path::ancestors`/`exists`.
 - The group glue's sort and message mapping: differential tests against the
@@ -1245,11 +1454,22 @@ classes and `Path::to_str` stay in the glue.
   is the first failing check in field order (`first_record_error`: key, port,
   project, task, creation time, last use; the glue rejects a pre-epoch time
   first). Every encoded row decodes to exactly the record's fields
-  (`lemma_encoded_record_round_trips`; `sticky` is not persisted), and every
-  decodable row is the encoding of its decoded fields
-  (`lemma_decoded_row_re_encodes`). `StoredKey` and `StoredRow` have private
-  fields, so only these two encoders construct what the write paths bind; every
-  write returns `Error::Validation` before any SQL.
+  (`lemma_encoded_record_round_trips`; `sticky` is not persisted). In the
+  other direction, `lemma_decoded_row_re_encodes` proves that a decodable
+  row's key is storable and its tag re-encodes to the stored tag text (the
+  tag codec bijection); its port and timestamp facts restate `row_decodes`,
+  and it does not state `encodes(f, row)` for a decoded record.
+- Write paths: `StoredKey` and `StoredRow` have private fields, so every
+  bound key comes from `encode_storage_key` and every inserted row from
+  `encode_record`. The two `UPDATE` statements also bind values neither
+  encoder produces: their timestamps come from `encode_unix_secs`, and the
+  metadata update checks `project` and `task` in glue
+  (`check_stored_identifier`, which calls
+  `identifier::is_canonical_identifier`, the predicate `encode_record`
+  applies). Every reservation write path returns `Error::Validation` before
+  it writes a value the reader would reject. Keys and supplied values are
+  checked before any SQL runs; `update_last_used` converts the current time
+  after its `BEGIN IMMEDIATE`, before the `UPDATE`.
 - Lookups: `lookup_key` is the key's exact text. Among rows whose tag decodes,
   it matches exactly the rows holding the requested key, so a lookup never
   returns another key's row (a `Some("")` tag never aliases the untagged one)
@@ -1260,8 +1480,10 @@ classes and `Path::to_str` stay in the glue.
 - Prefix queries (Unix): `prefix_query` maps a `Path::starts_with` prefix to
   `Everything`, `Nothing` (relative, or containing `..`) or the canonical key
   of its segments. On canonical stored paths, `canonical_is_component_prefix`
-  with the key is exactly the `starts_with` model. Every match starts with the
-  key's bytes (`lemma_prefix_query_exact`), so the byte-exact prefilter
+  with the key is exactly the `starts_with` model (`prefix_query`'s
+  postcondition). Every match starts with the key's bytes
+  (`lemma_prefix_query_exact`, which holds by the definition of
+  `spec_component_prefix`), so the byte-exact prefilter
   `instr(path, key) = 1` never drops a match. Non-Unix targets test each stored
   text with `Path::starts_with` and decode only the matches (unverified).
 - `busy_timeout_millis` is `max(v, 0)`.
@@ -1343,15 +1565,6 @@ Glue: `escape_text` in `trop/src/database/operations.rs` and
 
 Trusted: equality with `char::escape_default`, checked exhaustively.
 
-Additions to earlier kernels (no existing specification changed):
-`path::has_parent_segment` / `lemma_parent_free_segs`,
-`path_relation::canonical_is_component_prefix`, `text::bytes_equal` /
-`bytes_eq_ignore_ascii_case`. The `verified::identifier` paragraph "Stored-tag
-sentinel (specification only)... the shipped write path does not enforce
-`is_valid_tag`" is obsolete: `storage::encode_storage_key`,
-`storage::lookup_key` and `storage::decode_stored_tag` implement it, and every
-write enforces it.
-
 ### `verified::migrate` — migration conflicts, the action schedule, path rebasing, and the migration guard
 
 Glue: `trop/src/operations/migrate.rs` (`MigratePlan::build` /
@@ -1364,12 +1577,24 @@ stored tag text. The same id lists feed `guard_moves`, `classify_conflicts` and
 
 - `classify_conflicts` returns, strictly increasing, exactly the items whose
   destination exists and is not itself a source (`is_conflict`). It fails
-  exactly on malformed key lists, and every error variant is pinned, checked in
-  this order:
-  - the lengths differ (`LengthMismatch`, also for a `dest_exists` mismatch);
-  - an id is out of range;
-  - a source repeats;
-  - a destination repeats (the error names both items).
+  exactly on malformed key lists. The code checks:
+  - the lengths first (`LengthMismatch`, also for a `dest_exists`
+    mismatch);
+  - then the sources, left to right, reporting the first out-of-range id
+    (`KeyOutOfRange`) or repeat (`DuplicateSource`) it meets;
+  - then the destinations the same way (`KeyOutOfRange`, or `DuplicateDest`,
+    which names both items).
+
+  The postconditions pin `LengthMismatch` in both directions and tie every
+  other variant to its cause: some id is out of range, two sources are
+  equal, or two destinations are equal while the sources are in range and
+  distinct. So `DuplicateDest` is never reported while a source is out of
+  range or repeated. They do not fix the choice in two cases, where the
+  order above holds by construction: a repeated source together with an
+  out-of-range id, source or destination (with three keys, sources
+  `[0, 0]` and destinations `[9, 1]`, the code reports `DuplicateSource`,
+  and `KeyOutOfRange` would also satisfy them); and, with valid sources,
+  destinations that hold both an out-of-range id and a repeat.
 
   Lemmas:
   - `lemma_conflicts_are_overwrites`: under a consistent snapshot, the
@@ -1382,7 +1607,8 @@ stored tag text. The same id lists feed `guard_moves`, `classify_conflicts` and
     conflict and changes nothing.
 - `schedule_migration` returns exactly `spec_schedule`: delete every source,
   then every destination that is not a source, then create `0..n`. Its errors
-  are pinned as above. Its postcondition, for every store:
+  are checked and specified as above (without `dest_exists`). Its
+  postcondition, for every store:
   - running the plan yields `moved`: each payload at its destination
     (overwriting what was there), the other sources gone, every other row
     untouched;
@@ -1461,18 +1687,32 @@ from `crate::path::relationship::path_tokens`, the same tokens
   carries `--force`, `--allow-unrelated-path` and the working directory's
   tokens. With either override the fallback is never consulted.
 
-The SQL queries only produce candidates; the kernel decides. Recursive mode
-uses the prefix query, all-tags mode the exact-path query, and exact-key mode
-the key's own row. Selection compares stored identities: the target's exact
-path (the database stores a path as its own text and holds no non-UTF-8 path)
-and the requested tag; a struct-literal `Some("")` tag selects nothing, since
-decoded rows never carry it (as `storage::lookup_key` finds nothing for it).
-Migrate interns keys by their exact path.
+The SQL queries only produce candidates; the kernel selects among them.
+Recursive mode uses the prefix query, all-tags mode the exact-path query, and
+exact-key mode the key's own row. Selection compares component tokens
+(`path_tokens`, built from `std` path components, so `/w/a/` and `/w/a` have
+equal tokens) and the requested tag as stored; a struct-literal `Some("")`
+tag selects nothing, since decoded rows never carry it (as
+`storage::lookup_key` finds nothing for it).
+
+The candidate queries identify paths differently: the exact-key and
+all-tags queries match the stored text exactly, and the prefix query follows
+`Path::starts_with` (components). For a target in canonical form the stored
+text and the tokens agree, so the candidates include every row the kernel
+would select and the kernel decides. Every CLI target is normalized or
+canonicalized, so this holds for the CLI. A library caller can pass a
+non-canonical target (`ReservationKey::new` does not normalize, and `path`
+is public). Then the exact modes can miss rows whose tokens equal the
+target's (a target `/w/a/` finds no row stored at `/w/a`, and reports it as
+already released), while recursive mode finds and deletes them.
+
+Migrate interns keys by their exact stored path text.
 
 Trusted:
 - token equality and prefix coincide with `Path` component equality and
   `Path::starts_with` (`test_path_tokens_agree_with_std`);
-- the candidate queries return a superset of the selected rows;
+- the candidate queries return a superset of the selected rows, for
+  canonical targets (every CLI target) only;
 - the working directory read for the tokens is the one the fallback reads.
 
 ### `verified::shell` — `--shell` names, shell detection, export lines
@@ -1639,10 +1879,16 @@ explaining that Verus cannot see inside `b"..."` literals.
 - Iterate on one module with `just verify-module <name>` (it runs
   `cargo verus focus`; `cargo verus verify` rejects partial runs), then run
   the full `just verify`. A run proves something only if it prints a
-  `verification results`
-  line; cargo-verus uses content-checksum freshness, so give each checkout
-  (and each git worktree) its own `CARGO_TARGET_DIR`, or one checkout's cached
-  result can be replayed for another.
+  `verification results:: N verified, 0 errors` line. When the harness
+  crate is fresh, cargo replays its cached output instead of running the
+  verifier; the replay has no results line and ignores which module was
+  asked for. Both recipes therefore drop the harness crate's cached build
+  before running (dependencies stay cached) and fail, through
+  `scripts/check-verus-results.sh`, unless every results line reports 0
+  errors and at least one is printed. Calling `cargo verus`
+  directly does neither, and one checkout's cached result can then be
+  replayed for another, so give each checkout (and each git worktree) its
+  own `CARGO_TARGET_DIR`.
 - This Verus version cannot prove existential postconditions over a generic
   error type (`r matches Err(e) ==> exists|p| ...`). Return the witness
   instead (for example `ScanFailure { port, error }` in
@@ -1658,3 +1904,12 @@ explaining that Verus cannot see inside `b"..."` literals.
   checksums, and the Rust toolchain in `scripts/install-verus.sh`, and set
   `vstd` in `Cargo.toml` to the crates.io version published from the same
   commit (`0.0.0-YYYY-MM-DD-HHMM`). Re-run `just verify`.
+- Keep the build toolchain and the verifier's toolchain in step. `vstd`'s
+  `std` specifications are written for, and resolved against,
+  `VERUS_RUST_TOOLCHAIN` (now 1.100.0), while `rust-toolchain.toml` and the
+  CI jobs build `trop` with 1.99.1 (see "Trusted computing base"). When
+  bumping either, move the other with it where possible, or update the skew
+  recorded in the trusted base. The build toolchain is `rust-toolchain.toml`
+  plus every `dtolnay/rust-toolchain@1.99.1` pin in
+  `.github/workflows/ci.yml` and `.github/workflows/property-tests.yml`;
+  move them together. The licenses job's `@stable` is not a pin and stays.

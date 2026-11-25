@@ -283,9 +283,11 @@ impl FromStr for PortExclusion {
     /// This one parser serves the YAML string form, `TROP_EXCLUDED_PORTS`,
     /// and `trop exclude`. The text splits at its first `..`; whitespace
     /// around the whole text and around each side of `..` is ignored. Each
-    /// number has exactly the syntax of `u16::from_str` (an optional `+`,
-    /// then ASCII digits, at most 65535). The separator search and the
-    /// number parsing are verified kernels. Parsing does not validate:
+    /// number has the verified kernel's syntax (an optional `+`, then ASCII
+    /// digits, at most 65535); that this is also `u16::from_str`'s syntax is
+    /// trusted, pinned by `test_parse_u16_kernel_matches_from_str`. The
+    /// separator search and the number parsing are verified kernels; the
+    /// trimming is `str::trim`. Parsing does not validate:
     /// `"0"` and `"5010..5000"` parse, and validation rejects them.
     ///
     /// # Examples

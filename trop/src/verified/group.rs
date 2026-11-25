@@ -2558,14 +2558,15 @@ pub open spec fn stored_view_of_plan(s: Seq<RawService>, ports: Seq<u16>) -> Seq
     )
 }
 
-/// Repeating a group request right after a fresh allocation refreshes it:
-/// for every fresh plan, `derive_compatible_base` on the stored group (same
-/// services, same scan range) accepts it, so the request takes the refresh
-/// path -- never a conflict or a forced replacement -- and keeps exactly the
-/// planned ports. A reported base equals the plan's base. It can only be
-/// `None` while the plan has a base when every service ended up on its own
-/// preferred port (a fallback port can coincide with the service's own
-/// unavailable preference if the probes' answers change between calls).
+/// A fresh plan passes the shape-compatibility check: for every fresh plan,
+/// `derive_compatible_base` on the stored group (same services, same scan
+/// range) accepts it, so that check never reports a conflict for it. This is
+/// one condition of the refresh path, not all of it: this lemma says nothing
+/// about `match_stored_tags`, `plan_group_metadata`, or the glue's
+/// `CompatClass` mapping. A reported base equals the plan's base. It can
+/// only be `None` while the plan has a base when every service ended up on
+/// its own preferred port (a fallback port can coincide with the service's
+/// own unavailable preference if the probes' answers change between calls).
 pub proof fn lemma_fresh_plan_is_compatible(
     s: Seq<RawService>,
     ports: Seq<u16>,
