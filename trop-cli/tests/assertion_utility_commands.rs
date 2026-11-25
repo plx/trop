@@ -1619,6 +1619,72 @@ fn test_exclude_duplicate_detection() {
     assert_eq!(count, 1, "Should not create duplicate exclusions");
 }
 
+/// Regression: `trop exclude` used to write reversed ranges and port 0 to the
+/// config file, which then failed validation on every later load.
+///
+/// **Invariant**: An invalid exclusion is rejected before anything is written.
+#[test]
+fn test_exclude_rejects_invalid_exclusions_without_writing() {
+    let env = TestEnv::new();
+
+    let config_path = env.path().join("trop.yaml");
+    let initial = "project: test\n";
+    fs::write(&config_path, initial).expect("Failed to write config");
+
+    for (argument, reason) in [
+        ("8090..8080", "end < start"),
+        ("0", "Invalid port: 0"),
+        ("0..10", "Invalid start port: 0"),
+    ] {
+        let output = env
+            .command_bare()
+            .arg("exclude")
+            .arg(argument)
+            .current_dir(env.path())
+            .output()
+            .expect("Failed to run exclude");
+
+        assert_eq!(output.status.code(), Some(4), "{argument}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).expect("Invalid UTF-8");
+        assert!(stderr.contains(reason), "{argument}: {stderr}");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("Failed to read config"),
+            initial,
+            "{argument}: config must be unchanged"
+        );
+    }
+
+    // The configuration still loads.
+    env.command_bare()
+        .arg("validate")
+        .arg(&config_path)
+        .assert()
+        .success();
+}
+
+/// `trop exclude` accepts the same text as the YAML string form, including
+/// whitespace around `..`.
+#[test]
+fn test_exclude_accepts_whitespace_around_range_separator() {
+    let env = TestEnv::new();
+
+    let config_path = env.path().join("trop.yaml");
+    fs::write(&config_path, "project: test\n").expect("Failed to write config");
+
+    env.command_bare()
+        .arg("exclude")
+        .arg(" 8080 .. 8090 ")
+        .current_dir(env.path())
+        .assert()
+        .success();
+
+    let parsed: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&config_path).expect("Failed to read config"))
+            .expect("Failed to parse config");
+    assert_eq!(parsed["excluded_ports"][0]["start"], 8080);
+    assert_eq!(parsed["excluded_ports"][0]["end"], 8090);
+}
+
 // ============================================================================
 // Configuration Command Tests: compact-exclusions
 // ============================================================================
@@ -1766,6 +1832,80 @@ excluded_ports:
         range_count, 1,
         "Overlapping ranges should be merged into one"
     );
+}
+
+/// Regression: compact-exclusions used to silently drop a reversed range
+/// (`[5010..5000, 6000]` was rewritten to `[6000]`), changing the set of
+/// excluded ports, and kept port 0.
+///
+/// **Invariant**: compaction never changes the excluded set; invalid entries
+/// are reported as a configuration error and the file is left untouched.
+#[test]
+fn test_compact_exclusions_rejects_invalid_entries_without_writing() {
+    let env = TestEnv::new();
+
+    let config_path = env.path().join("trop.yaml");
+    for config in [
+        "project: test\nexcluded_ports:\n  - \"5010..5000\"\n  - 6000\n",
+        "project: test\nexcluded_ports:\n  - \"5010..5000\"\n",
+        "project: test\nexcluded_ports:\n  - 0\n  - 1\n",
+    ] {
+        fs::write(&config_path, config).expect("Failed to write config");
+
+        let output = env
+            .command()
+            .arg("compact-exclusions")
+            .arg(&config_path)
+            .output()
+            .expect("Failed to run compact-exclusions");
+
+        assert_eq!(output.status.code(), Some(7), "{config}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).expect("Invalid UTF-8");
+        assert!(stderr.contains("excluded_ports[0]"), "{config}: {stderr}");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("Failed to read config"),
+            config,
+            "config must be unchanged"
+        );
+    }
+}
+
+/// Compaction output is the canonical form: sorted, merged, and `Single`
+/// for one-port runs (a one-port range `5000..5000` becomes `5000`).
+#[test]
+fn test_compact_exclusions_writes_canonical_form() {
+    let env = TestEnv::new();
+
+    let config_path = env.path().join("trop.yaml");
+    let config = r#"
+project: test
+
+excluded_ports:
+  - 9000
+  - "5003..5005"
+  - 5000
+  - start: 5001
+    end: 5002
+  - "7000..7000"
+"#;
+    fs::write(&config_path, config).expect("Failed to write config");
+
+    env.command()
+        .arg("compact-exclusions")
+        .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Compacted 5 exclusions to 3"));
+
+    let parsed: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&config_path).expect("Failed to read config"))
+            .expect("Failed to parse config");
+    let excluded = &parsed["excluded_ports"];
+    assert_eq!(excluded[0]["start"], 5000);
+    assert_eq!(excluded[0]["end"], 5005);
+    assert_eq!(excluded[1], 7000);
+    assert_eq!(excluded[2], 9000);
+    assert!(excluded[3].is_null());
 }
 
 // ============================================================================

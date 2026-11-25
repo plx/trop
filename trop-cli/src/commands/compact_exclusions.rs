@@ -3,9 +3,9 @@
 use crate::error::CliError;
 use crate::utils::GlobalOptions;
 use clap::Args;
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use trop::config::{Config, PortExclusion};
+use trop::port::exclusions::compact_exclusions;
 
 /// Compact exclusion list to minimal representation.
 #[derive(Args)]
@@ -33,12 +33,17 @@ impl CompactExclusionsCommand {
         let mut config: Config = serde_yaml::from_str(&contents)
             .map_err(|e| CliError::Config(format!("Parse error: {e}")))?;
 
-        // 2. Compact exclusions
+        // 2. Compact exclusions. Invalid entries (port 0, reversed ranges)
+        //    are reported, never dropped: compaction must not change the set
+        //    of excluded ports.
         if let Some(ref mut exclusions) = config.excluded_ports {
             let original_count = exclusions.len();
-            let compacted = compact_exclusion_list(exclusions);
+            let compacted =
+                compact_exclusions(exclusions).map_err(|e| CliError::Config(e.to_string()))?;
             let new_count = compacted.len();
 
+            // The compacted list is verified to be count-minimal, so an
+            // unchanged count means the list already has the minimal size.
             if original_count != new_count {
                 println!("Compacted {original_count} exclusions to {new_count}");
 
@@ -66,63 +71,17 @@ impl CompactExclusionsCommand {
 }
 
 /// Compact a list of port exclusions to minimal representation.
+///
+/// Delegates to the verified compaction (`trop::port::exclusions::compact_exclusions`):
+/// the result excludes exactly the same ports, is sorted with overlapping and
+/// adjacent entries merged, and no shorter list excludes the same ports.
+///
+/// A list with an invalid entry (port 0 or a reversed range) has no
+/// compaction; it is returned unchanged rather than altered, so the excluded
+/// set never changes. Callers that must report invalid entries use
+/// `compact_exclusions` directly.
 pub fn compact_exclusion_list(exclusions: &[PortExclusion]) -> Vec<PortExclusion> {
-    // Collect all excluded ports
-    let mut ports = BTreeSet::new();
-    for exclusion in exclusions {
-        match exclusion {
-            PortExclusion::Single(p) => {
-                ports.insert(*p);
-            }
-            PortExclusion::Range { start, end } => {
-                for p in *start..=*end {
-                    ports.insert(p);
-                }
-            }
-        }
-    }
-
-    // Build minimal ranges
-    let mut result = Vec::new();
-    let mut current_start: Option<u16> = None;
-    let mut current_end: Option<u16> = None;
-
-    for &port in &ports {
-        match (current_start, current_end) {
-            (None, None) => {
-                current_start = Some(port);
-                current_end = Some(port);
-            }
-            (Some(start), Some(end)) => {
-                if port == end + 1 {
-                    // Extend current range
-                    current_end = Some(port);
-                } else {
-                    // Save current range and start new one
-                    if start == end {
-                        result.push(PortExclusion::Single(start));
-                    } else {
-                        result.push(PortExclusion::Range { start, end });
-                    }
-                    current_start = Some(port);
-                    current_end = Some(port);
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    // Save final range
-    if let (Some(start), Some(end)) = (current_start, current_end) {
-        debug_assert!(start <= end, "start should never exceed end");
-        if start == end {
-            result.push(PortExclusion::Single(start));
-        } else {
-            result.push(PortExclusion::Range { start, end });
-        }
-    }
-
-    result
+    compact_exclusions(exclusions).unwrap_or_else(|_| exclusions.to_vec())
 }
 
 #[cfg(test)]
@@ -388,7 +347,7 @@ mod tests {
     ///
     /// **Property**: Compaction should work regardless of input order
     /// **Example**: [8085, 8080, 8081] → Range{8080..8081}, Single(8085)
-    /// **Implementation detail**: Uses BTreeSet which provides sorting
+    /// **Implementation detail**: The verified compaction is order-independent
     /// **Why test this**: Real config files might have unsorted exclusions
     #[test]
     fn test_compact_unsorted_input() {
@@ -595,6 +554,49 @@ mod tests {
             compacted.len(),
             1,
             "Should compact 5 consecutive singles to 1 range"
+        );
+    }
+
+    /// Regression: a reversed range used to vanish (changing the excluded
+    /// set) and port 0 used to survive or merge with port 1. A list with an
+    /// invalid entry is now returned unchanged, and the fallible compaction
+    /// that `compact-exclusions` uses rejects it.
+    #[test]
+    fn test_compact_never_changes_invalid_lists() {
+        for exclusions in [
+            vec![
+                PortExclusion::Range {
+                    start: 5010,
+                    end: 5000,
+                },
+                PortExclusion::Single(6000),
+            ],
+            vec![PortExclusion::Range {
+                start: 5010,
+                end: 5000,
+            }],
+            vec![PortExclusion::Single(0), PortExclusion::Single(1)],
+        ] {
+            assert_eq!(compact_exclusion_list(&exclusions), exclusions);
+            assert!(compact_exclusions(&exclusions).is_err());
+        }
+    }
+
+    #[test]
+    fn test_compact_full_port_space() {
+        let exclusions = vec![
+            PortExclusion::Range {
+                start: 2,
+                end: 65535,
+            },
+            PortExclusion::Single(1),
+        ];
+        assert_eq!(
+            compact_exclusion_list(&exclusions),
+            vec![PortExclusion::Range {
+                start: 1,
+                end: 65535
+            }]
         );
     }
 }
