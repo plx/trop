@@ -2218,6 +2218,287 @@ Glue: none directly; `verified::cleanup::plan_removals` calls `order_removals`.
 - A differential test shows it equals the previous stable `sort_by` comparator,
   and 65,535 candidates sort quickly.
 
+### `verified::sql_schema` — schema-SQL tokenizer, normalized form, token-run containment
+
+Glue: `trop/src/database/validation.rs` (`validate_required_constraints`,
+`validate_exact_table_definitions`).
+
+- `tokenize_schema_sql` computes `tokenize(sql, allowed)`, a recursive
+  byte-level specification. At each position it skips ASCII whitespace
+  (`u8::is_ascii_whitespace`) and reads one token:
+  - a bare word: a maximal run of ASCII alphanumerics, `_`, `$` and non-ASCII
+    bytes, ASCII-lowercased (`w`);
+  - a `"..."` identifier with `""` escapes. It reads as the bare word when it
+    is closed and its decoded text is exactly the allowed table name; otherwise
+    it is kept raw (`q`);
+  - `'...'` / `` `...` `` literals (kind = the delimiter), `[...]` (`[`), and
+    `--` and `/* */` comments (`c`). Each is kept raw and runs to the end when
+    unterminated;
+  - an operator of 1, 2 (`<= >= != == <> -> ||`) or 3 (`->>`) bytes (`s`).
+
+  It is total and panic-free, and it terminates on every byte string: every
+  token is non-empty, which is the `#[via_fn]` termination proof.
+- `normalize_schema_sql` is `encode_tokens(tokenize(..))`. Each token is
+  written as kind, decimal byte length, `:`, value, `;`. The encoding is
+  injective (`lemma_encode_tokens_injective`, via `lemma_decimal` and
+  `lemma_decimal_colon_split`), so normalized forms are equal exactly when the
+  token streams are (`lemma_normalized_eq_iff`).
+- `token_run_contains` is exactly `contains_run`: the needle's tokens occur as
+  a contiguous run of the haystack's tokens.
+  - The required-constraint check now uses it.
+  - Before, `String::contains` on the encoded stream could be satisfied by a
+    comment or a quoted literal whose raw text contained the encoded
+    constraint. Validation then failed later for the wrong reason.
+- What equal tokens mean:
+  - **Strictness** (`lemma_tokens_cover_input`): the token spans tile the
+    input, and every byte outside them is whitespace. Each token's value is
+    fixed by its raw text (`token_text`):
+    - a bare word is its word bytes, lowercased;
+    - the allowed identifier is `"` + the name with `"` doubled + `"`;
+    - everything else is exactly its raw text.
+
+    So equal token streams mean the texts differ only in inter-token
+    whitespace, the ASCII case of bare words, and the quoting of the allowed
+    identifier.
+  - **Robustness, whitespace** (`lemma_space_between_tokens`): inserting an
+    ASCII whitespace byte at any position before the end of the input that the
+    lexer reaches leaves the tokens unchanged. At the very end it need not,
+    because an unterminated quote, bracket or comment absorbs the byte.
+  - **Robustness, case** (`lemma_word_case_irrelevant`): replacing a byte
+    inside a bare word by a byte with the same ASCII lowercase leaves the
+    tokens unchanged. It also leaves unchanged the positions the lexer reaches
+    and every word's extent, so any number of such changes leaves the tokens
+    unchanged too. No scanner end moves, because every scanner compares bytes
+    only with non-word bytes (`lemma_recase_*`).
+  - **Quoting** (`lemma_closed_quote_round_trip`): a closed quoted token is its
+    decoded text with delimiters doubled.
+- Byte-level tokenizing equals the historical `char`-level tokenizer on every
+  `&str`. All delimiters are ASCII, and every byte of a non-ASCII UTF-8
+  sequence is a word byte. This is a meta-argument, pinned by a differential
+  test against the historical implementation, which is kept verbatim in the
+  glue's tests: 200,000 random strings with multi-byte and control chars, times
+  5 allowed values, plus edge cases.
+
+Glue: `sql.as_bytes()` of the `sqlite_schema` text and of the expected CREATE
+text (after `replacen("IF NOT EXISTS", "", 1)`), `Some(table.as_bytes())` as
+the allowed identifier, and `!=` on the normalized byte vectors.
+
+### `verified::wal` — enabling WAL journal mode with a bounded retry
+
+Glue: `trop/src/database/connection.rs` (`enable_wal_with_retry`,
+`is_in_memory`).
+
+- `journal_mode_accepted` is `mode_accepted`: the reported mode is `wal` (ASCII
+  case-insensitive), or `memory` only for an in-memory database.
+  - The reported mode was previously ignored. A database SQLite keeps in
+    another mode now fails with a clear `SQLITE_CANTOPEN` error; for example, a
+    temporary database reports `delete`.
+  - Read-only opens and `Database::validate` never run the pragma.
+  - Only an empty file name counts as in memory (`is_in_memory`). A name
+    rusqlite cannot report (not UTF-8) counts as a file.
+- `enable_wal` drives four oracles: the clock (ns since the start), `PRAGMA
+  busy_timeout`, `PRAGMA journal_mode = WAL`, and a pause.
+  - Every call takes a ticket and returns the next one.
+  - It returns the outcome, the last ticket, and a ghost log `WalLog { events,
+    tickets }`.
+  - It proves `wal_run`, made up of the parts below.
+- **The log is the calls** (`calls_chained`): call `i` took `tickets[i]`,
+  returned `tickets[i + 1]`, and gave the answer recorded in `events[i]`. For a
+  pause, the record is the length actually requested.
+  - The ticket type is generic and unbounded, so the kernel can neither copy
+    nor create a ticket.
+  - The log is therefore the single chain of calls from the caller's ticket to
+    the returned one: no replayed answer, no unrecorded call, no reordering.
+  - The glue numbers its calls (ticket `n` in, `n + 1` out).
+- **Exact shape**: `k` retried rounds, then one last round (`settled_run`),
+  then the restore of `busy_timeout` to the whole timeout as the last effect on
+  every exit.
+  - `retried_round`, five effects:
+    1. a clock reading `t`; the elapsed time is the reading, raised to the
+       previous round's elapsed time plus its pause (`clock_at`,
+       `round_floor`);
+    2. a successful `busy_timeout` of `floor((timeout - t)+ / 1 ms)`;
+    3. an attempt that reported contention;
+    4. a clock reading `u < timeout`;
+    5. a pause of `min(timeout - u, 10 ms)`, which is between 1 ns and 10 ms
+       (`lemma_pause_bounds`).
+  - `last_round`: the same opening, then exactly one of:
+    - `BusyTimeoutFailed(e)`;
+    - an accepted mode: `Enabled`, or `RestoreFailed(e)` when the restore
+      fails;
+    - `NotWal(m)`;
+    - `Failed(e)`: any other error, returned immediately;
+    - `TimedOut(e)`: contention, then a clock reading at or past the timeout.
+  - So an attempt is retried only after contention, only while time remains,
+    and only after a pause. An earlier error wins over a failed restore.
+- `total_pause <= timeout`, and the loop terminates for every clock oracle
+  (measure `timeout - floor`).
+
+Glue: `Instant::elapsed().as_nanos()`, `execute_batch("PRAGMA busy_timeout =
+{ms}")`, `query_row("PRAGMA journal_mode = WAL")` classified by
+`sqlite_error_is_lock_contention`, and `thread::sleep(Duration::from_nanos)`.
+Each closure returns `call + 1` as its ticket.
+- With a monotonic clock and sleeps at least as long as requested, the
+  decisions equal the historical loop's.
+- The chain guarantee carries over from an arbitrary ticket type to the glue's
+  `u64` by parametricity. This is checked by reading: the kernel uses no
+  type-inspecting operation (no `size_of`, `Any` or trait bound on the ticket).
+
+### `verified::symlink` — bounded symlink following
+
+Glue: `trop/src/path/canonicalize.rs` (`canonicalize_safe`,
+`canonicalize_bounded`) and `trop/src/path/resolver.rs`
+(`PathResolver::resolve` for implicit paths, `resolve_canonical`).
+
+- `follow_links` is generic over the state, a `step` oracle (link / not a link
+  / missing / error) and a `same` oracle. It returns the outcome and a ghost
+  `Walk`, and proves `followed`:
+  - The chain is real: it starts at the start, and each state links to the next
+    (`follows`).
+  - At most `max_depth` links are followed. `TooDeep` is reported only when
+    exactly `max_depth` were followed and the state reached is a link again. So
+    a chain of exactly `max_depth` links resolves, and `max_depth == 0` accepts
+    a non-link. The historical loop checked the depth before reading the link
+    and rejected both.
+  - Loop detection is sound and complete for `same`. `Loop(s)` is reported only
+    when `s` is the same as an earlier state (at `walk.earlier`). On every
+    other outcome, `same` said "different" for every pair of visited states
+    (`distinct`).
+  - Resolved, Missing and Failed are the last state's own answer.
+  - It terminates, with measure `max_depth - depth`.
+- `PathResolver`'s `max_symlink_depth` (default 40) now bounds the links
+  followed at the path itself. Before, it had no effect. Links in parent
+  directories are resolved by the OS.
+- A loop at the path that repeats a path exactly is reported as `SymlinkLoop`,
+  naming the repeated path; it was previously `Io(ELOOP)`. Because `same` is
+  `PathBuf` equality, a loop spelled differently (for example through `..`)
+  never repeats exactly and hits the depth bound instead.
+
+Glue:
+- `step` classifies `fs::symlink_metadata` (`read_link` for links) and joins a
+  relative target to the link's parent with `Path::join`. `..` is deliberately
+  not normalized lexically: the OS must resolve it physically.
+- `same` is `PathBuf` equality, as the old `HashSet` used.
+- A resolved state goes through `fs::canonicalize`.
+- `canonicalize_safe` resolves a dangling chain end physically. Its deepest
+  existing ancestor is canonicalized through `canonicalize_existing` (the
+  verified `deepest_existing_prefix` search), and the missing named components
+  are appended. Before, the lexically joined path was returned, such as
+  `<T>/symdir/../missing` for what is physically `<T>/x/missing`.
+- `canonicalize_bounded` names the input path in not-found, permission and
+  depth errors, like `canonicalize`.
+
+Trusted-base additions: none (no
+`assume`/`admit`/`external_body`/`assume_specification`).
+
+### `verified::civil_time`: Unix time to UTC civil date and time, and its `%Y-%m-%d %H:%M:%S` text
+
+Glue: `trop/src/output/mod.rs` (`format_utc_timestamp`). It splits a
+`SystemTime` with `duration_since(UNIX_EPOCH)` into a direction, whole seconds
+and nanoseconds. trop-cli's `format_timestamp` calls it for `trop list` and
+`trop port-info`.
+
+- Calendar vocabulary:
+  - `is_leap_year`: the Gregorian rule. `%` is Euclidean and years are
+    astronomical (year 0 is 1 BC).
+  - `days_in_month`, `days_in_year`.
+  - `days_from_civil(y, m, d) = days_before_year(y) + days_before_month(y, m) +
+    d - 1`. Both terms are plain sums of year and month lengths counted from
+    1970-01-01, so the definition is the calendar itself, not a closed formula.
+- Calendar lemmas:
+  - `lemma_year_period`: 400 years hold 146097 days.
+  - `lemma_cycle_start`.
+  - `lemma_years_increase`, `lemma_months_increase`, `lemma_date_bounds`.
+  - `lemma_dates_increase`: day numbers follow the calendar order of valid
+    dates.
+- `civil_from_instant(before_epoch, secs, nanos)`:
+  - It is total for every `u64` second count and `u32` nanosecond count, in
+    both directions, with no overflow.
+  - The result is valid: month in `1..=12`, day in `1..=days_in_month`, hour
+    below 24, minute and second below 60.
+  - It is an exact inverse: `days_from_civil * 86400 + h*3600 + m*60 + s` is
+    `floor_unix_seconds`, the floor of the instant. Sub-second instants before
+    the epoch round down, as chrono does.
+  - `lemma_civil_unique`: no other valid civil time has that second. The
+    conversion is a bijection, and the result is `utc_civil(..)`.
+- `civil_text`: chrono's `%Y-%m-%d %H:%M:%S`.
+  - The year is zero-padded to four digits, with `+` above 9999 and `-` below
+    0. The other fields are two digits.
+  - `format_unix_instant` returns a `String` whose UTF-8 bytes are
+    `civil_text(utc_civil(floor_unix_seconds(..)))`.
+- Text lemmas:
+  - `lemma_civil_text_ascii`.
+  - `lemma_civil_text_shape`: for years `0..=9999` the text is 19 bytes.
+    Separators sit at fixed positions, and each field's digits parse to the
+    field.
+  - `lemma_text_order`: for years `0..=9999`, Unix-time order is exactly byte
+    order of the text.
+  - `lemma_civil_text_injective`: for every year, distinct civil times give
+    distinct text.
+
+Behavior change: the old chrono path panicked for a `SystemTime` outside
+chrono's range (before `-262143-01-01`, after `+262142-12-31 23:59:59`). Such
+times are unreachable from stored reservations. The kernel continues the
+calendar instead, for example `+262143-01-01 00:00:00`.
+
+Trusted: byte equality with chrono over its whole range is pinned by
+`trop/tests/timestamp_format.rs`:
+- every day of 800 years at both ends of the day;
+- random instants with random nanoseconds;
+- named boundaries.
+
+Beyond chrono's range, the same file compares against an independent
+closed-form (Hinnant) reference.
+
+### `verified::json`: the JSON port map (`reserve-group --format=json`)
+
+Glue: `trop/src/output/formatters.rs` (`JsonFormatter`). It passes the map's
+`(tag, port)` pairs to `render_port_map_pretty`. Formatting has no error path.
+
+- `json_escape_char` / `json_escape_body`: `serde_json`'s escaping.
+  - Two-byte escapes: `\"`, `\\`, `\b`, `\t`, `\n`, `\f`, `\r`.
+  - Other C0 controls: `\u00xx` with lowercase hex.
+  - Everything else is copied, including DEL, non-ASCII text and
+    `U+2028`/`U+2029`.
+  - `lemma_escape_matches_serde_bytes`: the UTF-8 text of the escape equals
+    `json_escape_bytes` of the UTF-8 text. That function is serde_json's
+    per-byte `ESCAPE` table, transcribed.
+- `json_scan_string`: the RFC 8259 §7 grammar after an opening quote. It stops
+  at the first unescaped quote, rejects raw controls, and decodes every escape
+  in either hex case. Surrogate escapes are outside it.
+  - `lemma_json_string_round_trip`: every escaped string scans back to itself
+    and ends exactly at its closing quote, whatever follows. The escaped text
+    contains no raw control character.
+  - `lemma_json_string_injective`.
+- `json_object_pretty`: `{}` when empty, otherwise `{\n  "k": v,\n  ...\n}`.
+  This is serde_json's `PrettyFormatter` for a flat object. Values are the
+  canonical decimal text of the port (`verified::render`).
+- `read_json_object`: RFC 8259 for a single object whose values are
+  non-negative `int`s, with optional whitespace around every structural
+  character.
+  - `lemma_object_reads_back`: the rendered object reads back as exactly its
+    entries, in order. The output is valid JSON and loses nothing.
+  - `lemma_port_map_reads_back`.
+- `render_port_map_pretty`: renders the entries in `render::canonical_order` of
+  their UTF-8 key bytes (`BTreeMap<String, _>` order).
+  - `lemma_sorted_keys_increase`: for distinct keys, the keys strictly
+    increase.
+  - `lemma_render_order_independent`: the text depends only on the map, not on
+    the input order.
+
+Glue: `(tag.as_str(), port.value())` for each `HashMap` entry. Keys are
+distinct.
+
+Trusted: the layout and the `ESCAPE` table transcription match
+`serde_json::to_string_pretty`. This is pinned by
+`trop/tests/json_port_map.rs`: a snapshot, a character sweep, adversarial and
+arbitrary property tests, and a serde_json parse-back.
+
+Proof engineering: `#[verifier::spinoff_prover]` isolates four heavy `json`
+functions from shared solver state. The reader functions are
+`#[verifier::opaque]`, and `read_members` terminates by a `#[via_fn]` proof.
+None of these extend the trusted base.
+
 ## Working on verified code
 
 - Read the rules at the top of `trop/src/verified/mod.rs`.
@@ -2242,6 +2523,17 @@ Glue: none directly; `verified::cleanup::plan_removals` calls `order_removals`.
   directly does neither, and one checkout's cached result can then be
   replayed for another, so give each checkout (and each git worktree) its
   own `CARGO_TARGET_DIR`.
+- Proofs near Z3's resource limit are flaky: Verus spreads a module's
+  functions over several solver processes, so the incremental context a
+  query meets varies between runs, and adding unrelated kernels can tip a
+  proof over the limit. After a large change, run the whole suite once at
+  half the default limit (`cd trop-verification && cargo verus verify --
+  --rlimit 5`). Give any proof that fails there its own solver
+  (`#[verifier::spinoff_prover]`), simplify it (an explicit equality chain
+  often removes a sequence-index matching loop), or, if it still needs more
+  than half the budget in isolation, explicit headroom
+  (`#[verifier::rlimit(20)]`, which changes how long Z3 may search, not what
+  is proved).
 - This Verus version cannot prove existential postconditions over a generic
   error type (`r matches Err(e) ==> exists|p| ...`). Return the witness
   instead (for example `ScanFailure { port, error }` in

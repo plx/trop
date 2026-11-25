@@ -59,6 +59,7 @@
     - verified/ # Verus-verified kernels (specs + proofs); production code delegates to these
       - mod.rs # Kernel list and the rules for code in this tree
       - allocation.rs # Port availability classification, forward scan, single-port allocation, preferred-then-scan fallback, exhaustion blockers (oracle-generic)
+      - civil_time.rs # Unix instant -> UTC civil date/time (proleptic Gregorian, exact inverse, overflow-free) and the `%Y-%m-%d %H:%M:%S` text
       - cleanup.rs # Cleanup selection (days->secs, 30-day automatic default), Prune/Expire/Keep reasons, fail-closed prune probe classification, probe-once, removal plan, revalidate-then-delete fates
       - cli.rs # CLI decisions: exit-code table (usage errors 4, 2 only for lock timeouts), SQLite lock-contention codes, data-dir selection, init plan, assertion verdicts, flag derivations, scan probes, list filters, port-argument parsing
       - config.rs # Configuration kernel: TROP_* text (decimal/bool/format), reservations group rules (order-independent), lock-wait bounds, defaults, leaf overlay, placement, discovery
@@ -70,6 +71,7 @@
       - group.rs # Group requests via the shared identifier rule (kernel trims tags/project/task), offset-pattern search, fresh plans, stored-group matching/compatibility, reconciliation, reserve-group/autoreserve output selection
       - identifier.rs # Unicode trim spec + verified &str trim, identifier rule (blank > NUL > 255 bytes), canonical form, stored-tag sentinel lemmas
       - inference.rs # Git inference name steps: repository name (.git parent rule, one .git suffix) and refs/heads/ branch names
+      - json.rs # JSON port map: serde_json string escaping, RFC 8259 string scanner and object reader with round trips, pretty layout, sorted rendering
       - migrate.rs # Migration conflict classification, all-deletes-then-creates schedule, guard over every source/destination key, canonical path rebasing
       - occupancy.rs # Occupancy policy: effective skip flags, probe matrix (set/order/count), fail-closed probe fold, ascending range scan, owner status
       - path.rs # Path normalization: `.`/`..` stack, Unix byte normalizer + canonical-form recognizer, tilde classifier/join, deepest-existing-prefix search, provenance policy
@@ -82,10 +84,13 @@
       - schema_version.rs # Schema-version classification (corrupt metadata never restamped), i32 parsing, v1 preflight completeness, column layouts
       - shell.rs # --shell alias table, SHELL basename classification and detection precedence, export lines with injection-freedom proofs
       - sort.rs # Stable merge sort of positions by u64 key and the cleanup removal order (prune in scan order, then expire oldest-first)
+      - sql_schema.rs # Schema-SQL tokenizer (byte-level spec + exec), injective normalization, token-run containment, coverage, whitespace and bare-word-case robustness
       - sticky.rs # Sticky project/task rules for group refresh and forced replacement (shared can_change_field)
       - storage.rs # Stored ports/timestamps/paths/tags/rows: write predicate == read predicate, injective keys, exact lookups, row round trip, prefix-query key
+      - symlink.rs # Bounded symlink following over step/same oracles: exactly max_depth links, sound and complete loop detection, ghost walk
       - text.rs # ASCII case folding and byte comparisons, ASCII/UTF-8 bridging lemmas, char-offset &str slicing
       - verbosity.rs # Log-level names, CLI resolution (--quiet wins, flags override TROP_LOG_MODE), invalid TROP_LOG_MODE detection, logger severity filter
+      - wal.rs # WAL enablement: journal-mode acceptance, ticket-chained clock/busy-timeout/attempt/pause oracles, exact retry run shape
   - tests/ # Integration tests
     - common/ # Shared test utilities
       - mod.rs # Common test helpers
