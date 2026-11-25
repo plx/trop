@@ -4,6 +4,7 @@ use crate::error::CliError;
 use crate::invocation::InvocationContext;
 use clap::Args;
 use std::path::PathBuf;
+use trop::cli_support::{assertion_outcome, AssertionOutcome};
 
 /// Assert that the data directory exists and is valid.
 #[derive(Args)]
@@ -48,29 +49,19 @@ impl AssertDataDirCommand {
         if exists && self.validate {
             validate_database(context)?;
         }
-        let valid = exists;
 
-        // 4. Check assertion
-        let success = if self.not { !valid } else { valid };
-
-        // 5. Return with appropriate exit code
-        if success {
-            Ok(())
-        } else {
-            let msg = if self.not {
-                format!(
-                    "Assertion failed: data directory exists at {}",
-                    data_dir.display()
-                )
-            } else if self.validate && exists {
-                "Assertion failed: database validation failed".to_string()
-            } else {
-                format!(
-                    "Assertion failed: data directory not found at {}",
-                    data_dir.display()
-                )
-            };
-            Err(CliError::SemanticFailure(msg))
+        // 4. Check the assertion (verified): a failure names what was
+        // observed. (A failed validation never reaches this point.)
+        match assertion_outcome(exists, self.not) {
+            AssertionOutcome::Holds => Ok(()),
+            AssertionOutcome::FailsPresent => Err(CliError::SemanticFailure(format!(
+                "Assertion failed: data directory exists at {}",
+                data_dir.display()
+            ))),
+            AssertionOutcome::FailsAbsent => Err(CliError::SemanticFailure(format!(
+                "Assertion failed: data directory not found at {}",
+                data_dir.display()
+            ))),
         }
     }
 }

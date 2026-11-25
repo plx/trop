@@ -18,6 +18,10 @@
 //!   `spec_component_prefix` is the byte-level test that agrees with
 //!   segment-prefix (`lemma_component_prefix_iff_segs`), and
 //!   `spec_rebase` moves a path from one ancestor to another.
+//! - `home_display` decides how `trop list` shortens a path below the home
+//!   directory: component-wise (like `Path::strip_prefix`), `~/` for the home
+//!   directory itself and `~/rest` below it, and the shortened form names
+//!   exactly the original path (`lemma_home_display_round_trip`).
 //!
 //! Production glue: `crate::path::relationship` (`PathRelationship::between`
 //! and the helpers built on it).
@@ -1313,6 +1317,91 @@ pub proof fn lemma_rebase_canonical(x: Seq<Seq<u8>>, from: Seq<Seq<u8>>, to: Seq
         }
     }
     super::path::lemma_render_canonical(r);
+}
+
+// ===========================================================================
+// Home-relative display (vocabulary for `trop list`)
+// ===========================================================================
+
+/// How `trop list` shows a path relative to the home directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HomeDisplay {
+    /// The path is the home directory: show `~/`.
+    Home,
+    /// The path lies strictly below the home directory: show `~/` followed
+    /// by the path's components from `rest_start` on.
+    Below {
+        /// Index of the first component after the home directory's.
+        rest_start: usize,
+    },
+    /// The path is not under the home directory (or there is no usable home
+    /// directory): show it in full.
+    Elsewhere,
+}
+
+/// `home` (non-empty) is a component prefix of `path`.
+pub open spec fn under_home<A>(path: Seq<A>, home: Seq<A>) -> bool {
+    home.len() > 0 && is_prefix_of(home, path)
+}
+
+/// Decides how to show `path` given `home`, component-wise: the components
+/// are compared as tokens, so `/home/al` is never a prefix of
+/// `/home/alice/x`. An empty `home` never shortens anything.
+pub fn home_display(path: &[PathToken], home: &[PathToken]) -> (r: HomeDisplay)
+    ensures
+        r == HomeDisplay::Home <==> under_home(tok_views(path@), tok_views(home@)) && path@.len()
+            == home@.len(),
+        r matches HomeDisplay::Below { rest_start } ==> rest_start == home@.len() && rest_start
+            < path@.len() && under_home(tok_views(path@), tok_views(home@)),
+        r == HomeDisplay::Elsewhere <==> !under_home(tok_views(path@), tok_views(home@)),
+{
+    let n = home.len();
+    if n == 0 || n > path.len() {
+        return HomeDisplay::Elsewhere;
+    }
+    let mut k: usize = 0;
+    while k < n
+        invariant
+            n == home@.len() <= path@.len(),
+            0 <= k <= n,
+            forall|j: int| 0 <= j < k ==> tok_view(#[trigger] path@[j]) == tok_view(home@[j]),
+        decreases n - k,
+    {
+        if !token_eq(&path[k], &home[k]) {
+            proof {
+                assert(tok_views(path@).subrange(0, n as int)[k as int] == tok_view(path@[k as int]));
+                assert(tok_views(home@)[k as int] == tok_view(home@[k as int]));
+            }
+            return HomeDisplay::Elsewhere;
+        }
+        k += 1;
+    }
+    proof {
+        assert(tok_views(path@).subrange(0, n as int) =~= tok_views(home@));
+    }
+    if n == path.len() {
+        HomeDisplay::Home
+    } else {
+        HomeDisplay::Below { rest_start: n }
+    }
+}
+
+/// The shortened display is a faithful name: home's components followed by
+/// the rest give back the path (so expanding `~` restores it), and two paths
+/// under the same home with the same rest are the same path.
+pub proof fn lemma_home_display_round_trip<A>(path: Seq<A>, other: Seq<A>, home: Seq<A>)
+    requires
+        under_home(path, home),
+        under_home(other, home),
+    ensures
+        home + path.subrange(home.len() as int, path.len() as int) == path,
+        path.subrange(home.len() as int, path.len() as int) == other.subrange(
+            home.len() as int,
+            other.len() as int,
+        ) ==> path == other,
+{
+    assert(home + path.subrange(home.len() as int, path.len() as int) =~= path);
+    assert(home + other.subrange(home.len() as int, other.len() as int) =~= other);
 }
 
 } // verus!

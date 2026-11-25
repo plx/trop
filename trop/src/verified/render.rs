@@ -23,9 +23,13 @@
 //!   human-readable output, injectively (`unescape_field` inverts it) and
 //!   as the identity on text without them; `tab_row` joins escaped fields
 //!   with tabs, one line with one column per field.
+//! - `delimited_record`: one CSV/TSV record, written exactly as the `csv`
+//!   crate's default writer writes it; a strict RFC 4180 reader model
+//!   (`read_record`) reads every written record back as exactly its fields
+//!   (`lemma_delimited_round_trip`).
 //!
 //! Production glue: `crate::output` (`formatters`, `display_field`,
-//! `tab_row`).
+//! `tab_row`) and `crate::cli_support` (`delimited_record`).
 
 use vstd::prelude::*;
 
@@ -2453,6 +2457,568 @@ pub fn tab_row(fields: &[&str]) -> (row: String)
         assert(shown.subrange(0, fields@.len() as int) =~= shown);
     }
     row
+}
+
+// ---------------------------------------------------------------------------
+// Delimited (CSV/TSV) records
+// ---------------------------------------------------------------------------
+
+/// A character that forces a field to be quoted: the delimiter, `"`, or a
+/// line break (`\r`, `\n`).
+pub open spec fn forces_quotes(c: char, d: char) -> bool {
+    c == d || c == '"' || c == '\r' || c == '\n'
+}
+
+/// The field must be quoted (the `csv` crate's `QuoteStyle::Necessary`).
+pub open spec fn needs_quotes(f: Seq<char>, d: char) -> bool {
+    exists|i: int| 0 <= i < f.len() && forces_quotes(#[trigger] f[i], d)
+}
+
+/// `f` with every `"` doubled.
+pub open spec fn double_quotes(f: Seq<char>) -> Seq<char>
+    decreases f.len(),
+{
+    if f.len() == 0 {
+        Seq::<char>::empty()
+    } else {
+        double_quotes(f.drop_last()) + if f.last() == '"' {
+            seq!['"', '"']
+        } else {
+            seq![f.last()]
+        }
+    }
+}
+
+/// One field as written: verbatim when it needs no quotes, otherwise in
+/// double quotes with inner quotes doubled.
+pub open spec fn delimited_field(f: Seq<char>, d: char) -> Seq<char> {
+    if needs_quotes(f, d) {
+        seq!['"'] + double_quotes(f) + seq!['"']
+    } else {
+        f
+    }
+}
+
+/// A record's text without its terminator: the written fields joined by the
+/// delimiter. A record of no fields, or of one empty field, is written `""`
+/// (an empty line would read as no field at all), as the `csv` crate writes
+/// both.
+pub open spec fn record_text(fs: Seq<Seq<char>>, d: char) -> Seq<char> {
+    if fs.len() == 0 || (fs.len() == 1 && fs[0].len() == 0) {
+        seq!['"', '"']
+    } else {
+        join_with(fs.map_values(|f: Seq<char>| delimited_field(f, d)), d)
+    }
+}
+
+/// A record as written: its text and one `\n` terminator.
+pub open spec fn delimited_record_spec(fs: Seq<Seq<char>>, d: char) -> Seq<char> {
+    record_text(fs, d).push('\n')
+}
+
+/// Where a strict RFC 4180 reader is inside a record.
+// A ghost type: only specifications use it. Ordinary builds erase the
+// specifications but keep the declaration, which would otherwise trip the
+// `dead_code` lint.
+#[allow(dead_code)]
+pub ghost enum ReadMode {
+    /// At the start of a field.
+    FieldStart,
+    /// Inside an unquoted field.
+    Unquoted,
+    /// Inside a quoted field.
+    Quoted,
+    /// Just after a `"` inside a quoted field (the closing quote, or the
+    /// first half of a doubled quote).
+    QuoteSeen,
+    /// The text is not a well-formed record.
+    Malformed,
+}
+
+/// A reader's state: the fields read so far, the current field, the mode.
+// A ghost type, like `ReadMode`.
+#[allow(dead_code)]
+pub ghost struct ReadState {
+    /// The completed fields.
+    pub fields: Seq<Seq<char>>,
+    /// The field being read.
+    pub current: Seq<char>,
+    /// Where the reader is.
+    pub mode: ReadMode,
+}
+
+/// The reader at the start of a record.
+pub open spec fn read_start() -> ReadState {
+    ReadState { fields: Seq::empty(), current: Seq::empty(), mode: ReadMode::FieldStart }
+}
+
+/// The current field is complete: it joins the fields and a new one starts.
+pub open spec fn end_field(st: ReadState) -> ReadState {
+    ReadState { fields: st.fields.push(st.current), current: Seq::empty(), mode: ReadMode::FieldStart }
+}
+
+/// The reader as `st`, but in mode `mode` with current field `current`.
+pub open spec fn with_current(st: ReadState, current: Seq<char>, mode: ReadMode) -> ReadState {
+    ReadState { fields: st.fields, current, mode }
+}
+
+/// One character of a strict RFC 4180 reader (with delimiter `d`): a quote
+/// opens a quoted field only at its start; inside quotes a doubled quote is
+/// one quote and a single one closes the field, which must then end; a line
+/// break outside quotes, or a quote inside an unquoted field, is malformed
+/// (a line break would end the record).
+pub open spec fn read_step(st: ReadState, c: char, d: char) -> ReadState {
+    match st.mode {
+        ReadMode::FieldStart => if c == '"' {
+            with_current(st, st.current, ReadMode::Quoted)
+        } else if c == d {
+            end_field(st)
+        } else if c == '\r' || c == '\n' {
+            with_current(st, st.current, ReadMode::Malformed)
+        } else {
+            with_current(st, st.current.push(c), ReadMode::Unquoted)
+        },
+        ReadMode::Unquoted => if c == d {
+            end_field(st)
+        } else if c == '\r' || c == '\n' || c == '"' {
+            with_current(st, st.current, ReadMode::Malformed)
+        } else {
+            with_current(st, st.current.push(c), ReadMode::Unquoted)
+        },
+        ReadMode::Quoted => if c == '"' {
+            with_current(st, st.current, ReadMode::QuoteSeen)
+        } else {
+            with_current(st, st.current.push(c), ReadMode::Quoted)
+        },
+        ReadMode::QuoteSeen => if c == '"' {
+            with_current(st, st.current.push('"'), ReadMode::Quoted)
+        } else if c == d {
+            end_field(st)
+        } else {
+            with_current(st, st.current, ReadMode::Malformed)
+        },
+        ReadMode::Malformed => st,
+    }
+}
+
+/// The reader after the characters `s`, starting from `st`.
+pub open spec fn read_chars(st: ReadState, s: Seq<char>, d: char) -> ReadState {
+    s.fold_left(st, |st: ReadState, c: char| read_step(st, c, d))
+}
+
+/// Reads a record's text (without its terminator) as a strict RFC 4180
+/// reader does: the fields, or `None` when the text is not a single
+/// well-formed record (an unclosed quote, stray quote, or line break outside
+/// quotes).
+pub open spec fn read_record(text: Seq<char>, d: char) -> Option<Seq<Seq<char>>> {
+    let st = read_chars(read_start(), text, d);
+    match st.mode {
+        ReadMode::Quoted | ReadMode::Malformed => None,
+        _ => Some(st.fields.push(st.current)),
+    }
+}
+
+/// The reader holds `f` as an unfinished field that the next delimiter (or
+/// the end of the text) completes.
+pub open spec fn holds_field(st: ReadState, f: Seq<char>) -> bool {
+    &&& st.current == f
+    &&& (st.mode == ReadMode::Unquoted || st.mode == ReadMode::QuoteSeen || (st.mode
+        == ReadMode::FieldStart && f.len() == 0))
+}
+
+/// Reading a concatenation reads one part after the other.
+proof fn lemma_read_concat(st: ReadState, a: Seq<char>, b: Seq<char>, d: char)
+    ensures
+        read_chars(st, a + b, d) == read_chars(read_chars(st, a, d), b, d),
+{
+    let s = a + b;
+    let f = |st: ReadState, c: char| read_step(st, c, d);
+    s.lemma_fold_left_split(st, f, a.len() as int);
+    assert(s.subrange(0, a.len() as int) =~= a);
+    assert(s.subrange(a.len() as int, s.len() as int) =~= b);
+}
+
+/// Reading one more character is one step.
+proof fn lemma_read_push(st: ReadState, s: Seq<char>, c: char, d: char)
+    ensures
+        read_chars(st, s.push(c), d) == read_step(read_chars(st, s, d), c, d),
+{
+    assert(s.push(c).drop_last() =~= s);
+}
+
+/// An unquoted field is read character by character into the current field.
+proof fn lemma_read_plain(st: ReadState, f: Seq<char>, d: char)
+    requires
+        st.mode == ReadMode::FieldStart,
+        st.current.len() == 0,
+        !needs_quotes(f, d),
+    ensures
+        read_chars(st, f, d).fields == st.fields,
+        holds_field(read_chars(st, f, d), f),
+    decreases f.len(),
+{
+    if f.len() == 0 {
+        assert(read_chars(st, f, d) == st);
+        assert(st.current =~= f);
+    } else {
+        let init = f.drop_last();
+        assert(!needs_quotes(init, d)) by {
+            assert forall|i: int| 0 <= i < init.len() implies !forces_quotes(
+                #[trigger] init[i],
+                d,
+            ) by {
+                assert(init[i] == f[i]);
+            }
+        }
+        lemma_read_plain(st, init, d);
+        assert(f =~= init.push(f.last()));
+        lemma_read_push(st, init, f.last(), d);
+        assert(!forces_quotes(f[f.len() - 1], d));
+        let before = read_chars(st, init, d);
+        if init.len() == 0 {
+            assert(before.current =~= Seq::<char>::empty());
+            assert(before.current.push(f.last()) =~= f);
+        } else {
+            assert(before.current.push(f.last()) =~= f);
+        }
+    }
+}
+
+/// Inside quotes, the doubled-quote form of `f` reads back as `f`.
+proof fn lemma_read_doubled(st: ReadState, f: Seq<char>, d: char)
+    requires
+        st.mode == ReadMode::Quoted,
+    ensures
+        read_chars(st, double_quotes(f), d) == with_current(
+            st,
+            st.current + f,
+            ReadMode::Quoted,
+        ),
+    decreases f.len(),
+{
+    if f.len() == 0 {
+        assert(double_quotes(f) =~= Seq::<char>::empty());
+        assert(st.current + f =~= st.current);
+    } else {
+        let init = f.drop_last();
+        let c = f.last();
+        lemma_read_doubled(st, init, d);
+        let mid = with_current(st, st.current + init, ReadMode::Quoted);
+        let chunk = if c == '"' {
+            seq!['"', '"']
+        } else {
+            seq![c]
+        };
+        assert(double_quotes(f) == double_quotes(init) + chunk);
+        lemma_read_concat(st, double_quotes(init), chunk, d);
+        if c == '"' {
+            lemma_read_push(mid, seq!['"'], '"', d);
+            assert(seq!['"'].push('"') =~= chunk);
+            lemma_read_push(mid, Seq::<char>::empty(), '"', d);
+            assert(Seq::<char>::empty().push('"') =~= seq!['"']);
+        } else {
+            lemma_read_push(mid, Seq::<char>::empty(), c, d);
+            assert(Seq::<char>::empty().push(c) =~= chunk);
+        }
+        assert((st.current + init).push(c) =~= st.current + f);
+    }
+}
+
+/// A written field, read from the start of a field, is held as that field.
+proof fn lemma_read_field(st: ReadState, f: Seq<char>, d: char)
+    requires
+        st.mode == ReadMode::FieldStart,
+        st.current.len() == 0,
+        d != '"',
+    ensures
+        read_chars(st, delimited_field(f, d), d).fields == st.fields,
+        holds_field(read_chars(st, delimited_field(f, d), d), f),
+{
+    if needs_quotes(f, d) {
+        let open = read_step(st, '"', d);
+        assert(open == with_current(st, st.current, ReadMode::Quoted));
+        lemma_read_push(st, Seq::<char>::empty(), '"', d);
+        assert(Seq::<char>::empty().push('"') =~= seq!['"']);
+        lemma_read_concat(st, seq!['"'], double_quotes(f), d);
+        lemma_read_doubled(open, f, d);
+        let body = read_chars(open, double_quotes(f), d);
+        lemma_read_concat(st, seq!['"'] + double_quotes(f), seq!['"'], d);
+        lemma_read_push(body, Seq::<char>::empty(), '"', d);
+        assert(st.current + f =~= f);
+    } else {
+        lemma_read_plain(st, f, d);
+    }
+}
+
+/// Reading joined written fields holds all but the last as completed fields
+/// and the last as the unfinished field.
+proof fn lemma_read_join(fs: Seq<Seq<char>>, d: char)
+    requires
+        fs.len() > 0,
+        d != '"',
+    ensures
+        read_chars(
+            read_start(),
+            join_with(fs.map_values(|f: Seq<char>| delimited_field(f, d)), d),
+            d,
+        ).fields == fs.drop_last(),
+        holds_field(
+            read_chars(
+                read_start(),
+                join_with(fs.map_values(|f: Seq<char>| delimited_field(f, d)), d),
+                d,
+            ),
+            fs.last(),
+        ),
+    decreases fs.len(),
+{
+    let shown = fs.map_values(|f: Seq<char>| delimited_field(f, d));
+    if fs.len() == 1 {
+        assert(join_with(shown, d) == shown[0]);
+        lemma_read_field(read_start(), fs[0], d);
+        assert(fs.drop_last() =~= Seq::<Seq<char>>::empty());
+    } else {
+        let init = fs.drop_last();
+        lemma_read_join(init, d);
+        let shown_init = init.map_values(|f: Seq<char>| delimited_field(f, d));
+        assert(shown.drop_last() =~= shown_init);
+        let before = read_chars(read_start(), join_with(shown_init, d), d);
+        // The delimiter completes the previous field.
+        lemma_read_push(read_start(), join_with(shown_init, d), d, d);
+        let after = read_step(before, d, d);
+        assert(after == end_field(before));
+        assert(after.fields =~= init.drop_last().push(init.last()));
+        assert(init.drop_last().push(init.last()) =~= init);
+        lemma_read_field(after, fs.last(), d);
+        lemma_read_concat(read_start(), join_with(shown_init, d).push(d), shown.last(), d);
+        assert(join_with(shown, d) == join_with(shown.drop_last(), d).push(d) + shown.last());
+    }
+}
+
+/// Round trip: every record the writer produces (with a delimiter other
+/// than `"`, `\r` and `\n`) is a single well-formed RFC 4180 record that
+/// reads back as exactly its fields, so the column count and every field's
+/// content survive any field text (commas, tabs, quotes, line breaks). Its
+/// only line break outside quotes is the terminator.
+pub proof fn lemma_delimited_round_trip(fs: Seq<Seq<char>>, d: char)
+    requires
+        fs.len() > 0,
+        d != '"',
+        d != '\r',
+        d != '\n',
+    ensures
+        read_record(record_text(fs, d), d) == Some(fs),
+        delimited_record_spec(fs, d).last() == '\n',
+{
+    if fs.len() == 1 && fs[0].len() == 0 {
+        let open = read_step(read_start(), '"', d);
+        lemma_read_push(read_start(), Seq::<char>::empty(), '"', d);
+        assert(Seq::<char>::empty().push('"') =~= seq!['"']);
+        lemma_read_push(read_start(), seq!['"'], '"', d);
+        assert(seq!['"'].push('"') =~= seq!['"', '"']);
+        let st = read_chars(read_start(), seq!['"', '"'], d);
+        assert(st.mode == ReadMode::QuoteSeen);
+        assert(st.fields.push(st.current) =~= fs);
+    } else {
+        lemma_read_join(fs, d);
+        let st = read_chars(
+            read_start(),
+            join_with(fs.map_values(|f: Seq<char>| delimited_field(f, d)), d),
+            d,
+        );
+        assert(st.fields.push(st.current) =~= fs);
+    }
+}
+
+/// Fields that need no quoting are written verbatim (so ordinary output is
+/// unchanged), and a quoted field starts and ends with `"`.
+pub proof fn lemma_delimited_field_shape(f: Seq<char>, d: char)
+    ensures
+        !needs_quotes(f, d) ==> delimited_field(f, d) == f,
+        needs_quotes(f, d) ==> delimited_field(f, d).len() >= 2 && delimited_field(f, d)[0] == '"'
+            && delimited_field(f, d).last() == '"',
+{
+}
+
+/// Whether `f` needs quotes (see `needs_quotes`).
+fn field_needs_quotes(f: &str, d: char) -> (r: bool)
+    ensures
+        r == needs_quotes(f@, d),
+{
+    let mut chars = f.chars();
+    let ghost n = f@.len() as int;
+    let ghost mut k: int = 0;
+    loop
+        invariant
+            0 <= k <= n,
+            n == f@.len(),
+            vstd::std_specs::iter::IteratorSpec::remaining(&chars) == f@.subrange(k, n),
+            forall|i: int| 0 <= i < k ==> !forces_quotes(#[trigger] f@[i], d),
+        decreases n - k,
+    {
+        let Some(c) = chars.next() else {
+            proof {
+                assert(f@.subrange(k, n).len() == 0);
+            }
+            return false;
+        };
+        proof {
+            assert(f@.subrange(k, n)[0] == f@[k]);
+        }
+        if c == d || c == '"' || c == '\r' || c == '\n' {
+            return true;
+        }
+        proof {
+            k = k + 1;
+        };
+    }
+}
+
+/// Appends `f` with every `"` doubled.
+fn push_doubled(out: &mut String, f: &str)
+    ensures
+        final(out)@ == old(out)@ + double_quotes(f@),
+{
+    let ghost start = out@;
+    let mut chars = f.chars();
+    let ghost n = f@.len() as int;
+    let ghost mut k: int = 0;
+    let mut done = false;
+    proof {
+        assert(f@.subrange(0, 0) =~= Seq::<char>::empty());
+        assert(start + double_quotes(Seq::<char>::empty()) =~= start);
+    }
+    while !done
+        invariant
+            0 <= k <= n,
+            n == f@.len(),
+            vstd::std_specs::iter::IteratorSpec::remaining(&chars) == f@.subrange(k, n),
+            out@ == start + double_quotes(f@.subrange(0, k)),
+            done ==> k == n,
+        decreases n - k + if done {
+            0int
+        } else {
+            1int
+        },
+    {
+        match chars.next() {
+            Some(c) => {
+                proof {
+                    assert(f@.subrange(k, n)[0] == f@[k]);
+                    let next = f@.subrange(0, k + 1);
+                    assert(next.drop_last() =~= f@.subrange(0, k));
+                    assert(next.last() == c);
+                }
+                let ghost before = out@;
+                if c == '"' {
+                    out.push('"');
+                    out.push('"');
+                } else {
+                    out.push(c);
+                }
+                proof {
+                    let chunk = if c == '"' {
+                        seq!['"', '"']
+                    } else {
+                        seq![c]
+                    };
+                    assert(out@ =~= before + chunk);
+                    assert(start + double_quotes(f@.subrange(0, k + 1)) =~= start + (double_quotes(
+                        f@.subrange(0, k),
+                    ) + chunk));
+                    k = k + 1;
+                };
+            },
+            None => {
+                done = true;
+            },
+        }
+    }
+    proof {
+        assert(f@.subrange(0, n) =~= f@);
+    };
+}
+
+/// Appends one written field (see `delimited_field`).
+fn push_delimited_field(out: &mut String, f: &str, d: char)
+    ensures
+        final(out)@ == old(out)@ + delimited_field(f@, d),
+{
+    if field_needs_quotes(f, d) {
+        let ghost start = out@;
+        out.push('"');
+        push_doubled(out, f);
+        out.push('"');
+        proof {
+            assert(out@ =~= start + (seq!['"'] + double_quotes(f@) + seq!['"']));
+        };
+    } else {
+        out.push_str(f);
+    }
+}
+
+/// Writes one delimited record (CSV with `,`, TSV with `\t`) exactly as the
+/// `csv` crate's default writer does: each field verbatim unless it contains
+/// the delimiter, `"`, `\r` or `\n`, in which case it is quoted with inner
+/// quotes doubled; fields joined by the delimiter; one `\n` terminator; a
+/// record of no fields or of one empty field written `""`. See
+/// `lemma_delimited_round_trip`.
+pub fn delimited_record(fields: &[&str], d: char) -> (out: String)
+    ensures
+        out@ == delimited_record_spec(fields@.map_values(|f: &str| f@), d),
+{
+    let ghost views = fields@.map_values(|f: &str| f@);
+    let ghost shown = views.map_values(|f: Seq<char>| delimited_field(f, d));
+    let mut out = String::new();
+    let blank = match fields.len() {
+        0 => true,
+        1 => fields[0].is_empty(),
+        _ => false,
+    };
+    if blank {
+        out.push('"');
+        out.push('"');
+        out.push('\n');
+        proof {
+            if fields@.len() == 1 {
+                assert(views[0] == fields@[0]@);
+            }
+            assert(out@ =~= seq!['"', '"'].push('\n'));
+        }
+        return out;
+    }
+    let mut i: usize = 0;
+    while i < fields.len()
+        invariant
+            0 <= i <= fields.len(),
+            views == fields@.map_values(|f: &str| f@),
+            shown == views.map_values(|f: Seq<char>| delimited_field(f, d)),
+            out@ == join_with(shown.subrange(0, i as int), d),
+        decreases fields.len() - i,
+    {
+        if i > 0 {
+            out.push(d);
+        }
+        push_delimited_field(&mut out, fields[i], d);
+        proof {
+            assert(views[i as int] == fields@[i as int]@);
+            let prefix = shown.subrange(0, i + 1);
+            if i == 0 {
+                assert(prefix =~= seq![shown[0]]);
+            } else {
+                assert(prefix.drop_last() =~= shown.subrange(0, i as int));
+            }
+        }
+        i += 1;
+    }
+    proof {
+        assert(shown.subrange(0, fields@.len() as int) =~= shown);
+        if fields@.len() == 1 {
+            assert(views[0] == fields@[0]@);
+        }
+    }
+    out.push('\n');
+    out
 }
 
 } // verus!

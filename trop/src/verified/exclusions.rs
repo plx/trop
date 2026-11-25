@@ -3,8 +3,9 @@
 //!
 //! Production glue: `crate::port::exclusions` (`ExclusionManager`, list
 //! validation and compaction), `crate::config::validator`
-//! (`excluded_ports` validation), and `crate::config::schema`
-//! (`PortExclusion` text parsing).
+//! (`excluded_ports` validation), `crate::config::schema`
+//! (`PortExclusion` text parsing), and `crate::cli_support`
+//! (`unreserved_ports`, the ports `scan --autoexclude` may exclude).
 
 use vstd::prelude::*;
 
@@ -2742,6 +2743,83 @@ pub fn first_reserved_port<E, F: Fn(u16) -> Result<bool, E>>(
         }
         p += 1;
     }
+}
+
+// ===========================================================================
+// `scan --autoexclude`: occupied ports that are not reserved
+// ===========================================================================
+
+/// The occupied ports `scan --autoexclude` may exclude: those not reserved.
+pub open spec fn not_reserved(reserved: Seq<u16>) -> spec_fn(u16) -> bool {
+    |p: u16| !reserved.contains(p)
+}
+
+/// The occupied ports that are not reserved, in their original order
+/// (duplicates kept). No reserved port is ever returned, so
+/// `scan --autoexclude` never excludes a reserved port, and every occupied
+/// unreserved port is returned.
+pub fn unreserved_ports(occupied: &[u16], reserved: &[u16]) -> (r: Vec<u16>)
+    ensures
+        r@ == occupied@.filter(not_reserved(reserved@)),
+        forall|i: int| 0 <= i < r@.len() ==> !reserved@.contains(#[trigger] r@[i]),
+        forall|i: int|
+            0 <= i < occupied@.len() && !reserved@.contains(occupied@[i]) ==> #[trigger] r@.contains(
+                occupied@[i],
+            ),
+{
+    let ghost keep = not_reserved(reserved@);
+    let mut r: Vec<u16> = Vec::new();
+    let mut i: usize = 0;
+    proof {
+        reveal(Seq::filter);
+        assert(occupied@.subrange(0, 0) =~= Seq::<u16>::empty());
+    }
+    while i < occupied.len()
+        invariant
+            i <= occupied@.len(),
+            keep == not_reserved(reserved@),
+            r@ == occupied@.subrange(0, i as int).filter(keep),
+        decreases occupied@.len() - i,
+    {
+        let p = occupied[i];
+        let mut j: usize = 0;
+        let mut found = false;
+        while j < reserved.len()
+            invariant
+                j <= reserved@.len(),
+                found == exists|k: int| 0 <= k < j && reserved@[k] == p,
+            decreases reserved@.len() - j,
+        {
+            if reserved[j] == p {
+                found = true;
+            }
+            j += 1;
+        }
+        proof {
+            reveal(Seq::filter);
+            let prefix = occupied@.subrange(0, i as int + 1);
+            assert(prefix.drop_last() =~= occupied@.subrange(0, i as int));
+            assert(prefix.last() == p);
+            assert(found == reserved@.contains(p));
+        }
+        if !found {
+            r.push(p);
+        }
+        i += 1;
+    }
+    proof {
+        assert(occupied@.subrange(0, occupied@.len() as int) =~= occupied@);
+        assert forall|k: int| 0 <= k < r@.len() implies !reserved@.contains(#[trigger] r@[k]) by {
+            occupied@.lemma_filter_pred(keep, k);
+        }
+        assert forall|k: int|
+            0 <= k < occupied@.len() && !reserved@.contains(occupied@[k]) implies #[trigger] r@.contains(
+            occupied@[k],
+        ) by {
+            occupied@.lemma_filter_contains(keep, k);
+        }
+    }
+    r
 }
 
 } // verus!

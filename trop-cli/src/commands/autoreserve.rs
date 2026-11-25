@@ -16,8 +16,9 @@ use super::reserve_group::{dry_run_database, report_dry_run, OutputFormatArg};
 #[derive(Args)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AutoreserveCommand {
-    /// Task identifier; omission preserves an existing value (clearing unsupported)
-    #[arg(long, env = "TROP_TASK")]
+    /// Task identifier (overrides TROP_TASK); omission preserves an existing
+    /// value (clearing unsupported)
+    #[arg(long)]
     pub task: Option<String>,
 
     /// Output format
@@ -89,7 +90,9 @@ impl AutoreserveCommand {
 
         // 2. Build AutoreserveOptions
         let options = AutoreserveOptions::new(start_dir.clone())
-            .with_task(self.task)
+            // The effective task: `--task`, else `TROP_TASK`, validated (and
+            // attributed to its source) like `reserve`'s.
+            .with_task(context.effective()?.task().map(str::to_owned))
             .with_force(self.force)
             .with_allow_unrelated_path(context.effective()?.allow_unrelated_path())
             .with_allow_project_change(context.effective()?.allow_project_change())

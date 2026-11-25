@@ -5,9 +5,16 @@
 //!   `normal` and `verbose`, compared without ASCII case, and nothing else
 //!   (no trimming, no prefixes); `lemma_parse_name_round_trip` shows every
 //!   level's name parses back to it, in any ASCII case.
-//! - `resolve_verbosity` is the single precedence rule: `--verbose` wins,
-//!   then `--quiet`, then a valid `TROP_LOG_MODE` value, then `Normal`. An
-//!   invalid environment value is ignored, never an error.
+//! - `resolve_verbosity` is the precedence rule for one flag at a time:
+//!   `--verbose` wins, then `--quiet`, then a valid `TROP_LOG_MODE` value,
+//!   then `Normal`. An invalid environment value is ignored, never an error.
+//! - `resolve_cli_verbosity` is the rule the command line uses for both the
+//!   logger and the commands: it is `resolve_verbosity` with `--quiet`
+//!   taking precedence over `--verbose` when both are given (a request to
+//!   suppress output is never overridden), so either flag overrides
+//!   `TROP_LOG_MODE`. `invalid_log_mode` says when `TROP_LOG_MODE` is set to
+//!   something that is not a level name, so the CLI can diagnose it; an
+//!   empty value counts as unset (`lemma_empty_log_mode_is_unset`).
 //! - `should_emit` is the logger's filter: a message is printed exactly when
 //!   the level's rank reaches the severity's threshold (`Quiet` prints
 //!   nothing, `Normal` errors and warnings, `Verbose` everything); it is
@@ -20,7 +27,8 @@
 //! than through the logger. Making logged errors essential would set
 //! `threshold(Severity::Error)` to 0; that is a maintainer decision.
 //!
-//! Production glue: `crate::logging` (`LogLevel`, `Logger`, `init_logger`).
+//! Production glue: `crate::logging` (`LogLevel`, `Logger`,
+//! `resolve_log_level`, `init_logger`, `invalid_log_mode`).
 
 use vstd::prelude::*;
 
@@ -199,6 +207,54 @@ pub proof fn lemma_resolution_monotone(quiet: bool, env: Option<Seq<u8>>)
     }
 }
 
+/// The command line's precedence: `--quiet` wins over `--verbose`, then
+/// `--verbose`, then a valid `TROP_LOG_MODE` value, then `Normal`. It is
+/// `resolved_level` with `--verbose` ignored when `--quiet` is given.
+pub open spec fn cli_level(verbose: bool, quiet: bool, env: Option<Seq<u8>>) -> Verbosity {
+    resolved_level(verbose && !quiet, quiet, env)
+}
+
+/// The command-line rule: either flag overrides the environment (the
+/// environment matters only without flags, and then a valid level name is
+/// used as is); `--quiet` always gives `Quiet` and `--verbose` without
+/// `--quiet` always gives `Verbose`; and the flags never make the result
+/// both quiet and verbose (it is one level).
+pub proof fn lemma_cli_level(verbose: bool, quiet: bool, e1: Option<Seq<u8>>, e2: Option<Seq<u8>>)
+    ensures
+        verbose || quiet ==> cli_level(verbose, quiet, e1) == cli_level(verbose, quiet, e2),
+        quiet ==> cli_level(verbose, quiet, e1) == Verbosity::Quiet,
+        verbose && !quiet ==> cli_level(verbose, quiet, e1) == Verbosity::Verbose,
+        !verbose && !quiet ==> cli_level(verbose, quiet, e1) == resolved_level(false, false, e1),
+        forall|v: Verbosity|
+            #![auto]
+            e1 == Some(level_name(v)) ==> cli_level(false, false, e1) == v,
+        rank(cli_level(verbose, false, e1)) >= rank(cli_level(false, false, e1)),
+{
+    lemma_resolution_monotone(false, e1);
+}
+
+/// `TROP_LOG_MODE` is set to something that is not a level name. An empty
+/// value (`TROP_LOG_MODE=`, the usual way to clear a variable) counts as
+/// unset: it is not diagnosed, and `resolved_level` gives `Normal` for it,
+/// as for an unset variable (`lemma_empty_log_mode_is_unset`).
+pub open spec fn is_invalid_log_mode(env: Option<Seq<u8>>) -> bool {
+    env matches Some(e) && e.len() > 0 && parse_level(e) is None
+}
+
+/// An empty `TROP_LOG_MODE` behaves exactly like an unset one: it resolves
+/// to the same level for every combination of flags, and it is not
+/// diagnosed. Every other value that is not a level name is diagnosed.
+pub proof fn lemma_empty_log_mode_is_unset(verbose: bool, quiet: bool, e: Seq<u8>)
+    ensures
+        cli_level(verbose, quiet, Some(Seq::<u8>::empty())) == cli_level(verbose, quiet, None),
+        !is_invalid_log_mode(Some(Seq::<u8>::empty())),
+        !is_invalid_log_mode(None),
+        e.len() > 0 ==> (is_invalid_log_mode(Some(e)) <==> parse_level(e) is None),
+{
+    // Every accepted name has 5 to 7 bytes.
+    lemma_parse_level_exact(Seq::<u8>::empty(), Verbosity::Normal);
+}
+
 /// A message severity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -310,6 +366,40 @@ pub fn resolve_verbosity(verbose: bool, quiet: bool, env: Option<&[u8]>) -> (v: 
             },
             None => Verbosity::Normal,
         }
+    }
+}
+
+/// Resolves the command line's level (see `cli_level`): `--quiet` wins over
+/// `--verbose`, either flag wins over `TROP_LOG_MODE`.
+pub fn resolve_cli_verbosity(verbose: bool, quiet: bool, env: Option<&[u8]>) -> (v: Verbosity)
+    ensures
+        v == cli_level(
+            verbose,
+            quiet,
+            match env {
+                Some(e) => Some(e@),
+                None => None,
+            },
+        ),
+        quiet ==> v == Verbosity::Quiet,
+        verbose && !quiet ==> v == Verbosity::Verbose,
+{
+    resolve_verbosity(verbose && !quiet, quiet, env)
+}
+
+/// Decides `is_invalid_log_mode`.
+pub fn invalid_log_mode(env: Option<&[u8]>) -> (r: bool)
+    ensures
+        r == is_invalid_log_mode(
+            match env {
+                Some(e) => Some(e@),
+                None => None,
+            },
+        ),
+{
+    match env {
+        Some(e) => !e.is_empty() && parse_verbosity(e).is_none(),
+        None => false,
     }
 }
 

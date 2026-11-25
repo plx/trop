@@ -217,7 +217,14 @@ fn dry_run_rejects_an_overlong_task_like_a_live_run() {
     let live = reserve_group(&env, &project_dir, &config, &["--task", &task]);
 
     assert_same_failure(&dry, &live, "overlong task");
-    assert!(stderr(&live).contains("'task'"), "{}", stderr(&live));
+    // The task is validated like `reserve --task`: a configuration error
+    // naming the command line (exit 7).
+    assert_eq!(live.status.code(), Some(7), "{}", stderr(&live));
+    assert!(
+        stderr(&live).contains("'task (<command line>)'"),
+        "{}",
+        stderr(&live)
+    );
     assert!(stderr(&live).contains("255 bytes"), "{}", stderr(&live));
     assert!(!env.data_dir.join("trop.db").exists() || rows(&env).is_empty());
 }

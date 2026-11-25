@@ -4,6 +4,7 @@
 //! wrapping library errors and providing appropriate exit codes.
 
 use std::fmt;
+use trop::cli_support::{exit_code_for, ErrorClass};
 use trop::Error as LibError;
 
 /// CLI-specific error type with exit code mapping.
@@ -21,6 +22,10 @@ pub enum CliError {
     /// Data directory not found (and auto-init disabled).
     NoDataDirectory,
 
+    /// No data directory could be determined (no `--data-dir` or
+    /// `TROP_DATA_DIR`, and no usable home directory).
+    DataDirectoryUndetermined(String),
+
     /// Configuration error.
     Config(String),
 
@@ -29,31 +34,40 @@ pub enum CliError {
 }
 
 impl CliError {
+    /// The failure class of this error (the input to the exit-code table).
+    pub fn class(&self) -> ErrorClass {
+        match self {
+            CliError::SemanticFailure(_) => ErrorClass::Semantic,
+            CliError::Library(lib_err) => match lib_err {
+                LibError::LockTimeout { .. } => ErrorClass::LockTimeout,
+                LibError::StickyFieldChange { .. } => ErrorClass::StickyField,
+                LibError::PathRelationshipViolation { .. } => ErrorClass::PathRelationship,
+                _ => ErrorClass::OtherLibrary,
+            },
+            CliError::NoDataDirectory | CliError::DataDirectoryUndetermined(_) => {
+                ErrorClass::NoDataDir
+            }
+            CliError::InvalidArguments(_) => ErrorClass::InvalidArguments,
+            CliError::Io(_) => ErrorClass::Io,
+            CliError::Config(_) => ErrorClass::Config,
+        }
+    }
+
     /// Get the appropriate exit code for this error.
     ///
-    /// Exit codes:
-    /// - 0: Success (not an error)
-    /// - 1: Semantic failure (e.g., assertion failed)
-    /// - 2: Timeout waiting for database lock
-    /// - 3: No data directory found
-    /// - 4: Invalid arguments
+    /// The verified kernel `verified::cli::exit_code_for` maps the error's
+    /// class to the specification's table:
+    /// - 0: Success (never produced for an error)
+    /// - 1: Semantic failure (e.g., assertion failed, refused sticky-field or
+    ///   unrelated-path change)
+    /// - 2: Timeout waiting for database lock (and nothing else)
+    /// - 3: No data directory found or determinable
+    /// - 4: Invalid arguments (including command-line usage errors)
     /// - 5: I/O error
     /// - 6: Other library error
     /// - 7: Configuration error
     pub fn exit_code(&self) -> i32 {
-        match self {
-            CliError::SemanticFailure(_) => 1,
-            CliError::Library(lib_err) => match lib_err {
-                LibError::LockTimeout { .. } => 2,
-                LibError::StickyFieldChange { .. } => 1,
-                LibError::PathRelationshipViolation { .. } => 1,
-                _ => 6,
-            },
-            CliError::NoDataDirectory => 3,
-            CliError::InvalidArguments(_) => 4,
-            CliError::Io(_) => 5,
-            CliError::Config(_) => 7,
-        }
+        exit_code_for(self.class())
     }
 }
 
@@ -68,6 +82,9 @@ impl fmt::Display for CliError {
                     f,
                     "Data directory not found (use --data-dir or enable auto-init)"
                 )
+            }
+            CliError::DataDirectoryUndetermined(msg) => {
+                write!(f, "Data directory not determined: {msg}")
             }
             CliError::Config(msg) => write!(f, "Configuration error: {msg}"),
             CliError::SemanticFailure(msg) => write!(f, "{msg}"),
@@ -94,5 +111,40 @@ impl From<LibError> for CliError {
 impl From<std::io::Error> for CliError {
     fn from(e: std::io::Error) -> Self {
         CliError::Io(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The specification's exit-code table, for every CLI error class.
+    #[test]
+    fn exit_codes_follow_the_specification_table() {
+        let cases: Vec<(CliError, i32)> = vec![
+            (CliError::SemanticFailure("no".into()), 1),
+            (
+                CliError::Library(LibError::LockTimeout {
+                    timeout: std::time::Duration::from_secs(1),
+                    operation: "x".into(),
+                }),
+                2,
+            ),
+            (CliError::NoDataDirectory, 3),
+            (CliError::DataDirectoryUndetermined("no home".into()), 3),
+            (CliError::InvalidArguments("bad".into()), 4),
+            (CliError::Io(std::io::Error::other("io")), 5),
+            (
+                CliError::Library(LibError::Validation {
+                    field: "f".into(),
+                    message: "m".into(),
+                }),
+                6,
+            ),
+            (CliError::Config("bad".into()), 7),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.exit_code(), code, "{error:?}");
+        }
     }
 }

@@ -3,8 +3,9 @@
 //! This module provides a simple stderr-based logging system with
 //! configurable log levels.
 //!
-//! Level names, the CLI/`TROP_LOG_MODE` precedence, and the severity filter
-//! are decided by the formally verified kernel `verified::verbosity` (see
+//! Level names, the CLI/`TROP_LOG_MODE` precedence (`--quiet`, then
+//! `--verbose`, then `TROP_LOG_MODE`), and the severity filter are decided by
+//! the formally verified kernel `verified::verbosity` (see
 //! `docs/verification.md`); this module maps its results onto [`LogLevel`].
 
 use std::env;
@@ -224,11 +225,15 @@ impl Default for Logger {
 /// `TROP_LOG_MODE` value.
 ///
 /// The priority order is:
-/// 1. `--verbose`
-/// 2. `--quiet`
+/// 1. `--quiet` (it wins over `--verbose` when both are given: a request to
+///    suppress output is never overridden)
+/// 2. `--verbose`
 /// 3. `log_mode`, when it names a level (ASCII case-insensitive); any other
 ///    value is ignored
 /// 4. Default (Normal)
+///
+/// The `trop` CLI derives both its logger and its commands' quiet/verbose
+/// behavior from this one level.
 ///
 /// # Examples
 ///
@@ -236,7 +241,8 @@ impl Default for Logger {
 /// use trop::logging::resolve_log_level;
 /// use trop::LogLevel;
 ///
-/// assert_eq!(resolve_log_level(true, true, Some("quiet")), LogLevel::Verbose);
+/// assert_eq!(resolve_log_level(true, true, Some("verbose")), LogLevel::Quiet);
+/// assert_eq!(resolve_log_level(true, false, Some("quiet")), LogLevel::Verbose);
 /// assert_eq!(resolve_log_level(false, true, Some("verbose")), LogLevel::Quiet);
 /// assert_eq!(resolve_log_level(false, false, Some("QUIET")), LogLevel::Quiet);
 /// assert_eq!(resolve_log_level(false, false, Some("loud")), LogLevel::Normal);
@@ -244,7 +250,7 @@ impl Default for Logger {
 /// ```
 #[must_use]
 pub fn resolve_log_level(verbose: bool, quiet: bool, log_mode: Option<&str>) -> LogLevel {
-    LogLevel::from_verbosity(verbosity::resolve_verbosity(
+    LogLevel::from_verbosity(verbosity::resolve_cli_verbosity(
         verbose,
         quiet,
         log_mode.map(str::as_bytes),
@@ -263,7 +269,7 @@ pub fn resolve_log_level(verbose: bool, quiet: bool, log_mode: Option<&str>) -> 
 /// * `verbose` - If true, sets level to Verbose
 /// * `quiet` - If true, sets level to Quiet
 ///
-/// If both `verbose` and `quiet` are true, `verbose` takes precedence. See
+/// If both `verbose` and `quiet` are true, `quiet` takes precedence. See
 /// [`resolve_log_level`].
 ///
 /// # Examples
@@ -362,9 +368,9 @@ mod tests {
     }
 
     #[test]
-    fn test_init_logger_verbose_takes_precedence() {
+    fn test_init_logger_quiet_takes_precedence() {
         let logger = init_logger(true, true);
-        assert_eq!(logger.level(), LogLevel::Verbose);
+        assert_eq!(logger.level(), LogLevel::Quiet);
     }
 
     #[test]
@@ -494,10 +500,12 @@ mod tests {
         for verbose in [false, true] {
             for quiet in [false, true] {
                 for env in envs {
-                    let expected = if verbose {
-                        LogLevel::Verbose
-                    } else if quiet {
+                    // `--quiet` wins over `--verbose`; either flag wins
+                    // over the environment.
+                    let expected = if quiet {
                         LogLevel::Quiet
+                    } else if verbose {
+                        LogLevel::Verbose
                     } else {
                         env.and_then(|value| LogLevel::parse(value).ok())
                             .unwrap_or(LogLevel::Normal)

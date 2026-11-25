@@ -7,7 +7,7 @@ use crate::error::CliError;
 use crate::invocation::InvocationContext;
 use clap::Parser;
 use std::path::PathBuf;
-use trop::operations::init::{init_database, InitOptions};
+use trop::operations::init::{init_database, plan_init, InitOptions, InitPlan};
 
 /// Initialize trop data directory and database.
 #[derive(Parser)]
@@ -38,48 +38,6 @@ impl InitCommand {
     pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
         let data_dir = context.data_dir()?.to_path_buf();
 
-        if self.dry_run {
-            // Dry-run mode: show what would be done
-            println!("Dry-run mode: no changes will be made");
-            println!();
-            println!("Would initialize trop in: {}", data_dir.display());
-
-            if !data_dir.exists() {
-                println!("  - Create data directory: {}", data_dir.display());
-            } else {
-                println!("  - Data directory already exists: {}", data_dir.display());
-            }
-
-            let db_path = data_dir.join("trop.db");
-            if db_path.exists() {
-                if self.overwrite {
-                    println!("  - Remove existing database: {}", db_path.display());
-                    println!("  - Create new database: {}", db_path.display());
-                } else {
-                    println!(
-                        "  - ERROR: Database already exists (use --overwrite to replace): {}",
-                        db_path.display()
-                    );
-                }
-            } else {
-                println!("  - Create database: {}", db_path.display());
-            }
-
-            if self.with_config {
-                let config_path = data_dir.join("config.yaml");
-                if config_path.exists() {
-                    println!(
-                        "  - Configuration file already exists (will not overwrite): {}",
-                        config_path.display()
-                    );
-                } else {
-                    println!("  - Create configuration file: {}", config_path.display());
-                }
-            }
-
-            return Ok(());
-        }
-
         // Build initialization options
         let options = InitOptions::new(data_dir.clone())
             .with_overwrite(self.overwrite)
@@ -87,6 +45,15 @@ impl InitCommand {
             .with_busy_timeout(std::time::Duration::from_secs(
                 context.effective()?.maximum_lock_wait_seconds(),
             ));
+
+        if self.dry_run {
+            // The dry run reports the plan the live run would carry out, and
+            // fails exactly when it would (an existing database without
+            // --overwrite), with the same error and exit code.
+            let plan = plan_init(&options).map_err(CliError::from)?;
+            print_dry_run(&plan, self.with_config);
+            return Ok(());
+        }
 
         // Execute initialization
         let result = init_database(&options).map_err(CliError::from)?;
@@ -99,7 +66,7 @@ impl InitCommand {
         }
 
         if result.database_created {
-            if self.overwrite {
+            if result.database_replaced {
                 println!("  - Recreated database");
             } else {
                 println!("  - Created database");
@@ -113,5 +80,38 @@ impl InitCommand {
         }
 
         Ok(())
+    }
+}
+
+/// Prints what a live run would do.
+fn print_dry_run(plan: &InitPlan, with_config: bool) {
+    let data_dir = &plan.data_dir;
+    println!("Dry-run mode: no changes will be made");
+    println!();
+    println!("Would initialize trop in: {}", data_dir.display());
+
+    if plan.create_data_dir {
+        println!("  - Create data directory: {}", data_dir.display());
+    } else {
+        println!("  - Data directory already exists: {}", data_dir.display());
+    }
+
+    let db_path = plan.database_path();
+    if plan.replace_database {
+        println!("  - Remove existing database: {}", db_path.display());
+        println!("  - Create new database: {}", db_path.display());
+    } else {
+        println!("  - Create database: {}", db_path.display());
+    }
+
+    let config_path = plan.config_path();
+    if plan.create_config {
+        println!("  - Create configuration file: {}", config_path.display());
+    } else if with_config {
+        // Requested but kept: the plan never replaces an existing file.
+        println!(
+            "  - Configuration file already exists (will not overwrite): {}",
+            config_path.display()
+        );
     }
 }

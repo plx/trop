@@ -17,9 +17,8 @@ use crate::invocation::{
 use crate::utils::GlobalOptions;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use trop::config::{
-    CleanupConfig, ConfigField, OccupancyConfig, OutputFormat as ConfigOutputFormat, PortConfig,
-};
+use trop::cli_support::{cleanup_switches, occupancy_layer, OccupancySwitches};
+use trop::config::{CleanupConfig, ConfigField, OutputFormat as ConfigOutputFormat, PortConfig};
 
 /// Command-line tool for managing ephemeral port reservations.
 #[derive(Parser)]
@@ -200,14 +199,20 @@ impl Command {
                     command.allow_change,
                     ConfigField::AllowChange,
                 );
+                // `--disable-autoclean` turns off both cleanups (verified).
+                let (disable_autoprune, disable_autoexpire) = cleanup_switches(
+                    command.disable_autoprune,
+                    command.disable_autoexpire,
+                    command.disable_autoclean,
+                );
                 set_true(
                     &mut command_line,
-                    command.disable_autoprune || command.disable_autoclean,
+                    disable_autoprune,
                     ConfigField::DisableAutoprune,
                 );
                 set_true(
                     &mut command_line,
-                    command.disable_autoexpire || command.disable_autoclean,
+                    disable_autoexpire,
                     ConfigField::DisableAutoexpire,
                 );
                 set_occupancy_overrides(
@@ -250,9 +255,11 @@ impl Command {
                     command.skip_udp,
                     command.check_all_interfaces,
                 );
+                validate_task_like_reserve(&mut command_line, command.task.as_ref());
                 ConfigScope::ExplicitProject(command.config_path.clone())
             }
             Self::Autoreserve(command) => {
+                validate_task_like_reserve(&mut command_line, command.task.as_ref());
                 set_permissions(
                     &mut command_line,
                     command.allow_unrelated_path,
@@ -292,7 +299,10 @@ impl Command {
                 ConfigScope::Discover
             }
             Self::Scan(command) => {
-                set_port_overrides(&mut command_line, command.min, command.max)?;
+                // Parsed exactly like `reserve`'s bounds (same messages, exit 4).
+                let min = parse_port_flag("--min", command.min.as_deref())?;
+                let max = parse_port_flag("--max", command.max.as_deref())?;
+                set_port_overrides(&mut command_line, min, max)?;
                 set_occupancy_overrides(
                     &mut command_line,
                     false,
@@ -381,6 +391,22 @@ impl Command {
     }
 }
 
+/// Route a `reserve-group`/`autoreserve` `--task` through the configuration
+/// layer `reserve` uses for its own `--task`. The group commands then take
+/// their task from the effective configuration (`--task`, else `TROP_TASK`),
+/// exactly as `reserve` does, so the same invalid value is rejected the same
+/// way by all three commands (a configuration error naming its source, the
+/// command line or `TROP_TASK`, exit 7).
+fn validate_task_like_reserve(command_line: &mut CommandLineConfig, task: Option<&String>) {
+    if let Some(task) = task {
+        command_line.reservation_metadata = Some(ReservationMetadataRequest {
+            clear_project: false,
+            task: Some(task.clone()),
+            clear_task: false,
+        });
+    }
+}
+
 /// Parse a `trop reserve` port flag, reporting a bad value once (not wrapped
 /// twice in "Invalid arguments").
 fn parse_port_flag(flag: &str, value: Option<&str>) -> Result<Option<u16>, CliError> {
@@ -464,34 +490,35 @@ fn set_occupancy_overrides(
     skip_udp: bool,
     check_all_interfaces: bool,
 ) {
-    if !(skip || skip_ip4 || skip_ip6 || skip_tcp || skip_udp || check_all_interfaces) {
+    // The verified layer: no layer without a switch, and `Some(true)` exactly
+    // for the given switches (the command line never re-enables a probe).
+    let Some(layer) = occupancy_layer(OccupancySwitches {
+        skip,
+        skip_ipv4: skip_ip4,
+        skip_ipv6: skip_ip6,
+        skip_tcp,
+        skip_udp,
+        check_all_interfaces,
+    }) else {
         return;
-    }
+    };
 
-    command_line.config.occupancy_check = Some(OccupancyConfig {
-        skip: skip.then_some(true),
-        skip_ip4: skip_ip4.then_some(true),
-        skip_ip6: skip_ip6.then_some(true),
-        skip_tcp: skip_tcp.then_some(true),
-        skip_udp: skip_udp.then_some(true),
-        check_all_interfaces: check_all_interfaces.then_some(true),
-    });
-
-    for (enabled, field) in [
-        (skip, ConfigField::OccupancySkip),
-        (skip_ip4, ConfigField::OccupancySkipIp4),
-        (skip_ip6, ConfigField::OccupancySkipIp6),
-        (skip_tcp, ConfigField::OccupancySkipTcp),
-        (skip_udp, ConfigField::OccupancySkipUdp),
+    for (leaf, field) in [
+        (layer.skip, ConfigField::OccupancySkip),
+        (layer.skip_ip4, ConfigField::OccupancySkipIp4),
+        (layer.skip_ip6, ConfigField::OccupancySkipIp6),
+        (layer.skip_tcp, ConfigField::OccupancySkipTcp),
+        (layer.skip_udp, ConfigField::OccupancySkipUdp),
         (
-            check_all_interfaces,
+            layer.check_all_interfaces,
             ConfigField::OccupancyCheckAllInterfaces,
         ),
     ] {
-        if enabled {
+        if leaf.is_some() {
             command_line.record(field);
         }
     }
+    command_line.config.occupancy_check = Some(layer);
 }
 
 fn set_cleanup_days(command_line: &mut CommandLineConfig, days: Option<u32>) {
@@ -523,6 +550,7 @@ fn set_true(command_line: &mut CommandLineConfig, enabled: bool, field: ConfigFi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trop::config::OccupancyConfig;
 
     fn globals() -> GlobalOptions {
         GlobalOptions {

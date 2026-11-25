@@ -6,24 +6,24 @@ use crate::invocation::InvocationContext;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 use std::fmt::Write as _;
+use trop::cli_support::{delimited_record, scan_check_config, unreserved_ports};
 use trop::config::{Config, PortConfig};
+use trop::output::display_field;
 use trop::port::allocator::port_range_from_config;
 use trop::port::exclusions::{add_ports_to_list, compact_exclusions, is_compact, WriteScope};
-use trop::port::occupancy::{
-    OccupancyCheckConfig, OccupancyReport, OccupiedProbe, SystemOccupancyChecker,
-};
+use trop::port::occupancy::{OccupancyReport, OccupiedProbe, SystemOccupancyChecker};
 use trop::{Database, Port, PortRange};
 
 /// Scan port range for occupied ports.
 #[derive(Args)]
 pub struct ScanCommand {
     /// Minimum port (uses config if not specified)
-    #[arg(long)]
-    pub min: Option<u16>,
+    #[arg(long, value_name = "MIN")]
+    pub min: Option<String>,
 
     /// Maximum port (uses config if not specified)
-    #[arg(long)]
-    pub max: Option<u16>,
+    #[arg(long, value_name = "MAX")]
+    pub max: Option<String>,
 
     /// Automatically add occupied, unreserved ports to exclusion list
     #[arg(long)]
@@ -108,13 +108,20 @@ impl ScanCommand {
         // 2. Open database
         let db = context.open_database()?;
 
-        // 3. Scan for occupied ports
+        // 3. Scan for occupied ports. Scanning is this command's purpose, so
+        // a configured global `skip` (meant for allocations) does not apply;
+        // the protocol and family switches do. When they leave no probe, the
+        // ports cannot be checked, and saying "nothing is occupied" would be
+        // false, so the scan fails instead (the verified
+        // `scan_check_config` decides both).
         let checker = SystemOccupancyChecker;
-        let check_config = config
-            .occupancy_check
-            .as_ref()
-            .map(OccupancyCheckConfig::from)
-            .unwrap_or_default();
+        let check_config = scan_check_config(config.occupancy_check.as_ref()).ok_or_else(|| {
+            CliError::Config(
+                "ports were not checked: the effective occupancy settings disable every \
+                 probe (both TCP and UDP, or both IPv4 and IPv6, are skipped)"
+                    .to_string(),
+            )
+        })?;
 
         let reports = checker
             .find_occupied_reports(&range, &check_config)
@@ -125,12 +132,9 @@ impl ScanCommand {
         let reserved_ports = Database::get_reserved_ports_in_range(db.connection(), &range)
             .map_err(CliError::from)?;
 
-        // 5. Find unreserved occupied ports
-        let unreserved_occupied: Vec<Port> = occupied_ports
-            .iter()
-            .filter(|p| !reserved_ports.contains(p))
-            .copied()
-            .collect();
+        // 5. Find unreserved occupied ports (verified: never a reserved port,
+        // so `--autoexclude` never excludes a reserved port).
+        let unreserved_occupied: Vec<Port> = unreserved_ports(&occupied_ports, &reserved_ports);
 
         // 6. Auto-exclude (and auto-compact) if requested
         if self.autoexclude && !unreserved_occupied.is_empty() {
@@ -234,10 +238,10 @@ impl ScanCommand {
                 println!("{json}");
             }
             ScanOutputFormat::Csv => {
-                print!("{}", render_delimited(&results, b',')?);
+                print!("{}", render_delimited(&results, ','));
             }
             ScanOutputFormat::Tsv => {
-                print!("{}", render_delimited(&results, b'\t')?);
+                print!("{}", render_delimited(&results, '\t'));
             }
         }
 
@@ -252,6 +256,12 @@ impl ScanCommand {
 
 fn optional_display<T: ToString>(value: Option<T>) -> String {
     value.map_or_else(|| "unavailable".to_string(), |value| value.to_string())
+}
+
+/// An owner field reported by the operating system (process name, user),
+/// escaped for the table so it cannot break the row's line or columns.
+fn owner_cell(value: Option<&str>) -> String {
+    value.map_or_else(|| "unavailable".to_string(), display_field)
 }
 
 fn render_table(results: &[ScanResult]) -> String {
@@ -284,8 +294,8 @@ fn render_table(results: &[ScanResult]) -> String {
             result.scope,
             result.address,
             optional_display(result.process_id),
-            optional_display(result.process_name.as_deref()),
-            optional_display(result.user.as_deref()),
+            owner_cell(result.process_name.as_deref()),
+            owner_cell(result.user.as_deref()),
             result.owner_status,
         )
         .expect("writing to a String cannot fail");
@@ -293,12 +303,13 @@ fn render_table(results: &[ScanResult]) -> String {
     output
 }
 
-fn render_delimited(results: &[ScanResult], delimiter: u8) -> Result<String, CliError> {
-    let mut writer = csv::WriterBuilder::new()
-        .delimiter(delimiter)
-        .from_writer(Vec::new());
-    writer
-        .write_record([
+/// The delimited (CSV/TSV) output, written by the verified
+/// `delimited_record` (byte for byte the `csv` crate's default writer): a
+/// field containing the delimiter, a quote, or a line break is quoted, so
+/// every probe is one record of eleven fields.
+fn render_delimited(results: &[ScanResult], delimiter: char) -> String {
+    let mut output = delimited_record(
+        &[
             "port",
             "status",
             "reserved",
@@ -310,31 +321,33 @@ fn render_delimited(results: &[ScanResult], delimiter: u8) -> Result<String, Cli
             "process_name",
             "user",
             "owner_status",
-        ])
-        .map_err(|error| CliError::Config(format!("Delimited output failed: {error}")))?;
+        ],
+        delimiter,
+    );
     for result in results {
-        writer
-            .write_record([
-                result.port.to_string(),
-                result.status.clone(),
-                result.reserved.to_string(),
-                result.protocol.clone(),
-                result.address_family.clone(),
-                result.scope.clone(),
-                result.address.clone(),
-                optional_display(result.process_id),
-                optional_display(result.process_name.as_deref()),
-                optional_display(result.user.as_deref()),
-                result.owner_status.clone(),
-            ])
-            .map_err(|error| CliError::Config(format!("Delimited output failed: {error}")))?;
+        let port = result.port.to_string();
+        let reserved = result.reserved.to_string();
+        let process_id = optional_display(result.process_id);
+        let process_name = optional_display(result.process_name.as_deref());
+        let user = optional_display(result.user.as_deref());
+        output.push_str(&delimited_record(
+            &[
+                &port,
+                &result.status,
+                &reserved,
+                &result.protocol,
+                &result.address_family,
+                &result.scope,
+                &result.address,
+                &process_id,
+                &process_name,
+                &user,
+                &result.owner_status,
+            ],
+            delimiter,
+        ));
     }
-    let bytes = writer
-        .into_inner()
-        .map_err(|error| CliError::Config(format!("Delimited output failed: {error}")))?;
-    let output = String::from_utf8(bytes)
-        .map_err(|error| CliError::Config(format!("Delimited output was not UTF-8: {error}")))?;
-    Ok(output)
+    output
 }
 
 #[cfg(test)]
@@ -498,15 +511,30 @@ mod tests {
     fn delimited_schema_snapshots_append_deterministic_evidence_columns() {
         let results = [unavailable_result()];
         assert_eq!(
-            render_delimited(&results, b',').unwrap(),
+            render_delimited(&results, ','),
             "port,status,reserved,protocol,address_family,scope,address,process_id,process_name,user,owner_status\n\
              5050,occupied,false,tcp,ipv4,localhost,127.0.0.1,unavailable,unavailable,unavailable,unavailable\n"
         );
         assert_eq!(
-            render_delimited(&results, b'\t').unwrap(),
+            render_delimited(&results, '\t'),
             "port\tstatus\treserved\tprotocol\taddress_family\tscope\taddress\tprocess_id\tprocess_name\tuser\towner_status\n\
              5050\toccupied\tfalse\ttcp\tipv4\tlocalhost\t127.0.0.1\tunavailable\tunavailable\tunavailable\tunavailable\n"
         );
+    }
+
+    /// Regression: an owner process name or user with a newline or tab
+    /// broke the scan table's one-line-per-probe layout.
+    #[test]
+    fn table_cells_from_the_os_are_escaped() {
+        let mut result = unavailable_result();
+        result.process_name = Some("evil\nproc".to_string());
+        result.user = Some("a\tb\u{1b}[31m".to_string());
+        let rendered = render_table(&[result]);
+        assert_eq!(rendered.lines().count(), 3, "{rendered}");
+        assert!(rendered.contains("\"evil\\nproc\""), "{rendered}");
+        assert!(rendered.contains("\"a\\tb\\x1b[31m\""), "{rendered}");
+        assert!(!rendered.contains('\t'));
+        assert!(!rendered.contains('\u{1b}'));
     }
 
     #[test]
