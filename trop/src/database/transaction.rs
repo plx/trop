@@ -72,15 +72,15 @@ impl Database {
             let mut delete_stmt = tx.prepare(DELETE_RESERVATION)?;
             let mut insert_stmt = tx.prepare(INSERT_RESERVATION)?;
             for row in &rows {
-                delete_stmt.execute(params![row.path, row.tag])?;
+                delete_stmt.execute(params![row.path(), row.tag()])?;
                 insert_stmt.execute(params![
-                    row.path,
-                    row.tag,
-                    row.port,
-                    row.project,
-                    row.task,
-                    row.created_at,
-                    row.last_used_at,
+                    row.path(),
+                    row.tag(),
+                    row.port(),
+                    row.project(),
+                    row.task(),
+                    row.created_at(),
+                    row.last_used_at(),
                 ])?;
             }
         }
@@ -139,7 +139,7 @@ impl Database {
         {
             let mut stmt = tx.prepare(DELETE_RESERVATION)?;
             for key in &stored {
-                total_deleted += stmt.execute(params![key.path, key.tag])?;
+                total_deleted += stmt.execute(params![key.path(), key.tag()])?;
             }
         }
 

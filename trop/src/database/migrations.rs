@@ -226,12 +226,20 @@ enum MigrationPhase {
 /// Initializes a fresh database directly at the current schema version.
 ///
 /// Initialization is atomic: a failed statement leaves the database
-/// uninitialized rather than exposing a partial schema.
+/// uninitialized rather than exposing a partial schema. The decision is made
+/// under the write lock, on what that transaction sees (verified kernel
+/// `classify_for_open`): only a database with neither the `metadata` nor the
+/// `reservations` table is initialized. A database another client
+/// initialized first (for example a concurrent first open) is validated and
+/// left unchanged, and any other schema is refused with the error opening
+/// reports; existing metadata is never restamped.
 ///
 /// # Errors
 ///
-/// Returns a typed migration error when the database is read-only, or a
-/// database error when schema creation, validation, or commit fails.
+/// Returns a typed migration error when the database is read-only or holds
+/// an older schema, an unsupported-version error for a newer schema, a
+/// corruption error for corrupt schema metadata, or a database error when
+/// schema creation, validation, or commit fails.
 pub fn initialize_schema(conn: &Connection) -> Result<()> {
     if conn.is_readonly(MAIN_DB)? {
         return Err(Error::MigrationRequired {
@@ -242,10 +250,31 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     }
 
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    initialize_schema_in_transaction(&tx)?;
-    validate_schema_v2(&tx)?;
-    tx.commit()?;
-    Ok(())
+    let metadata = observe_metadata(&tx)?;
+    match classify_for_open(metadata.state(), metadata.reservations_table) {
+        OpenDisposition::Initialize => {
+            initialize_schema_in_transaction(&tx)?;
+            validate_schema_v2(&tx)?;
+            tx.commit()?;
+            Ok(())
+        }
+        // Another client created the current schema first.
+        OpenDisposition::UpToDate => {
+            validate_schema_v2(&tx)?;
+            tx.rollback()?;
+            Ok(())
+        }
+        OpenDisposition::MigrateFromPublished => Err(Error::MigrationRequired {
+            found: PUBLISHED_SCHEMA_VERSION,
+            target: CURRENT_SCHEMA_VERSION,
+            action: "the database already holds the published schema; open it with \
+                     `Database::open` to apply the ordered migration"
+                .into(),
+        }),
+        OpenDisposition::Future(version) => Err(unsupported_version(version)),
+        OpenDisposition::NoMigrationPath(version) => Err(no_migration_path(version)),
+        OpenDisposition::Corrupt(corruption) => Err(version_corruption(corruption)),
+    }
 }
 
 fn initialize_schema_in_transaction(conn: &Connection) -> Result<()> {
@@ -260,32 +289,36 @@ fn initialize_schema_in_transaction(conn: &Connection) -> Result<()> {
 
 /// Gets the schema version stored in the metadata table.
 ///
-/// Version zero denotes an uninitialized database: neither the `metadata`
-/// nor the `reservations` table exists.
+/// Version zero denotes an uninitialized database, and only that: neither
+/// the `metadata` nor the `reservations` table exists. (A stored version of
+/// zero is reported as an error instead, so it cannot be mistaken for an
+/// uninitialized database.)
 ///
 /// # Errors
 ///
 /// Returns a database corruption error when the schema metadata is corrupt:
 /// a `metadata` table without exactly one integer `schema_version` row, or a
 /// `reservations` table without a `metadata` table. Such a database is never
-/// treated as uninitialized.
+/// treated as uninitialized. A stored version of zero is reported as a
+/// migration-required error (no migration path), as opening reports it.
 pub fn get_schema_version(conn: &Connection) -> Result<i32> {
     let observed = observe_metadata(conn)?;
     match classify_for_open(observed.state(), observed.reservations_table) {
         OpenDisposition::Initialize => Ok(0),
         OpenDisposition::UpToDate => Ok(CURRENT_SCHEMA_VERSION),
         OpenDisposition::MigrateFromPublished => Ok(PUBLISHED_SCHEMA_VERSION),
+        OpenDisposition::NoMigrationPath(0) => Err(no_migration_path(0)),
         OpenDisposition::Future(version) | OpenDisposition::NoMigrationPath(version) => Ok(version),
         OpenDisposition::Corrupt(corruption) => Err(version_corruption(corruption)),
     }
 }
 
 /// What the glue observed about the schema metadata: the facts the verified
-/// schema-version kernel classifies.
+/// schema-version kernel classifies, all read from one snapshot.
 pub(super) struct ObservedMetadata {
     version: ObservedVersion,
-    /// Whether a `reservations` table exists (only looked up, and only
-    /// relevant, when there is no `metadata` table).
+    /// Whether a `reservations` table exists (only relevant when there is no
+    /// `metadata` table).
     reservations_table: bool,
 }
 
@@ -309,8 +342,41 @@ impl ObservedMetadata {
 }
 
 /// Reads the `schema_version` rows, and whether a `reservations` table
-/// exists when the `metadata` table does not.
+/// exists, from one consistent snapshot of the database.
+///
+/// Separate autocommit statements could straddle another client's commit:
+/// a concurrent first open would then see a `reservations` table but no
+/// `metadata` table and misreport a healthy database as corrupt. Outside a
+/// transaction the reads therefore run in one read transaction; inside one,
+/// the caller's transaction already fixes the snapshot.
 pub(super) fn observe_metadata(conn: &Connection) -> Result<ObservedMetadata> {
+    observe_metadata_with(conn, || Ok(()))
+}
+
+/// `observe_metadata`, running `between_reads` after the first read (tests
+/// use it to commit from another connection in the middle).
+fn observe_metadata_with(
+    conn: &Connection,
+    between_reads: impl FnOnce() -> Result<()>,
+) -> Result<ObservedMetadata> {
+    if !conn.is_autocommit() {
+        return observe_metadata_in_snapshot(conn, between_reads);
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let observed = observe_metadata_in_snapshot(&tx, between_reads)?;
+    tx.commit()?;
+    Ok(observed)
+}
+
+/// `observe_metadata` within the caller's transaction.
+fn observe_metadata_in_snapshot(
+    conn: &Connection,
+    between_reads: impl FnOnce() -> Result<()>,
+) -> Result<ObservedMetadata> {
+    // This first read starts the transaction's snapshot, so the `metadata`
+    // lookup below is resolved against the same snapshot.
+    let reservations_table = table_exists(conn, "reservations")?;
+    between_reads()?;
     let version = match conn.prepare(SELECT_SCHEMA_VERSION) {
         Err(error) if is_missing_metadata_table(&error) => ObservedVersion::NoTable,
         Err(error) => return Err(error.into()),
@@ -328,8 +394,6 @@ pub(super) fn observe_metadata(conn: &Connection) -> Result<ObservedMetadata> {
             }
         }
     };
-    let reservations_table =
-        matches!(version, ObservedVersion::NoTable) && table_exists(conn, "reservations")?;
     Ok(ObservedMetadata {
         version,
         reservations_table,
@@ -367,6 +431,15 @@ fn version_corruption(corruption: Corruption) -> Error {
         Corruption::NotAnInteger => "schema_version must be a base-10 signed integer",
     };
     Error::corrupt_stored_value("metadata", "value", "key=\"schema_version\"", reason)
+}
+
+/// The error for an older stored version that has no ordered migration.
+fn no_migration_path(version: i32) -> Error {
+    Error::MigrationRequired {
+        found: version,
+        target: CURRENT_SCHEMA_VERSION,
+        action: "no ordered migration is available for this older schema version".into(),
+    }
 }
 
 /// The error for a schema newer than this client.
@@ -411,19 +484,15 @@ fn check_schema_compatibility_with_observer(
     mut observer: impl FnMut(MigrationPhase) -> Result<()>,
 ) -> Result<()> {
     // The verified kernel decides; only a database with neither table is
-    // initialized, and corrupt metadata is reported, never restamped.
+    // initialized, and corrupt metadata is reported, never restamped. The
+    // observation is one snapshot, and initialization decides again under
+    // the write lock (another client may create the schema in between).
     let metadata = observe_metadata(conn)?;
     match classify_for_open(metadata.state(), metadata.reservations_table) {
         OpenDisposition::Initialize => return initialize_schema(conn),
         OpenDisposition::UpToDate => return Ok(()),
         OpenDisposition::Future(version) => return Err(unsupported_version(version)),
-        OpenDisposition::NoMigrationPath(version) => {
-            return Err(Error::MigrationRequired {
-                found: version,
-                target: CURRENT_SCHEMA_VERSION,
-                action: "no ordered migration is available for this older schema version".into(),
-            });
-        }
+        OpenDisposition::NoMigrationPath(version) => return Err(no_migration_path(version)),
         OpenDisposition::Corrupt(corruption) => return Err(version_corruption(corruption)),
         OpenDisposition::MigrateFromPublished => {}
     }
@@ -864,6 +933,147 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// The metadata observation is one snapshot: another connection that
+    /// initializes the database between its two reads is not half-seen as
+    /// "a reservations table without a metadata table" (which reported a
+    /// healthy database as corrupt during concurrent first opens). Opening
+    /// then finds the schema current under the lock and leaves it unchanged.
+    #[test]
+    fn metadata_observation_is_one_snapshot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("trop.db");
+        let observer = Connection::open(&path).unwrap();
+        let initializer = Connection::open(&path).unwrap();
+        for conn in [&observer, &initializer] {
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal");
+        }
+
+        let snapshot =
+            observe_metadata_with(&observer, || initialize_schema(&initializer)).unwrap();
+        assert_eq!(
+            classify_for_open(snapshot.state(), snapshot.reservations_table),
+            OpenDisposition::Initialize
+        );
+        assert!(observer.is_autocommit(), "the read transaction ended");
+
+        // The initializer committed in the meantime. Acting on its stale
+        // observation, the observer initializes: under the write lock it
+        // finds the schema current and leaves it unchanged.
+        initializer
+            .execute(
+                "UPDATE metadata SET value = '02' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        initialize_schema(&observer).unwrap();
+        check_schema_compatibility(&observer).unwrap();
+        let stored: String = observer
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "02");
+    }
+
+    /// `initialize_schema` decides under its write lock: it initializes only
+    /// an empty database, accepts one that is already current, and refuses
+    /// (without restamping) every other schema.
+    #[test]
+    fn initialize_schema_never_restamps_existing_metadata() {
+        let stored_version = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+        };
+
+        let conn = create_test_connection();
+        initialize_schema(&conn).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(stored_version(&conn).as_deref(), Some("2"));
+
+        let conn = create_test_connection();
+        initialize_schema(&conn).unwrap();
+        conn.execute(
+            "UPDATE metadata SET value = '3' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            initialize_schema(&conn),
+            Err(Error::UnsupportedSchemaVersion { found: 3, .. })
+        ));
+        assert_eq!(stored_version(&conn).as_deref(), Some("3"));
+
+        let conn = create_test_connection();
+        initialize_schema(&conn).unwrap();
+        conn.execute("DELETE FROM metadata", []).unwrap();
+        assert!(matches!(
+            initialize_schema(&conn),
+            Err(Error::DatabaseCorruption { .. })
+        ));
+        assert_eq!(stored_version(&conn), None);
+
+        let conn = create_test_connection();
+        create_published_v1_schema(&conn);
+        assert!(matches!(
+            initialize_schema(&conn),
+            Err(Error::MigrationRequired { found: 1, .. })
+        ));
+        assert_eq!(stored_version(&conn).as_deref(), Some("1"));
+
+        let conn = create_test_connection();
+        initialize_schema(&conn).unwrap();
+        conn.execute(
+            "UPDATE metadata SET value = '0' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            initialize_schema(&conn),
+            Err(Error::MigrationRequired { found: 0, .. })
+        ));
+        assert_eq!(stored_version(&conn).as_deref(), Some("0"));
+    }
+
+    /// `get_schema_version` returns 0 only for an uninitialized database; a
+    /// stored version of zero (any spelling) is an error, as when opening.
+    #[test]
+    fn stored_version_zero_is_not_reported_as_uninitialized() {
+        for value in ["0", "-0", "+0", "000"] {
+            let conn = create_test_connection();
+            initialize_schema(&conn).unwrap();
+            conn.execute(
+                "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
+                [value],
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    get_schema_version(&conn),
+                    Err(Error::MigrationRequired { found: 0, .. })
+                ),
+                "{value}"
+            );
+        }
+        // Other versions without a migration path are still reported.
+        let conn = create_test_connection();
+        initialize_schema(&conn).unwrap();
+        conn.execute(
+            "UPDATE metadata SET value = '-1' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), -1);
     }
 
     /// The column layout check through the verified kernel: names exact,

@@ -7,9 +7,9 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{Error, Result};
 use crate::verified::schema_version::{
-    classify_for_validation, parse_i32_decimal, ColumnFacts, Corruption, ValidateDisposition,
+    classify_for_validation, ColumnFacts, Corruption, MetadataState, ValidateDisposition,
 };
-use crate::verified::storage::SqlType;
+use crate::verified::storage::{Cell, SqlType};
 
 use super::migrations::observe_metadata;
 use super::operations::row_to_reservation;
@@ -177,7 +177,14 @@ fn validate_current_database_inner(conn: &Connection) -> Result<()> {
 /// current exactly when it validates).
 fn validate_schema_version(conn: &Connection) -> Result<()> {
     let observed = observe_metadata(conn)?;
-    match classify_for_validation(observed.state()) {
+    schema_version_verdict(observed.state())
+}
+
+/// Validation's verdict on observed schema metadata (verified kernel
+/// `classify_for_validation`), as an error for anything but a current,
+/// well-formed version.
+fn schema_version_verdict(state: MetadataState<'_>) -> Result<()> {
+    match classify_for_validation(state) {
         ValidateDisposition::Valid => Ok(()),
         ValidateDisposition::Future(version) => Err(Error::UnsupportedSchemaVersion {
             expected: u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or_default(),
@@ -241,25 +248,17 @@ fn validate_metadata_rows(conn: &Connection) -> Result<()> {
         }
     }
 
-    if schema_versions.len() != 1 {
-        return Err(Error::corrupt_stored_value(
-            "metadata",
-            "value",
-            "key=\"schema_version\"",
-            "exactly one schema_version row is required",
-        ));
-    }
-
-    if parse_i32_decimal(schema_versions[0].as_bytes()).is_none() {
-        return Err(Error::corrupt_stored_value(
-            "metadata",
-            "value",
-            "key=\"schema_version\"",
-            "schema_version must be a base-10 signed integer",
-        ));
-    }
-
-    Ok(())
+    // This scan is a separate read from `validate_schema_version`'s, so the
+    // `schema_version` rows it saw are classified again by the same verified
+    // kernel instead of being re-checked by hand.
+    let state = match schema_versions.as_slice() {
+        [] => MetadataState::NoVersionRow,
+        [first, rest @ ..] => MetadataState::VersionRow {
+            value: Cell::Text(first),
+            more_rows: !rest.is_empty(),
+        },
+    };
+    schema_version_verdict(state)
 }
 
 fn validate_reservation_rows(conn: &Connection) -> Result<()> {

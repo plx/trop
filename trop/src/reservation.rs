@@ -366,7 +366,10 @@ impl Reservation {
     /// Checks if the reservation has expired based on the given maximum age.
     ///
     /// A reservation is considered expired if it hasn't been used for longer
-    /// than `max_age`.
+    /// than `max_age`. The age is measured from the current time with
+    /// sub-second precision, while `Database::find_expired_reservations`
+    /// compares whole seconds, so the two can disagree for up to one second
+    /// around the boundary.
     ///
     /// # Examples
     ///

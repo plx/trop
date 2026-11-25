@@ -15,12 +15,16 @@
 //!   it valid.
 //! - `classify_legacy_row` reports which preflight categories a schema-v1 row
 //!   violates. A row violates none exactly when the migration copies it
-//!   faithfully: the copied row (tag `NULL` becomes `''`) is accepted by the
-//!   v2 decoder (`storage::values_decode`) and decodes to the same key
-//!   (`classify_legacy_row`'s postcondition), so the preflight blocks every
-//!   row that would make the migrated database fail validation, and no
-//!   other. The four categories the SQL preflight already counted keep their
-//!   exact SQL meaning (`violations_of`).
+//!   faithfully: every value already has its v2 storage class, and the
+//!   copied row (tag `NULL` becomes `''`) is accepted by the v2 decoder
+//!   (`storage::values_decode`) and decodes to the same key
+//!   (`classify_legacy_row`'s postcondition). So the preflight blocks exactly
+//!   the rows the migration would not copy faithfully; these include every
+//!   row the v2 decoder would reject, and also a few the copy would change
+//!   but the decoder would accept (a lone `''` tag, which would become the
+//!   untagged key, or a `TEXT` port the `STRICT` column would convert). The
+//!   four categories the SQL preflight already counted keep their exact SQL
+//!   meaning (`violations_of`).
 //! - `columns_match` compares a table's columns with the expected layout;
 //!   checking primary-key positions or hidden columns only strengthens it.
 //!
@@ -808,8 +812,9 @@ fn cell_above_max(c: Cell) -> (r: bool)
 
 /// The preflight categories a legacy row violates. Total. Each flag has its
 /// exact meaning (`violations_of`), and a row violates no category exactly
-/// when the migration copies it faithfully, so the preflight blocks every
-/// row that would make the migrated database fail validation and no other.
+/// when the migration copies it faithfully. So the preflight blocks exactly
+/// the rows the migration would not copy faithfully, which include every row
+/// that would make the migrated database fail validation.
 pub fn classify_legacy_row(r: &LegacyRow) -> (v: LegacyRowViolations)
     ensures
         v == violations_of(*r),

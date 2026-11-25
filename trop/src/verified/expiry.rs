@@ -10,9 +10,13 @@
 //!   beyond `i64::MAX` seconds (the old `as i64` cast wrapped those to
 //!   negative ages and selected every reservation).
 //! - `duration_exceeds` is the `Duration` comparison `age > max_age` on
-//!   `(seconds, nanoseconds)` pairs; with whole-second ages it agrees with
-//!   `expired`, so the in-memory check and the SQL query select the same
-//!   reservations.
+//!   `(seconds, nanoseconds)` pairs. With a whole-second age (a caller that
+//!   captures `now` in whole seconds) it agrees with `expired`
+//!   (`lemma_whole_second_age_agrees`), so such a caller and the SQL query
+//!   select the same reservations. `Reservation::is_expired` reads the clock
+//!   with sub-second precision while `find_expired_reservations` truncates
+//!   `now` to whole seconds, so the two can disagree for up to one second
+//!   around the boundary; the lemma does not cover that pair.
 //!
 //! Production glue: `Database::find_expired_reservations` binds
 //! `expiry_cutoff(now, max_age.as_secs())`; `Reservation::is_expired` decides
@@ -159,8 +163,9 @@ pub proof fn lemma_duration_gt_is_total_nanos_gt(
 /// With a whole-second age (as when `now` is captured in whole seconds and
 /// `last_used` comes from storage), the `Duration` comparison is the
 /// whole-second rule `expired`, whatever the maximum age's sub-second part.
-/// So the in-memory check and `last_used_at < expiry_cutoff(now, max_secs)`
-/// agree.
+/// So a check with such an age and `last_used_at < expiry_cutoff(now,
+/// max_secs)` agree. (An age measured with sub-second precision, as in
+/// `Reservation::is_expired`, is outside this lemma.)
 pub proof fn lemma_whole_second_age_agrees(now: int, last_used: int, max_secs: int, max_nanos: int)
     requires
         now >= last_used,

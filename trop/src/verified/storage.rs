@@ -19,24 +19,33 @@
 //!   (`lemma_storable_key_iff_decodes`), stored keys are injective
 //!   (`lemma_stored_key_injective`), and on Unix stored-text equality is
 //!   component equality (`lemma_unix_stored_identity_is_component_identity`).
-//! - Rows: `encode_record` is the whole write path for one reservation, and
-//!   `row_decodes` is what `row_to_reservation` accepts once the SQL types
-//!   are right. Every encoded row decodes to the original fields
+//! - Rows: `encode_record` is the whole write path for one reservation (an
+//!   error is the first failing check in field order, `first_record_error`),
+//!   and `row_decodes` is what `row_to_reservation` accepts once the SQL
+//!   types are right. Every encoded row decodes to the original fields
 //!   (`lemma_encoded_record_round_trips`), and every decodable row is the
 //!   encoding of the fields it decodes to (`lemma_decoded_row_re_encodes`).
 //!   The `sticky` flag is not part of the row: it is not persisted.
+//!   `StoredKey` and `StoredRow` have private fields, so only
+//!   `encode_storage_key` and `encode_record` construct what the write paths
+//!   bind.
+//! - Lookups: `lookup_key` is the key's exact text (storable or not), and
+//!   among rows whose tag decodes it matches exactly the rows holding the
+//!   requested key; there is no lookup when no row can hold the key (no
+//!   UTF-8 text, or a `Some("")` tag, which would alias the untagged row).
 //! - Prefix queries: `prefix_query` turns a `Path::starts_with` prefix into
 //!   the canonical SQL key; with the component-prefix post-filter it selects
 //!   exactly the stored paths the `std` model of `starts_with` selects, and
-//!   every selected path starts with the key's bytes, so a byte-prefix SQL
+//!   every selected path starts with the key's bytes, so the byte-prefix SQL
 //!   prefilter never drops a true match (`lemma_prefix_query_exact`).
 //!
 //! Production glue: `crate::database::operations` (`row_to_reservation`, the
-//! write paths, `get_reservations_by_path_prefix`, the busy-timeout readback),
-//! `crate::database::transaction`, `crate::reservation`
-//! (`ReservationKey::storage_key`), `crate::path::storage_platform`. SQL
-//! semantics (`LIKE`, `CHECK`, `UNIQUE`, value storage classes), rusqlite's
-//! value mapping, `Path::to_str` and the `std::path` model are trusted.
+//! write paths, the lookups, `get_reservations_by_path_prefix`, the
+//! busy-timeout readback), `crate::database::transaction`,
+//! `crate::reservation` (`ReservationKey::storage_key`),
+//! `crate::path::storage_platform`. SQL semantics (`=` and `instr` on TEXT,
+//! `CHECK`, `UNIQUE`, value storage classes), rusqlite's value mapping,
+//! `Path::to_str` and the `std::path` model are trusted.
 
 use vstd::prelude::*;
 
@@ -85,12 +94,26 @@ pub enum SecsEncodeError {
     OutsideSupportedRange,
 }
 
+/// Why `secs` cannot be written, or `None` when it is storable: beyond
+/// `i64::MAX` first, then beyond `MAX_STORABLE_UNIX_SECS`.
+pub open spec fn secs_error(secs: u64) -> Option<SecsEncodeError> {
+    if secs as int > i64::MAX as int {
+        Some(SecsEncodeError::ExceedsI64)
+    } else if secs > MAX_STORABLE_UNIX_SECS {
+        Some(SecsEncodeError::OutsideSupportedRange)
+    } else {
+        None
+    }
+}
+
 /// Encodes whole seconds since the epoch as the stored `INTEGER`. Total.
 pub fn encode_unix_secs(secs: u64) -> (r: Result<i64, SecsEncodeError>)
     ensures
         r matches Ok(v) ==> v as int == secs as int,
         r is Ok <==> storable_secs(secs as int),
         r matches Err(e) ==> (e == SecsEncodeError::ExceedsI64 <==> secs as int > i64::MAX as int),
+        r matches Err(e) ==> secs_error(secs) == Some(e),
+        r is Ok <==> secs_error(secs) is None,
 {
     match i64::try_from(secs) {
         Err(_) => Err(SecsEncodeError::ExceedsI64),
@@ -391,13 +414,42 @@ pub enum KeyError {
     TagNotCanonical,
 }
 
-/// A key's stored form: the `path` and `tag` columns.
+/// A key's stored form: the `path` and `tag` columns. The fields are
+/// private and only `encode_storage_key` constructs it, so every value is the
+/// encoding of a storable key: code outside this module cannot write a
+/// hand-built key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoredKey<'a> {
+    path: &'a str,
+    tag: &'a str,
+}
+
+impl<'a> StoredKey<'a> {
+    /// The stored path.
+    pub closed spec fn spec_path(self) -> &'a str {
+        self.path
+    }
+
+    /// The stored tag.
+    pub closed spec fn spec_tag(self) -> &'a str {
+        self.tag
+    }
+
     /// The stored path: the key's own text.
-    pub path: &'a str,
+    pub fn path(&self) -> (path: &'a str)
+        ensures
+            path == self.spec_path(),
+    {
+        self.path
+    }
+
     /// The stored tag: the tag, or `""` for no tag.
-    pub tag: &'a str,
+    pub fn tag(&self) -> (tag: &'a str)
+        ensures
+            tag == self.spec_tag(),
+    {
+        self.tag
+    }
 }
 
 /// The stored tag column for a tag (exec form of `encode_stored_tag`).
@@ -446,9 +498,8 @@ pub fn encode_storage_key<'a>(path: Option<&'a str>, platform: PathPlatform, tag
             platform,
             opt_chars(tag),
         )),
-        r matches Ok(k) ==> path == Some(k.path) && k.tag@ == super::identifier::encode_stored_tag(
-            opt_chars(tag),
-        ),
+        r matches Ok(k) ==> path == Some(k.spec_path()) && k.spec_tag()@
+            == super::identifier::encode_stored_tag(opt_chars(tag)),
         r matches Err(e) ==> key_error(path, platform, tag) == Some(e),
         r is Ok <==> key_error(path, platform, tag) is None,
 {
@@ -534,6 +585,133 @@ pub proof fn lemma_unix_stored_identity_is_component_identity(
 }
 
 // ===========================================================================
+// Lookups
+// ===========================================================================
+
+/// The stored columns a lookup by key matches (`WHERE path = ? AND tag = ?`).
+/// Unlike `StoredKey`, the key need not be storable: a row stored under a
+/// non-storable key's exact text is corrupt, and a lookup that finds it
+/// reports the corruption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LookupKey<'a> {
+    path: &'a str,
+    tag: &'a str,
+}
+
+impl<'a> LookupKey<'a> {
+    /// The `path` column matched.
+    pub closed spec fn spec_path(self) -> &'a str {
+        self.path
+    }
+
+    /// The `tag` column matched.
+    pub closed spec fn spec_tag(self) -> &'a str {
+        self.tag
+    }
+
+    /// The `path` column matched: the key's own text.
+    pub fn path(&self) -> (path: &'a str)
+        ensures
+            path == self.spec_path(),
+    {
+        self.path
+    }
+
+    /// The `tag` column matched: the tag, or `""` for no tag.
+    pub fn tag(&self) -> (tag: &'a str)
+        ensures
+            tag == self.spec_tag(),
+    {
+        self.tag
+    }
+}
+
+/// A row whose `path` and `tag` columns hold `stored_path` and `stored_tag`
+/// is matched by the lookup `k` (none matches nothing).
+pub open spec fn lookup_matches(k: Option<LookupKey>, stored_path: Seq<char>, stored_tag: Seq<char>) -> bool {
+    match k {
+        Some(k) => k.spec_path()@ == stored_path && k.spec_tag()@ == stored_tag,
+        None => false,
+    }
+}
+
+/// A row whose `path` and `tag` columns hold `stored_path` and `stored_tag`
+/// decodes to the key `(path, tag)` (as far as the key columns go).
+pub open spec fn holds_key(
+    stored_path: Seq<char>,
+    stored_tag: Seq<char>,
+    path: Seq<char>,
+    tag: Option<Seq<char>>,
+) -> bool {
+    stored_path == path && super::identifier::decode_stored_tag(stored_tag) == Some(tag)
+}
+
+/// The lookup for the key `(path, tag)`: `path` is the key path's text
+/// (`None` when it is not valid UTF-8), `tag` its tag. Total.
+///
+/// Exactness: among rows whose tag column decodes, the lookup matches
+/// exactly the rows holding the requested key, so it never returns another
+/// key's row (a `Some("")` tag never aliases the untagged sentinel) and
+/// never misses the key's own row. There is no lookup (`None`) exactly when
+/// no row can hold the key: the path has no exact text, or the tag is
+/// `Some("")`, which no stored tag decodes to. Otherwise the lookup is the
+/// key's exact text, storable or not, so a corrupt row stored under that text
+/// is still found and reported.
+pub fn lookup_key<'a>(path: Option<&'a str>, tag: Option<&'a str>) -> (r: Option<LookupKey<'a>>)
+    ensures
+        r is None <==> (path is None || opt_chars(tag) == Some(Seq::<char>::empty())),
+        r matches Some(k) ==> path == Some(k.spec_path()) && k.spec_tag()@
+            == super::identifier::encode_stored_tag(opt_chars(tag)),
+        forall|stored_path: Seq<char>, stored_tag: Seq<char>|
+            super::identifier::decode_stored_tag(stored_tag) is Some ==> (#[trigger] lookup_matches(
+                r,
+                stored_path,
+                stored_tag,
+            ) <==> (path is Some && holds_key(
+                stored_path,
+                stored_tag,
+                path->Some_0@,
+                opt_chars(tag),
+            ))),
+{
+    let Some(p) = path else {
+        proof {
+            assert forall|stored_path: Seq<char>, stored_tag: Seq<char>|
+                super::identifier::decode_stored_tag(stored_tag) is Some implies (
+                #[trigger] lookup_matches(None, stored_path, stored_tag) <==> (path is Some
+                    && holds_key(stored_path, stored_tag, path->Some_0@, opt_chars(tag)))) by {}
+        }
+        return None;
+    };
+    if let Some(t) = tag {
+        if t.is_empty() {
+            proof {
+                assert forall|stored_path: Seq<char>, stored_tag: Seq<char>|
+                    super::identifier::decode_stored_tag(stored_tag) is Some implies (
+                    #[trigger] lookup_matches(None, stored_path, stored_tag) <==> (path is Some
+                        && holds_key(stored_path, stored_tag, path->Some_0@, opt_chars(tag)))) by {
+                    // No stored tag decodes to `Some("")`: `""` is untagged.
+                    if super::identifier::decode_stored_tag(stored_tag) == Some(opt_chars(tag)) {
+                        assert(stored_tag.len() > 0);
+                    }
+                }
+            }
+            return None;
+        }
+    }
+    let k = LookupKey { path: p, tag: encode_tag_text(tag) };
+    proof {
+        assert forall|stored_path: Seq<char>, stored_tag: Seq<char>|
+            super::identifier::decode_stored_tag(stored_tag) is Some implies (
+            #[trigger] lookup_matches(Some(k), stored_path, stored_tag) <==> (path is Some
+                && holds_key(stored_path, stored_tag, path->Some_0@, opt_chars(tag)))) by {
+            lemma_tag_codec_bijection(stored_tag, opt_chars(tag));
+        }
+    }
+    Some(k)
+}
+
+// ===========================================================================
 // Whole rows
 // ===========================================================================
 
@@ -559,23 +737,112 @@ pub struct RecordFields<'a> {
     pub last_used_secs: u64,
 }
 
-/// A schema-v2 `reservations` row with correctly typed SQL values.
+/// A schema-v2 `reservations` row with correctly typed SQL values, as the
+/// write path produces it. The fields are private and only `encode_record`
+/// constructs it, so every value is the encoding of a storable record: code
+/// outside this module cannot write a hand-built row.
 #[derive(Clone, Copy, Debug)]
 pub struct StoredRow<'a> {
+    path: &'a str,
+    tag: &'a str,
+    port: i64,
+    project: Option<&'a str>,
+    task: Option<&'a str>,
+    created_at: i64,
+    last_used_at: i64,
+}
+
+impl<'a> StoredRow<'a> {
+    /// `path`.
+    pub closed spec fn spec_path(self) -> &'a str {
+        self.path
+    }
+
+    /// `tag`.
+    pub closed spec fn spec_tag(self) -> &'a str {
+        self.tag
+    }
+
+    /// `port`.
+    pub closed spec fn spec_port(self) -> i64 {
+        self.port
+    }
+
+    /// `project`.
+    pub closed spec fn spec_project(self) -> Option<&'a str> {
+        self.project
+    }
+
+    /// `task`.
+    pub closed spec fn spec_task(self) -> Option<&'a str> {
+        self.task
+    }
+
+    /// `created_at`.
+    pub closed spec fn spec_created_at(self) -> i64 {
+        self.created_at
+    }
+
+    /// `last_used_at`.
+    pub closed spec fn spec_last_used_at(self) -> i64 {
+        self.last_used_at
+    }
+
     /// `path` (TEXT).
-    pub path: &'a str,
+    pub fn path(&self) -> (path: &'a str)
+        ensures
+            path == self.spec_path(),
+    {
+        self.path
+    }
+
     /// `tag` (TEXT, `""` for no tag).
-    pub tag: &'a str,
+    pub fn tag(&self) -> (tag: &'a str)
+        ensures
+            tag == self.spec_tag(),
+    {
+        self.tag
+    }
+
     /// `port` (INTEGER).
-    pub port: i64,
+    pub fn port(&self) -> (port: i64)
+        ensures
+            port == self.spec_port(),
+    {
+        self.port
+    }
+
     /// `project` (TEXT or NULL).
-    pub project: Option<&'a str>,
+    pub fn project(&self) -> (project: Option<&'a str>)
+        ensures
+            project == self.spec_project(),
+    {
+        self.project
+    }
+
     /// `task` (TEXT or NULL).
-    pub task: Option<&'a str>,
+    pub fn task(&self) -> (task: Option<&'a str>)
+        ensures
+            task == self.spec_task(),
+    {
+        self.task
+    }
+
     /// `created_at` (INTEGER).
-    pub created_at: i64,
+    pub fn created_at(&self) -> (created_at: i64)
+        ensures
+            created_at == self.spec_created_at(),
+    {
+        self.created_at
+    }
+
     /// `last_used_at` (INTEGER).
-    pub last_used_at: i64,
+    pub fn last_used_at(&self) -> (last_used_at: i64)
+        ensures
+            last_used_at == self.spec_last_used_at(),
+    {
+        self.last_used_at
+    }
 }
 
 /// Why a reservation cannot be written, in the order the fields are checked.
@@ -606,15 +873,39 @@ pub open spec fn record_storable(f: RecordFields) -> bool {
     &&& storable_secs(f.last_used_secs as int)
 }
 
+/// The first check a record fails, in the field order the write path checks
+/// them: the key (UTF-8, path, tag), port, project, task, creation time, last
+/// use; `None` when the record is storable.
+pub open spec fn first_record_error(f: RecordFields) -> Option<RecordError> {
+    match key_error(f.path, f.platform, f.tag) {
+        Some(e) => Some(RecordError::Key(e)),
+        None => if f.port == 0 {
+            Some(RecordError::InvalidPort)
+        } else if !opt_canonical(opt_chars(f.project)) {
+            Some(RecordError::ProjectNotCanonical)
+        } else if !opt_canonical(opt_chars(f.task)) {
+            Some(RecordError::TaskNotCanonical)
+        } else {
+            match secs_error(f.created_secs) {
+                Some(e) => Some(RecordError::CreatedAt(e)),
+                None => match secs_error(f.last_used_secs) {
+                    Some(e) => Some(RecordError::LastUsedAt(e)),
+                    None => None,
+                },
+            }
+        },
+    }
+}
+
 /// `row` is the stored form of `f`.
 pub open spec fn encodes(f: RecordFields, row: StoredRow) -> bool {
-    &&& f.path == Some(row.path)
-    &&& row.tag@ == super::identifier::encode_stored_tag(opt_chars(f.tag))
-    &&& row.port as int == f.port as int
-    &&& row.project == f.project
-    &&& row.task == f.task
-    &&& row.created_at as int == f.created_secs as int
-    &&& row.last_used_at as int == f.last_used_secs as int
+    &&& f.path == Some(row.spec_path())
+    &&& row.spec_tag()@ == super::identifier::encode_stored_tag(opt_chars(f.tag))
+    &&& row.spec_port() as int == f.port as int
+    &&& row.spec_project() == f.project
+    &&& row.spec_task() == f.task
+    &&& row.spec_created_at() as int == f.created_secs as int
+    &&& row.spec_last_used_at() as int == f.last_used_secs as int
 }
 
 /// What `row_to_reservation` accepts once every column has its SQL type,
@@ -642,44 +933,34 @@ pub open spec fn values_decode(
 /// What `row_to_reservation` accepts for a correctly typed row.
 pub open spec fn row_decodes(row: StoredRow, platform: PathPlatform) -> bool {
     values_decode(
-        text_bytes(row.path),
+        text_bytes(row.spec_path()),
         platform,
-        row.tag@,
-        row.port as int,
-        opt_chars(row.project),
-        opt_chars(row.task),
-        row.created_at as int,
-        row.last_used_at as int,
+        row.spec_tag()@,
+        row.spec_port() as int,
+        opt_chars(row.spec_project()),
+        opt_chars(row.spec_task()),
+        row.spec_created_at() as int,
+        row.spec_last_used_at() as int,
     )
 }
 
 /// The tag a decodable row decodes to.
 pub open spec fn decoded_tag(row: StoredRow) -> Option<Seq<char>> {
-    super::identifier::decode_stored_tag(row.tag@)->Some_0
+    super::identifier::decode_stored_tag(row.spec_tag()@)->Some_0
 }
 
 /// The write path for one reservation: checks every persisted field and
 /// returns the row to insert. Total. It succeeds exactly for storable
-/// records, the row is their encoding, and errors follow the field order
-/// path, tag, port, project, task, created, last used.
+/// records, the row is their encoding, and an error is the first failing
+/// check in the field order path, tag, port, project, task, created, last
+/// used (`first_record_error`). (The glue rejects a timestamp before the
+/// Unix epoch, which has no `u64` seconds, before calling this.)
 pub fn encode_record<'a>(f: &RecordFields<'a>) -> (r: Result<StoredRow<'a>, RecordError>)
     ensures
         r is Ok <==> record_storable(*f),
+        r is Ok <==> first_record_error(*f) is None,
         r matches Ok(row) ==> encodes(*f, row),
-        r matches Err(RecordError::Key(e)) ==> key_error(f.path, f.platform, f.tag) == Some(e),
-        r matches Err(RecordError::InvalidPort) ==> (f.path is Some && storable_key(
-            text_bytes(f.path->Some_0),
-            f.platform,
-            opt_chars(f.tag),
-        ) && f.port == 0),
-        r matches Err(RecordError::ProjectNotCanonical) ==> !opt_canonical(opt_chars(f.project)),
-        r matches Err(RecordError::TaskNotCanonical) ==> opt_canonical(opt_chars(f.project))
-            && !opt_canonical(opt_chars(f.task)),
-        r matches Err(RecordError::CreatedAt(e)) ==> !storable_secs(f.created_secs as int) && (e
-            == SecsEncodeError::ExceedsI64 <==> f.created_secs as int > i64::MAX as int),
-        r matches Err(RecordError::LastUsedAt(e)) ==> storable_secs(f.created_secs as int)
-            && !storable_secs(f.last_used_secs as int) && (e == SecsEncodeError::ExceedsI64
-            <==> f.last_used_secs as int > i64::MAX as int),
+        r matches Err(e) ==> first_record_error(*f) == Some(e),
 {
     let key = match encode_storage_key(f.path, f.platform, f.tag) {
         Ok(key) => key,
@@ -731,12 +1012,12 @@ pub proof fn lemma_encoded_record_round_trips(f: RecordFields, row: StoredRow)
     ensures
         row_decodes(row, f.platform),
         decoded_tag(row) == opt_chars(f.tag),
-        Some(row.path) == f.path,
-        row.port as int == f.port as int,
-        opt_chars(row.project) == opt_chars(f.project),
-        opt_chars(row.task) == opt_chars(f.task),
-        row.created_at as int == f.created_secs as int,
-        row.last_used_at as int == f.last_used_secs as int,
+        Some(row.spec_path()) == f.path,
+        row.spec_port() as int == f.port as int,
+        opt_chars(row.spec_project()) == opt_chars(f.project),
+        opt_chars(row.spec_task()) == opt_chars(f.task),
+        row.spec_created_at() as int == f.created_secs as int,
+        row.spec_last_used_at() as int == f.last_used_secs as int,
 {
     super::identifier::lemma_stored_tag_round_trip(opt_chars(f.tag));
 }
@@ -749,13 +1030,13 @@ pub proof fn lemma_decoded_row_re_encodes(row: StoredRow, platform: PathPlatform
     requires
         row_decodes(row, platform),
     ensures
-        storable_key(text_bytes(row.path), platform, decoded_tag(row)),
-        super::identifier::encode_stored_tag(decoded_tag(row)) == row.tag@,
-        super::port::is_valid_port(row.port as int),
-        storable_secs(row.created_at as int),
-        storable_secs(row.last_used_at as int),
+        storable_key(text_bytes(row.spec_path()), platform, decoded_tag(row)),
+        super::identifier::encode_stored_tag(decoded_tag(row)) == row.spec_tag()@,
+        super::port::is_valid_port(row.spec_port() as int),
+        storable_secs(row.spec_created_at() as int),
+        storable_secs(row.spec_last_used_at() as int),
 {
-    lemma_tag_codec_bijection(row.tag@, decoded_tag(row));
+    lemma_tag_codec_bijection(row.spec_tag()@, decoded_tag(row));
 }
 
 // ===========================================================================
@@ -945,9 +1226,10 @@ proof fn lemma_prefix_key(prefix: Seq<u8>, key: Seq<u8>)
 /// Exactness and completeness of the prefix query: on stored canonical
 /// paths, `query_selects` is exactly the `starts_with` model, and every
 /// selected path starts with the key's bytes, so the SQL prefilter
-/// `path LIKE key || '%'` (trusted to select a superset of the byte-prefix
-/// matches: `%`/`_` only widen it and ASCII matching ignores case) never
-/// drops a true match. The post-filter is `canonical_is_component_prefix`.
+/// `instr(path, key) = 1` (trusted: true exactly when the stored text's
+/// UTF-8 bytes start with the key's bytes; no wildcards, case folding, NUL
+/// truncation or pattern-length limit) never drops a true match. The
+/// post-filter is `canonical_is_component_prefix`.
 pub proof fn lemma_prefix_query_exact(q: PrefixQuery, s: Seq<u8>)
     requires
         query_selects(q, s),

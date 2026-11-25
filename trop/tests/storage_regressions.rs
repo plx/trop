@@ -90,6 +90,8 @@ fn huge_max_age_expires_nothing() {
 // Prefix queries
 // ---------------------------------------------------------------------------
 
+// The prefix-query tests use Unix path spellings.
+#[cfg(unix)]
 fn prefix_database(dir: &Path, stored: &[&str]) -> Database {
     let mut db = open(&dir.join("trop.db"));
     for (offset, path) in (0u16..).zip(stored) {
@@ -136,8 +138,9 @@ fn prefix_query_is_component_wise_whatever_the_prefix_spelling() {
     assert_eq!(query("").len(), 6);
 }
 
-/// `LIKE` wildcards and ASCII case folding in the prefilter only widen it;
-/// the component-wise post-filter keeps exactly the true matches.
+/// `%`, `_` and ASCII case in stored paths and prefixes are plain bytes: the
+/// byte-exact `instr` prefilter and the component-wise post-filter keep
+/// exactly the true matches.
 #[test]
 #[cfg(unix)]
 fn prefix_query_ignores_like_wildcards_and_case() {
@@ -158,8 +161,8 @@ fn prefix_query_ignores_like_wildcards_and_case() {
     assert_eq!(query("/p\\q"), ["/p\\q"]);
 }
 
-/// SQLite's `LIKE` reads text only up to a NUL; the prefilter still keeps
-/// every true match when stored paths or the prefix contain one.
+/// The prefilter compares whole byte strings, so it keeps every true match
+/// when stored paths or the prefix contain a NUL.
 #[test]
 #[cfg(unix)]
 fn prefix_query_keeps_matches_with_nul_bytes() {
@@ -173,6 +176,22 @@ fn prefix_query_keeps_matches_with_nul_bytes() {
     assert_eq!(query("/n\0ul/"), ["/n\0ul", "/n\0ul/x"]);
     assert_eq!(query("/n"), ["/n/x\0y"]);
     assert_eq!(query("/n/x\0y"), ["/n/x\0y"]);
+}
+
+/// `LIKE` patterns are limited to 50,000 bytes, so a prefix query by a long
+/// key failed with "LIKE or GLOB pattern too complex" although the stored
+/// path was writable. The `instr` prefilter has no such limit.
+#[test]
+#[cfg(unix)]
+fn prefix_query_by_a_long_key_finds_its_matches() {
+    let long = format!("/{}", "a".repeat(60_000));
+    let below = format!("{long}/x");
+    let sibling = format!("{long}b/x");
+    let dir = tempdir().unwrap();
+    let db = prefix_database(dir.path(), &[&below, &sibling, "/other"]);
+    let found =
+        Database::get_reservations_by_path_prefix(db.connection(), Path::new(&long)).unwrap();
+    assert_eq!(paths(&found), [below]);
 }
 
 /// A prefix that is not valid UTF-8 cannot be a component prefix of any
@@ -362,6 +381,49 @@ fn empty_tag_never_aliases_the_untagged_reservation() {
     assert_eq!(all[0].port().value(), 5000);
 }
 
+/// Lookups match a key's exact text: a corrupt row stored under the exact
+/// text of a key that could not be written is still read and reported (as
+/// before the write-side checks), while a `Some("")` tag finds nothing
+/// rather than the untagged reservation at the same path.
+#[test]
+fn lookups_report_corrupt_rows_and_never_alias() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("trop.db");
+    let mut db = open(&db_path);
+    db.create_reservation(&reservation("/project", None, 5000))
+        .unwrap();
+    {
+        let raw = Connection::open(&db_path).unwrap();
+        raw.execute(
+            "INSERT INTO reservations VALUES ('/a/b/', ' web ', 5001, NULL, NULL, 1, 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let details = corruption_details(
+        Database::get_reservation(db.connection(), &struct_key("/a/b/", Some(" web ")))
+            .unwrap_err(),
+    );
+    assert!(details.contains("field=path"), "{details}");
+
+    // Other keys at those paths have no row.
+    assert!(
+        Database::get_reservation(db.connection(), &struct_key("/a/b/", None))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        Database::get_reservation(db.connection(), &struct_key("/project", Some("")))
+            .unwrap()
+            .is_none()
+    );
+    let untagged = Database::get_reservation(db.connection(), &struct_key("/project", None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(untagged.port().value(), 5000);
+}
+
 /// A deserialized reservation can carry identifiers the builder would never
 /// produce; the writer refuses them instead of storing an unreadable row.
 #[test]
@@ -518,6 +580,41 @@ fn stored_version_zero_is_not_reinitialized() {
         )
         .unwrap();
     assert_eq!(value, "0");
+}
+
+/// Concurrent first opens of a new database never see each other's
+/// initialization half-done. Reading the metadata in two autocommit
+/// statements let an opener see a `reservations` table without a `metadata`
+/// table and report the healthy database as corrupt.
+#[test]
+fn concurrent_first_opens_never_report_corruption() {
+    use std::sync::{Arc, Barrier};
+
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 200;
+    let mut failures = Vec::new();
+    for _ in 0..ROUNDS {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("trop.db");
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let openers = (0..THREADS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Database::open(DatabaseConfig::new(&path)).map(|_| ())
+                })
+            })
+            .collect::<Vec<_>>();
+        for opener in openers {
+            if let Err(error) = opener.join().unwrap() {
+                failures.push(error.to_string());
+            }
+        }
+        assert_eq!(get_schema_version(open(&path).connection()).unwrap(), 2);
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 /// A truly empty database still initializes.

@@ -9,7 +9,9 @@
 //! checks paths, tags, ports, identifiers and timestamps with the matching
 //! kernel decoders. The kernel proves that the write predicate and the read
 //! predicate are the same set, so nothing trop writes is later reported as
-//! corruption, and that the stored key is injective.
+//! corruption, and that the stored key is injective. Lookups by key match the
+//! key's exact text (`lookup_key`), so they never return another key's row
+//! and still report a corrupt row stored under that text.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -117,7 +119,9 @@ fn record_error(error: RecordError) -> Error {
 /// # Errors
 ///
 /// Returns a validation error for a key, project, task or timestamp that the
-/// database could not read back.
+/// database could not read back: the first failing field in the order path,
+/// tag, port, project, task, creation time, last use. A timestamp before the
+/// Unix epoch has no `u64` seconds for the kernel, so it is reported first.
 pub(super) fn encode_reservation(reservation: &Reservation) -> Result<StoredRow<'_>> {
     let key = reservation.key();
     let fields = RecordFields {
@@ -206,33 +210,21 @@ impl OwnedCell {
     }
 }
 
-/// The stored text of a path that is looked up exactly, or `None` when no
-/// stored row can have that path: it is not valid UTF-8 or not storable
-/// (every row the decoder accepts has a storable path).
-fn stored_path_text(path: &Path) -> Option<&str> {
-    let text = path.to_str()?;
-    let verdict = crate::verified::storage::classify_stored_path(
-        text.as_bytes(),
-        crate::path::storage_platform(path),
-    );
-    matches!(verdict, PathVerdict::Canonical).then_some(text)
-}
-
 /// Writes `row`, replacing the row stored under the same key (and only that
 /// row: the stored key is injective, and a port held by another key makes
 /// the plain `INSERT` fail).
 fn replace_row(conn: &Connection, row: &StoredRow<'_>) -> Result<()> {
-    conn.execute(DELETE_RESERVATION, params![row.path, row.tag])?;
+    conn.execute(DELETE_RESERVATION, params![row.path(), row.tag()])?;
     conn.execute(
         INSERT_RESERVATION,
         params![
-            row.path,
-            row.tag,
-            row.port,
-            row.project,
-            row.task,
-            row.created_at,
-            row.last_used_at,
+            row.path(),
+            row.tag(),
+            row.port(),
+            row.project(),
+            row.task(),
+            row.created_at(),
+            row.last_used_at(),
         ],
     )?;
     Ok(())
@@ -244,9 +236,9 @@ fn replace_row(conn: &Connection, row: &StoredRow<'_>) -> Result<()> {
 /// key: on stored (canonical) paths, "has the key as a component prefix"
 /// (`canonical_is_component_prefix`, the post-filter) is exactly
 /// `Path::starts_with(prefix)`, and every such path starts with the key's
-/// bytes, so the SQL prefilter `path LIKE key || '%'` (a superset of the
-/// byte-prefix matches: `%` and `_` in the key only widen it, and ASCII
-/// letters match without case) never drops a match.
+/// bytes, so the SQL prefilter `instr(path, key) = 1` (exactly the stored
+/// texts whose bytes start with the key's: no wildcards, case folding, NUL
+/// truncation or pattern-length limit) never drops a match.
 #[cfg(unix)]
 fn reservations_under(conn: &Connection, prefix: &Path) -> Result<Vec<Reservation>> {
     use std::os::unix::ffi::OsStrExt;
@@ -283,13 +275,27 @@ fn reservations_under(conn: &Connection, prefix: &Path) -> Result<Vec<Reservatio
 ///
 /// Outside Unix, stored paths may be native (`C:\...`) or `/`-rooted
 /// spellings written on Unix, so no single text key prefilters both: every
-/// row is read and filtered with [`Path::starts_with`].
+/// row's stored path text is tested with [`Path::starts_with`], and only the
+/// rows that match are decoded (so, as with the Unix prefilter, a corrupt
+/// row elsewhere does not fail the query). A decoded path is the stored
+/// text itself, so no further filtering is needed.
 #[cfg(not(unix))]
 fn reservations_under(conn: &Connection, prefix: &Path) -> Result<Vec<Reservation>> {
-    Ok(Database::list_all_reservations(conn)?
-        .into_iter()
-        .filter(|reservation| reservation.key().path.starts_with(prefix))
-        .collect())
+    let mut stmt = conn.prepare(LIST_RESERVATIONS)?;
+    let mut rows = stmt.query([])?;
+    let mut reservations = Vec::new();
+    while let Some(row) = rows.next()? {
+        let matches = match row.get_ref(0)? {
+            ValueRef::Text(bytes) => {
+                std::str::from_utf8(bytes).is_ok_and(|text| Path::new(text).starts_with(prefix))
+            }
+            _ => false,
+        };
+        if matches {
+            reservations.push(row_to_reservation(row)?);
+        }
+    }
+    Ok(reservations)
 }
 
 /// Converts stored Unix epoch seconds to a representable `SystemTime`
@@ -539,7 +545,7 @@ const SELECT_RESERVED_PORTS: &str = r"
 const SELECT_BY_PATH_PREFIX: &str = r"
     SELECT path, tag, port, project, task, created_at, last_used_at
     FROM reservations
-    WHERE path LIKE ? || '%'
+    WHERE instr(path, ?) = 1
     ORDER BY path, tag
 ";
 
@@ -747,8 +753,9 @@ impl Database {
     /// # Returns
     ///
     /// - `Ok(Some(reservation))` if the reservation exists
-    /// - `Ok(None)` if the reservation doesn't exist, including when the key
-    ///   could not be stored at all (no stored row has such a key)
+    /// - `Ok(None)` if the reservation doesn't exist, including when no
+    ///   stored row can hold the key (a path that is not valid UTF-8, or a
+    ///   `Some("")` tag, which would otherwise alias the untagged reservation)
     /// - `Err(_)` if a database error occurs
     ///
     /// # Examples
@@ -765,14 +772,18 @@ impl Database {
     /// let reservation = Database::get_reservation(db.connection(), &key).unwrap();
     /// ```
     pub fn get_reservation(conn: &Connection, key: &ReservationKey) -> Result<Option<Reservation>> {
-        // Every row the decoder accepts has a storable key, so a key that
-        // cannot be stored has no reservation (and is never looked up by a
-        // lossy or aliasing spelling).
-        let Ok(stored) = key.storage_key() else {
+        // The verified kernel `lookup_key` matches exactly the rows holding
+        // this key: the key's own text, never a lossy or aliasing spelling.
+        // A key no row can hold (a path that is not UTF-8, or a `Some("")`
+        // tag) has no reservation; a corrupt row stored under a non-storable
+        // key's exact text is still read and reported.
+        let Some(lookup) =
+            crate::verified::storage::lookup_key(key.path.to_str(), key.tag.as_deref())
+        else {
             return Ok(None);
         };
         let mut stmt = conn.prepare(SELECT_RESERVATION)?;
-        let mut rows = stmt.query(params![stored.path, stored.tag])?;
+        let mut rows = stmt.query(params![lookup.path(), lookup.tag()])?;
         rows.next()?.map(row_to_reservation).transpose()
     }
 
@@ -817,7 +828,8 @@ impl Database {
 
         let now = systemtime_to_unix_secs(SystemTime::now())?;
 
-        let rows_affected = tx.execute(UPDATE_LAST_USED, params![now, stored.path, stored.tag])?;
+        let rows_affected =
+            tx.execute(UPDATE_LAST_USED, params![now, stored.path(), stored.tag()])?;
 
         tx.commit()?;
         Ok(rows_affected > 0)
@@ -861,7 +873,7 @@ impl Database {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let rows_affected = tx.execute(DELETE_RESERVATION, params![stored.path, stored.tag])?;
+        let rows_affected = tx.execute(DELETE_RESERVATION, params![stored.path(), stored.tag()])?;
 
         tx.commit()?;
         Ok(rows_affected > 0)
@@ -881,7 +893,7 @@ impl Database {
         let stored = storable_key(key)?;
         let now = systemtime_to_unix_secs(SystemTime::now())?;
         let rows_affected =
-            conn.execute(UPDATE_LAST_USED, params![now, stored.path, stored.tag])?;
+            conn.execute(UPDATE_LAST_USED, params![now, stored.path(), stored.tag()])?;
         Ok(rows_affected > 0)
     }
 
@@ -900,7 +912,7 @@ impl Database {
         let last_used_at = systemtime_to_unix_secs(last_used_at)?;
         let rows_affected = conn.execute(
             UPDATE_METADATA_AND_LAST_USED,
-            params![project, task, last_used_at, stored.path, stored.tag],
+            params![project, task, last_used_at, stored.path(), stored.tag()],
         )?;
         Ok(rows_affected > 0)
     }
@@ -916,7 +928,8 @@ impl Database {
     /// stored, or an error if the database deletion fails.
     pub fn delete_reservation_simple(conn: &Connection, key: &ReservationKey) -> Result<bool> {
         let stored = storable_key(key)?;
-        let rows_affected = conn.execute(DELETE_RESERVATION, params![stored.path, stored.tag])?;
+        let rows_affected =
+            conn.execute(DELETE_RESERVATION, params![stored.path(), stored.tag()])?;
         Ok(rows_affected > 0)
     }
 
@@ -934,13 +947,13 @@ impl Database {
         let rows_affected = conn.execute(
             DELETE_RESERVATION_IF_UNCHANGED,
             params![
-                row.path,
-                row.tag,
-                row.port,
-                row.project,
-                row.task,
-                row.created_at,
-                row.last_used_at,
+                row.path(),
+                row.tag(),
+                row.port(),
+                row.project(),
+                row.task(),
+                row.created_at(),
+                row.last_used_at(),
             ],
         )?;
         Ok(rows_affected > 0)
@@ -1048,7 +1061,10 @@ impl Database {
         conn: &Connection,
         path: &Path,
     ) -> Result<Vec<Reservation>> {
-        let Some(stored) = stored_path_text(path) else {
+        // A path with no UTF-8 text has no exact stored text, so no row; any
+        // other path is matched by its own text (a corrupt row stored under a
+        // non-storable path's text is read and reported).
+        let Some(stored) = path.to_str() else {
             return Ok(Vec::new());
         };
         let mut stmt = conn.prepare_cached(SELECT_BY_EXACT_PATH)?;
@@ -1069,7 +1085,10 @@ impl Database {
         conn: &Connection,
         path: &Path,
     ) -> Result<Vec<Reservation>> {
-        let Some(stored) = stored_path_text(path) else {
+        // A path with no UTF-8 text has no exact stored text, so no row; any
+        // other path is matched by its own text (a corrupt row stored under a
+        // non-storable path's text is read and reported).
+        let Some(stored) = path.to_str() else {
             return Ok(Vec::new());
         };
         let mut stmt = conn.prepare_cached(SELECT_TAGGED_BY_EXACT_PATH)?;
@@ -1742,8 +1761,8 @@ mod tests {
                  SET last_used_at = last_used_at + 1
                  WHERE path = ? AND tag = ?",
                 params![
-                    snapshot.key().storage_key().unwrap().path,
-                    snapshot.key().storage_key().unwrap().tag
+                    snapshot.key().storage_key().unwrap().path(),
+                    snapshot.key().storage_key().unwrap().tag()
                 ],
             )
             .unwrap();
@@ -1753,6 +1772,198 @@ mod tests {
             .unwrap()
             .is_some());
         transaction.commit().unwrap();
+    }
+
+    /// The metadata update validates the key, project and task before any
+    /// SQL, exactly as the row decoder will read them back.
+    #[test]
+    fn metadata_update_validates_before_any_write() {
+        let db = create_test_database();
+        let reservation = create_test_reservation("/test/metadata", 5000);
+        Database::create_reservation_simple(db.connection(), &reservation).unwrap();
+        let before = Database::get_reservation(db.connection(), reservation.key())
+            .unwrap()
+            .unwrap();
+        let now = SystemTime::now();
+        let update = |key: &ReservationKey, project: Option<&str>, task: Option<&str>| {
+            Database::update_metadata_and_last_used_simple(db.connection(), key, project, task, now)
+        };
+        let field = |result: Result<bool>| match result {
+            Err(Error::Validation { field, .. }) => field,
+            other => panic!("expected a validation error, got {other:?}"),
+        };
+
+        let unstorable = [
+            (
+                ReservationKey {
+                    path: PathBuf::from("/test/metadata/"),
+                    tag: None,
+                },
+                "path",
+            ),
+            (
+                ReservationKey {
+                    path: PathBuf::from("relative"),
+                    tag: None,
+                },
+                "path",
+            ),
+            (
+                ReservationKey {
+                    path: PathBuf::from("/test/metadata"),
+                    tag: Some(" web ".into()),
+                },
+                "tag",
+            ),
+            (
+                ReservationKey {
+                    path: PathBuf::from("/test/metadata"),
+                    tag: Some(String::new()),
+                },
+                "tag",
+            ),
+        ];
+        for (key, expected) in &unstorable {
+            assert_eq!(field(update(key, Some("p"), Some("t"))), *expected);
+        }
+        for (project, task, expected) in [
+            (Some(" p "), None, "project"),
+            (Some(""), None, "project"),
+            (None, Some("t "), "task"),
+            (Some("p"), Some("   "), "task"),
+            // The key is checked first, then the project, then the task.
+            (Some(" p "), Some(" t "), "project"),
+        ] {
+            assert_eq!(field(update(reservation.key(), project, task)), expected);
+        }
+        let key = ReservationKey {
+            path: PathBuf::from("/test/metadata/"),
+            tag: None,
+        };
+        assert_eq!(field(update(&key, Some(" p "), None)), "path");
+
+        // Nothing changed, and the row still decodes.
+        let after = Database::get_reservation(db.connection(), reservation.key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.project(), before.project());
+        assert_eq!(after.task(), before.task());
+        assert_eq!(after.last_used_at(), before.last_used_at());
+
+        // A storable update goes through.
+        assert!(update(reservation.key(), Some("p"), Some("t")).unwrap());
+        let updated = Database::get_reservation(db.connection(), reservation.key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.project(), Some("p"));
+        assert_eq!(updated.task(), Some("t"));
+    }
+
+    /// Exact-path lookups match the path's own text: a corrupt row stored
+    /// under a non-storable path's text is reported, and a path that is not
+    /// UTF-8 (no exact text) finds nothing.
+    #[test]
+    fn exact_path_lookups_report_corrupt_rows() {
+        let db = create_test_database();
+        db.connection()
+            .execute(
+                "INSERT INTO reservations VALUES ('/a/b/', 'web', 5001, NULL, NULL, 1, 1)",
+                [],
+            )
+            .unwrap();
+        for result in [
+            Database::get_reservations_by_exact_path(db.connection(), Path::new("/a/b/")),
+            Database::get_tagged_reservations_by_exact_path(db.connection(), Path::new("/a/b/")),
+        ] {
+            assert!(matches!(result, Err(Error::DatabaseCorruption { .. })));
+        }
+        assert_eq!(
+            Database::get_reservations_by_exact_path(db.connection(), Path::new("/a/b"))
+                .unwrap()
+                .len(),
+            0
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path = Path::new(std::ffi::OsStr::from_bytes(b"/a/b/\xff"));
+            assert_eq!(
+                Database::get_reservations_by_exact_path(db.connection(), path)
+                    .unwrap()
+                    .len(),
+                0
+            );
+        }
+    }
+
+    /// The guarded delete encodes its snapshot with the verified kernel: a
+    /// snapshot the database could not hold is a validation error, and
+    /// nothing is deleted.
+    #[test]
+    fn guarded_delete_validates_its_snapshot() {
+        let db = create_test_database();
+        let reservation = create_test_reservation("/test/guarded", 5000);
+        Database::create_reservation_simple(db.connection(), &reservation).unwrap();
+        let stored = Database::get_reservation(db.connection(), reservation.key())
+            .unwrap()
+            .unwrap();
+        let rebuilt = |key: ReservationKey, project: Option<&str>| {
+            Reservation::builder(key, stored.port())
+                .created_at(stored.created_at())
+                .last_used_at(stored.last_used_at())
+                .build()
+                .map(|reservation| {
+                    // Bypass the builder's checks, as deserialization can.
+                    let mut value = serde_json::to_value(&reservation).unwrap();
+                    value["project"] = project.map_or(serde_json::Value::Null, Into::into);
+                    serde_json::from_value::<Reservation>(value).unwrap()
+                })
+                .unwrap()
+        };
+        let snapshots = [
+            (
+                rebuilt(
+                    ReservationKey {
+                        path: PathBuf::from("/test/guarded/"),
+                        tag: None,
+                    },
+                    None,
+                ),
+                "path",
+            ),
+            (
+                rebuilt(
+                    ReservationKey {
+                        path: PathBuf::from("/test/guarded"),
+                        tag: Some(String::new()),
+                    },
+                    None,
+                ),
+                "tag",
+            ),
+            (rebuilt(reservation.key().clone(), Some(" p ")), "project"),
+        ];
+        for (snapshot, expected) in &snapshots {
+            match Database::delete_reservation_if_unchanged(db.connection(), snapshot) {
+                Err(Error::Validation { field, .. }) => assert_eq!(field, *expected),
+                other => panic!("expected a validation error, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            Database::list_all_reservations(db.connection())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The exact snapshot still deletes.
+        assert!(Database::delete_reservation_if_unchanged(db.connection(), &stored).unwrap());
+        assert_eq!(
+            Database::list_all_reservations(db.connection())
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[test]
