@@ -28,8 +28,13 @@
 //!   partition the scan.
 //! - **Revalidation.** `revalidate_all` re-reads each candidate before its
 //!   guarded delete. Each candidate gets exactly one `Fate`, justified by the
-//!   oracles' answers; a delete is only ever requested for a candidate just
-//!   observed unchanged and still eligible, and a dry run consults no oracle.
+//!   oracles' answers, and `settle` places each fate in exactly one of the
+//!   removed and preserved lists. A dry run consults no oracle, and a delete
+//!   is only requested in a live run, for an eligible candidate, after some
+//!   read of it answered `Unchanged`. (`Fn` oracles are specified by their
+//!   answers, not by call history, so the spec cannot rule out a later
+//!   re-read before the delete; in production the guarded delete itself
+//!   compares the whole row with the planned snapshot.)
 //! - **Autoclean partition.** `split_by_reason` splits removals into pruned
 //!   and expired lists that partition them, so the counts add up.
 //!
@@ -323,8 +328,15 @@ pub open spec fn spec_still_eligible(
     }
 }
 
-/// Re-checks a candidate's reason against fresh evidence
+/// Re-checks a candidate's reason against the given evidence
 /// (`spec_still_eligible`).
+///
+/// Production passes the evidence the candidate was planned with (the
+/// planning-time path status and evaluation time, and the planned row, which
+/// an `Unchanged` read equals), so by `lemma_unchanged_candidate_still_eligible`
+/// every planned candidate is still eligible and `Fate::Ineligible` cannot
+/// occur there: the re-check is provably redundant and kept as defense in
+/// depth, as in the code it replaced.
 pub fn still_eligible(
     reason: CleanupReason,
     path_prunable: bool,
@@ -351,7 +363,9 @@ pub fn still_eligible(
 
 /// Re-evaluating the same evidence keeps every candidate eligible: a row
 /// that is unchanged since planning (same path status, same last use) is
-/// still eligible for the reason it was planned with.
+/// still eligible for the reason it was planned with. So the eligibility
+/// re-check of an unchanged row never fails; revalidation is, in effect, the
+/// row-snapshot equality check.
 pub proof fn lemma_unchanged_candidate_still_eligible(
     prune_enabled: bool,
     path_prunable: bool,
@@ -800,7 +814,7 @@ pub fn plan_removals(cands: &[Candidate]) -> (plan: CleanupPlan)
 // Revalidate, then delete
 // ===========================================================================
 
-/// A fresh read of a planned candidate's row.
+/// A read of a planned candidate's row, compared with its planned snapshot.
 pub enum Observation<R> {
     /// The row is gone (a database trigger of an earlier delete removed it).
     Vanished,
@@ -855,7 +869,10 @@ pub open spec fn observed_unchanged<R, E, O: Fn(usize) -> Result<Observation<R>,
 }
 
 /// A delete may be requested for candidate `i`: a live run, the candidate is
-/// still eligible, and it was just observed unchanged.
+/// eligible, and the read oracle answers `Unchanged` for it (some read of it
+/// returned `Unchanged`). This is a fact about the oracle's possible answers,
+/// not about which read came last: it does not say that no other read of `i`
+/// happened between that answer and the delete.
 pub open spec fn delete_permitted<R, E, O: Fn(usize) -> Result<Observation<R>, E>>(
     eligible: Seq<bool>,
     observe: O,
@@ -903,9 +920,10 @@ pub open spec fn justified<
 
 /// What a justified fate means for the accounting: a candidate counts as
 /// removed only in a dry run, when it was observed gone, or when its guarded
-/// delete (requested only after an unchanged, eligible read) removed it or
-/// found it gone; a preserved candidate was observed changed or ineligible,
-/// or survived its guarded delete, and is never preserved in a dry run.
+/// delete (permitted only in a live run, for an eligible candidate a read
+/// answered `Unchanged` for) removed it or found it gone; a preserved
+/// candidate was observed changed or ineligible, or survived its guarded
+/// delete, and is never preserved in a dry run.
 pub proof fn lemma_fate_meaning<
     R,
     E,
@@ -931,6 +949,48 @@ pub proof fn lemma_fate_meaning<
 {
 }
 
+/// Where a candidate ends up in the accounting.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Settlement<R> {
+    /// Reported removed (with its planned row).
+    Removed,
+    /// Preserved, as planned (unchanged but no longer eligible).
+    PreservedAsPlanned,
+    /// Preserved, with its current row.
+    PreservedAs(R),
+}
+
+/// The settlement of a fate: removals (`removes`) are reported removed; a
+/// changed or replaced row is preserved with its current value; an
+/// ineligible one is preserved as planned.
+pub open spec fn spec_settle<R>(fate: Fate<R>) -> Settlement<R> {
+    match fate {
+        Fate::Changed(r) => Settlement::PreservedAs(r),
+        Fate::Replaced(r) => Settlement::PreservedAs(r),
+        Fate::Ineligible => Settlement::PreservedAsPlanned,
+        _ => Settlement::Removed,
+    }
+}
+
+/// Places one fate in exactly one of the removed and preserved lists
+/// (`spec_settle`): it is reported removed exactly when `removes(fate)`.
+/// With `revalidate_all`'s one fate per candidate, the removed and preserved
+/// candidates partition the plan, so the considered rows are the preserved
+/// ones plus the removed ones.
+pub fn settle<R>(fate: Fate<R>) -> (s: Settlement<R>)
+    ensures
+        s == spec_settle(fate),
+        (s is Removed) <==> removes(fate),
+{
+    match fate {
+        Fate::Changed(current) | Fate::Replaced(current) => Settlement::PreservedAs(current),
+        Fate::Ineligible => Settlement::PreservedAsPlanned,
+        Fate::Selected | Fate::Vanished | Fate::Deleted | Fate::VanishedAtDelete => {
+            Settlement::Removed
+        },
+    }
+}
+
 /// The oracle error that stopped a revalidation, at candidate `index`.
 pub struct RevalFailure<E> {
     /// The candidate being revalidated.
@@ -939,22 +999,30 @@ pub struct RevalFailure<E> {
     pub error: E,
 }
 
-/// Revalidates and deletes the planned candidates `0..eligible.len()` in
-/// order (`eligible[i]`: candidate `i`'s reason still holds, see
-/// `still_eligible`).
+/// Revalidates and deletes the planned candidates `0..eligible.len()`
+/// (`eligible[i]`: candidate `i`'s reason still holds, see `still_eligible`).
 ///
 /// - Call discipline (the `requires`, which ordinary closures always meet):
-///   a dry run consults neither oracle, and `delete(i)` is only requested
-///   for a live run's candidate `i` that is still eligible and was just
-///   observed `Unchanged` — deletion acts only on fresh, still-eligible
-///   evidence.
+///   a dry run grants `observe` no precondition, so it consults neither
+///   oracle; `observe(i)` is only callable for `i < n`; and `delete(i)` is
+///   only callable when `delete_permitted`: a live run, `eligible[i]`, and
+///   some read of `i` answered `Unchanged`.
 /// - On success every candidate has exactly one fate, the one the oracles'
-///   answers determine (`justified`); so the removed and preserved
-///   candidates partition the plan, and a candidate counts as removed only
-///   when it was observed gone or the guarded delete removed it or found it
-///   gone (or in a dry run).
-/// - A failure is the first oracle error, from candidate `index`'s read or
-///   (after an unchanged, eligible read) its delete.
+///   answers determine (`justified`); `settle` then places it in exactly one
+///   of the removed and preserved lists, and a candidate counts as removed
+///   only when it was observed gone or the guarded delete removed it or
+///   found it gone (or in a dry run).
+/// - A failure is an oracle error at candidate `index`: its read's, or
+///   (when a delete was permitted) its delete's.
+///
+/// Not specified: the order of the calls, that each oracle is called at
+/// most once per candidate, and that no read of `i` happens between the
+/// `Unchanged` answer and `delete(i)`. `Fn` oracles are specified by their
+/// answers, not by call history. The implementation reads each candidate
+/// once, in ascending order, and deletes right after an `Unchanged` read; in
+/// production the guarded delete compares the whole row with the planned
+/// snapshot in one statement, so a stale decision cannot delete a changed
+/// row.
 pub fn revalidate_all<
     R,
     E,

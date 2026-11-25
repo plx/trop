@@ -5,7 +5,10 @@
 //!   default whenever no threshold is configured, whether the `cleanup`
 //!   section is missing or present without `expire_after_days` (before the
 //!   fix, `cleanup: Some(CleanupConfig { expire_after_days: None })` reported
-//!   automatic expiration as enabled but expired nothing).
+//!   automatic expiration as enabled but expired nothing), for single
+//!   reservations and for groups (`ReserveGroupPlan::new` loads one
+//!   `trop.yaml` without built-in defaults, so `cleanup: {}` reaches the
+//!   group's automatic cleanup as exactly such a section).
 //! - Revalidation: every planned removal ends in exactly one bucket, and the
 //!   reported counts add up, for rows that vanish, change, or survive a
 //!   guarded delete.
@@ -18,8 +21,13 @@ use std::time::{Duration, SystemTime};
 
 use tempfile::TempDir;
 use trop::config::{CleanupConfig, Config, OccupancyConfig, PortConfig};
-use trop::operations::{CleanupOperations, ReserveOptions, ReservePlan};
-use trop::{Database, DatabaseConfig, Error, PlanExecutor, Port, Reservation, ReservationKey};
+use trop::operations::{
+    CleanupOperations, ReserveGroupOptions, ReserveGroupPlan, ReserveOptions, ReservePlan,
+};
+use trop::{
+    Database, DatabaseConfig, Error, ExecutionResult, PlanExecutor, Port, Reservation,
+    ReservationKey,
+};
 
 const DAY: u64 = 24 * 60 * 60;
 
@@ -138,6 +146,80 @@ fn automatic_expiration_agrees_for_missing_and_empty_cleanup_sections() {
             "cleanup section {cleanup:?}"
         );
     }
+}
+
+/// Reserves a two-service group (`web` at offset 0, `api` at offset 1) in
+/// the two-port range `5700`-`5701`, whose first port is held by a
+/// 40-day-old reservation at an existing directory, so only automatic
+/// expiration can make room. `cleanup_section` is the configuration file's
+/// `cleanup` section (empty for none). Returns the result and whether the
+/// stale blocker is still stored.
+fn reserve_group_after_stale_blocker(
+    cleanup_section: &str,
+) -> (trop::Result<ExecutionResult>, bool) {
+    let mut fixture = Fixture::new();
+    let project = fixture.existing_dir("project");
+    let config_path = project.join("trop.yaml");
+    fs::write(
+        &config_path,
+        format!(
+            "project: cleanup-regression
+ports:
+  min: 5700
+  max: 5701
+occupancy_check:
+  skip: true
+{cleanup_section}reservations:
+  services:
+    web:
+      offset: 0
+    api:
+      offset: 1
+"
+        ),
+    )
+    .unwrap();
+    let stale = fixture.existing_dir("stale");
+    fixture.store(&stale, None, 5700, Duration::from_secs(40 * DAY));
+    let stale_key = ReservationKey::new(stale, None).unwrap();
+
+    let result = ReserveGroupPlan::new(
+        ReserveGroupOptions::new(config_path).with_allow_unrelated_path(true),
+    )
+    .and_then(|planner| planner.build_plan(fixture.db.connection()))
+    .and_then(|plan| PlanExecutor::new(fixture.db.connection()).execute(&plan));
+    let stale_stored = Database::get_reservation(fixture.db.connection(), &stale_key)
+        .unwrap()
+        .is_some();
+    (result, stale_stored)
+}
+
+#[test]
+fn group_automatic_expiration_without_a_threshold_uses_the_thirty_day_default() {
+    // `cleanup: {}` loads as `Some(CleanupConfig { expire_after_days: None })`.
+    let (result, stale_stored) = reserve_group_after_stale_blocker("cleanup: {}\n");
+    let result = result.expect("enabled automatic expiration must make room for the group");
+    let ports = result.allocated_ports.expect("group ports");
+    assert_eq!(ports.get("web"), Some(&port(5700)));
+    assert_eq!(ports.get("api"), Some(&port(5701)));
+    assert!(!stale_stored, "the stale blocker must have been expired");
+}
+
+#[test]
+fn group_automatic_expiration_agrees_for_missing_and_empty_cleanup_sections() {
+    for section in ["", "cleanup: {}\n", "cleanup:\n  expire_after_days: 30\n"] {
+        let (result, stale_stored) = reserve_group_after_stale_blocker(section);
+        assert!(result.is_ok(), "cleanup section {section:?}: {result:?}");
+        assert!(!stale_stored, "cleanup section {section:?}");
+    }
+    // A 60-day threshold keeps the 40-day-old blocker: the group fails.
+    let (result, stale_stored) =
+        reserve_group_after_stale_blocker("cleanup:\n  expire_after_days: 60\n");
+    assert!(
+        matches!(result, Err(Error::GroupAllocationFailed { .. })),
+        "{result:?}"
+    );
+    assert!(stale_stored);
 }
 
 #[test]

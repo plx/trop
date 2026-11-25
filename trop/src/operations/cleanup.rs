@@ -23,8 +23,8 @@ use std::time::{Duration, SystemTime};
 use crate::config::CleanupConfig;
 use crate::database::Database;
 use crate::verified::cleanup::{
-    self as kernel, AbsenceEvidence, Candidate, CleanupReason, Deletion, Elapsed, ErrorFacts, Fate,
-    IoKindClass, Observation, PathStatusKind, ProbeOutcome, PruneErrorKind, Selection,
+    self as kernel, AbsenceEvidence, Candidate, CleanupReason, Deletion, Elapsed, ErrorFacts,
+    IoKindClass, Observation, PathStatusKind, ProbeOutcome, PruneErrorKind, Selection, Settlement,
 };
 use crate::{Reservation, Result};
 use rusqlite::Connection;
@@ -602,12 +602,22 @@ impl CleanupOperations {
 
         after_candidate_discovery();
 
-        // Revalidate the mutable predicate and the complete persisted row
-        // snapshot immediately before each guarded DELETE (verified
-        // `revalidate_all`): a changed row is preserved rather than applying
-        // stale evidence, and a delete is only requested for a row just read
-        // back unchanged and still eligible. A dry run reads and deletes
-        // nothing.
+        // Revalidate the complete persisted row snapshot immediately before
+        // each guarded DELETE (verified `revalidate_all`): a changed or
+        // vanished row is not deleted, a delete is only requested in a live
+        // run for an eligible row a read answered `Unchanged` for, and a dry
+        // run reads and deletes nothing. The kernel's spec cannot state call
+        // order over `Fn` oracles; that the read is the latest one before
+        // the delete rests on the kernel loop's structure (one read per row,
+        // its delete right after it) and on the guarded DELETE, which
+        // compares the whole row with the planned snapshot in one statement.
+        //
+        // The eligibility re-check uses the planning evidence (the path
+        // status and evaluation time of this transaction, and the planned
+        // row, which an `Unchanged` read equals), so it holds for every
+        // planned candidate (verified
+        // `lemma_unchanged_candidate_still_eligible`): `Fate::Ineligible`
+        // cannot occur here, and is kept as defense in depth.
         let eligible: Vec<bool> = planned_removals
             .iter()
             .map(|planned| {
@@ -649,16 +659,14 @@ impl CleanupOperations {
                 failure.error
             })?;
 
+        // The verified `settle` places each fate in exactly one list, so
+        // the considered rows are the preserved ones plus the removed ones.
         let mut removed = Vec::with_capacity(planned_removals.len());
         for (planned, fate) in planned_removals.into_iter().zip(fates) {
-            match fate {
-                Fate::Selected | Fate::Vanished | Fate::Deleted | Fate::VanishedAtDelete => {
-                    removed.push(planned);
-                }
-                Fate::Changed(current) | Fate::Replaced(current) => {
-                    preserved_reservations.push(current);
-                }
-                Fate::Ineligible => preserved_reservations.push(planned.reservation),
+            match kernel::settle(fate) {
+                Settlement::Removed => removed.push(planned),
+                Settlement::PreservedAsPlanned => preserved_reservations.push(planned.reservation),
+                Settlement::PreservedAs(current) => preserved_reservations.push(current),
             }
         }
 
@@ -2464,5 +2472,70 @@ mod tests {
         assert!(PrunePathStatus::Missing.is_prunable());
         assert!(PrunePathStatus::NotDirectory.is_prunable());
         assert!(!PrunePathStatus::ExistingDirectory.is_prunable());
+    }
+
+    #[test]
+    fn test_glue_settlement_places_each_fate_in_one_list() {
+        use crate::verified::cleanup::Fate;
+        // Removals: a dry-run selection, a row observed gone, a deleted row,
+        // and a row gone after a delete that matched nothing.
+        for fate in [
+            Fate::Selected,
+            Fate::Vanished,
+            Fate::Deleted,
+            Fate::VanishedAtDelete,
+        ] {
+            assert_eq!(kernel::settle::<u16>(fate), Settlement::Removed);
+        }
+        // Preserved with the current row, or as planned.
+        assert_eq!(
+            kernel::settle(Fate::Changed(7_u16)),
+            Settlement::PreservedAs(7)
+        );
+        assert_eq!(
+            kernel::settle(Fate::Replaced(9_u16)),
+            Settlement::PreservedAs(9)
+        );
+        assert_eq!(
+            kernel::settle::<u16>(Fate::Ineligible),
+            Settlement::PreservedAsPlanned
+        );
+    }
+
+    #[test]
+    fn test_planned_candidates_are_always_still_eligible() {
+        // The eligibility re-check uses the planning evidence, so every
+        // candidate the plan selects is still eligible (verified
+        // `lemma_unchanged_candidate_still_eligible`); exercised over the
+        // reason table's corners, including the exact expiry boundary and a
+        // last use in the future.
+        let ages = [
+            None,
+            Some(Elapsed { secs: 0, nanos: 0 }),
+            Some(Elapsed {
+                secs: 86_400,
+                nanos: 0,
+            }),
+            Some(Elapsed {
+                secs: 86_400,
+                nanos: 1,
+            }),
+            Some(Elapsed {
+                secs: u64::MAX,
+                nanos: 999_999_999,
+            }),
+        ];
+        for prune in [false, true] {
+            for prunable in [false, true] {
+                for max_age in [None, Some(0), Some(86_400), Some(u64::MAX)] {
+                    for age in ages {
+                        let reason = kernel::cleanup_reason(prune, prunable, max_age, age);
+                        if reason != CleanupReason::Keep {
+                            assert!(kernel::still_eligible(reason, prunable, max_age, age));
+                        }
+                    }
+                }
+            }
+        }
     }
 }

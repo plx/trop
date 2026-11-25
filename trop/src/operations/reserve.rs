@@ -471,15 +471,18 @@ impl<'a> ReservePlan<'a> {
     }
 
     /// The unrelated-path guard for the requested path, shared with release
-    /// and migrate. The verified guard decides whether the check applies
-    /// (neither `--force` nor `--allow-unrelated-path`, the same rule as
-    /// `ReservePolicy::check_path_relationship`) and the lexical relation to
+    /// and migrate. Whether the check applies is the verified policy's
+    /// `check_path_relationship` (neither `--force` nor
+    /// `--allow-unrelated-path`); the guard is built with that decision as
+    /// its only override, so it applies exactly when the policy says so
+    /// (verified `lemma_reserve_guard_is_policy` ties the policy to the
+    /// guard's flag rule). The verified guard decides the lexical relation to
     /// the current directory (the same, an ancestor, or a descendant is
     /// allowed); the database's single-path check is the physical fallback
     /// for a lexically unrelated path, and its error is the refusal.
     fn check_path_relationship(&self) -> Result<()> {
         let path = &self.options.key.path;
-        let guard = path_guard(self.options.force, self.options.allow_unrelated_path, true)?;
+        let guard = path_guard(false, !self.policy().check_path_relationship, true)?;
         guard_paths(&guard, &[path_tokens(path)], &|_index| {
             Database::validate_path_relationship(path, false).err()
         })
