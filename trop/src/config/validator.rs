@@ -255,37 +255,11 @@ impl ConfigValidator {
 
     /// Validate excluded ports list.
     ///
-    /// Ensures all ports are valid and ranges are properly ordered.
+    /// Ensures all ports are valid and ranges are properly ordered. The
+    /// decision (and the precedence among errors) is made by the verified
+    /// exclusion kernel through [`crate::port::exclusions::validate_exclusions`].
     fn validate_excluded_ports(excluded: &[PortExclusion]) -> Result<()> {
-        for (i, exclusion) in excluded.iter().enumerate() {
-            match exclusion {
-                PortExclusion::Single(port) => {
-                    Port::try_from(*port).map_err(|_| Error::Validation {
-                        field: format!("excluded_ports[{i}]"),
-                        message: format!("Invalid port: {port}"),
-                    })?;
-                }
-                PortExclusion::Range { start, end } => {
-                    Port::try_from(*start).map_err(|_| Error::Validation {
-                        field: format!("excluded_ports[{i}]"),
-                        message: format!("Invalid start port: {start}"),
-                    })?;
-
-                    Port::try_from(*end).map_err(|_| Error::Validation {
-                        field: format!("excluded_ports[{i}]"),
-                        message: format!("Invalid end port: {end}"),
-                    })?;
-
-                    if end < start {
-                        return Err(Error::Validation {
-                            field: format!("excluded_ports[{i}]"),
-                            message: format!("Invalid range: {start}..{end} (end < start)"),
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
+        crate::port::exclusions::validate_exclusions(excluded)
     }
 
     /// Validate cleanup configuration.

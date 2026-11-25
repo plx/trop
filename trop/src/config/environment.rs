@@ -285,6 +285,9 @@ impl EnvironmentConfig {
     /// Parse excluded ports from comma-separated string.
     ///
     /// Supports both individual ports (e.g., "5001") and ranges (e.g., "5000..5010").
+    /// Each item uses the same parser as the YAML string form and
+    /// `trop exclude` (`PortExclusion`'s `FromStr`), so whitespace around
+    /// each side of `..` is ignored here too.
     fn parse_excluded_ports(s: &str) -> Result<Vec<PortExclusion>> {
         let mut exclusions = Vec::new();
 
@@ -294,28 +297,11 @@ impl EnvironmentConfig {
                 continue;
             }
 
-            if let Some((start_str, end_str)) = part.split_once("..") {
-                // Range format: "5000..5010"
-                let start: u16 = start_str.parse().map_err(|_| Error::Validation {
-                    field: "TROP_EXCLUDED_PORTS".into(),
-                    message: format!("Invalid port in range: {start_str}"),
-                })?;
-
-                let end: u16 = end_str.parse().map_err(|_| Error::Validation {
-                    field: "TROP_EXCLUDED_PORTS".into(),
-                    message: format!("Invalid port in range: {end_str}"),
-                })?;
-
-                exclusions.push(PortExclusion::Range { start, end });
-            } else {
-                // Single port
-                let port_num: u16 = part.parse().map_err(|_| Error::Validation {
-                    field: "TROP_EXCLUDED_PORTS".into(),
-                    message: format!("Invalid port: {part}"),
-                })?;
-
-                exclusions.push(PortExclusion::Single(port_num));
-            }
+            let exclusion = part.parse().map_err(|error| Error::Validation {
+                field: "TROP_EXCLUDED_PORTS".into(),
+                message: format!("{error}"),
+            })?;
+            exclusions.push(exclusion);
         }
 
         Ok(exclusions)
@@ -418,6 +404,41 @@ mod tests {
     fn test_parse_excluded_ports_invalid_range() {
         let result = EnvironmentConfig::parse_excluded_ports("5000..invalid");
         assert!(result.is_err());
+    }
+
+    /// Regression: the env var used to reject whitespace around `..`, which
+    /// the YAML string form accepts. All sources now share one parser.
+    #[test]
+    fn test_parse_excluded_ports_whitespace_around_range_separator() {
+        let result = EnvironmentConfig::parse_excluded_ports("5000 .. 5010, 6000 ..6001").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                PortExclusion::Range {
+                    start: 5000,
+                    end: 5010
+                },
+                PortExclusion::Range {
+                    start: 6000,
+                    end: 6001
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_excluded_ports_error_messages_unchanged() {
+        let message = |s: &str| match EnvironmentConfig::parse_excluded_ports(s) {
+            Err(Error::Validation { field, message }) => {
+                assert_eq!(field, "TROP_EXCLUDED_PORTS");
+                message
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        };
+        assert_eq!(message("5001, abc"), "Invalid port: abc");
+        assert_eq!(message("x..5010"), "Invalid port in range: x");
+        assert_eq!(message("5000..y "), "Invalid port in range: y");
+        assert_eq!(message("70000"), "Invalid port: 70000");
     }
 
     #[test]

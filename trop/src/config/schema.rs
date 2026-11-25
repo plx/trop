@@ -5,6 +5,10 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
+
+use crate::verified::exclusions::{find_range_separator, parse_u16};
 
 /// Default minimum port for port allocation ranges.
 pub const DEFAULT_MIN_PORT: u16 = 5000;
@@ -166,25 +170,70 @@ impl<'de> Deserialize<'de> for PortExclusion {
         match Helper::deserialize(deserializer)? {
             Helper::Single(port) => Ok(PortExclusion::Single(port)),
             Helper::Range { start, end } => Ok(PortExclusion::Range { start, end }),
-            Helper::String(s) => {
-                // Parse "5000..5010" format
-                if let Some((start_str, end_str)) = s.split_once("..") {
-                    let start = start_str.trim().parse().map_err(|_| {
-                        D::Error::custom(format!("Invalid port in range: {start_str}"))
-                    })?;
-                    let end = end_str.trim().parse().map_err(|_| {
-                        D::Error::custom(format!("Invalid port in range: {end_str}"))
-                    })?;
-                    Ok(PortExclusion::Range { start, end })
-                } else {
-                    // Try parsing as a single port
-                    let port = s
-                        .trim()
-                        .parse()
-                        .map_err(|_| D::Error::custom(format!("Invalid port: {s}")))?;
-                    Ok(PortExclusion::Single(port))
-                }
-            }
+            // "5001" or "5000..5010": the shared exclusion-text parser.
+            Helper::String(s) => s.parse().map_err(D::Error::custom),
+        }
+    }
+}
+
+/// Error returned when text is neither a port (`"5001"`) nor an inclusive
+/// port range (`"5000..5010"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsePortExclusionError {
+    message: String,
+}
+
+impl fmt::Display for ParsePortExclusionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ParsePortExclusionError {}
+
+impl FromStr for PortExclusion {
+    type Err = ParsePortExclusionError;
+
+    /// Parses a port (`"5001"`) or an inclusive port range (`"5000..5010"`).
+    ///
+    /// This one parser serves the YAML string form, `TROP_EXCLUDED_PORTS`,
+    /// and `trop exclude`. The text splits at its first `..`; whitespace
+    /// around the whole text and around each side of `..` is ignored. Each
+    /// number has exactly the syntax of `u16::from_str` (an optional `+`,
+    /// then ASCII digits, at most 65535). The separator search and the
+    /// number parsing are verified kernels. Parsing does not validate:
+    /// `"0"` and `"5010..5000"` parse, and validation rejects them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trop::config::PortExclusion;
+    ///
+    /// assert_eq!("5001".parse(), Ok(PortExclusion::Single(5001)));
+    /// assert_eq!(
+    ///     " 5000 .. 5010 ".parse(),
+    ///     Ok(PortExclusion::Range { start: 5000, end: 5010 })
+    /// );
+    /// assert!("5000..".parse::<PortExclusion>().is_err());
+    /// ```
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let port = |part: &str| parse_u16(part.trim().as_bytes());
+        if let Some(at) = find_range_separator(text.as_bytes()) {
+            // `text[at..at + 2]` is the ASCII `..`, so both slice bounds are
+            // character boundaries.
+            let (start_text, end_text) = (&text[..at], &text[at + 2..]);
+            let invalid = |part: &str| ParsePortExclusionError {
+                message: format!("Invalid port in range: {part}"),
+            };
+            let start = port(start_text).ok_or_else(|| invalid(start_text))?;
+            let end = port(end_text).ok_or_else(|| invalid(end_text))?;
+            Ok(Self::Range { start, end })
+        } else {
+            port(text)
+                .map(Self::Single)
+                .ok_or_else(|| ParsePortExclusionError {
+                    message: format!("Invalid port: {text}"),
+                })
         }
     }
 }
@@ -468,6 +517,186 @@ cleanup:
         assert_eq!(config.output_format, Some(OutputFormat::Json));
         assert!(config.ports.is_some());
         assert!(config.cleanup.is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // The unified exclusion-text parser.
+    // ------------------------------------------------------------------
+
+    /// The YAML string-form parser before unification.
+    fn previous_yaml_parse(text: &str) -> Option<PortExclusion> {
+        if let Some((start, end)) = text.split_once("..") {
+            Some(PortExclusion::Range {
+                start: start.trim().parse().ok()?,
+                end: end.trim().parse().ok()?,
+            })
+        } else {
+            text.trim().parse().ok().map(PortExclusion::Single)
+        }
+    }
+
+    /// The `TROP_EXCLUDED_PORTS` item parser before unification (applied to
+    /// the trimmed item).
+    fn previous_env_parse(item: &str) -> Option<PortExclusion> {
+        if let Some((start, end)) = item.split_once("..") {
+            Some(PortExclusion::Range {
+                start: start.parse().ok()?,
+                end: end.parse().ok()?,
+            })
+        } else {
+            item.parse().ok().map(PortExclusion::Single)
+        }
+    }
+
+    /// The `trop exclude` argument parser before unification.
+    fn previous_cli_parse(text: &str) -> Option<PortExclusion> {
+        if let Some(at) = text.find("..") {
+            Some(PortExclusion::Range {
+                start: text[..at].parse().ok()?,
+                end: text[at + 2..].parse().ok()?,
+            })
+        } else {
+            text.parse().ok().map(PortExclusion::Single)
+        }
+    }
+
+    /// Every string of up to four characters over an alphabet with digits,
+    /// signs, dots, ASCII and Unicode whitespace, and a letter, plus longer
+    /// hand-picked cases.
+    fn exclusion_text_corpus() -> Vec<String> {
+        let alphabet = [
+            '0', '1', '5', '9', '+', '-', '.', ' ', '\t', 'a', '\u{a0}', '\u{3000}',
+        ];
+        let mut corpus = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for c in alphabet {
+                    let mut text = prefix.clone();
+                    text.push(c);
+                    next.push(text);
+                }
+            }
+            corpus.extend(next.iter().cloned());
+            frontier = next;
+        }
+        for text in [
+            "5000..5010",
+            " 5000 .. 5010 ",
+            "5000 ..5010",
+            "\u{a0}5000..5010\u{3000}",
+            "+5000..+5010",
+            "0005000",
+            "65535",
+            "65536",
+            "99999999999999999999",
+            "00000000000000065535",
+            "1..2..3",
+            "...",
+            "5000...5010",
+            "5000..",
+            "..5010",
+            "-1",
+            "+",
+            "5000..5000",
+            "5010..5000",
+            "0..0",
+        ] {
+            corpus.push(text.to_string());
+        }
+        corpus
+    }
+
+    #[test]
+    fn test_unified_parser_is_exactly_the_previous_yaml_parser() {
+        for text in exclusion_text_corpus() {
+            assert_eq!(
+                text.parse::<PortExclusion>().ok(),
+                previous_yaml_parse(&text),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// Regression for the divergent parsers: everything the previous
+    /// `TROP_EXCLUDED_PORTS` and `trop exclude` parsers accepted still parses
+    /// to the same entry, and whitespace around `..` is now accepted by all.
+    #[test]
+    fn test_unified_parser_accepts_everything_previously_accepted() {
+        for text in exclusion_text_corpus() {
+            let parsed = text.parse::<PortExclusion>().ok();
+            if let Some(previous) = previous_env_parse(text.trim()) {
+                assert_eq!(parsed, Some(previous), "env {text:?}");
+            }
+            if let Some(previous) = previous_cli_parse(&text) {
+                assert_eq!(parsed, Some(previous), "cli {text:?}");
+            }
+        }
+        assert_eq!(previous_env_parse("5000 .. 5010"), None);
+        assert_eq!(previous_cli_parse(" 5000"), None);
+        assert_eq!(
+            "5000 .. 5010".parse(),
+            Ok(PortExclusion::Range {
+                start: 5000,
+                end: 5010
+            })
+        );
+        assert_eq!(" 5000".parse(), Ok(PortExclusion::Single(5000)));
+    }
+
+    #[test]
+    fn test_parse_u16_kernel_matches_from_str() {
+        use crate::verified::exclusions::parse_u16;
+        let check = |text: &str| {
+            assert_eq!(
+                parse_u16(text.as_bytes()),
+                text.parse::<u16>().ok(),
+                "{text:?}"
+            );
+        };
+        for value in 0..=70_000_u32 {
+            check(&value.to_string());
+            check(&format!("+{value}"));
+            check(&format!("00{value}"));
+            check(&format!("-{value}"));
+            check(&format!(" {value}"));
+            check(&format!("{value}."));
+        }
+        for text in exclusion_text_corpus() {
+            check(&text);
+        }
+    }
+
+    #[test]
+    fn test_exclusion_text_round_trip() {
+        for value in 0..=u16::MAX {
+            assert_eq!(value.to_string().parse(), Ok(PortExclusion::Single(value)));
+        }
+        for (start, end) in [(0, 0), (1, 65_535), (5000, 5010), (65_535, 1), (7, 7)] {
+            assert_eq!(
+                format!("{start}..{end}").parse(),
+                Ok(PortExclusion::Range { start, end })
+            );
+        }
+    }
+
+    #[test]
+    fn test_exclusion_text_error_messages() {
+        let message = |text: &str| text.parse::<PortExclusion>().unwrap_err().to_string();
+        assert_eq!(message("abc"), "Invalid port: abc");
+        assert_eq!(message(" 70000 "), "Invalid port:  70000 ");
+        assert_eq!(message("x ..5010"), "Invalid port in range: x ");
+        assert_eq!(message("5000.. y"), "Invalid port in range:  y");
+        assert_eq!(message("1..2..3"), "Invalid port in range: 2..3");
+
+        let yaml_error = serde_yaml::from_str::<PortExclusion>(r#""5000..x""#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            yaml_error.contains("Invalid port in range: x"),
+            "{yaml_error}"
+        );
     }
 }
 
