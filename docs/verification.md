@@ -368,6 +368,158 @@ of `trop/src/operations/reserve.rs`, so that path can delegate to it.
   or the value every stored row agrees on. Otherwise it reports the first
   disagreeing row. It never invents or mixes metadata.
 
+### `verified::identifier` — whitespace trimming, the identifier rule, stored tags
+
+Glue: `trop/src/identifier.rs` (`trim_identifier`, `check_identifier`, `is_canonical_identifier`, `identifier_error_message`). Callers:
+- `ReservationKey::new` trims and rejects blank tags. It is lenient: it is the constructor for stored rows, migration and lookups.
+- `ReservationKey::new_validated` applies the identifier rule. `trop reserve` uses it.
+- `ReservationBuilder::project` and `task` trim; `build` requires the canonical form.
+- `ConfigValidator::validate_identifier` and `validate_runtime_identifier` apply the rule, and `validate_reservation_group` trims each tag once, for uniqueness and for env-name derivation.
+
+Properties:
+- `trimmed(s)` specifies `str::trim`: drop leading, then trailing, Unicode `White_Space` chars. `is_ws` lists the 25 code points and is proved equal to `vstd`'s model of `char::is_whitespace`.
+- `trim(&str) -> &str` returns exactly `trimmed(s)` as a sub-slice of its input. Its `split_at` cuts are proved to fall on char boundaries, so it cannot panic.
+- Trim bounds characterize the result: everything outside `s[a..b]` is whitespace, `s[a]` and `s[b-1]` are not, and the bounds are unique when the result is non-empty. Trimming is idempotent and ignores whitespace padding, and the result is empty exactly when `s` is all whitespace.
+- `check_identifier` is exactly `identifier_verdict`: `Blank`, then `ContainsNul`, then `TooLong` (more than 255 UTF-8 bytes of the trimmed value), otherwise `Ok(trimmed)`. An accepted value is canonical, re-validates to the same result, and contains no NUL anywhere. NUL is never whitespace, so the trimmed value contains NUL exactly when the raw value does.
+- `is_canonical_identifier` decides `is_canonical(s)`: `s` is non-empty and `trimmed(s) == s`, equivalently neither its first nor its last char is whitespace. `ReservationBuilder::build` decides with it, so every built reservation has the form the stored-row readers require.
+- Stored-tag sentinel (specification only). Schema v2 stores `None` as `""`. Decoding inverts encoding for every valid tag, the encoding is injective (a tagged key never aliases the untagged key), and every tag accepted by `check_identifier` round-trips. No exec kernel code encodes or decodes stored tags yet: `database/` does it unverified. Because `ReservationKey` has public fields and derives `Deserialize`, the shipped write path does not enforce `is_valid_tag`.
+
+### `verified::env_name` — portable environment-variable names
+
+Glue: `trop/src/identifier.rs` (`EnvironmentVariableName::{parse, resolve, collision_key}`, plus `derive_from_tag` in tests). The validator calls `resolve` with the trimmed tag.
+
+- `check_env_name` is exactly `env_name_verdict` over the name's UTF-8 bytes: `Empty`, then `TooLong` (more than 255 bytes), then `BadFirst`, then `BadRest`. It accepts exactly `[A-Za-z_][A-Za-z0-9_]*` of 1 to 255 bytes.
+- Shell-inertness: a portable name is pure ASCII `[0-9A-Za-z_]`. It contains no control byte, space, quote, backtick, `$ = ; & | < > ( ) { } [ ] * ? # \ ! ~ % ^ , . : @ + -`, and no non-ASCII byte.
+- `derive_env_name` returns a name exactly when the byte-wise derivation (`-` to `_`, `a-z` to `A-Z`) is portable, and then returns those bytes. Tags with non-ASCII text never derive, so the old `is_ascii` pre-check was redundant.
+- Derivation preserves length, removes lowercase and `-`, and is idempotent. Two tags derive the same name iff they agree byte-wise up to ASCII case and `-`/`_`.
+- `resolve_env_name`: an explicit mapping is validated on its own and returned verbatim, never falling back to the tag; otherwise the name is derived. Every resolved name is portable.
+- `env_collision_key` is the ASCII uppercase of the name. For portable names the key is portable, and two keys are equal exactly when the names are equal ignoring ASCII case.
+
+### `verified::text` — ASCII and UTF-8 helpers
+
+Used by `identifier` and `env_name`; no direct production glue.
+
+- ASCII case folding over bytes and over chars is idempotent, and folded keys are equal exactly under ASCII-case-insensitive equality.
+- ASCII bytes and chars coincide: ASCII bytes round-trip through UTF-8, and an all-ASCII encoding means ASCII chars, one byte per char.
+- Every char prefix ends on a UTF-8 char boundary, and prefix byte offsets are injective. `char_slice` (kernel-internal) slices a `&str` at proved char offsets.
+
+Trusted-base additions (no new escape hatches): `vstd`'s specs of `char::is_whitespace`, `char::len_utf8`, `str::chars` / `Iterator::next`, `str::as_bytes`, `str::split_at`, `String::push` and `char::to_ascii_uppercase`.
+- `char::is_whitespace` and `char::len_utf8` are checked against the kernel model for all 1,112,064 scalar values by `identifier::tests::kernel_whitespace_model_matches_std_for_every_scalar_value`.
+- The trim and the identifier rule are differential-tested against `str::trim` and the pre-kernel implementation, and the env-name grammar and derivation against independent pre-kernel oracles, by the property tests in `trop/src/identifier.rs`.
+- Glue-level trust: the choice of `ReservationKey::new` (lenient) versus `new_validated` (rule) at each call site.
+
+### `verified::path` — lexical path normalization
+
+Glue: `trop/src/path/normalize.rs` (`expand_tilde`, `resolve_components`,
+`normalize`), `trop/src/path/types.rs` (`NormalizedPath::new`),
+`trop/src/path/canonicalize.rs` (`canonicalize_existing`),
+`trop/src/path/resolver.rs` (`PathResolver::resolve`), and the helpers
+`component_kind` / `is_canonical_absolute` in `trop/src/path/mod.rs`.
+
+- `resolve_component_kinds` (all platforms; `resolve_components`): computes
+  `spec_resolve`, a stack over component kinds. `.` is dropped, roots,
+  prefixes and names are pushed, and `..` pops only a named component;
+  anything else is an error ("escapes root", unchanged). The kept indices
+  are strictly increasing, select only anchors and names, and include every
+  root/prefix (absolute stays absolute; the old "re-push the root" fallback
+  was dead). Resolution is idempotent.
+- `normalize_unix` (Unix `normalize`): computes `spec_normalize(p, cwd)`:
+  take the segments of `p` (or of `cwd/p` for relative `p`), resolve `..`,
+  and render the result as `/` or `/a/b`. It is total. Proved:
+  - every result is canonical (`spec_is_canonical_abs`), and its segments
+    are the resolved segments of the input;
+  - normalization is idempotent, even across working directories;
+  - absolute input ignores the working directory;
+  - no byte other than `/` is introduced, so a NUL appears only if the input
+    had one, and backslash-free input yields the backslash-free portable form.
+- `is_canonical_abs_path` (Unix `NormalizedPath::new`): exactly
+  `spec_is_canonical_abs`: `/`, or `/` followed by segments that are
+  non-empty and not `.` or `..` (optionally also free of `\`). With `\`
+  allowed it accepts exactly the fixed points of normalization
+  (`lemma_canonical_iff_fixpoint`). On canonical strings, byte equality is
+  segment equality (`lemma_canonical_injective`).
+- `classify_tilde` / `tilde_join` (`expand_tilde`): an exact classification
+  of a leading `~`.
+  - A home-relative path skips every separator after `~`, so `~//etc` stays
+    under the home directory.
+  - `\` is a separator only on Windows; on Unix `~\x` is a literal name.
+  - The expansion's segments are the home directory's segments followed by
+    the rest's (`lemma_tilde_join_segments`).
+  - On Windows the glue also rejects a rest that `std` parses as starting
+    with a drive prefix (`~/C:x`), which `join` would otherwise use to
+    replace the home directory.
+- `deepest_existing_prefix` (`canonicalize_existing`): works over an
+  `exists` oracle and walks up one named component at a time. It returns the
+  deepest prefix observed to exist; every longer prefix was observed absent,
+  and the remainder consists of named components only. Its oracle
+  precondition covers only prefixes followed by named components, so it
+  provably never probes above a root, prefix, `.` or `..`.
+- `resolve_by_provenance` (`PathResolver::resolve`): explicit paths are only
+  normalized. The oracle precondition is `implicit ==> canonicalize.requires(())`,
+  so the explicit branch provably never calls the canonicalization oracle.
+  Implicit paths yield the oracle's canonical path or its error, never a
+  silent fallback. They warn exactly when the error is "not found" and
+  warnings are enabled.
+
+### `verified::path_relation` — path relationships, component prefixes, rebasing
+
+Glue: `trop/src/path/relationship.rs` (`PathRelationship::between`,
+`is_within`, `contains`, and the component tokenization).
+
+- `path_relationship` computes `spec_between`; `path_is_within` and
+  `path_contains` compute `between_within` / `between_contains`.
+  - Both paths are first resolved lexically (`spec_lex_resolve`): `.` is
+    dropped and `..` cancels a preceding name. A `..` with nothing to cancel
+    (at the root, at the start of a relative path, after a drive prefix) is
+    kept as part of the path's *head*, with its root or prefix. A `..` is
+    kept exactly when `resolve_components` would fail
+    (`lemma_lex_resolve_keeps_parent_iff_strict_fails`), and the two
+    resolutions agree whenever it succeeds.
+  - A resolved path is its head followed by names
+    (`lemma_lex_resolved_shape`). Paths with different heads are
+    `Unrelated`: relative vs rooted (including the empty path), different
+    prefixes, or a different number of unresolvable `..` (so `../..` vs `..`
+    and `/..` vs `/` fail closed). Otherwise `spec_rel` decides: `Same` when
+    equal, `Ancestor`/`Descendant` for a strict prefix, else `Unrelated`.
+  - Proved:
+    - the relation is reflexive and flip-symmetric, and `Ancestor` is
+      transitive;
+    - `Same` holds exactly when the resolved paths are equal;
+    - a relative path is never related to an anchored one;
+    - `Ancestor`/`Descendant` mean that the deeper path extends the
+      shallower by named components only;
+    - within/contains are converses and form a partial order up to
+      resolution.
+- The `spec_rel` algebra is proved for any element type: exactly one case
+  holds, flip, reflexivity, transitivity, within/contains as the prefix
+  order, and appending segments gives an ancestor.
+- Canonical strings: `spec_component_prefix` (a byte prefix that ends at a
+  `/` boundary, so `/a/b` is not a component prefix of `/a/bc`) is
+  equivalent to segment prefix. Segment prefix implies byte prefix, so a
+  byte-prefix prefilter is complete. `/` is a component prefix of every
+  canonical path.
+- `spec_rebase` (moving a subtree between ancestors): it round-trips, is
+  injective, preserves `spec_rel`, and preserves canonical form.
+
+Trusted (in addition to the base): the `std::path` model.
+- On Unix, for an absolute byte string `s`, `Path::components()` is the root
+  followed by `segs(s)`. (A relative `./a` also starts with a `CurDir`,
+  which `segs` drops; the glue relies on the model for absolute strings
+  only.) Pushing components rebuilds the path, and `PathBuf::push` of a
+  relative remainder is `spec_tilde_join`.
+- Roots and prefixes come only as a leading run, and `PathBuf::pop` removes
+  a trailing name. Unmodeled: on Windows, a mid-path name carrying a drive
+  prefix followed by `..`, where legacy push/pop behavior may differ.
+- Components are keyed by an injective `OsStr` encoding: bytes on Unix,
+  UTF-16 units on Windows, `Debug` elsewhere. A Windows prefix is keyed by
+  its parsed `Prefix` value.
+
+Differential tests against the replaced implementations pin this model.
+Filesystem and environment answers (`exists`, `canonicalize`, `current_dir`,
+`home_dir`) are trusted as observed. The oracle closures are total; their
+preconditions are conditional, so they also restrict which oracle calls the
+kernels may make.
+
 ## Working on verified code
 
 - Read the rules at the top of `trop/src/verified/mod.rs`.

@@ -835,7 +835,7 @@ reservations:
         let db = create_test_database();
 
         for (task, message) in [
-            ("x".repeat(300), "Cannot exceed 255 characters"),
+            ("x".repeat(300), "Cannot exceed 255 bytes"),
             ("dev\0task".to_string(), "Cannot contain null bytes"),
         ] {
             let options = ReserveGroupOptions::new(config_path.clone())

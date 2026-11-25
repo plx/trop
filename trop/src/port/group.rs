@@ -140,7 +140,7 @@ const fn identifier_message(issue: IdentifierIssue) -> &'static str {
     match issue {
         IdentifierIssue::Empty => "Cannot be empty or only whitespace",
         IdentifierIssue::ContainsNul => "Cannot contain null bytes",
-        IdentifierIssue::TooLong => "Cannot exceed 255 characters",
+        IdentifierIssue::TooLong => "Cannot exceed 255 bytes",
     }
 }
 
@@ -158,7 +158,7 @@ fn shape_error(error: ShapeError) -> Error {
             match issue {
                 IdentifierIssue::Empty => "Service tags must not be empty or whitespace-only",
                 IdentifierIssue::ContainsNul => "Service tags cannot contain null bytes",
-                IdentifierIssue::TooLong => "Service tags cannot exceed 255 characters",
+                IdentifierIssue::TooLong => "Service tags cannot exceed 255 bytes",
             }
             .to_string(),
         ),
@@ -2085,10 +2085,7 @@ mod tests {
         request.task = Some(long.clone());
         assert_eq!(
             validation_message(request.normalized()),
-            (
-                "task".to_string(),
-                "Cannot exceed 255 characters".to_string()
-            )
+            ("task".to_string(), "Cannot exceed 255 bytes".to_string())
         );
 
         request.task = Some(format!("  {limit}  "));
@@ -2107,10 +2104,7 @@ mod tests {
         request.project = Some(long.clone());
         assert_eq!(
             validation_message(request.normalized()),
-            (
-                "project".to_string(),
-                "Cannot exceed 255 characters".to_string()
-            )
+            ("project".to_string(), "Cannot exceed 255 bytes".to_string())
         );
 
         request.project = Some("  ".to_string());
@@ -2127,7 +2121,7 @@ mod tests {
             validation_message(request.normalized()),
             (
                 "services".to_string(),
-                "Service tags cannot exceed 255 characters".to_string()
+                "Service tags cannot exceed 255 bytes".to_string()
             )
         );
 
