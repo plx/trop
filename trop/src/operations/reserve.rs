@@ -19,16 +19,17 @@ use crate::port::allocator::{
     allocator_from_config, AllocationOptions, AllocationResult, PortAllocator,
 };
 use crate::port::occupancy::OccupancyCheckConfig;
+use crate::port::CleanupRun;
 use crate::verified::allocation::{self as allocation_kernel, Attempt, Fallback};
 use crate::verified::release::guard_paths;
 use crate::verified::reserve::{
-    self as kernel, AllocationRelaxations, CleanupSwitches, DeferredStep, ExistingDecision, Intent,
-    MetadataPermissions, ReserveFlags, ReservePolicy, Retry, StoredRow,
+    self as kernel, AllocationRelaxations, CleanupCounts, CleanupSwitches, DeferredStep,
+    ExistingDecision, Intent, MetadataPermissions, ReserveFlags, ReservePolicy, Retry, StoredRow,
 };
 use crate::{AutomaticCleanupStatus, Port, PortExhaustionDetails, Reservation, ReservationKey};
 use rusqlite::Connection;
 
-use super::cleanup::{AutocleanResult, CleanupOperations};
+use super::cleanup::CleanupOperations;
 use super::plan::{OperationPlan, PlanAction};
 use super::release::path_guard;
 
@@ -494,7 +495,8 @@ impl<'a> ReservePlan<'a> {
     /// This method performs all validation and determines what actions
     /// are needed. When automatic allocation finds the range exhausted and
     /// automatic cleanup is enabled, the plan defers allocation to
-    /// execution, which cleans up once and retries once.
+    /// execution, which cleans up once and, when that freed something,
+    /// retries once.
     ///
     /// # Errors
     ///
@@ -645,7 +647,13 @@ impl<'a> ReservePlan<'a> {
             let occupancy_config = self.occupancy_config();
             let blockers = allocator.exhaustion_blockers(conn, &occupancy_config, ignored_key)?;
             let details = PortExhaustionDetails::new(
-                AutomaticCleanupStatus::new(false, cleanup.prune, cleanup.expire, 0, 0),
+                AutomaticCleanupStatus::new(
+                    CleanupRun::Skipped,
+                    cleanup.prune,
+                    cleanup.expire,
+                    0,
+                    0,
+                ),
                 blockers,
             );
             return Err(Error::PortExhausted {
@@ -894,18 +902,23 @@ where
             // 30-day default (verified `automatic_selection`).
             let unconfigured = CleanupConfig::default();
             let cleanup_config = full_config.cleanup.as_ref().unwrap_or(&unconfigured);
-            CleanupOperations::automatic_cleanup_in_connection(
+            let result = CleanupOperations::automatic_cleanup_in_connection(
                 conn,
                 cleanup_config,
                 policy.cleanup.prune,
                 policy.cleanup.expire,
                 after_candidate_discovery,
-            )
+            )?;
+            Ok(CleanupCounts {
+                pruned: result.pruned_count,
+                expired: result.expired_count,
+            })
         };
 
         // The verified kernel runs the first allocation, and only after an
         // exhausted one with cleanup enabled the single cleanup, and only
-        // after a successful cleanup the single retry (the same allocation).
+        // after a cleanup that freed something the single retry (the same
+        // allocation).
         match kernel::allocate_with_cleanup_retry(
             policy.cleanup.retry_possible(),
             allocate,
@@ -927,15 +940,15 @@ where
                 Some(format!(
                     "Automatic cleanup after initial port exhaustion pruned {} and expired \
                          {} reservation(s); allocation succeeded on the single retry.",
-                    cleanup.pruned_count, cleanup.expired_count
+                    cleanup.pruned, cleanup.expired
                 )),
             ),
-            Retry::Exhausted { cleanup } => Err(port_exhausted_error(
+            Retry::Exhausted { cleanup, retried } => Err(port_exhausted_error(
                 &allocator,
                 conn,
                 occupancy_config,
                 ignored_key,
-                cleanup_status(policy, cleanup.as_ref()),
+                cleanup_status(policy, cleanup, retried),
             )?),
         }
     };
@@ -949,23 +962,27 @@ where
 }
 
 /// The typed cleanup diagnostics of a terminal exhaustion: attempted exactly
-/// when a cleanup ran, with its counts (zero when it did not run).
+/// when a cleanup ran, with its counts (zero when it did not run), and
+/// retried as the verified control reports it (exactly when the cleanup
+/// freed something).
 fn cleanup_status(
     policy: ReservePolicy,
-    cleanup: Option<&AutocleanResult>,
+    cleanup: Option<CleanupCounts>,
+    retried: bool,
 ) -> AutomaticCleanupStatus {
-    match cleanup {
-        Some(cleanup) => AutomaticCleanupStatus::new(
-            true,
-            policy.cleanup.prune,
-            policy.cleanup.expire,
-            cleanup.pruned_count,
-            cleanup.expired_count,
-        ),
-        None => {
-            AutomaticCleanupStatus::new(false, policy.cleanup.prune, policy.cleanup.expire, 0, 0)
-        }
-    }
+    let (run, pruned, expired) = match cleanup {
+        Some(cleanup) if retried => (CleanupRun::Retried, cleanup.pruned, cleanup.expired),
+        Some(cleanup) => (CleanupRun::NotRetried, cleanup.pruned, cleanup.expired),
+        // The verified control never retries without a cleanup.
+        None => (CleanupRun::Skipped, 0, 0),
+    };
+    AutomaticCleanupStatus::new(
+        run,
+        policy.cleanup.prune,
+        policy.cleanup.expire,
+        pruned,
+        expired,
+    )
 }
 
 fn persist_deferred_outcome(
@@ -2044,6 +2061,135 @@ mod tests {
         );
     }
 
+    /// Occupancy probing disabled, so these tests do not depend on the host's
+    /// sockets (or on IPv6 support).
+    fn no_occupancy_probes() -> OccupancyCheckConfig {
+        OccupancyCheckConfig {
+            skip_tcp: true,
+            skip_udp: true,
+            skip_ipv4: true,
+            skip_ipv6: true,
+            check_all_interfaces: false,
+        }
+    }
+
+    /// A deferred allocation of `target_key` whose only candidate port is
+    /// `port`, with automatic cleanup enabled.
+    fn deferred_single_port_reserve(target_key: &ReservationKey, port: Port) -> Reservation {
+        let config = Config {
+            ports: Some(PortConfig {
+                min: port.value(),
+                max: Some(port.value()),
+                max_offset: None,
+            }),
+            ..Default::default()
+        };
+        Reservation::builder(target_key.clone(), port)
+            .build()
+            .unwrap()
+            .with_deferred_reserve(DeferredReserve {
+                options: ReserveOptions::new(target_key.clone(), None),
+                full_config: config,
+                occupancy_config: no_occupancy_probes(),
+                existing_at_planning: false,
+            })
+    }
+
+    /// Regression: the specification retries the scan only "if anything got
+    /// freed up" (allocation step 5). A cleanup that removes nothing is
+    /// reported as exhaustion without a second scan, even when the port
+    /// became free meanwhile (simulated by deleting the blocker from inside
+    /// the cleanup, after candidate discovery, where the live blocker is
+    /// fresh and its path exists, so the cleanup itself removes nothing).
+    /// The previous control retried after every cleanup and granted the port.
+    #[test]
+    fn test_cleanup_that_freed_nothing_is_not_retried() {
+        let directory = tempdir().unwrap();
+        let blocker_path = directory.path().join("blocker");
+        let target_path = directory.path().join("target");
+        std::fs::create_dir(&blocker_path).unwrap();
+        std::fs::create_dir(&target_path).unwrap();
+        let blocker_key = ReservationKey::new(blocker_path, None).unwrap();
+        let target_key = ReservationKey::new(target_path, None).unwrap();
+        let port = Port::try_from(5470).unwrap();
+        let mut db = create_test_database();
+        db.create_reservation(
+            &Reservation::builder(blocker_key.clone(), port)
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let planned = deferred_single_port_reserve(&target_key, port);
+        let transaction = db.begin_transaction().unwrap();
+        let outcome = execute_reserve_after_cleanup_with_barrier(&transaction, &planned, || {
+            assert!(Database::delete_reservation_simple(&transaction, &blocker_key).unwrap());
+        });
+        transaction.rollback().unwrap();
+        let Err(error) = outcome else {
+            panic!("a cleanup that freed nothing must not be followed by a retry");
+        };
+
+        let details = error
+            .port_exhaustion_details()
+            .expect("exhaustion must expose typed details");
+        assert!(details.cleanup().attempted());
+        assert!(!details.cleanup().retried());
+        assert_eq!(
+            (details.cleanup().pruned(), details.cleanup().expired()),
+            (0, 0)
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("after cleanup") && message.contains("not retried"),
+            "{message}"
+        );
+        assert!(!message.contains("after the single retry"), "{message}");
+        assert!(Database::get_reservation(db.connection(), &target_key)
+            .unwrap()
+            .is_none());
+    }
+
+    /// A cleanup that frees something is followed by exactly one retry, and
+    /// its success is reported with the counts.
+    #[test]
+    fn test_cleanup_that_freed_a_reservation_is_retried() {
+        let directory = tempdir().unwrap();
+        let stale_path = directory.path().join("stale");
+        let target_path = directory.path().join("target");
+        std::fs::create_dir(&target_path).unwrap();
+        let stale_key = ReservationKey::new(stale_path, None).unwrap();
+        let target_key = ReservationKey::new(target_path, None).unwrap();
+        let port = Port::try_from(5471).unwrap();
+        let mut db = create_test_database();
+        // The stale path never exists, so the automatic prune removes it.
+        db.create_reservation(
+            &Reservation::builder(stale_key.clone(), port)
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let planned = deferred_single_port_reserve(&target_key, port);
+        let transaction = db.begin_transaction().unwrap();
+        let outcome = execute_reserve_after_cleanup(&transaction, &planned).unwrap();
+        transaction.commit().unwrap();
+
+        assert_eq!(outcome.port, port);
+        let warning = outcome.warning.expect("a retry after cleanup is reported");
+        assert!(warning.contains("pruned 1 and expired 0"), "{warning}");
+        assert!(warning.contains("single retry"), "{warning}");
+        assert!(Database::get_reservation(db.connection(), &stale_key)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            Database::get_reservation(db.connection(), &target_key)
+                .unwrap()
+                .map(|reservation| reservation.port()),
+            Some(port)
+        );
+    }
+
     #[test]
     fn test_plan_path_relationship_denied() {
         let db = create_test_database();
@@ -2436,13 +2582,22 @@ mod tests {
         assert_eq!(calls, vec![None]);
     }
 
-    /// The retry kernel over scripted oracles: cleanup runs at most once,
-    /// only after an exhausted first allocation and only when possible; the
-    /// retry runs at most once, only after a successful cleanup.
+    /// The cleanup-then-retry control (verified `allocate_with_cleanup_retry`)
+    /// runs the cleanup at most once, only after an exhausted first
+    /// allocation and only when possible; the retry runs at most once, only
+    /// after a cleanup that freed something.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn cleanup_retry_runs_cleanup_at_most_once() {
         let port = Port::try_from(5000).unwrap();
-        let run = |possible: bool, first: Fallback<Port>, cleaned: bool, second: Fallback<Port>| {
+        let freed = CleanupCounts {
+            pruned: 1,
+            expired: 2,
+        };
+        let run = |possible: bool,
+                   first: Fallback<Port>,
+                   cleaned: Option<CleanupCounts>,
+                   second: Fallback<Port>| {
             let calls = Cell::new(Vec::new());
             let log = |call: &'static str| {
                 let mut seen = calls.take();
@@ -2458,16 +2613,12 @@ mod tests {
                     log("allocate");
                     Ok(answer(&first))
                 };
-                let cleanup = || -> Result<(usize, usize)> {
+                let cleanup = || -> Result<CleanupCounts> {
                     log("cleanup");
-                    if cleaned {
-                        Ok((1, 2))
-                    } else {
-                        Err(Error::Validation {
-                            field: "cleanup".into(),
-                            message: "scripted failure".into(),
-                        })
-                    }
+                    cleaned.ok_or_else(|| Error::Validation {
+                        field: "cleanup".into(),
+                        message: "scripted failure".into(),
+                    })
                 };
                 let retry = || -> Result<Fallback<Port>> {
                     log("retry");
@@ -2482,7 +2633,7 @@ mod tests {
             let (outcome, calls) = run(
                 possible,
                 Fallback::Allocated(port),
-                true,
+                Some(freed),
                 Fallback::Exhausted,
             );
             assert!(matches!(
@@ -2492,28 +2643,91 @@ mod tests {
             assert_eq!(calls, vec!["allocate"]);
         }
 
-        let (outcome, calls) = run(false, Fallback::Exhausted, true, Fallback::Allocated(port));
-        assert!(matches!(outcome, Ok(Retry::Exhausted { cleanup: None })));
-        assert_eq!(calls, vec!["allocate"]);
-
-        let (outcome, calls) = run(true, Fallback::Exhausted, true, Fallback::Allocated(port));
-        assert!(matches!(
-            outcome,
-            Ok(Retry::Allocated { port: allocated, cleanup: Some((1, 2)) }) if allocated == port
-        ));
-        assert_eq!(calls, vec!["allocate", "cleanup", "retry"]);
-
-        let (outcome, calls) = run(true, Fallback::Exhausted, true, Fallback::Exhausted);
+        let (outcome, calls) = run(
+            false,
+            Fallback::Exhausted,
+            Some(freed),
+            Fallback::Allocated(port),
+        );
         assert!(matches!(
             outcome,
             Ok(Retry::Exhausted {
-                cleanup: Some((1, 2))
+                cleanup: None,
+                retried: false
             })
+        ));
+        assert_eq!(calls, vec!["allocate"]);
+
+        let (outcome, calls) = run(
+            true,
+            Fallback::Exhausted,
+            Some(freed),
+            Fallback::Allocated(port),
+        );
+        assert!(matches!(
+            outcome,
+            Ok(Retry::Allocated { port: allocated, cleanup: Some(counts) })
+                if allocated == port && counts == freed
         ));
         assert_eq!(calls, vec!["allocate", "cleanup", "retry"]);
 
+        let (outcome, calls) = run(true, Fallback::Exhausted, Some(freed), Fallback::Exhausted);
+        assert!(matches!(
+            outcome,
+            Ok(Retry::Exhausted {
+                cleanup: Some(counts),
+                retried: true
+            }) if counts == freed
+        ));
+        assert_eq!(calls, vec!["allocate", "cleanup", "retry"]);
+
+        // One freed reservation of either kind is enough for the retry.
+        for counts in [
+            CleanupCounts {
+                pruned: 1,
+                expired: 0,
+            },
+            CleanupCounts {
+                pruned: 0,
+                expired: 1,
+            },
+        ] {
+            let (outcome, calls) = run(
+                true,
+                Fallback::Exhausted,
+                Some(counts),
+                Fallback::Allocated(port),
+            );
+            assert!(matches!(
+                outcome,
+                Ok(Retry::Allocated { cleanup: Some(seen), .. }) if seen == counts
+            ));
+            assert_eq!(calls, vec!["allocate", "cleanup", "retry"]);
+        }
+
+        // A cleanup that freed nothing is reported without a retry, even
+        // when a retry would now succeed.
+        let nothing = CleanupCounts {
+            pruned: 0,
+            expired: 0,
+        };
+        let (outcome, calls) = run(
+            true,
+            Fallback::Exhausted,
+            Some(nothing),
+            Fallback::Allocated(port),
+        );
+        assert!(matches!(
+            outcome,
+            Ok(Retry::Exhausted {
+                cleanup: Some(counts),
+                retried: false
+            }) if counts == nothing
+        ));
+        assert_eq!(calls, vec!["allocate", "cleanup"]);
+
         // A failed cleanup is the result; there is no retry.
-        let (outcome, calls) = run(true, Fallback::Exhausted, false, Fallback::Allocated(port));
+        let (outcome, calls) = run(true, Fallback::Exhausted, None, Fallback::Allocated(port));
         assert!(matches!(outcome, Err(Error::Validation { .. })));
         assert_eq!(calls, vec!["allocate", "cleanup"]);
     }
@@ -2527,28 +2741,30 @@ mod tests {
             &config,
         );
         let policy = planner.policy();
-        let skipped = cleanup_status(policy, None);
+        let skipped = cleanup_status(policy, None, false);
         assert!(!skipped.attempted());
+        assert!(!skipped.retried());
         assert!(skipped.prune_enabled());
         assert!(!skipped.expire_enabled());
         assert_eq!((skipped.pruned(), skipped.expired()), (0, 0));
 
-        let cleanup = AutocleanResult {
-            considered_count: 4,
-            preserved_count: 1,
-            pruned_count: 2,
-            expired_count: 1,
-            total_removed: 3,
-            considered_reservations: Vec::new(),
-            preserved_reservations: Vec::new(),
-            removed_reservations: Vec::new(),
-            pruned_reservations: Vec::new(),
-            expired_reservations: Vec::new(),
-            prune_path_decisions: Vec::new(),
+        let cleanup = CleanupCounts {
+            pruned: 2,
+            expired: 1,
         };
-        let ran = cleanup_status(policy, Some(&cleanup));
+        let ran = cleanup_status(policy, Some(cleanup), true);
         assert!(ran.attempted());
+        assert!(ran.retried());
         assert_eq!((ran.pruned(), ran.expired()), (2, 1));
+
+        let nothing = CleanupCounts {
+            pruned: 0,
+            expired: 0,
+        };
+        let idle = cleanup_status(policy, Some(nothing), false);
+        assert!(idle.attempted());
+        assert!(!idle.retried());
+        assert_eq!((idle.pruned(), idle.expired()), (0, 0));
     }
 
     /// The previous unrelated-path check: the policy decides whether it

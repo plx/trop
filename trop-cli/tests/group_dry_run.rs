@@ -393,3 +393,63 @@ fn reserve_group_respects_disabled_automatic_cleanup() {
     );
     assert_eq!(rows(&env), before, "no cleanup may run");
 }
+
+/// A data directory a live run cannot create (here, below a regular file)
+/// fails the group dry runs too, with the live run's exit code, printing no
+/// ports and creating nothing. The dry runs used to plan against an empty
+/// copy and print ports while the live run failed with an I/O error.
+#[test]
+fn dry_run_fails_like_a_live_run_when_the_data_directory_cannot_be_created() {
+    let env = TestEnv::new();
+    let (project_dir, config) = project(&env, 9000);
+    let obstruction = env.temp_path.join("plain-file");
+    fs::write(&obstruction, "not a directory").unwrap();
+
+    for data_dir in [obstruction.join("data"), obstruction.clone()] {
+        let run = |args: &[&str]| {
+            env.command_bare()
+                .current_dir(&project_dir)
+                .arg("--data-dir")
+                .arg(&data_dir)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let config_arg = config.to_str().unwrap();
+        for (command, live_args, dry_args) in [
+            (
+                "reserve-group",
+                vec!["reserve-group", config_arg, "--skip-occupancy-check"],
+                vec![
+                    "reserve-group",
+                    config_arg,
+                    "--skip-occupancy-check",
+                    "--dry-run",
+                ],
+            ),
+            (
+                "autoreserve",
+                vec!["autoreserve", "--skip-occupancy-check"],
+                vec!["autoreserve", "--skip-occupancy-check", "--dry-run"],
+            ),
+        ] {
+            let what = format!("{command} with --data-dir {}", data_dir.display());
+            let dry = run(&dry_args);
+            let live = run(&live_args);
+            assert!(!dry.status.success(), "{what}: dry run succeeded");
+            assert!(!live.status.success(), "{what}: live run succeeded");
+            assert_eq!(dry.status.code(), live.status.code(), "{what}: exit codes");
+            assert!(stdout(&dry).is_empty(), "{what}: {}", stdout(&dry));
+            assert!(
+                stderr(&dry).contains("I/O error"),
+                "{what}: {}",
+                stderr(&dry)
+            );
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(&obstruction).unwrap(),
+        "not a directory",
+        "the obstruction is left alone"
+    );
+}

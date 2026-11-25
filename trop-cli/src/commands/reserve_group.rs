@@ -9,7 +9,9 @@ use crate::utils::format_allocations;
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
 use std::time::Duration;
-use trop::operations::reserve_group::{select_group_output, GroupOutputFormat};
+use trop::operations::reserve_group::{
+    check_database_directory_creatable, select_group_output, GroupOutputFormat,
+};
 use trop::operations::{ReserveGroupOptions, ReserveGroupPlan};
 use trop::output::OutputFormat;
 use trop::{Config, ExecutionResult, PlanExecutor};
@@ -214,7 +216,10 @@ impl ReserveGroupCommand {
 
 /// The database a group dry run copies (`None` when none exists yet), and
 /// the lock wait for reading it. A missing database with auto-init disabled
-/// fails exactly as a live run fails when it opens the database.
+/// fails exactly as a live run fails when it opens the database; a missing
+/// database whose directory a live run could not create (an existing
+/// ancestor is not a directory) fails with the live run's error class and
+/// exit code, without creating anything.
 pub(crate) fn dry_run_database(
     context: &InvocationContext,
 ) -> Result<(Option<PathBuf>, Duration), CliError> {
@@ -227,6 +232,7 @@ pub(crate) fn dry_run_database(
     if effective.disable_autoinit() {
         return Err(CliError::NoDataDirectory);
     }
+    check_database_directory_creatable(&db_path).map_err(CliError::from)?;
     Ok((None, timeout))
 }
 

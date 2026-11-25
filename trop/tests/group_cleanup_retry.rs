@@ -165,7 +165,9 @@ fn group_exhaustion_prunes_reservations_of_missing_directories() {
 #[test]
 fn disabled_expiry_keeps_stale_reservations_and_the_group_fails() {
     // Pruning stays enabled but cannot free a port of an existing directory;
-    // expiry, which could, is disabled.
+    // expiry, which could, is disabled. The cleanup frees nothing, so (by the
+    // specification's "If anything got freed up, retry") the scan is not
+    // retried, and the error says so instead of claiming a retry.
     let mut fixture = fixture("disable_autoexpire: true\n");
     let other = fixture.existing_dir("other");
     let stale = fixture.reserve(&other, 5000, STALE);
@@ -178,7 +180,9 @@ fn disabled_expiry_keeps_stale_reservations_and_the_group_fails() {
         matches!(
             &error,
             Error::GroupAllocationFailed { attempted: 2, reason }
-                if reason.contains("even after automatic cleanup pruned 0 and expired 0")
+                if reason.contains("automatic cleanup pruned 0 and expired 0")
+                    && reason.contains("so the scan was not retried")
+                    && !reason.contains("retried once")
         ),
         "{error}"
     );

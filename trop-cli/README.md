@@ -126,8 +126,11 @@ port actually stored after reconciliation.
 
 When the configured range is initially exhausted, `reserve` runs the enabled
 automatic cleanup phases under the same database transaction as allocation:
-stale-path pruning first, then configured age-based expiration. It then retries
-the complete allocation scan exactly once. `--disable-autoprune`,
+stale-path pruning first, then configured age-based expiration. When that
+cleanup removed at least one reservation, it then retries the complete
+allocation scan exactly once; when it removed nothing, the range is reported
+exhausted without a second scan. `reserve-group` and `autoreserve` do the same
+for an exhausted group. `--disable-autoprune`,
 `--disable-autoexpire`, and `--disable-autoclean` override the corresponding
 effective config/environment settings; `--force` does not re-enable a disabled
 phase. Normal mode reports only aggregate prune/expire counts on stderr, while

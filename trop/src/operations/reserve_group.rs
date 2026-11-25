@@ -463,13 +463,16 @@ impl ReserveGroupPlan {
 }
 
 /// Runs a planned group allocation: reconciliation and, for a fresh group,
-/// the allocation with one automatic cleanup and retry when the fallback
-/// pattern is exhausted -- the same step single reservations take.
+/// the allocation with one automatic cleanup when the fallback pattern is
+/// exhausted, and one retry when that cleanup freed something -- the same
+/// step single reservations take.
 ///
 /// The cleanup policy is the verified `verified::reserve::cleanup_policy` of
 /// the configuration's `disable_autoprune`/`disable_autoexpire` switches, so
-/// a retry is possible unless both are disabled. Expiry uses the configured
-/// `cleanup` section, or 30 days without one, as for single reservations.
+/// a cleanup is possible unless both are disabled. Enabled expiry uses the
+/// configured `expire_after_days`, or the built-in 30-day default when it is
+/// unset (no `cleanup` section, or one without `expire_after_days`; verified
+/// `verified::cleanup::automatic_selection`), as for single reservations.
 pub(crate) fn execute_group_allocation(
     conn: &Connection,
     request: &GroupAllocationRequest,
@@ -489,10 +492,10 @@ pub(crate) fn execute_group_allocation(
         policy,
         cleanup.retry_possible(),
         |conn| {
-            let default_cleanup = CleanupConfig {
-                expire_after_days: Some(30),
-            };
-            let cleanup_config = full_config.cleanup.as_ref().unwrap_or(&default_cleanup);
+            // The 30-day default is applied by the verified selection, not
+            // here: an unset threshold is passed through unchanged.
+            let unconfigured = CleanupConfig::default();
+            let cleanup_config = full_config.cleanup.as_ref().unwrap_or(&unconfigured);
             let result = CleanupOperations::automatic_cleanup_in_connection(
                 conn,
                 cleanup_config,
@@ -524,15 +527,20 @@ pub(crate) fn execute_group_allocation(
 /// WAL-mode database read-only can leave its `-wal`/`-shm` files beside it;
 /// the contents never change.
 ///
+/// Like `Database::open`, it first rejects a `busy_timeout` `SQLite` cannot
+/// store (more than `i32::MAX` milliseconds) with the same validation error,
+/// whether or not a database file exists.
+///
 /// # Errors
 ///
-/// Returns an error if the file cannot be opened or read, or if its schema
-/// is not supported.
+/// Returns an error if the busy timeout is too large, if the file cannot be
+/// opened or read, or if its schema is not supported.
 #[doc(hidden)]
 pub fn open_dry_run_snapshot(
     database: Option<&Path>,
     busy_timeout: Duration,
 ) -> Result<Connection> {
+    validate_busy_timeout(busy_timeout)?;
     let snapshot = Connection::open_in_memory()?;
     if let Some(path) = database {
         let source = Connection::open_with_flags(
@@ -546,6 +554,87 @@ pub fn open_dry_run_snapshot(
     }
     check_schema_compatibility(&snapshot)?;
     Ok(snapshot)
+}
+
+/// Checks, without creating anything, that a live run could create the
+/// directory that will hold the database at `db_path`, which does not exist
+/// yet.
+///
+/// A live run's `Database::open` creates the missing parent directories with
+/// `create_dir_all`, which fails when the deepest existing ancestor of the
+/// database's directory is not a directory (for example a regular file used
+/// as `--data-dir` or one of its ancestors). A dry run with no database plans
+/// against an empty copy and creates nothing, so it checks that ancestor
+/// instead and fails with an I/O error -- the error class, and so the exit
+/// code, of the live failure; the message describes the obstruction rather
+/// than repeating the operating system's text. Permissions are not checked:
+/// a directory the live run cannot write to is not detected.
+///
+/// # Errors
+///
+/// Returns `Error::Io` when an existing ancestor is not a directory, or when
+/// an ancestor cannot be inspected.
+#[doc(hidden)]
+pub fn check_database_directory_creatable(db_path: &Path) -> Result<()> {
+    let Some(directory) = db_path.parent() else {
+        return Ok(());
+    };
+    // The first failure to inspect a component other than "not found" (for
+    // example "not a directory", reported below a regular file). It is
+    // reported only if no ancestor turns out to be the obstruction.
+    let mut inspection_error: Option<std::io::Error> = None;
+    let mut ancestor = directory;
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) if ancestor.is_dir() => {
+                return inspection_error.map_or(Ok(()), |error| Err(Error::Io(error)));
+            }
+            Ok(_) => {
+                let kind = if ancestor == directory {
+                    ErrorKind::AlreadyExists
+                } else {
+                    ErrorKind::Other
+                };
+                return Err(Error::Io(std::io::Error::new(
+                    kind,
+                    format!(
+                        "cannot create the database directory {}: {} exists and is not a \
+                         directory",
+                        directory.display(),
+                        ancestor.display()
+                    ),
+                )));
+            }
+            Err(error) => {
+                if error.kind() != ErrorKind::NotFound && inspection_error.is_none() {
+                    inspection_error = Some(error);
+                }
+                match ancestor.parent() {
+                    Some(parent) => ancestor = parent,
+                    None => {
+                        return inspection_error.map_or(Ok(()), |error| Err(Error::Io(error)));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Rejects a busy timeout `SQLite` cannot store, exactly as `Database::open`
+/// does: the verified `verified::config::busy_timeout_ok` over the
+/// duration's parts, with the same validation error. Without this check,
+/// rusqlite's `busy_timeout` panics on such a value.
+fn validate_busy_timeout(timeout: Duration) -> Result<()> {
+    if crate::verified::config::busy_timeout_ok(timeout.as_secs(), timeout.subsec_nanos()) {
+        return Ok(());
+    }
+    Err(Error::Validation {
+        field: "maximum_lock_wait_seconds".into(),
+        message: format!(
+            "Timeout must not exceed {} milliseconds",
+            crate::verified::config::MAX_BUSY_TIMEOUT_MILLIS
+        ),
+    })
 }
 
 /// Copies every table (with its rows), index, trigger, and view of `source`

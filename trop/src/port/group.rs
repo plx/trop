@@ -15,12 +15,12 @@ use crate::port::allocator::{PortAllocator, PortAvailability};
 use crate::port::occupancy::{OccupancyCheckConfig, PortOccupancyChecker};
 use crate::verified::allocation::Fallback;
 use crate::verified::group::{
-    decide_group_reconciliation, derive_compatible_base, find_pattern_base, match_stored_tags,
-    plan_fresh_group, validate_group_request, CompatClass, CompatError, FreshGroupError,
-    FreshGroupPlan, GroupDecision, PreferredVerdict, RawService, ShapeError, StoredService,
+    derive_compatible_base, find_pattern_base, match_stored_tags, plan_fresh_group,
+    reconcile_group, validate_group_request, CompatClass, CompatError, FreshGroupError,
+    FreshGroupPlan, PreferredVerdict, RawService, Reconciliation, ShapeError, StoredService,
     TagMatchError, ValidatedGroupShape,
 };
-use crate::verified::reserve::{allocate_with_cleanup_retry, Retry};
+use crate::verified::reserve::{allocate_with_cleanup_retry, CleanupCounts, Retry};
 use crate::verified::sticky::{
     plan_group_metadata, replacement_metadata, ReplacementSource, StickyField, StickyResolution,
     StoredMetadata,
@@ -382,18 +382,24 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
             occupancy_config,
             policy,
             false,
-            |_| Ok(GroupCleanupCounts::default()),
+            |_| {
+                Ok(GroupCleanupCounts {
+                    pruned: 0,
+                    expired: 0,
+                })
+            },
         )?;
         Ok(outcome.result)
     }
 
     /// Allocate or reconcile a group under an explicit safety policy, with
-    /// one automatic cleanup and retry when a fresh allocation is exhausted.
+    /// one automatic cleanup when a fresh allocation is exhausted, and one
+    /// retry when that cleanup freed something.
     ///
     /// When a fresh allocation (of a new group, or after a forced
     /// replacement deleted the stored one) finds no base for the fallback
-    /// pattern and `cleanup_possible` holds, `cleanup` runs once and the
-    /// allocation is retried once (the verified control
+    /// pattern and `cleanup_possible` holds, `cleanup` runs once, and when it
+    /// freed something the allocation is retried once (the verified control
     /// `verified::reserve::allocate_with_cleanup_retry`, shared with single
     /// reservations). Everything runs inside one savepoint, so a failure
     /// also rolls the cleanup back.
@@ -434,16 +440,23 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         existing: &[Reservation],
         policy: GroupReconciliationPolicy,
     ) -> Result<GroupReconciliation> {
-        let compat = self.compatible_existing_group(request, existing);
-        let class = match &compat {
-            Ok(_) => CompatClass::Compatible,
-            Err(Error::ReservationConflict { .. }) => CompatClass::Conflict,
-            Err(_) => CompatClass::OtherError,
+        // The verified kernel classifies the stored group (through this
+        // closure) only when there are stored rows, and decides.
+        let classify = || {
+            let compat = self.compatible_existing_group(request, existing);
+            let class = match &compat {
+                Ok(_) => CompatClass::Compatible,
+                Err(Error::ReservationConflict { .. }) => CompatClass::Conflict,
+                Err(_) => CompatClass::OtherError,
+            };
+            (class, compat)
         };
 
-        match decide_group_reconciliation(existing.len(), class, policy.force) {
-            GroupDecision::AllocateFresh => Ok(GroupReconciliation::AllocateFresh(request.clone())),
-            GroupDecision::Replace => {
+        match reconcile_group(existing.len(), policy.force, classify) {
+            Reconciliation::AllocateFresh => {
+                Ok(GroupReconciliation::AllocateFresh(request.clone()))
+            }
+            Reconciliation::Replace(_) => {
                 let request = Self::replacement_request(request, existing)?;
                 let existing_keys = existing
                     .iter()
@@ -454,14 +467,21 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
                     existing_keys,
                 })
             }
-            // The verified decision is `Refresh` only for a compatible group
-            // and `Fail` only for a compatibility error, so `compat?` yields
-            // the group to refresh or the error to report.
-            GroupDecision::Refresh | GroupDecision::Fail => {
-                let result = compat?;
+            // The kernel returns `Refresh` only with what `classify` returned
+            // for the class `Compatible`, which the closure assigns to `Ok`.
+            Reconciliation::Refresh(compat) => {
+                let Ok(result) = compat else {
+                    unreachable!("verified: Refresh carries a compatible group")
+                };
                 let metadata = Self::plan_metadata_refresh(request, existing, policy)?;
                 Ok(GroupReconciliation::Refresh { result, metadata })
             }
+            // The kernel returns `Fail` only with a `Conflict` or
+            // `OtherError` result, which the closure assigns to `Err`.
+            Reconciliation::Fail(compat) => match compat {
+                Err(error) => Err(error),
+                Ok(_) => unreachable!("verified: Fail carries a compatibility error"),
+            },
         }
     }
 
@@ -750,8 +770,9 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     /// `verified::group::plan_fresh_group` decides every port (pinning,
     /// fallback classification, and the lowest-base pattern search), and the
     /// verified control `verified::reserve::allocate_with_cleanup_retry`
-    /// decides whether an exhausted search is retried after one automatic
-    /// cleanup; this glue supplies the probes and the cleanup and performs
+    /// decides whether one automatic cleanup runs after an exhausted search
+    /// and whether the search is retried after it (exactly when it freed
+    /// something); this glue supplies the probes and the cleanup and performs
     /// the inserts.
     fn allocate_fresh_group<K>(
         &self,
@@ -806,8 +827,12 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
                 port: plan,
                 cleanup,
             } => (plan, cleanup),
-            Retry::Exhausted { cleanup } => {
-                return Err(pattern_exhausted(exhausted_fallbacks.get(), cleanup));
+            Retry::Exhausted { cleanup, retried } => {
+                return Err(pattern_exhausted(
+                    exhausted_fallbacks.get(),
+                    cleanup,
+                    retried,
+                ));
             }
         };
 
@@ -898,14 +923,10 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     }
 }
 
-/// What one automatic cleanup removed before a group allocation was retried.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct GroupCleanupCounts {
-    /// Reservations pruned (their paths no longer exist).
-    pub(crate) pruned: usize,
-    /// Reservations expired (unused for too long).
-    pub(crate) expired: usize,
-}
+/// What one automatic cleanup removed after an exhausted group allocation:
+/// the verified kernel's `CleanupCounts`, whose `freed_anything` decides
+/// whether the allocation is retried.
+pub(crate) type GroupCleanupCounts = CleanupCounts;
 
 /// A group allocation together with the warning to report, if any.
 #[derive(Debug, Clone)]
@@ -941,15 +962,25 @@ fn preferred_only_unavailable(port: u16, verdict: PreferredVerdict) -> Result<Er
     })
 }
 
-/// The error for a fallback pattern that no base satisfies, after the
-/// automatic cleanup and retry when one ran.
-fn pattern_exhausted(fallback_count: usize, cleaned: Option<GroupCleanupCounts>) -> Error {
+/// The error for a fallback pattern that no base satisfies: after the
+/// automatic cleanup when one ran, and after the retry when the verified
+/// control retried (exactly when the cleanup freed something).
+fn pattern_exhausted(
+    fallback_count: usize,
+    cleaned: Option<GroupCleanupCounts>,
+    retried: bool,
+) -> Error {
     let reason = match cleaned {
         None => "No scanned base can satisfy the complete offset fallback pattern".to_string(),
-        Some(counts) => format!(
+        Some(counts) if retried => format!(
             "No scanned base can satisfy the complete offset fallback pattern, even after \
              automatic cleanup pruned {} and expired {} reservation(s) and the scan was \
              retried once",
+            counts.pruned, counts.expired
+        ),
+        Some(counts) => format!(
+            "No scanned base can satisfy the complete offset fallback pattern; automatic \
+             cleanup pruned {} and expired {} reservation(s), so the scan was not retried",
             counts.pruned, counts.expired
         ),
     };
@@ -2664,7 +2695,10 @@ mod tests {
                 true,
                 |_| {
                     calls.set(calls.get() + 1);
-                    Ok(GroupCleanupCounts::default())
+                    Ok(GroupCleanupCounts {
+                        pruned: 0,
+                        expired: 0,
+                    })
                 },
             )
             .unwrap();
@@ -2717,5 +2751,286 @@ mod tests {
         assert!(outcome
             .warning
             .is_some_and(|warning| warning.contains("pruned 1 and expired 0")));
+    }
+
+    /// Regression: the specification retries "if anything got freed up". A
+    /// cleanup that reports nothing removed is not followed by a re-plan,
+    /// even when the port became free meanwhile (here the cleanup oracle
+    /// frees it behind the counts' back), and the error does not claim a
+    /// retry. The previous control re-planned after every cleanup.
+    #[test]
+    fn cleanup_that_freed_nothing_is_not_retried() {
+        let config = OccupancyCheckConfig::default();
+        let request = group_request(vec![
+            service("web", Some(0), None),
+            service("api", Some(1), None),
+        ]);
+        let blocker = Reservation::builder(
+            ReservationKey::new(PathBuf::from("/other"), None).unwrap(),
+            Port::try_from(5000).unwrap(),
+        )
+        .build()
+        .unwrap();
+        let db = create_test_database();
+        Database::create_reservation_simple(db.connection(), &blocker).unwrap();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5001);
+
+        let calls = Cell::new(0);
+        let error = allocator
+            .allocate_group_with_cleanup(
+                db.connection(),
+                &request,
+                &config,
+                GroupReconciliationPolicy::default(),
+                true,
+                |conn| {
+                    calls.set(calls.get() + 1);
+                    assert!(Database::delete_reservation_simple(conn, blocker.key())?);
+                    Ok(GroupCleanupCounts {
+                        pruned: 0,
+                        expired: 0,
+                    })
+                },
+            )
+            .expect_err("a cleanup that freed nothing must not be followed by a re-plan");
+        assert_eq!(calls.get(), 1);
+        match &error {
+            Error::GroupAllocationFailed { attempted, reason } => {
+                assert_eq!(*attempted, 2);
+                assert!(reason.contains("not retried"), "{reason}");
+                assert!(!reason.contains("retried once"), "{reason}");
+            }
+            other => panic!("expected GroupAllocationFailed, got {other:?}"),
+        }
+        // The savepoint rolled the oracle's delete back with the failure.
+        assert!(Database::get_reservation(db.connection(), blocker.key())
+            .unwrap()
+            .is_some());
+    }
+
+    /// The conflict details of the trusted error mapping: what each
+    /// incompatibility of the stored rows is reported as.
+    fn conflict_details(error: Error) -> String {
+        match error {
+            Error::ReservationConflict { details } => details,
+            other => panic!("expected a reservation conflict, got {other:?}"),
+        }
+    }
+
+    /// A forced shape replacement that omits a field the stored rows
+    /// disagree on is refused with "stored rows disagree on <field>", and
+    /// nothing changes (verified `replacement_metadata`'s error, mapped by
+    /// the glue).
+    #[test]
+    fn forced_replacement_reports_the_field_stored_rows_disagree_on() {
+        let db = create_test_database();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
+        let config = OccupancyCheckConfig::default();
+        let original = group_request(vec![
+            service("web", Some(0), None),
+            service("api", Some(1), None),
+        ]);
+        allocator
+            .allocate_group(db.connection(), &original, &config)
+            .unwrap();
+        let forced = GroupReconciliationPolicy {
+            force: true,
+            ..GroupReconciliationPolicy::default()
+        };
+        let reshaped = group_request(vec![
+            service("web", Some(0), None),
+            service("api", Some(1), None),
+            service("db", Some(2), None),
+        ]);
+
+        for (field, statement) in [
+            (
+                "project",
+                "UPDATE reservations SET project = 'p-' || tag, task = 'same'",
+            ),
+            (
+                "task",
+                "UPDATE reservations SET project = 'same', task = 't-' || tag",
+            ),
+        ] {
+            db.connection().execute(statement, []).unwrap();
+            let before = Database::list_all_reservations(db.connection()).unwrap();
+            let details = conflict_details(
+                allocator
+                    .allocate_group_with_policy(db.connection(), &reshaped, &config, forced)
+                    .unwrap_err(),
+            );
+            assert!(
+                details.contains(&format!("stored rows disagree on {field}")),
+                "{details}"
+            );
+            assert!(details.contains("/test/project"), "{details}");
+            assert_eq!(
+                Database::list_all_reservations(db.connection()).unwrap(),
+                before
+            );
+        }
+
+        // An explicit value resolves the disagreement.
+        let mut explicit = reshaped.clone();
+        explicit.project = Some("chosen".to_string());
+        explicit.task = Some("chosen".to_string());
+        allocator
+            .allocate_group_with_policy(db.connection(), &explicit, &config, forced)
+            .unwrap();
+    }
+
+    /// A stored group whose tags are not the requested set (a strict subset
+    /// or superset) is "requested service set does not match stored service
+    /// set" (verified `match_stored_tags`' `SetMismatch`).
+    #[test]
+    fn stored_tag_set_mismatch_is_reported() {
+        let db = create_test_database();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
+        let config = OccupancyCheckConfig::default();
+        allocator
+            .allocate_group(
+                db.connection(),
+                &group_request(vec![service("web", Some(0), None)]),
+                &config,
+            )
+            .unwrap();
+
+        let superset = group_request(vec![
+            service("web", Some(0), None),
+            service("api", Some(1), None),
+        ]);
+        let details = conflict_details(
+            allocator
+                .allocate_group(db.connection(), &superset, &config)
+                .unwrap_err(),
+        );
+        assert!(
+            details.contains("requested service set does not match stored service set"),
+            "{details}"
+        );
+
+        let db = create_test_database();
+        allocator
+            .allocate_group(db.connection(), &superset, &config)
+            .unwrap();
+        let subset = group_request(vec![service("api", Some(1), None)]);
+        let details = conflict_details(
+            allocator
+                .allocate_group(db.connection(), &subset, &config)
+                .unwrap_err(),
+        );
+        assert!(
+            details.contains("requested service set does not match stored service set"),
+            "{details}"
+        );
+    }
+
+    /// Untagged and duplicate stored rows (which the database's tagged,
+    /// primary-keyed lookup never returns, so the rows are handed to the
+    /// compatibility check directly) are reported with their own messages.
+    #[test]
+    fn untagged_and_duplicate_stored_rows_are_reported() {
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5100);
+        let request = group_request(vec![
+            service("web", Some(0), None),
+            service("api", Some(1), None),
+        ]);
+        let row = |tag: Option<&str>, port: u16| {
+            Reservation::builder(
+                ReservationKey::new(PathBuf::from("/test/project"), tag.map(str::to_string))
+                    .unwrap(),
+                Port::try_from(port).unwrap(),
+            )
+            .build()
+            .unwrap()
+        };
+
+        let untagged = [row(Some("api"), 5001), row(None, 5000)];
+        let details = conflict_details(
+            allocator
+                .compatible_existing_group(&request, &untagged)
+                .unwrap_err(),
+        );
+        assert!(
+            details.contains("stored group unexpectedly contains an untagged reservation"),
+            "{details}"
+        );
+
+        let duplicate = [row(Some("web"), 5000), row(Some("web"), 5001)];
+        let details = conflict_details(
+            allocator
+                .compatible_existing_group(&request, &duplicate)
+                .unwrap_err(),
+        );
+        assert!(
+            details.contains("stored group contains duplicate service tags"),
+            "{details}"
+        );
+
+        // The first offending row is reported: an untagged row before a
+        // duplicate.
+        let both = [
+            row(None, 5002),
+            row(Some("web"), 5000),
+            row(Some("web"), 5001),
+        ];
+        let details = conflict_details(
+            allocator
+                .compatible_existing_group(&request, &both)
+                .unwrap_err(),
+        );
+        assert!(details.contains("untagged"), "{details}");
+
+        // The well-formed group is compatible.
+        let ok = [row(Some("api"), 5001), row(Some("web"), 5000)];
+        let result = allocator.compatible_existing_group(&request, &ok).unwrap();
+        assert_eq!(result.base_port, Some(Port::try_from(5000).unwrap()));
+    }
+
+    /// A retry after a cleanup that freed something, which is exhausted
+    /// too, says that the scan was retried once.
+    #[test]
+    fn exhausted_retry_after_a_freeing_cleanup_reports_the_retry() {
+        let config = OccupancyCheckConfig::default();
+        let request = group_request(vec![
+            service("web", Some(0), None),
+            service("api", Some(1), None),
+        ]);
+        let blocker = Reservation::builder(
+            ReservationKey::new(PathBuf::from("/other"), None).unwrap(),
+            Port::try_from(5000).unwrap(),
+        )
+        .build()
+        .unwrap();
+        let db = create_test_database();
+        Database::create_reservation_simple(db.connection(), &blocker).unwrap();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5001);
+
+        let error = allocator
+            .allocate_group_with_cleanup(
+                db.connection(),
+                &request,
+                &config,
+                GroupReconciliationPolicy::default(),
+                true,
+                |_| {
+                    Ok(GroupCleanupCounts {
+                        pruned: 0,
+                        expired: 2,
+                    })
+                },
+            )
+            .unwrap_err();
+        match &error {
+            Error::GroupAllocationFailed { attempted, reason } => {
+                assert_eq!(*attempted, 2);
+                assert!(
+                    reason.contains("pruned 0 and expired 2") && reason.contains("retried once"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected GroupAllocationFailed, got {other:?}"),
+        }
     }
 }

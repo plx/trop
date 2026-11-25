@@ -649,12 +649,27 @@ impl SystemOccupancyChecker {
         range: &PortRange,
         config: &OccupancyCheckConfig,
     ) -> Result<Vec<OccupancyReport>> {
-        let mut reports = scan_range(range, |port| {
-            let report = Self::report_with(port, config, Self::probe_socket)?;
-            Ok(report.is_occupied().then_some(report))
-        })?;
+        let mut reports = Self::find_occupied_reports_with(range, config, Self::probe_socket)?;
         Self::enrich_owner_metadata(&mut reports);
         Ok(reports)
+    }
+
+    /// The range scan behind `find_occupied_reports`, with the bind probes
+    /// run by `run_probe`: the verified `scan_ports` inspects the range in
+    /// ascending order and stops at the first failure, `report_with` builds
+    /// each port's report, and only occupied ports' reports are kept.
+    fn find_occupied_reports_with<F>(
+        range: &PortRange,
+        config: &OccupancyCheckConfig,
+        run_probe: F,
+    ) -> Result<Vec<OccupancyReport>>
+    where
+        F: Fn(&OccupancyProbe) -> io::Result<()>,
+    {
+        scan_range(range, |port| {
+            let report = Self::report_with(port, config, &run_probe)?;
+            Ok(report.is_occupied().then_some(report))
+        })
     }
 
     fn enrich_owner_metadata(reports: &mut [OccupancyReport]) {
@@ -1845,6 +1860,109 @@ mod tests {
         assert!(matches!(error, Error::OccupancyCheckFailed { port: p, .. } if p == port));
         assert!(diagnostic.contains("UDP IPv6 wildcard bind at [::]:5050"));
         assert!(diagnostic.contains("synthetic last-probe failure"));
+    }
+
+    /// `find_occupied_reports`' range scan (the glue `trop scan` uses), with
+    /// scripted binds over a range ending at 65535: only occupied ports'
+    /// reports are kept, in ascending port order, each with the in-use
+    /// probes in matrix order; the scan stops at the first failing port and
+    /// reports that port's failure, and no later port is probed.
+    #[test]
+    fn test_find_occupied_reports_keeps_occupied_ports_in_order_and_stops_at_first_failure() {
+        let range = PortRange::new(
+            Port::try_from(65532).unwrap(),
+            Port::try_from(65535).unwrap(),
+        )
+        .unwrap();
+        let config = OccupancyCheckConfig {
+            skip_udp: true,
+            skip_ipv6: true,
+            ..Default::default()
+        };
+        let in_use = || {
+            Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "synthetic bind conflict",
+            ))
+        };
+
+        // 65532 free, 65533 and 65535 occupied, 65534 free.
+        let probed = RefCell::new(Vec::new());
+        let reports =
+            SystemOccupancyChecker::find_occupied_reports_with(&range, &config, |probe| {
+                probed.borrow_mut().push(probe.address.port());
+                match probe.address.port() {
+                    65533 | 65535 => in_use(),
+                    _ => Ok(()),
+                }
+            })
+            .unwrap();
+        assert_eq!(probed.take(), vec![65532, 65533, 65534, 65535]);
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| report.port.value())
+                .collect::<Vec<_>>(),
+            vec![65533, 65535]
+        );
+        for report in &reports {
+            assert_eq!(report.enabled_probe_count, 1);
+            assert_eq!(
+                report.occupied_probes,
+                vec![OccupiedProbe {
+                    protocol: OccupancyProtocol::Tcp,
+                    address_family: OccupancyAddressFamily::Ipv4,
+                    scope: OccupancyScope::Localhost,
+                    address: Ipv4Addr::LOCALHOST.into(),
+                    owner: OccupancyOwner::default(),
+                }]
+            );
+        }
+
+        // A failure at 65534 ends the scan there: 65535 is never probed and
+        // the occupied 65533 is not reported.
+        let probed = RefCell::new(Vec::new());
+        let error = SystemOccupancyChecker::find_occupied_reports_with(&range, &config, |probe| {
+            probed.borrow_mut().push(probe.address.port());
+            match probe.address.port() {
+                65533 => in_use(),
+                65534 => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "synthetic scan failure",
+                )),
+                _ => Ok(()),
+            }
+        })
+        .unwrap_err();
+        assert_eq!(probed.take(), vec![65532, 65533, 65534]);
+        assert!(
+            matches!(error, Error::OccupancyCheckFailed { port, .. } if port.value() == 65534),
+            "{error}"
+        );
+        assert!(error.to_string().contains("synthetic scan failure"));
+
+        // A single-port range at the top of the domain, and a skipped policy
+        // that probes nothing and reports nothing.
+        let top = PortRange::new(
+            Port::try_from(65535).unwrap(),
+            Port::try_from(65535).unwrap(),
+        )
+        .unwrap();
+        let reports =
+            SystemOccupancyChecker::find_occupied_reports_with(&top, &config, |_| in_use())
+                .unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].port.value(), 65535);
+        let skipped = OccupancyCheckConfig {
+            skip_tcp: true,
+            skip_udp: true,
+            ..Default::default()
+        };
+        let reports = SystemOccupancyChecker::find_occupied_reports_with(&range, &skipped, |_| {
+            unreachable!("a skipped policy runs no probe")
+        })
+        .unwrap();
+        assert_eq!(reports, Vec::<OccupancyReport>::new());
     }
 
     #[test]

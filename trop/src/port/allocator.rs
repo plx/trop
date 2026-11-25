@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use crate::config::PortConfig;
 use crate::database::Database;
 use crate::error::{Error, PortUnavailableReason};
-use crate::verified::allocation::{self, Blocker, Checks, SingleOutcome};
+use crate::verified::allocation::{self, Blocker, Checks, Holder, SingleOutcome};
 use crate::verified::port::PortSpan;
 use crate::verified::port_bounds::{resolve_port_bounds, PortBoundsError};
 use crate::{PortExhaustionBlockers, PortRange, ReservationKey, Result};
@@ -170,8 +170,11 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     /// 1. If a preferred port is specified and available, use it
     /// 2. Otherwise, scan forward from range minimum
     /// 3. For each candidate port, check it's not reserved, excluded, or occupied
-    /// 4. If exhausted and cleanup is enabled, try cleanup and retry
-    /// 5. Return the first available port or exhaustion
+    /// 4. Return the first available port or exhaustion
+    ///
+    /// Automatic cleanup is not run here: after an exhaustion the reserve
+    /// operation cleans up once and retries only when the cleanup freed
+    /// something (verified `verified::reserve::allocate_with_cleanup_retry`).
     ///
     /// # Errors
     ///
@@ -454,13 +457,21 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         )
     }
 
+    /// Whether `port` is reserved by a key other than `ignored_key` (the key
+    /// being replaced). The glue only looks up the port's holder and compares
+    /// its key with `ignored_key`; the verified `reserved_by_other` decides
+    /// that only another key's reservation blocks.
     fn is_reserved_by_other(
         conn: &Connection,
         port: Port,
         ignored_key: Option<&ReservationKey>,
     ) -> Result<bool> {
-        Ok(Database::get_reservation_by_port(conn, port)?
-            .is_some_and(|reservation| ignored_key != Some(reservation.key())))
+        let holder = match Database::get_reservation_by_port(conn, port)? {
+            None => Holder::Nobody,
+            Some(reservation) if ignored_key == Some(reservation.key()) => Holder::ReplacedKey,
+            Some(_) => Holder::OtherKey,
+        };
+        Ok(allocation::reserved_by_other(holder))
     }
 
     // Oracles for the verified kernels. A kernel consults its oracles only at
@@ -1139,6 +1150,52 @@ mod tests {
                 reason: PortUnavailableReason::Reserved,
             }
         );
+    }
+
+    /// The reservation oracle's glue: the holder lookup and key comparison
+    /// feed the verified `reserved_by_other`. Only the exact replaced key
+    /// (same path and tag) is exempt; a sibling tag of the same path, or any
+    /// holder when nothing is replaced, blocks; an unheld port never does.
+    /// Covers the port domain's edges (1 and 65535).
+    #[test]
+    fn test_reserved_by_other_glue_exempts_only_the_replaced_key() {
+        let mut db = create_test_database();
+        let replaced =
+            ReservationKey::new(PathBuf::from("/test/owner"), Some("web".to_string())).unwrap();
+        let sibling =
+            ReservationKey::new(PathBuf::from("/test/owner"), Some("api".to_string())).unwrap();
+        let untagged = ReservationKey::new(PathBuf::from("/test/owner"), None).unwrap();
+        let lowest = Port::try_from(1).unwrap();
+        let highest = Port::try_from(65535).unwrap();
+        let middle = Port::try_from(5000).unwrap();
+        let free = Port::try_from(5001).unwrap();
+        for (key, port) in [
+            (&replaced, highest),
+            (&sibling, lowest),
+            (&untagged, middle),
+        ] {
+            db.create_reservation(&Reservation::builder(key.clone(), port).build().unwrap())
+                .unwrap();
+        }
+        let conn = db.connection();
+        let blocks = |port: Port, ignored: Option<&ReservationKey>| {
+            PortAllocator::<MockOccupancyChecker>::is_reserved_by_other(conn, port, ignored)
+                .unwrap()
+        };
+
+        // Replacing `replaced`: only its own port is exempt.
+        assert!(!blocks(highest, Some(&replaced)));
+        assert!(blocks(lowest, Some(&replaced)));
+        assert!(blocks(middle, Some(&replaced)));
+        assert!(!blocks(free, Some(&replaced)));
+        // Nothing replaced: every holder blocks, an unheld port never does.
+        for port in [highest, lowest, middle] {
+            assert!(blocks(port, None));
+        }
+        assert!(!blocks(free, None));
+        // Replacing the untagged key does not exempt the tagged siblings.
+        assert!(!blocks(middle, Some(&untagged)));
+        assert!(blocks(highest, Some(&untagged)));
     }
 
     #[test]

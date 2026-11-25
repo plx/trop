@@ -187,23 +187,35 @@ impl std::error::Error for InvalidPortError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AutomaticCleanupStatus {
-    attempted: bool,
+    run: CleanupRun,
     prune_enabled: bool,
     expire_enabled: bool,
     pruned: usize,
     expired: usize,
 }
 
+/// Whether the automatic cleanup ran, and whether the allocation was retried
+/// after it (only after a cleanup that freed something).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CleanupRun {
+    /// No cleanup ran.
+    Skipped,
+    /// A cleanup ran and freed nothing, so the allocation was not retried.
+    NotRetried,
+    /// A cleanup ran, freed something, and the allocation was retried.
+    Retried,
+}
+
 impl AutomaticCleanupStatus {
     pub(crate) const fn new(
-        attempted: bool,
+        run: CleanupRun,
         prune_enabled: bool,
         expire_enabled: bool,
         pruned: usize,
         expired: usize,
     ) -> Self {
         Self {
-            attempted,
+            run,
             prune_enabled,
             expire_enabled,
             pruned,
@@ -214,7 +226,16 @@ impl AutomaticCleanupStatus {
     /// Whether automatic cleanup ran.
     #[must_use]
     pub const fn attempted(self) -> bool {
-        self.attempted
+        !matches!(self.run, CleanupRun::Skipped)
+    }
+
+    /// Whether the allocation was retried after the cleanup. The verified
+    /// cleanup-and-retry control retries exactly when the cleanup removed at
+    /// least one reservation, so this is `false` when cleanup did not run or
+    /// freed nothing.
+    #[must_use]
+    pub const fn retried(self) -> bool {
+        matches!(self.run, CleanupRun::Retried)
     }
 
     /// Whether stale-path pruning was enabled.
@@ -341,7 +362,7 @@ impl PortExhaustionDetails {
 
 impl fmt::Display for PortExhaustionDetails {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.cleanup.attempted {
+        if self.cleanup.retried() {
             write!(
                 f,
                 ": remaining blockers after the single retry: {}; automatic cleanup pruned {} \
@@ -349,6 +370,16 @@ impl fmt::Display for PortExhaustionDetails {
                 self.blockers,
                 self.cleanup.pruned,
                 self.cleanup.expired,
+                self.cleanup.policy_description()
+            )
+        } else if self.cleanup.attempted() {
+            write!(
+                f,
+                ": automatic cleanup pruned {} and expired {} reservation(s), so the scan was \
+                 not retried; remaining blockers: {}; {}",
+                self.cleanup.pruned,
+                self.cleanup.expired,
+                self.blockers,
                 self.cleanup.policy_description()
             )
         } else {

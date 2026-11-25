@@ -12,15 +12,16 @@
 //!   permission never turns an accepted request into a rejection, and that
 //!   the single and group paths accept, reject, and store exactly alike.
 //! - **The reserve policy** (`reserve_policy`): the effective checks derived
-//!   from the request flags. `--force` dominance and monotonicity in the
-//!   permissive flags are proved over `policy_of`, a spec copy of
-//!   `reserve_policy`'s postcondition (the two are not tied by an `ensures`).
+//!   from the request flags. Its postcondition is `policy == policy_of(flags)`,
+//!   so the `--force` dominance and monotonicity lemmas, proved over
+//!   `policy_of`, constrain the value production uses. Its cleanup part is
+//!   `cleanup_policy`, the rule group reservations call too.
 //! - **Cleanup-then-retry** (`allocate_with_cleanup_retry`): generic over the
 //!   allocation, cleanup, and retry oracles. Its contract covers when each
 //!   oracle may run (`retry_discipline`, stated as the oracles' own
 //!   preconditions): at most one cleanup, only after an exhausted first
 //!   allocation and only when cleanup is possible, and at most one retry,
-//!   only after a successful cleanup.
+//!   only after a cleanup that freed something (`freed_any`).
 //! - **Deferred reconciliation** (`deferred_step`): the execution-time replay
 //!   of the existing-reservation decision for a plan that deferred allocation.
 //! - **The reported port** (`reported_port`): the port a reserve plan reports,
@@ -237,21 +238,24 @@ impl CleanupPolicy {
     }
 }
 
-/// Derives the effective checks of a reserve request.
+/// Derives the effective checks of a reserve request: exactly `policy_of`.
 ///
 /// The specification's flag semantics: the path check applies unless
 /// `--force` or `--allow-unrelated-path`; `--force` acts as `--overwrite`,
 /// `--ignore-occupied`, and `--ignore-exclusions` together; each automatic
-/// cleanup is on unless disabled. (`lemma_force_dominates` and
-/// `lemma_policy_monotone` state the consequences for `policy_of`, which
-/// restates this postcondition; nothing but reading checks that the two
-/// agree.)
+/// cleanup is on unless disabled. The cleanup part is computed by
+/// `cleanup_policy`, the function group reservations call, so the rule exists
+/// once. Because the postcondition is `policy == policy_of(flags)`,
+/// `lemma_force_dominates` and `lemma_policy_monotone` (stated over
+/// `policy_of`) hold for the value this function returns.
 pub const fn reserve_policy(flags: ReserveFlags) -> (policy: ReservePolicy)
     ensures
+        policy == policy_of(flags),
         policy.check_path_relationship == (!flags.force && !flags.allow_unrelated_path),
         policy.reallocate_existing == reallocates(flags),
         policy.allocation.ignore_occupied == (flags.relaxations.ignore_occupied || flags.force),
         policy.allocation.ignore_exclusions == (flags.relaxations.ignore_exclusions || flags.force),
+        policy.cleanup == cleanup_of(flags.cleanup),
         policy.cleanup.prune == !flags.cleanup.disable_autoprune,
         policy.cleanup.expire == !flags.cleanup.disable_autoexpire,
 {
@@ -262,15 +266,14 @@ pub const fn reserve_policy(flags: ReserveFlags) -> (policy: ReservePolicy)
             ignore_occupied: flags.relaxations.ignore_occupied || flags.force,
             ignore_exclusions: flags.relaxations.ignore_exclusions || flags.force,
         },
-        cleanup: CleanupPolicy {
-            prune: !flags.cleanup.disable_autoprune,
-            expire: !flags.cleanup.disable_autoexpire,
-        },
+        cleanup: cleanup_policy(flags.cleanup),
     }
 }
 
-/// The policy `reserve_policy` returns (its postcondition as a value). A
-/// hand-written copy: no `ensures` clause ties it to `reserve_policy`.
+/// The policy of a reserve request: the path check applies unless `--force`
+/// or `--allow-unrelated-path`; `--overwrite` or `--force` reallocates;
+/// `--force` relaxes both preferred-port checks; the cleanup part is
+/// `cleanup_of` the switches. `reserve_policy` returns exactly this value.
 pub open spec fn policy_of(flags: ReserveFlags) -> ReservePolicy {
     ReservePolicy {
         check_path_relationship: !flags.force && !flags.allow_unrelated_path,
@@ -279,10 +282,7 @@ pub open spec fn policy_of(flags: ReserveFlags) -> ReservePolicy {
             ignore_occupied: flags.relaxations.ignore_occupied || flags.force,
             ignore_exclusions: flags.relaxations.ignore_exclusions || flags.force,
         },
-        cleanup: CleanupPolicy {
-            prune: !flags.cleanup.disable_autoprune,
-            expire: !flags.cleanup.disable_autoexpire,
-        },
+        cleanup: cleanup_of(flags.cleanup),
     }
 }
 
@@ -294,10 +294,10 @@ pub open spec fn cleanup_of(switches: CleanupSwitches) -> CleanupPolicy {
 
 /// The automatic cleanups an exhausted allocation may run (`cleanup_of`).
 ///
-/// `reserve-group` and `autoreserve` call this for their group allocations.
-/// `reserve_policy` states the same formula for single reservations in its
-/// own postcondition (it does not call this function), so both paths clean
-/// up alike for the same switches.
+/// `reserve_policy` computes its cleanup part with this function, and
+/// `reserve-group` and `autoreserve` call it for their group allocations, so
+/// both paths clean up alike for the same switches (they read the switches
+/// from different sources; see `lemma_cleanup_policy_shared`).
 pub const fn cleanup_policy(switches: CleanupSwitches) -> (policy: CleanupPolicy)
     ensures
         policy == cleanup_of(switches),
@@ -305,10 +305,14 @@ pub const fn cleanup_policy(switches: CleanupSwitches) -> (policy: CleanupPolicy
     CleanupPolicy { prune: !switches.disable_autoprune, expire: !switches.disable_autoexpire }
 }
 
-/// A definitional identity: `policy_of`'s cleanup field is `cleanup_of` its
-/// switches (the same expression), and a retry is possible unless both
-/// automatic cleanups are disabled. It constrains neither the exec
-/// `reserve_policy` nor where each path reads its switches from.
+/// A definitional identity: the cleanup part of a request's policy is
+/// `cleanup_of` its switches, and a retry is possible unless both automatic
+/// cleanups are disabled. With `reserve_policy`'s postcondition it applies
+/// to the policy single reservations use; group reservations use
+/// `cleanup_policy`, whose postcondition is `cleanup_of` too. It does not
+/// constrain where each path reads its switches from (`trop reserve` also
+/// has CLI flags; the group commands read configuration and environment
+/// only).
 pub proof fn lemma_cleanup_policy_shared(flags: ReserveFlags)
     ensures
         policy_of(flags).cleanup == cleanup_of(flags.cleanup),
@@ -854,28 +858,59 @@ pub proof fn lemma_decision_matches_group_row(
 // Cleanup, then one retry
 // ---------------------------------------------------------------------------
 
+/// What one automatic cleanup removed.
+///
+/// The single path copies `AutocleanResult`'s `pruned_count` and
+/// `expired_count`; the group path builds it from the same result. The two
+/// lists partition the removals (`super::cleanup::split_by_reason`), so the
+/// cleanup removed something exactly when either count is positive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CleanupCounts {
+    /// Reservations pruned (their paths no longer exist).
+    pub pruned: usize,
+    /// Reservations expired (unused for too long).
+    pub expired: usize,
+}
+
+/// The cleanup freed something: it removed at least one reservation (the
+/// specification's "If anything got freed up, retry").
+pub open spec fn freed_any(counts: CleanupCounts) -> bool {
+    counts.pruned > 0 || counts.expired > 0
+}
+
+impl CleanupCounts {
+    /// Whether the cleanup removed at least one reservation (`freed_any`).
+    pub const fn freed_anything(self) -> (b: bool)
+        ensures
+            b == freed_any(self),
+    {
+        self.pruned > 0 || self.expired > 0
+    }
+}
+
 /// The result of an allocation with one cleanup-and-retry.
-pub enum Retry<P, C> {
-    /// A port was allocated. `cleanup` holds the cleanup's result when the
-    /// first allocation was exhausted and the retry after cleanup succeeded.
-    Allocated { port: P, cleanup: Option<C> },
-    /// The range stayed exhausted. `cleanup` holds the cleanup's result when
-    /// a cleanup ran before the (also exhausted) retry.
-    Exhausted { cleanup: Option<C> },
+pub enum Retry<P> {
+    /// A port was allocated. `cleanup` holds the cleanup's counts when the
+    /// first allocation was exhausted, the cleanup freed something, and the
+    /// retry succeeded.
+    Allocated { port: P, cleanup: Option<CleanupCounts> },
+    /// The range stayed exhausted. `cleanup` holds the cleanup's counts when
+    /// a cleanup ran; `retried` says whether the allocation was retried
+    /// after it, which happens exactly when the cleanup freed something.
+    Exhausted { cleanup: Option<CleanupCounts>, retried: bool },
 }
 
 /// The first allocation was exhausted and cleanup was possible, so the
 /// cleanup ran and returned `counts`.
 pub open spec fn cleaned_up<
     P,
-    C,
     E,
     A: FnOnce() -> Result<Fallback<P>, E>,
-    K: FnOnce() -> Result<C, E>,
->(cleanup_possible: bool, allocate: A, cleanup: K, counts: C) -> bool {
+    K: FnOnce() -> Result<CleanupCounts, E>,
+>(cleanup_possible: bool, allocate: A, cleanup: K, counts: CleanupCounts) -> bool {
     &&& cleanup_possible
     &&& allocate.ensures((), Ok::<Fallback<P>, E>(Fallback::Exhausted))
-    &&& cleanup.ensures((), Ok::<C, E>(counts))
+    &&& cleanup.ensures((), Ok::<CleanupCounts, E>(counts))
 }
 
 /// The call discipline of `allocate_with_cleanup_retry`, stated as the
@@ -885,46 +920,52 @@ pub open spec fn cleaned_up<
 /// - the first allocation may always run;
 /// - the cleanup may run only when cleanup is possible and the first
 ///   allocation was exhausted;
-/// - the retry may run only after the cleanup succeeded.
+/// - the retry may run only after the cleanup succeeded and freed something
+///   (`freed_any`): a cleanup that removed nothing cannot have made room.
 ///
 /// Each oracle is an `FnOnce`, so each runs at most once. Ordinary Rust
 /// closures have no preconditions, so production glue meets these.
 pub open spec fn retry_discipline<
     P,
-    C,
     E,
     A: FnOnce() -> Result<Fallback<P>, E>,
-    K: FnOnce() -> Result<C, E>,
+    K: FnOnce() -> Result<CleanupCounts, E>,
     B: FnOnce() -> Result<Fallback<P>, E>,
 >(cleanup_possible: bool, allocate: A, cleanup: K, retry: B) -> bool {
     &&& allocate.requires(())
     &&& (cleanup_possible && allocate.ensures((), Ok::<Fallback<P>, E>(Fallback::Exhausted)))
         ==> cleanup.requires(())
-    &&& forall|counts: C| #[trigger] cleanup.ensures((), Ok::<C, E>(counts)) ==> retry.requires(())
+    &&& forall|counts: CleanupCounts|
+        #[trigger] cleanup.ensures((), Ok::<CleanupCounts, E>(counts)) && freed_any(counts)
+            ==> retry.requires(())
 }
 
 /// `r` is a correct result of one allocation with at most one
-/// cleanup-and-retry:
+/// cleanup-and-retry (the specification's allocation steps 4-6: when the
+/// scan is exhausted, clean up; if anything got freed up, retry the scan;
+/// if that still fails, report the error):
 ///
 /// - `Allocated { cleanup: None }`: the first allocation succeeded with that
 ///   port; no cleanup ran.
 /// - `Allocated { cleanup: Some(c) }`: the first allocation was exhausted,
-///   cleanup was possible and returned `c`, and the retry succeeded.
-/// - `Exhausted { cleanup: None }`: the first allocation was exhausted and
-///   cleanup was not possible (so it never ran).
-/// - `Exhausted { cleanup: Some(c) }`: exhausted, cleaned up (`c`), and the
-///   retry was exhausted too.
+///   cleanup was possible and returned `c`, `c` freed something, and the
+///   retry succeeded.
+/// - `Exhausted { cleanup: None, retried: false }`: the first allocation was
+///   exhausted and cleanup was not possible (so it never ran).
+/// - `Exhausted { cleanup: Some(c), retried }`: exhausted and cleaned up
+///   (`c`); `retried` exactly when `c` freed something, and then the retry
+///   was exhausted too. A cleanup that freed nothing is never followed by a
+///   retry.
 /// - an error is an oracle's error, unchanged: from the first allocation, or
 ///   — only after an exhausted first allocation with cleanup possible — from
-///   the cleanup or the retry.
+///   the cleanup, or from the retry after a cleanup that freed something.
 pub open spec fn retried<
     P,
-    C,
     E,
     A: FnOnce() -> Result<Fallback<P>, E>,
-    K: FnOnce() -> Result<C, E>,
+    K: FnOnce() -> Result<CleanupCounts, E>,
     B: FnOnce() -> Result<Fallback<P>, E>,
->(cleanup_possible: bool, allocate: A, cleanup: K, retry: B, r: Result<Retry<P, C>, E>) -> bool {
+>(cleanup_possible: bool, allocate: A, cleanup: K, retry: B, r: Result<Retry<P>, E>) -> bool {
     match r {
         Ok(Retry::Allocated { port, cleanup: None }) => allocate.ensures(
             (),
@@ -935,42 +976,47 @@ pub open spec fn retried<
             allocate,
             cleanup,
             counts,
-        ) && retry.ensures((), Ok::<Fallback<P>, E>(Fallback::Allocated(port))),
-        Ok(Retry::Exhausted { cleanup: None }) => !cleanup_possible && allocate.ensures(
-            (),
-            Ok::<Fallback<P>, E>(Fallback::Exhausted),
-        ),
-        Ok(Retry::Exhausted { cleanup: Some(counts) }) => cleaned_up(
+        ) && freed_any(counts) && retry.ensures((), Ok::<Fallback<P>, E>(Fallback::Allocated(port))),
+        Ok(Retry::Exhausted { cleanup: None, retried }) => !retried && !cleanup_possible
+            && allocate.ensures((), Ok::<Fallback<P>, E>(Fallback::Exhausted)),
+        Ok(Retry::Exhausted { cleanup: Some(counts), retried }) => cleaned_up(
             cleanup_possible,
             allocate,
             cleanup,
             counts,
-        ) && retry.ensures((), Ok::<Fallback<P>, E>(Fallback::Exhausted)),
+        ) && retried == freed_any(counts) && (retried ==> retry.ensures(
+            (),
+            Ok::<Fallback<P>, E>(Fallback::Exhausted),
+        )),
         Err(e) => allocate.ensures((), Err::<Fallback<P>, E>(e)) || (cleanup_possible
             && allocate.ensures((), Ok::<Fallback<P>, E>(Fallback::Exhausted)) && (
-        cleanup.ensures((), Err::<C, E>(e)) || retry.ensures((), Err::<Fallback<P>, E>(e)))),
+        cleanup.ensures((), Err::<CleanupCounts, E>(e)) || (retry.ensures(
+            (),
+            Err::<Fallback<P>, E>(e),
+        ) && exists|counts: CleanupCounts|
+            #[trigger] cleanup.ensures((), Ok::<CleanupCounts, E>(counts)) && freed_any(counts)))),
     }
 }
 
 /// Allocates; when the range is exhausted and cleanup is possible, runs the
-/// cleanup once and retries once (see `retried`).
+/// cleanup once, and when the cleanup freed something, retries once (see
+/// `retried`).
 ///
 /// The oracles are the first allocation `allocate`, the destructive
 /// `cleanup` (prune/expire), and the `retry` allocation. Their call
 /// discipline is verified through `retry_discipline`: `cleanup` runs only
 /// when `cleanup_possible` and after `allocate` returned `Exhausted`, and
-/// `retry` only after `cleanup` succeeded; each runs at most once
-/// (`FnOnce`). Generic over the port type, the cleanup's result, and the
-/// error, so the group path can reuse it. Production passes the same
-/// allocation closure as `allocate` and `retry`.
+/// `retry` only after `cleanup` succeeded and freed something; each runs at
+/// most once (`FnOnce`). Generic over the port type and the error, so the
+/// group path can reuse it. Production passes the same allocation closure as
+/// `allocate` and `retry`.
 pub fn allocate_with_cleanup_retry<
     P,
-    C,
     E,
     A: FnOnce() -> Result<Fallback<P>, E>,
-    K: FnOnce() -> Result<C, E>,
+    K: FnOnce() -> Result<CleanupCounts, E>,
     B: FnOnce() -> Result<Fallback<P>, E>,
->(cleanup_possible: bool, allocate: A, cleanup: K, retry: B) -> (r: Result<Retry<P, C>, E>)
+>(cleanup_possible: bool, allocate: A, cleanup: K, retry: B) -> (r: Result<Retry<P>, E>)
     requires
         // Only the oracles' own (conditional) preconditions: see
         // `retry_discipline`.
@@ -978,7 +1024,12 @@ pub fn allocate_with_cleanup_retry<
     ensures
         retried(cleanup_possible, allocate, cleanup, retry, r),
         !cleanup_possible ==> !(r matches Ok(Retry::Allocated { cleanup: Some(_), .. })),
-        !cleanup_possible ==> !(r matches Ok(Retry::Exhausted { cleanup: Some(_) })),
+        !cleanup_possible ==> (r matches Ok(Retry::Exhausted { cleanup, retried }) ==> cleanup is None
+            && !retried),
+        r matches Ok(Retry::Allocated { cleanup: Some(c), .. }) ==> freed_any(c),
+        r matches Ok(Retry::Exhausted { cleanup, retried }) ==> (retried <==> (cleanup matches Some(
+            c,
+        ) && freed_any(c))),
 {
     match allocate()? {
         Fallback::Allocated(port) => {
@@ -987,12 +1038,24 @@ pub fn allocate_with_cleanup_retry<
         Fallback::Exhausted => {},
     }
     if !cleanup_possible {
-        return Ok(Retry::Exhausted { cleanup: None });
+        return Ok(Retry::Exhausted { cleanup: None, retried: false });
     }
     let counts = cleanup()?;
-    match retry()? {
-        Fallback::Allocated(port) => Ok(Retry::Allocated { port, cleanup: Some(counts) }),
-        Fallback::Exhausted => Ok(Retry::Exhausted { cleanup: Some(counts) }),
+    if !counts.freed_anything() {
+        // Nothing was freed, so nothing can have made room: report the
+        // exhaustion without a second scan.
+        return Ok(Retry::Exhausted { cleanup: Some(counts), retried: false });
+    }
+    match retry() {
+        Ok(Fallback::Allocated(port)) => Ok(Retry::Allocated { port, cleanup: Some(counts) }),
+        Ok(Fallback::Exhausted) => Ok(Retry::Exhausted { cleanup: Some(counts), retried: true }),
+        Err(e) => {
+            proof {
+                assert(exists|c: CleanupCounts|
+                    #[trigger] cleanup.ensures((), Ok::<CleanupCounts, E>(c)) && freed_any(c));
+            }
+            Err(e)
+        },
     }
 }
 
