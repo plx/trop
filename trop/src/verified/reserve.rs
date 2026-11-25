@@ -280,6 +280,36 @@ pub open spec fn policy_of(flags: ReserveFlags) -> ReservePolicy {
     }
 }
 
+/// The automatic cleanups the switches leave enabled: each one runs unless
+/// it is disabled.
+pub open spec fn cleanup_of(switches: CleanupSwitches) -> CleanupPolicy {
+    CleanupPolicy { prune: !switches.disable_autoprune, expire: !switches.disable_autoexpire }
+}
+
+/// The automatic cleanups an exhausted allocation may run (`cleanup_of`).
+///
+/// `reserve-group` and `autoreserve` call this for their group allocations,
+/// and `reserve_policy` applies the same rule to single reservations
+/// (`lemma_cleanup_policy_shared`), so both paths clean up alike for the
+/// same switches.
+pub const fn cleanup_policy(switches: CleanupSwitches) -> (policy: CleanupPolicy)
+    ensures
+        policy == cleanup_of(switches),
+{
+    CleanupPolicy { prune: !switches.disable_autoprune, expire: !switches.disable_autoexpire }
+}
+
+/// Single and group reservations share the cleanup rule: the cleanup part
+/// of a reserve policy is exactly `cleanup_of` its switches, so a retry is
+/// possible unless both automatic cleanups are disabled.
+pub proof fn lemma_cleanup_policy_shared(flags: ReserveFlags)
+    ensures
+        policy_of(flags).cleanup == cleanup_of(flags.cleanup),
+        some_cleanup_enabled(cleanup_of(flags.cleanup)) <==> !(flags.cleanup.disable_autoprune
+            && flags.cleanup.disable_autoexpire),
+{
+}
+
 /// The requested preferred port: an explicit `--port` wins over a
 /// configured preference.
 pub fn choose_preferred<T>(explicit: Option<T>, hint: Option<T>) -> (r: Option<T>)

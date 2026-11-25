@@ -1,7 +1,9 @@
 //! Verified kernel: group allocation.
 //!
-//! - request validation (`validate_group_request`, producing the
-//!   invariant-carrying `ValidatedGroupShape`);
+//! - request validation and normalization (`validate_group_request`,
+//!   producing the invariant-carrying `ValidatedGroupShape`): service tags,
+//!   the project, and the task follow the shared identifier rule of
+//!   `super::identifier`, which also trims them;
 //! - the lowest-base offset-pattern search over an availability oracle
 //!   (`pattern_scan_end`, `find_pattern_base`);
 //! - fresh allocation planning: pin available preferred ports, place the
@@ -14,85 +16,86 @@
 //!   configuration helpers. (The scan range derived from `reservations.base`
 //!   is `super::port_bounds::group_scan_span`, next to the one resolution of
 //!   the configured bounds.)
+//! - the output selection of `reserve-group` and `autoreserve`
+//!   (`select_group_output`: an explicit `--shell` is parsed, and the shell
+//!   detected, only for the export format).
+//!
+//! Exhausted fresh allocations are retried once after automatic cleanup by
+//! the shared control `super::reserve::allocate_with_cleanup_retry`, under
+//! the cleanup policy `super::reserve::cleanup_policy`.
 //!
 //! Production glue: `crate::port::group`, `crate::operations::reserve_group`,
 //! and `crate::operations::autoreserve`.
 
+use super::identifier::{check_identifier, IdentifierError};
 use super::port::PortSpan;
-use super::sticky::bytes_eq;
 use vstd::prelude::*;
 
 verus! {
 
 // ---------------------------------------------------------------------------
-// Identifiers
+// Identifiers: the shared rule of `super::identifier`
 // ---------------------------------------------------------------------------
 
-/// Why a (trimmed) identifier -- a service tag, project, or task -- is
-/// invalid.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IdentifierIssue {
-    /// Empty (or whitespace only before trimming).
-    Empty,
-    /// Contains a NUL byte.
-    ContainsNul,
-    /// Longer than 255 bytes.
-    TooLong,
+/// `t` is a stored identifier value: the shared identifier rule accepts it
+/// unchanged (it is valid and already trimmed).
+pub open spec fn is_identifier_value(t: Seq<char>) -> bool {
+    super::identifier::identifier_verdict(t) == Ok::<Seq<char>, IdentifierError>(t)
 }
 
-/// A valid identifier: 1 to 255 bytes, none of them NUL.
-pub open spec fn is_valid_identifier(s: Seq<u8>) -> bool {
-    0 < s.len() <= 255 && !s.contains(0u8)
-}
-
-/// The first rule an identifier breaks, checked in the order empty, NUL,
-/// length (the order of the configuration validator).
-pub open spec fn identifier_issue_of(s: Seq<u8>) -> Option<IdentifierIssue> {
-    if s.len() == 0 {
-        Some(IdentifierIssue::Empty)
-    } else if s.contains(0u8) {
-        Some(IdentifierIssue::ContainsNul)
-    } else if s.len() > 255 {
-        Some(IdentifierIssue::TooLong)
-    } else {
-        None
-    }
-}
-
-/// The first rule `bytes` breaks as an identifier, if any.
-pub fn identifier_issue(bytes: &[u8]) -> (r: Option<IdentifierIssue>)
-    ensures
-        r == identifier_issue_of(bytes@),
-        r is None <==> is_valid_identifier(bytes@),
-{
-    if bytes.is_empty() {
-        return Some(IdentifierIssue::Empty);
-    }
-    let mut i: usize = 0;
-    while i < bytes.len()
-        invariant
-            0 <= i <= bytes@.len(),
-            forall|j: int| 0 <= j < i ==> bytes@[j] != 0u8,
-        decreases bytes@.len() - i,
-    {
-        if bytes[i] == 0 {
-            assert(bytes@[i as int] == 0u8);
-            return Some(IdentifierIssue::ContainsNul);
-        }
-        i += 1;
-    }
-    if bytes.len() > 255 {
-        Some(IdentifierIssue::TooLong)
-    } else {
-        None
-    }
-}
-
-/// An optional identifier is absent or valid.
-pub open spec fn opt_identifier_ok(value: Option<&[u8]>) -> bool {
+/// An optional raw identifier (project or task) is absent, or accepted by the
+/// shared identifier rule.
+pub open spec fn opt_identifier_ok(value: Option<&str>) -> bool {
     match value {
-        Some(bytes) => is_valid_identifier(bytes@),
+        Some(s) => super::identifier::is_valid_identifier(s@),
         None => true,
+    }
+}
+
+/// `t` is the normalized form of the optional raw identifier `raw`: absent
+/// when `raw` is, and otherwise its trimmed value.
+pub open spec fn opt_normalized(raw: Option<&str>, t: Option<&str>) -> bool {
+    match raw {
+        Some(s) => t matches Some(v) && v@ == super::identifier::trimmed(s@),
+        None => t is None,
+    }
+}
+
+/// An identifier the shared rule accepts is accepted unchanged after
+/// trimming: its trimmed value is a stored identifier value.
+pub proof fn lemma_trimmed_is_identifier_value(s: Seq<char>)
+    requires
+        super::identifier::is_valid_identifier(s),
+    ensures
+        is_identifier_value(super::identifier::trimmed(s)),
+{
+    super::identifier::lemma_revalidation(s);
+}
+
+/// A stored identifier value is its own trimmed form and passes the rule.
+pub proof fn lemma_identifier_value_is_trimmed(t: Seq<char>)
+    requires
+        is_identifier_value(t),
+    ensures
+        super::identifier::trimmed(t) == t,
+        super::identifier::is_valid_identifier(t),
+{
+}
+
+/// Applies the shared identifier rule to an optional raw identifier.
+fn check_optional(value: Option<&str>) -> (r: Result<Option<&str>, IdentifierError>)
+    ensures
+        r is Ok <==> opt_identifier_ok(value),
+        r matches Ok(t) ==> opt_normalized(value, t),
+        r matches Err(e) ==> value matches Some(s) && super::identifier::identifier_verdict(s@)
+            == Err::<Seq<char>, IdentifierError>(e),
+{
+    match value {
+        Some(s) => match check_identifier(s) {
+            Ok(t) => Ok(Some(t)),
+            Err(e) => Err(e),
+        },
+        None => Ok(None),
     }
 }
 
@@ -100,10 +103,13 @@ pub open spec fn opt_identifier_ok(value: Option<&[u8]>) -> bool {
 // Group request validation
 // ---------------------------------------------------------------------------
 
-/// One requested service: its trimmed tag and its allocation strategy.
+/// One service: its tag and its allocation strategy.
+///
+/// In a request the tag is raw; `validate_group_request` trims it, so the
+/// services of a `ValidatedGroupShape` carry trimmed tags.
 pub struct RawService {
-    /// The trimmed tag, as UTF-8 bytes.
-    pub tag: Vec<u8>,
+    /// The service tag.
+    pub tag: String,
     /// Offset from the group base (the fallback strategy).
     pub offset: Option<u16>,
     /// Preferred absolute port (tried first).
@@ -115,18 +121,18 @@ pub struct RawService {
 pub enum ShapeError {
     /// The group has no services.
     NoServices,
-    /// The project is not a valid identifier.
-    Project(IdentifierIssue),
-    /// The task is not a valid identifier.
-    Task(IdentifierIssue),
-    /// A tag is not a valid identifier.
+    /// The project breaks the identifier rule.
+    Project(IdentifierError),
+    /// The task breaks the identifier rule.
+    Task(IdentifierError),
+    /// A tag breaks the identifier rule.
     Tag {
         /// Service index.
         index: usize,
         /// The rule the tag breaks.
-        issue: IdentifierIssue,
+        issue: IdentifierError,
     },
-    /// A tag repeats an earlier service's tag.
+    /// A tag repeats an earlier service's tag (after trimming).
     DuplicateTag {
         /// Service index.
         index: usize,
@@ -157,10 +163,11 @@ pub enum ShapeError {
     },
 }
 
-/// A service on its own is well formed: valid tag, some allocation
-/// strategy, and no preferred port 0.
+/// A validated service is well formed: its tag is a stored identifier value
+/// (valid and trimmed), it has some allocation strategy, and its preferred
+/// port is not 0.
 pub open spec fn service_well_formed(s: RawService) -> bool {
-    &&& is_valid_identifier(s.tag@)
+    &&& is_identifier_value(s.tag@)
     &&& (s.offset is Some || s.preferred is Some)
     &&& s.preferred != Some(0u16)
 }
@@ -172,8 +179,8 @@ pub open spec fn services_clash(a: RawService, b: RawService) -> bool {
     ||| (a.preferred is Some && a.preferred == b.preferred)
 }
 
-/// A valid group: non-empty, every service well formed, and tags, offsets,
-/// and preferred ports pairwise distinct.
+/// A valid (validated) group: non-empty, every service well formed, and
+/// tags, offsets, and preferred ports pairwise distinct.
 pub open spec fn group_shape_valid(s: Seq<RawService>) -> bool {
     &&& s.len() > 0
     &&& forall|i: int| 0 <= i < s.len() ==> #[trigger] service_well_formed(s[i])
@@ -181,14 +188,60 @@ pub open spec fn group_shape_valid(s: Seq<RawService>) -> bool {
         0 <= i < s.len() && 0 <= j < s.len() && i != j ==> !#[trigger] services_clash(s[i], s[j])
 }
 
-/// The first problem with service `i` given the services before it, in the
-/// production check order: tag rules, duplicate tag, missing strategy,
-/// preferred port 0, duplicate offset, duplicate preferred port.
+/// The identity a requested service is stored under: its trimmed tag.
+pub open spec fn tag_key(s: RawService) -> Seq<char> {
+    super::identifier::trimmed(s.tag@)
+}
+
+/// A requested service on its own is acceptable: the identifier rule accepts
+/// its tag, it has some allocation strategy, and its preferred port is not 0.
+pub open spec fn request_service_ok(s: RawService) -> bool {
+    &&& super::identifier::is_valid_identifier(s.tag@)
+    &&& (s.offset is Some || s.preferred is Some)
+    &&& s.preferred != Some(0u16)
+}
+
+/// Two requested services clash: same trimmed tag, same offset, or same
+/// preferred port.
+pub open spec fn requests_clash(a: RawService, b: RawService) -> bool {
+    ||| tag_key(a) == tag_key(b)
+    ||| (a.offset is Some && a.offset == b.offset)
+    ||| (a.preferred is Some && a.preferred == b.preferred)
+}
+
+/// A valid group request: non-empty, every service acceptable, and no two
+/// services clash.
+pub open spec fn group_request_valid(s: Seq<RawService>) -> bool {
+    &&& s.len() > 0
+    &&& forall|i: int| 0 <= i < s.len() ==> #[trigger] request_service_ok(s[i])
+    &&& forall|i: int, j: int|
+        0 <= i < s.len() && 0 <= j < s.len() && i != j ==> !#[trigger] requests_clash(s[i], s[j])
+}
+
+/// `v` is the normalized form of the requested service `raw`: its trimmed
+/// tag, and the same strategy.
+pub open spec fn service_normalized(raw: RawService, v: RawService) -> bool {
+    &&& v.tag@ == tag_key(raw)
+    &&& v.offset == raw.offset
+    &&& v.preferred == raw.preferred
+}
+
+/// `v` normalizes the requested services `raw` one by one, in order.
+pub open spec fn shape_normalized(raw: Seq<RawService>, v: Seq<RawService>) -> bool {
+    &&& v.len() == raw.len()
+    &&& forall|i: int| 0 <= i < raw.len() ==> #[trigger] service_normalized(raw[i], v[i])
+}
+
+/// The first problem with requested service `i` given the services before
+/// it, in the production check order: the identifier rule for the tag,
+/// duplicate (trimmed) tag, missing strategy, preferred port 0, duplicate
+/// offset, duplicate preferred port.
 pub open spec fn service_issue(s: Seq<RawService>, i: int) -> Option<ShapeError> {
     let svc = s[i];
-    if identifier_issue_of(svc.tag@) is Some {
-        Some(ShapeError::Tag { index: i as usize, issue: identifier_issue_of(svc.tag@)->Some_0 })
-    } else if exists|j: int| 0 <= j < i && #[trigger] s[j].tag@ == svc.tag@ {
+    let verdict = super::identifier::identifier_verdict(svc.tag@);
+    if verdict is Err {
+        Some(ShapeError::Tag { index: i as usize, issue: verdict->Err_0 })
+    } else if exists|j: int| 0 <= j < i && #[trigger] tag_key(s[j]) == tag_key(svc) {
         Some(ShapeError::DuplicateTag { index: i as usize })
     } else if svc.offset is None && svc.preferred is None {
         Some(ShapeError::MissingOffsetAndPreferred { index: i as usize })
@@ -224,29 +277,29 @@ pub open spec fn shape_error_index(e: ShapeError) -> int {
     }
 }
 
-/// No service before `n` has an issue, so services `0..n` are well formed
-/// and pairwise clash-free.
+/// No service before `n` has an issue, so services `0..n` are acceptable and
+/// pairwise clash-free.
 proof fn lemma_prefix_valid(s: Seq<RawService>, n: int)
     requires
         0 <= n <= s.len(),
         forall|k: int| 0 <= k < n ==> #[trigger] service_issue(s, k) is None,
     ensures
-        forall|i: int| 0 <= i < n ==> #[trigger] service_well_formed(s[i]),
+        forall|i: int| 0 <= i < n ==> #[trigger] request_service_ok(s[i]),
         forall|i: int, j: int|
-            0 <= i < n && 0 <= j < n && i != j ==> !#[trigger] services_clash(s[i], s[j]),
+            0 <= i < n && 0 <= j < n && i != j ==> !#[trigger] requests_clash(s[i], s[j]),
 {
-    assert forall|i: int| 0 <= i < n implies #[trigger] service_well_formed(s[i]) by {
+    assert forall|i: int| 0 <= i < n implies #[trigger] request_service_ok(s[i]) by {
         assert(service_issue(s, i) is None);
     }
-    assert forall|i: int, j: int| 0 <= i < n && 0 <= j < n && i != j implies !#[trigger] services_clash(
+    assert forall|i: int, j: int| 0 <= i < n && 0 <= j < n && i != j implies !#[trigger] requests_clash(
         s[i],
         s[j],
     ) by {
         let lo = if i < j { i } else { j };
         let hi = if i < j { j } else { i };
         assert(service_issue(s, hi) is None);
-        if s[lo].tag@ == s[hi].tag@ {
-            assert(exists|k: int| 0 <= k < hi && #[trigger] s[k].tag@ == s[hi].tag@);
+        if tag_key(s[lo]) == tag_key(s[hi]) {
+            assert(exists|k: int| 0 <= k < hi && #[trigger] tag_key(s[k]) == tag_key(s[hi]));
         }
         if s[hi].offset is Some && s[lo].offset == s[hi].offset {
             assert(exists|k: int| 0 <= k < hi && #[trigger] s[k].offset == s[hi].offset);
@@ -257,32 +310,93 @@ proof fn lemma_prefix_valid(s: Seq<RawService>, n: int)
     }
 }
 
-/// A valid group has no service issue.
+/// A valid group request has no service issue.
 proof fn lemma_valid_has_no_issue(s: Seq<RawService>)
     requires
-        group_shape_valid(s),
+        group_request_valid(s),
     ensures
         forall|k: int| 0 <= k < s.len() ==> #[trigger] service_issue(s, k) is None,
 {
     assert forall|k: int| 0 <= k < s.len() implies #[trigger] service_issue(s, k) is None by {
-        assert(service_well_formed(s[k]));
-        if exists|j: int| 0 <= j < k && #[trigger] s[j].tag@ == s[k].tag@ {
-            let j = choose|j: int| 0 <= j < k && #[trigger] s[j].tag@ == s[k].tag@;
-            assert(services_clash(s[j], s[k]));
+        assert(request_service_ok(s[k]));
+        if exists|j: int| 0 <= j < k && #[trigger] tag_key(s[j]) == tag_key(s[k]) {
+            let j = choose|j: int| 0 <= j < k && #[trigger] tag_key(s[j]) == tag_key(s[k]);
+            assert(requests_clash(s[j], s[k]));
         }
         if s[k].offset is Some && exists|j: int| 0 <= j < k && #[trigger] s[j].offset == s[k].offset {
             let j = choose|j: int| 0 <= j < k && #[trigger] s[j].offset == s[k].offset;
-            assert(services_clash(s[j], s[k]));
+            assert(requests_clash(s[j], s[k]));
         }
         if s[k].preferred is Some && exists|j: int|
             0 <= j < k && #[trigger] s[j].preferred == s[k].preferred {
             let j = choose|j: int| 0 <= j < k && #[trigger] s[j].preferred == s[k].preferred;
-            assert(services_clash(s[j], s[k]));
+            assert(requests_clash(s[j], s[k]));
         }
     }
 }
 
-/// A validated group request: the services of a request that passed
+/// Normalizing a valid request yields a valid group: trimmed tags are stored
+/// identifier values, and distinct trimmed tags stay distinct.
+pub proof fn lemma_normalized_shape_valid(raw: Seq<RawService>, v: Seq<RawService>)
+    requires
+        group_request_valid(raw),
+        shape_normalized(raw, v),
+    ensures
+        group_shape_valid(v),
+{
+    assert forall|i: int| 0 <= i < v.len() implies #[trigger] service_well_formed(v[i]) by {
+        assert(request_service_ok(raw[i]));
+        assert(service_normalized(raw[i], v[i]));
+        lemma_trimmed_is_identifier_value(raw[i].tag@);
+    }
+    assert forall|i: int, j: int|
+        0 <= i < v.len() && 0 <= j < v.len() && i != j implies !#[trigger] services_clash(
+        v[i],
+        v[j],
+    ) by {
+        assert(!requests_clash(raw[i], raw[j]));
+        assert(service_normalized(raw[i], v[i]));
+        assert(service_normalized(raw[j], v[j]));
+    }
+}
+
+/// Validation is idempotent: a validated group is itself a valid request,
+/// and normalizes to itself. Validating its services again (with any valid
+/// project and task) therefore succeeds with the same services, so
+/// normalizing an already normalized request changes nothing.
+pub proof fn lemma_validation_idempotent(s: Seq<RawService>)
+    requires
+        group_shape_valid(s),
+    ensures
+        group_request_valid(s),
+        shape_normalized(s, s),
+        forall|k: int| 0 <= k < s.len() ==> #[trigger] service_issue(s, k) is None,
+{
+    assert forall|i: int| 0 <= i < s.len() implies #[trigger] tag_key(s[i]) == s[i].tag@
+        && super::identifier::is_valid_identifier(s[i].tag@) by {
+        assert(service_well_formed(s[i]));
+        lemma_identifier_value_is_trimmed(s[i].tag@);
+    }
+    assert forall|i: int| 0 <= i < s.len() implies #[trigger] request_service_ok(s[i]) by {
+        assert(service_well_formed(s[i]));
+        assert(tag_key(s[i]) == s[i].tag@);
+    }
+    assert forall|i: int, j: int|
+        0 <= i < s.len() && 0 <= j < s.len() && i != j implies !#[trigger] requests_clash(
+        s[i],
+        s[j],
+    ) by {
+        assert(!services_clash(s[i], s[j]));
+        assert(tag_key(s[i]) == s[i].tag@);
+        assert(tag_key(s[j]) == s[j].tag@);
+    }
+    assert forall|i: int| 0 <= i < s.len() implies #[trigger] service_normalized(s[i], s[i]) by {
+        assert(tag_key(s[i]) == s[i].tag@);
+    }
+    lemma_valid_has_no_issue(s);
+}
+
+/// A validated group shape: the normalized services of a request that passed
 /// `validate_group_request`, in the order they were given.
 ///
 /// The field is private and `validate_group_request` is the only
@@ -316,22 +430,30 @@ impl ValidatedGroupShape {
     }
 }
 
-/// Whether some service before `i` has the tag of service `i`.
-fn earlier_tag(s: &[RawService], i: usize) -> (found: bool)
-    requires
-        i < s@.len(),
+/// A validated group request: the normalized services, project, and task.
+pub struct ValidatedGroupRequest<'a> {
+    /// The services with trimmed tags, in request order.
+    pub shape: ValidatedGroupShape,
+    /// The trimmed project.
+    pub project: Option<&'a str>,
+    /// The trimmed task.
+    pub task: Option<&'a str>,
+}
+
+/// Whether some (normalized) service of `out` already has tag `key`.
+fn tag_taken(out: &[RawService], key: &String) -> (found: bool)
     ensures
-        found == exists|j: int| 0 <= j < i && #[trigger] s@[j].tag@ == s@[i as int].tag@,
+        found == exists|j: int| 0 <= j < out@.len() && #[trigger] out@[j].tag@ == key@,
 {
     let mut j: usize = 0;
-    while j < i
+    while j < out.len()
         invariant
-            0 <= j <= i < s@.len(),
-            forall|k: int| 0 <= k < j ==> #[trigger] s@[k].tag@ != s@[i as int].tag@,
-        decreases i - j,
+            0 <= j <= out@.len(),
+            forall|k: int| 0 <= k < j ==> #[trigger] out@[k].tag@ != key@,
+        decreases out@.len() - j,
     {
-        if bytes_eq(s[j].tag.as_slice(), s[i].tag.as_slice()) {
-            assert(s@[j as int].tag@ == s@[i as int].tag@);
+        if out[j].tag == *key {
+            assert(out@[j as int].tag@ == key@);
             return true;
         }
         j += 1;
@@ -387,66 +509,101 @@ fn earlier_preferred(s: &[RawService], i: usize, port: u16) -> (found: bool)
     false
 }
 
-/// The first issue of service `i` (see `service_issue`).
-fn check_service(s: &[RawService], i: usize) -> (r: Option<ShapeError>)
+/// Checks requested service `i` (see `service_issue`), given the normalized
+/// services `out` before it; returns its trimmed tag.
+fn check_service(s: &[RawService], out: &[RawService], i: usize) -> (r: Result<String, ShapeError>)
     requires
         i < s@.len(),
+        out@.len() == i,
+        forall|k: int| 0 <= k < i ==> #[trigger] service_normalized(s@[k], out@[k]),
     ensures
-        r == service_issue(s@, i as int),
+        r matches Ok(key) ==> service_issue(s@, i as int) is None && key@ == tag_key(s@[i as int]),
+        r matches Err(e) ==> service_issue(s@, i as int) == Some(e),
 {
     let svc = &s[i];
-    if let Some(issue) = identifier_issue(svc.tag.as_slice()) {
-        return Some(ShapeError::Tag { index: i, issue });
+    let trimmed = match check_identifier(svc.tag.as_str()) {
+        Ok(t) => t,
+        Err(issue) => {
+            return Err(ShapeError::Tag { index: i, issue });
+        },
+    };
+    let key = trimmed.to_owned();
+    if tag_taken(out, &key) {
+        proof {
+            let j = choose|j: int| 0 <= j < out@.len() && #[trigger] out@[j].tag@ == key@;
+            assert(service_normalized(s@[j], out@[j]));
+            assert(tag_key(s@[j]) == tag_key(s@[i as int]));
+        }
+        return Err(ShapeError::DuplicateTag { index: i });
     }
-    if earlier_tag(s, i) {
-        return Some(ShapeError::DuplicateTag { index: i });
+    proof {
+        assert forall|j: int| 0 <= j < i implies #[trigger] tag_key(s@[j]) != tag_key(
+            s@[i as int],
+        ) by {
+            assert(service_normalized(s@[j], out@[j]));
+            assert(out@[j].tag@ != key@);
+        }
     }
     if svc.offset.is_none() && svc.preferred.is_none() {
-        return Some(ShapeError::MissingOffsetAndPreferred { index: i });
+        return Err(ShapeError::MissingOffsetAndPreferred { index: i });
     }
     if let Some(0) = svc.preferred {
-        return Some(ShapeError::ZeroPreferred { index: i });
+        return Err(ShapeError::ZeroPreferred { index: i });
     }
     if let Some(offset) = svc.offset {
         if earlier_offset(s, i, offset) {
-            return Some(ShapeError::DuplicateOffset { index: i, offset });
+            return Err(ShapeError::DuplicateOffset { index: i, offset });
         }
     }
     if let Some(port) = svc.preferred {
         if earlier_preferred(s, i, port) {
-            return Some(ShapeError::DuplicatePreferred { index: i, port });
+            return Err(ShapeError::DuplicatePreferred { index: i, port });
         }
     }
-    None
+    Ok(key)
 }
 
-/// Validates a group request (tags, project, and task already trimmed).
+/// Validates and normalizes a group request.
 ///
-/// Succeeds exactly for a non-empty group whose project and task (when
-/// given) are valid identifiers and whose services satisfy
-/// `group_shape_valid`; the services are kept unchanged and in order.
-/// Otherwise reports the first error in production order: no services,
-/// project, task, then the first service with an issue (`service_issue`).
-pub fn validate_group_request(
-    services: Vec<RawService>,
-    project: Option<&[u8]>,
-    task: Option<&[u8]>,
-) -> (r: Result<ValidatedGroupShape, ShapeError>)
+/// Succeeds exactly when the group is non-empty, the shared identifier rule
+/// accepts the project and the task (when given), and the services form a
+/// valid request (`group_request_valid`: every tag accepted by the identifier
+/// rule, some allocation strategy and no preferred port 0 per service, and
+/// trimmed tags, offsets, and preferred ports pairwise distinct). The result
+/// holds the services in order with trimmed tags (`shape_normalized`), and
+/// the trimmed project and task. Otherwise reports the first error in
+/// production order: no services, project, task, then the first service with
+/// an issue (`service_issue`).
+pub fn validate_group_request<'a>(
+    services: &[RawService],
+    project: Option<&'a str>,
+    task: Option<&'a str>,
+) -> (r: Result<ValidatedGroupRequest<'a>, ShapeError>)
     ensures
-        r is Ok <==> (opt_identifier_ok(project) && opt_identifier_ok(task) && group_shape_valid(
+        r is Ok <==> (opt_identifier_ok(project) && opt_identifier_ok(task) && group_request_valid(
             services@,
         )),
-        r matches Ok(v) ==> v.services_view() == services@,
+        r matches Ok(v) ==> {
+            &&& shape_normalized(services@, v.shape.services_view())
+            &&& opt_normalized(project, v.project)
+            &&& opt_normalized(task, v.task)
+        },
         r matches Err(e) ==> match e {
             ShapeError::NoServices => services@.len() == 0,
             ShapeError::Project(issue) => {
                 &&& services@.len() > 0
-                &&& project matches Some(p) && identifier_issue_of(p@) == Some(issue)
+                &&& project matches Some(p) && super::identifier::identifier_verdict(p@) == Err::<
+                    Seq<char>,
+                    IdentifierError,
+                >(issue)
             },
             ShapeError::Task(issue) => {
                 &&& services@.len() > 0
                 &&& opt_identifier_ok(project)
-                &&& task matches Some(t) && identifier_issue_of(t@) == Some(issue)
+                &&& task matches Some(t) && super::identifier::identifier_verdict(t@) == Err::<
+                    Seq<char>,
+                    IdentifierError,
+                >(issue)
             },
             _ => {
                 &&& services@.len() > 0
@@ -459,57 +616,72 @@ pub fn validate_group_request(
     if services.is_empty() {
         return Err(ShapeError::NoServices);
     }
-    if let Some(p) = project {
-        if let Some(issue) = identifier_issue(p) {
+    let checked_project = match check_optional(project) {
+        Ok(value) => value,
+        Err(issue) => {
             return Err(ShapeError::Project(issue));
-        }
-    }
-    if let Some(t) = task {
-        if let Some(issue) = identifier_issue(t) {
+        },
+    };
+    let checked_task = match check_optional(task) {
+        Ok(value) => value,
+        Err(issue) => {
             return Err(ShapeError::Task(issue));
-        }
-    }
-    let s = services.as_slice();
+        },
+    };
+    let mut out: Vec<RawService> = Vec::new();
     let mut i: usize = 0;
-    while i < s.len()
+    while i < services.len()
         invariant
-            s@ == services@,
-            0 <= i <= s@.len(),
-            s@.len() > 0,
+            0 <= i <= services@.len(),
+            services@.len() > 0,
             opt_identifier_ok(project),
             opt_identifier_ok(task),
-            forall|k: int| 0 <= k < i ==> #[trigger] service_issue(s@, k) is None,
-        decreases s@.len() - i,
+            out@.len() == i,
+            forall|k: int| 0 <= k < i ==> #[trigger] service_normalized(services@[k], out@[k]),
+            forall|k: int| 0 <= k < i ==> #[trigger] service_issue(services@, k) is None,
+        decreases services@.len() - i,
     {
-        if let Some(e) = check_service(s, i) {
-            assert(shape_error_index(e) == i);
-            proof {
-                if group_shape_valid(s@) {
-                    lemma_valid_has_no_issue(s@);
+        let key = match check_service(services, out.as_slice(), i) {
+            Ok(key) => key,
+            Err(e) => {
+                assert(shape_error_index(e) == i);
+                proof {
+                    if group_request_valid(services@) {
+                        lemma_valid_has_no_issue(services@);
+                    }
+                }
+                return Err(e);
+            },
+        };
+        let svc = &services[i];
+        let ghost prev = out@;
+        out.push(RawService { tag: key, offset: svc.offset, preferred: svc.preferred });
+        proof {
+            assert forall|k: int| 0 <= k < i + 1 implies #[trigger] service_normalized(
+                services@[k],
+                out@[k],
+            ) by {
+                if k < i {
+                    assert(out@[k] == prev[k]);
+                    assert(service_normalized(services@[k], prev[k]));
                 }
             }
-            return Err(e);
         }
         i += 1;
     }
     proof {
-        lemma_prefix_valid(s@, s@.len() as int);
+        lemma_prefix_valid(services@, services@.len() as int);
+        lemma_normalized_shape_valid(services@, out@);
     }
-    Ok(ValidatedGroupShape { services })
+    Ok(
+        ValidatedGroupRequest {
+            shape: ValidatedGroupShape { services: out },
+            project: checked_project,
+            task: checked_task,
+        },
+    )
 }
 
-/// Validation is idempotent: no service of a validated shape has an issue,
-/// so validating its services again (with any valid project and task)
-/// succeeds with the same services. Normalizing an already normalized
-/// request therefore changes nothing.
-pub proof fn lemma_validation_idempotent(s: Seq<RawService>)
-    requires
-        group_shape_valid(s),
-    ensures
-        forall|k: int| 0 <= k < s.len() ==> #[trigger] service_issue(s, k) is None,
-{
-    lemma_valid_has_no_issue(s);
-}
 // ---------------------------------------------------------------------------
 // Offset patterns
 // ---------------------------------------------------------------------------
@@ -1802,12 +1974,12 @@ pub enum TagMatchError {
 }
 
 /// The tag of stored row `k` (meaningful when the row is tagged).
-pub open spec fn stored_tag(stored: Seq<Option<Vec<u8>>>, k: int) -> Seq<u8> {
+pub open spec fn stored_tag(stored: Seq<Option<String>>, k: int) -> Seq<char> {
     stored[k]->Some_0@
 }
 
 /// Stored rows `0..n` are all tagged, with pairwise distinct tags.
-pub open spec fn stored_prefix_ok(stored: Seq<Option<Vec<u8>>>, n: int) -> bool {
+pub open spec fn stored_prefix_ok(stored: Seq<Option<String>>, n: int) -> bool {
     &&& forall|k: int| 0 <= k < n ==> (#[trigger] stored[k]) is Some
     &&& forall|j: int, k: int|
         0 <= j < n && 0 <= k < n && j != k ==> #[trigger] stored_tag(stored, j)
@@ -1818,18 +1990,18 @@ pub open spec fn stored_prefix_ok(stored: Seq<Option<Vec<u8>>>, n: int) -> bool 
 }
 
 /// Some stored row is tagged `t`.
-pub open spec fn tag_stored(stored: Seq<Option<Vec<u8>>>, t: Seq<u8>) -> bool {
+pub open spec fn tag_stored(stored: Seq<Option<String>>, t: Seq<char>) -> bool {
     exists|k: int| 0 <= k < stored.len() && stored[k] is Some && #[trigger] stored_tag(stored, k) == t
 }
 
 /// Some requested service is tagged `t`.
-pub open spec fn tag_requested(req: Seq<RawService>, t: Seq<u8>) -> bool {
+pub open spec fn tag_requested(req: Seq<RawService>, t: Seq<char>) -> bool {
     exists|i: int| 0 <= i < req.len() && #[trigger] req[i].tag@ == t
 }
 
 /// The requested and stored tags are the same set (and, both being
 /// duplicate-free, the same multiset).
-pub open spec fn same_tag_sets(req: Seq<RawService>, stored: Seq<Option<Vec<u8>>>) -> bool {
+pub open spec fn same_tag_sets(req: Seq<RawService>, stored: Seq<Option<String>>) -> bool {
     &&& req.len() == stored.len()
     &&& forall|i: int| 0 <= i < req.len() ==> tag_stored(stored, #[trigger] req[i].tag@)
     &&& forall|k: int| 0 <= k < stored.len() ==> tag_requested(req, #[trigger] stored_tag(stored, k))
@@ -1841,7 +2013,7 @@ pub open spec fn row_matched(m: Seq<usize>, k: int) -> bool {
 }
 
 /// The first stored row tagged `tag`.
-fn find_stored(stored: &[Option<Vec<u8>>], tag: &[u8]) -> (r: Option<usize>)
+fn find_stored(stored: &[Option<String>], tag: &String) -> (r: Option<usize>)
     ensures
         r matches Some(k) ==> k < stored@.len() && stored@[k as int] is Some && stored_tag(
             stored@,
@@ -1858,7 +2030,7 @@ fn find_stored(stored: &[Option<Vec<u8>>], tag: &[u8]) -> (r: Option<usize>)
         decreases stored@.len() - k,
     {
         if let Some(t) = &stored[k] {
-            if bytes_eq(t.as_slice(), tag) {
+            if *t == *tag {
                 return Some(k);
             }
         }
@@ -1868,7 +2040,7 @@ fn find_stored(stored: &[Option<Vec<u8>>], tag: &[u8]) -> (r: Option<usize>)
 }
 
 /// Whether some requested service is tagged `tag`.
-fn requested_has(req: &[RawService], tag: &[u8]) -> (found: bool)
+fn requested_has(req: &[RawService], tag: &String) -> (found: bool)
     ensures
         found == tag_requested(req@, tag@),
 {
@@ -1879,7 +2051,7 @@ fn requested_has(req: &[RawService], tag: &[u8]) -> (found: bool)
             forall|j: int| 0 <= j < i ==> #[trigger] req@[j].tag@ != tag@,
         decreases req@.len() - i,
     {
-        if bytes_eq(req[i].tag.as_slice(), tag) {
+        if req[i].tag == *tag {
             return true;
         }
         i += 1;
@@ -1888,7 +2060,7 @@ fn requested_has(req: &[RawService], tag: &[u8]) -> (found: bool)
 }
 
 /// Whether a stored row before `k` carries `tag`.
-fn earlier_stored_tag(stored: &[Option<Vec<u8>>], k: usize, tag: &[u8]) -> (found: bool)
+fn earlier_stored_tag(stored: &[Option<String>], k: usize, tag: &String) -> (found: bool)
     requires
         k <= stored@.len(),
         forall|j: int| 0 <= j < k ==> (#[trigger] stored@[j]) is Some,
@@ -1904,7 +2076,7 @@ fn earlier_stored_tag(stored: &[Option<Vec<u8>>], k: usize, tag: &[u8]) -> (foun
         decreases k - j,
     {
         if let Some(other) = &stored[j] {
-            if bytes_eq(other.as_slice(), tag) {
+            if *other == *tag {
                 assert(stored_tag(stored@, j as int) == tag@);
                 return true;
             }
@@ -1916,7 +2088,7 @@ fn earlier_stored_tag(stored: &[Option<Vec<u8>>], k: usize, tag: &[u8]) -> (foun
 
 /// Checks that every stored row is tagged and no tag repeats, reporting the
 /// first offending row.
-fn check_stored_rows(stored: &[Option<Vec<u8>>]) -> (r: Result<(), TagMatchError>)
+fn check_stored_rows(stored: &[Option<String>]) -> (r: Result<(), TagMatchError>)
     ensures
         r is Ok <==> stored_prefix_ok(stored@, stored@.len() as int),
         r matches Err(TagMatchError::Untagged { index }) ==> {
@@ -1946,7 +2118,7 @@ fn check_stored_rows(stored: &[Option<Vec<u8>>]) -> (r: Result<(), TagMatchError
         let Some(tag) = &stored[k] else {
             return Err(TagMatchError::Untagged { index: k });
         };
-        if earlier_stored_tag(stored, k, tag.as_slice()) {
+        if earlier_stored_tag(stored, k, tag) {
             proof {
                 let j = choose|j: int| 0 <= j < k && #[trigger] stored_tag(stored@, j) == tag@;
                 assert(stored_tag(stored@, j) == stored_tag(stored@, k as int));
@@ -1978,7 +2150,7 @@ fn check_stored_rows(stored: &[Option<Vec<u8>>]) -> (r: Result<(), TagMatchError
 /// in order), then a mismatch between the two tag sets. On success
 /// `m[i]` is the stored row of requested service `i`, and `m` is a
 /// bijection between requested services and stored rows.
-pub fn match_stored_tags(requested: &ValidatedGroupShape, stored: &[Option<Vec<u8>>]) -> (r: Result<
+pub fn match_stored_tags(requested: &ValidatedGroupShape, stored: &[Option<String>]) -> (r: Result<
     Vec<usize>,
     TagMatchError,
 >)
@@ -2043,7 +2215,7 @@ pub fn match_stored_tags(requested: &ValidatedGroupShape, stored: &[Option<Vec<u
                     && stored_tag(stored@, m@[x] as int) == s[x].tag@,
         decreases req@.len() - i,
     {
-        match find_stored(stored, req[i].tag.as_slice()) {
+        match find_stored(stored, &req[i].tag) {
             None => {
                 assert(!tag_stored(stored@, s[i as int].tag@));
                 return Err(TagMatchError::SetMismatch);
@@ -2068,7 +2240,7 @@ pub fn match_stored_tags(requested: &ValidatedGroupShape, stored: &[Option<Vec<u
         decreases stored@.len() - k,
     {
         let requested_tag = match &stored[k] {
-            Some(tag) => requested_has(req, tag.as_slice()),
+            Some(tag) => requested_has(req, tag),
             None => false,
         };
         if !requested_tag {
@@ -2608,6 +2780,118 @@ pub fn first_present(present: &[bool]) -> (r: Option<usize>)
         i += 1;
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Output selection of `reserve-group` and `autoreserve`
+// ---------------------------------------------------------------------------
+
+/// The requested `--format`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormatArg {
+    /// Shell export statements (the one format that needs a shell).
+    Export,
+    /// JSON.
+    Json,
+    /// Dotenv lines.
+    Dotenv,
+    /// Human-readable text.
+    Human,
+}
+
+/// The selected output: export statements for shell `S`, or a
+/// shell-independent format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupOutput<S> {
+    /// Export statements for this shell.
+    Export(S),
+    /// JSON.
+    Json,
+    /// Dotenv lines.
+    Dotenv,
+    /// Human-readable text.
+    Human,
+}
+
+/// The call discipline of `select_group_output`, stated as the oracles'
+/// preconditions (a body that calls an oracle out of turn does not verify
+/// against oracles whose preconditions are exactly these):
+///
+/// - the explicit `--shell` (`parse`) is parsed only for the export format;
+/// - the shell is detected (`detect`) only for the export format, and only
+///   when no explicit shell was given.
+///
+/// Each oracle is an `FnOnce`, so each runs at most once. Ordinary Rust
+/// closures have no preconditions, so production glue meets these.
+pub open spec fn output_discipline<S, E, P: FnOnce() -> Result<S, E>, D: FnOnce() -> Result<S, E>>(
+    format: FormatArg,
+    parse: Option<P>,
+    detect: D,
+) -> bool {
+    format == FormatArg::Export ==> match parse {
+        Some(p) => p.requires(()),
+        None => detect.requires(()),
+    }
+}
+
+/// `r` is the output `format` selects:
+///
+/// - JSON, dotenv, and human output need no shell: they are selected
+///   unconditionally, whatever `--shell` says;
+/// - export output uses the explicit shell when one was given (an invalid one
+///   is the parser's error, never replaced by detection), and otherwise the
+///   detected shell (or the detector's error).
+pub open spec fn output_selected<S, E, P: FnOnce() -> Result<S, E>, D: FnOnce() -> Result<S, E>>(
+    format: FormatArg,
+    parse: Option<P>,
+    detect: D,
+    r: Result<GroupOutput<S>, E>,
+) -> bool {
+    match format {
+        FormatArg::Json => r == Ok::<GroupOutput<S>, E>(GroupOutput::Json),
+        FormatArg::Dotenv => r == Ok::<GroupOutput<S>, E>(GroupOutput::Dotenv),
+        FormatArg::Human => r == Ok::<GroupOutput<S>, E>(GroupOutput::Human),
+        FormatArg::Export => match parse {
+            Some(p) => match r {
+                Ok(GroupOutput::Export(shell)) => p.ensures((), Ok::<S, E>(shell)),
+                Err(e) => p.ensures((), Err::<S, E>(e)),
+                _ => false,
+            },
+            None => match r {
+                Ok(GroupOutput::Export(shell)) => detect.ensures((), Ok::<S, E>(shell)),
+                Err(e) => detect.ensures((), Err::<S, E>(e)),
+                _ => false,
+            },
+        },
+    }
+}
+
+/// Selects the output of `reserve-group` / `autoreserve` (see
+/// `output_selected`), consulting the shell parser and the detector only as
+/// `output_discipline` allows.
+pub fn select_group_output<S, E, P, D>(format: FormatArg, parse: Option<P>, detect: D) -> (r: Result<
+    GroupOutput<S>,
+    E,
+>) where P: FnOnce() -> Result<S, E>, D: FnOnce() -> Result<S, E>
+    requires
+        output_discipline(format, parse, detect),
+    ensures
+        output_selected(format, parse, detect, r),
+        format != FormatArg::Export ==> r is Ok,
+        r matches Ok(GroupOutput::Export(_)) ==> format == FormatArg::Export,
+{
+    match format {
+        FormatArg::Export => {
+            let shell = match parse {
+                Some(p) => p()?,
+                None => detect()?,
+            };
+            Ok(GroupOutput::Export(shell))
+        },
+        FormatArg::Json => Ok(GroupOutput::Json),
+        FormatArg::Dotenv => Ok(GroupOutput::Dotenv),
+        FormatArg::Human => Ok(GroupOutput::Human),
+    }
 }
 
 } // verus!

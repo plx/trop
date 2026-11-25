@@ -6,22 +6,29 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::config::{
-    Config, ConfigField, ConfigLoader, ConfigValidator, EffectiveConfig, PortConfig,
+    CleanupConfig, Config, ConfigField, ConfigLoader, ConfigValidator, EffectiveConfig, PortConfig,
 };
-use crate::database::Database;
+use crate::database::{check_schema_compatibility, Database};
 use crate::error::{Error, Result};
-use crate::port::allocator::port_span_from_config;
+use crate::output::{OutputFormat, ShellType};
+use crate::port::allocator::{allocator_from_config, port_span_from_config};
 use crate::port::group::{
-    GroupAllocationRequest, GroupReconciliationPolicy, ServiceAllocationRequest,
+    GroupAllocationOutcome, GroupAllocationRequest, GroupCleanupCounts, GroupReconciliationPolicy,
+    ServiceAllocationRequest,
 };
 use crate::port::occupancy::OccupancyCheckConfig;
-use crate::verified::group::config_service_offset;
+use crate::verified::group::{self as group_kernel, config_service_offset, FormatArg, GroupOutput};
 use crate::verified::port_bounds::group_scan_span;
+use crate::verified::reserve::{cleanup_policy, CleanupSwitches};
 use crate::{PathResolver, Port};
-use rusqlite::Connection;
+use rusqlite::types::Value;
+use rusqlite::{params_from_iter, Connection, OpenFlags};
 
+use super::cleanup::CleanupOperations;
+use super::executor::{ExecutionResult, PlanExecutor};
 use super::plan::{OperationPlan, PlanAction};
 
 /// Options for a reserve group operation.
@@ -347,6 +354,37 @@ impl ReserveGroupPlan {
         Ok(plan)
     }
 
+    /// Runs this group reservation as a dry run.
+    ///
+    /// The plan is built and executed exactly as a live run builds and
+    /// executes it -- reconciliation, the fresh allocation, the automatic
+    /// cleanup and single retry -- but inside a transaction on a private
+    /// in-memory copy of the database (`open_dry_run_snapshot`), which is
+    /// then discarded. The result therefore reports the ports a live run on
+    /// the same snapshot would reserve or refresh, with its warnings, and the
+    /// dry run fails with exactly the error such a live run would report.
+    /// `database` is the database file, or `None` when none exists yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns every error a live run would return, and an error if the
+    /// database cannot be read.
+    pub fn dry_run(
+        &self,
+        database: Option<&Path>,
+        busy_timeout: Duration,
+    ) -> Result<ExecutionResult> {
+        let snapshot = open_dry_run_snapshot(database, busy_timeout)?;
+        let transaction = snapshot.unchecked_transaction()?;
+        let plan = self.build_plan(&transaction)?;
+        let mut result = PlanExecutor::new(&transaction).execute(&plan)?;
+        // Dropping the transaction rolls the copy back; the copy itself is
+        // discarded with `snapshot`.
+        drop(transaction);
+        result.dry_run = true;
+        Ok(result)
+    }
+
     /// Builds a `GroupAllocationRequest` from the reservation group.
     ///
     /// Services are taken in tag order (the configuration stores them in a
@@ -422,6 +460,186 @@ impl ReserveGroupPlan {
         });
         Ok(config)
     }
+}
+
+/// Runs a planned group allocation: reconciliation and, for a fresh group,
+/// the allocation with one automatic cleanup and retry when the fallback
+/// pattern is exhausted -- the same step single reservations take.
+///
+/// The cleanup policy is the verified `verified::reserve::cleanup_policy` of
+/// the configuration's `disable_autoprune`/`disable_autoexpire` switches, so
+/// a retry is possible unless both are disabled. Expiry uses the configured
+/// `cleanup` section, or 30 days without one, as for single reservations.
+pub(crate) fn execute_group_allocation(
+    conn: &Connection,
+    request: &GroupAllocationRequest,
+    policy: GroupReconciliationPolicy,
+    full_config: &Config,
+    occupancy_config: &OccupancyCheckConfig,
+) -> Result<GroupAllocationOutcome> {
+    let allocator = allocator_from_config(full_config)?;
+    let cleanup = cleanup_policy(CleanupSwitches {
+        disable_autoprune: full_config.disable_autoprune.unwrap_or(false),
+        disable_autoexpire: full_config.disable_autoexpire.unwrap_or(false),
+    });
+    allocator.allocate_group_with_cleanup(
+        conn,
+        request,
+        occupancy_config,
+        policy,
+        cleanup.retry_possible(),
+        |conn| {
+            let default_cleanup = CleanupConfig {
+                expire_after_days: Some(30),
+            };
+            let cleanup_config = full_config.cleanup.as_ref().unwrap_or(&default_cleanup);
+            let result = CleanupOperations::automatic_cleanup_in_connection(
+                conn,
+                cleanup_config,
+                cleanup.prune,
+                cleanup.expire,
+                || {},
+            )?;
+            Ok(GroupCleanupCounts {
+                pruned: result.pruned_count,
+                expired: result.expired_count,
+            })
+        },
+    )
+}
+
+/// Opens a private, in-memory copy of a database for a dry run.
+///
+/// - With `database` (an existing database file), the file is opened
+///   read-only and copied -- every table with its rows, then its indexes,
+///   triggers, and views -- inside one read transaction, so the copy is one
+///   consistent snapshot.
+/// - Without one, the copy starts empty, as the database a live run would
+///   create.
+///
+/// The copy is then initialized or migrated in memory by the same schema
+/// check `Database::open` runs, so it is the database a live run would plan
+/// against, and an unsupported schema fails as a live run fails. The file is
+/// never written, created, initialized, or migrated. Opening an existing
+/// WAL-mode database read-only can leave its `-wal`/`-shm` files beside it;
+/// the contents never change.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or read, or if its schema
+/// is not supported.
+#[doc(hidden)]
+pub fn open_dry_run_snapshot(
+    database: Option<&Path>,
+    busy_timeout: Duration,
+) -> Result<Connection> {
+    let snapshot = Connection::open_in_memory()?;
+    if let Some(path) = database {
+        let source = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        source.busy_timeout(busy_timeout)?;
+        let read = source.unchecked_transaction()?;
+        copy_database(&read, &snapshot)?;
+        drop(read);
+    }
+    check_schema_compatibility(&snapshot)?;
+    Ok(snapshot)
+}
+
+/// Copies every table (with its rows), index, trigger, and view of `source`
+/// into the empty database `target`.
+fn copy_database(source: &Connection, target: &Connection) -> Result<()> {
+    let objects = {
+        let mut statement = source.prepare(
+            "SELECT type, name, sql FROM sqlite_master \
+             WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+             ORDER BY rowid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    // Tables and their rows first, then the objects that refer to them.
+    for (kind, name, sql) in &objects {
+        if kind == "table" {
+            target.execute_batch(sql)?;
+            copy_rows(source, target, name)?;
+        }
+    }
+    for (kind, _, sql) in &objects {
+        if kind != "table" {
+            target.execute_batch(sql)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copies every row of `table` from `source` into the same (empty) table of
+/// `target`.
+fn copy_rows(source: &Connection, target: &Connection, table: &str) -> Result<()> {
+    let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+    let mut select = source.prepare(&format!("SELECT * FROM {quoted}"))?;
+    let columns = select.column_count();
+    let placeholders = vec!["?"; columns].join(", ");
+    let mut insert = target.prepare(&format!("INSERT INTO {quoted} VALUES ({placeholders})"))?;
+    let mut rows = select.query([])?;
+    while let Some(row) = rows.next()? {
+        let values = (0..columns)
+            .map(|index| row.get::<_, Value>(index))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        insert.execute(params_from_iter(values))?;
+    }
+    Ok(())
+}
+
+/// The `--format` of `reserve-group` and `autoreserve`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupOutputFormat {
+    /// Shell export statements.
+    Export,
+    /// JSON.
+    Json,
+    /// Dotenv (`.env`) lines.
+    Dotenv,
+    /// Human-readable text.
+    Human,
+}
+
+/// Selects the output of `reserve-group` and `autoreserve`.
+///
+/// JSON, dotenv, and human output need no shell, so `shell` is ignored for
+/// them. Export output uses `shell` when it is given -- an unknown name is an
+/// error, never replaced by detection -- and otherwise the detected shell.
+/// The verified kernel `verified::group::select_group_output` decides, and it
+/// parses `shell` or detects the shell only in those cases.
+///
+/// # Errors
+///
+/// Returns an error for the export format when `shell` names no supported
+/// shell, or when no shell is given and detection fails.
+pub fn select_group_output(format: GroupOutputFormat, shell: Option<&str>) -> Result<OutputFormat> {
+    let format = match format {
+        GroupOutputFormat::Export => FormatArg::Export,
+        GroupOutputFormat::Json => FormatArg::Json,
+        GroupOutputFormat::Dotenv => FormatArg::Dotenv,
+        GroupOutputFormat::Human => FormatArg::Human,
+    };
+    let parse = shell.map(|name| move || ShellType::from_string(name));
+    Ok(
+        match group_kernel::select_group_output(format, parse, ShellType::detect)? {
+            GroupOutput::Export(shell) => OutputFormat::Export(shell),
+            GroupOutput::Json => OutputFormat::Json,
+            GroupOutput::Dotenv => OutputFormat::Dotenv,
+            GroupOutput::Human => OutputFormat::Human,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -978,5 +1196,113 @@ reservations:
             .config_with_group_base_as_scan_start(&group_with_base(Some(5000)))
             .unwrap_err();
         assert!(matches!(err, Error::Validation { field, .. } if field == "ports"));
+    }
+
+    /// Non-export formats never consult the shell, so an unknown `--shell`
+    /// is ignored for them; export parses an explicit shell (and never falls
+    /// back to detection when it is unknown).
+    #[test]
+    fn group_output_selection_consults_the_shell_only_for_export() {
+        for (format, expected) in [
+            (GroupOutputFormat::Json, OutputFormat::Json),
+            (GroupOutputFormat::Dotenv, OutputFormat::Dotenv),
+            (GroupOutputFormat::Human, OutputFormat::Human),
+        ] {
+            assert_eq!(select_group_output(format, Some("csh")).unwrap(), expected);
+            assert_eq!(select_group_output(format, None).unwrap(), expected);
+        }
+
+        assert_eq!(
+            select_group_output(GroupOutputFormat::Export, Some("ZSH")).unwrap(),
+            OutputFormat::Export(ShellType::Zsh)
+        );
+        assert_eq!(
+            select_group_output(GroupOutputFormat::Export, Some("pwsh")).unwrap(),
+            OutputFormat::Export(ShellType::PowerShell)
+        );
+        let error = select_group_output(GroupOutputFormat::Export, Some("csh")).unwrap_err();
+        assert!(matches!(error, Error::Validation { ref field, .. } if field == "shell"));
+
+        // Without an explicit shell, export uses exactly what detection says.
+        let detected = ShellType::detect().map(OutputFormat::Export);
+        let selected = select_group_output(GroupOutputFormat::Export, None);
+        assert_eq!(selected.ok(), detected.ok());
+    }
+
+    /// A dry-run snapshot holds every row of the source and keeps its
+    /// constraints and indexes; writing to it never reaches the file.
+    #[test]
+    fn dry_run_snapshot_copies_rows_constraints_and_indexes() {
+        use crate::{Reservation, ReservationKey};
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("trop.db");
+        {
+            let mut db = Database::open(crate::DatabaseConfig::new(&db_path)).unwrap();
+            for (index, port) in [5000_u16, 5001, 65535].into_iter().enumerate() {
+                let key = ReservationKey::new(
+                    PathBuf::from(format!("/snapshot/{index}")),
+                    (index > 0).then(|| format!("tag{index}")),
+                )
+                .unwrap();
+                let reservation = Reservation::builder(key, Port::try_from(port).unwrap())
+                    .project(Some("p".to_string()))
+                    .build()
+                    .unwrap();
+                db.create_reservation(&reservation).unwrap();
+            }
+        }
+        let original = Database::list_all_reservations(
+            Database::open(crate::DatabaseConfig::new(&db_path).read_only())
+                .unwrap()
+                .connection(),
+        )
+        .unwrap();
+
+        let snapshot =
+            open_dry_run_snapshot(Some(&db_path), std::time::Duration::from_secs(1)).unwrap();
+
+        assert_eq!(
+            Database::list_all_reservations(&snapshot).unwrap(),
+            original
+        );
+        let indexes: i64 = snapshot
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 3);
+        // The UNIQUE port constraint survives the copy.
+        let duplicate = snapshot.execute(
+            "INSERT INTO reservations (path, tag, port, created_at, last_used_at)
+             VALUES ('/other', '', 5000, 0, 0)",
+            [],
+        );
+        assert!(duplicate.is_err());
+        snapshot.execute("DELETE FROM reservations", []).unwrap();
+        drop(snapshot);
+        let after = Database::list_all_reservations(
+            Database::open(crate::DatabaseConfig::new(&db_path).read_only())
+                .unwrap()
+                .connection(),
+        )
+        .unwrap();
+        assert_eq!(after, original, "the file never changes");
+    }
+
+    /// Without a database file the snapshot is a freshly initialized empty
+    /// database, and nothing is created on disk.
+    #[test]
+    fn dry_run_snapshot_without_a_database_is_empty_and_initialized() {
+        let dir = TempDir::new().unwrap();
+        let snapshot = open_dry_run_snapshot(None, std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(Database::list_all_reservations(&snapshot).unwrap(), []);
+        assert_eq!(
+            crate::database::get_schema_version(&snapshot).unwrap(),
+            crate::database::get_schema_version(create_test_database().connection()).unwrap()
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

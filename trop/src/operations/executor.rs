@@ -7,13 +7,13 @@ use std::collections::HashMap;
 
 use crate::database::Database;
 use crate::error::{Error, Result};
-use crate::port::allocator::allocator_from_config;
 use crate::verified::reserve::{self as reserve_kernel, ReportedPort};
 use crate::{Port, ReservationKey};
 use rusqlite::Connection;
 
 use super::plan::{OperationPlan, PlanAction};
 use super::reserve::execute_reserve_after_cleanup;
+use super::reserve_group::execute_group_allocation;
 
 #[derive(Default)]
 struct ActionOutcome {
@@ -268,15 +268,18 @@ impl<'conn> PlanExecutor<'conn> {
                 full_config,
                 occupancy_config,
             } => {
-                let allocator = allocator_from_config(full_config)?;
-                let result = allocator.allocate_group_with_policy(
+                // Reconciliation, then a fresh allocation with one automatic
+                // cleanup and retry on exhaustion, as for single reservations.
+                let outcome = execute_group_allocation(
                     self.conn,
                     request,
-                    occupancy_config,
                     *policy,
+                    full_config,
+                    occupancy_config,
                 )?;
                 Ok(ActionOutcome {
-                    allocated_ports: Some(result.allocations),
+                    allocated_ports: Some(outcome.result.allocations),
+                    warnings: outcome.warning.into_iter().collect(),
                     ..ActionOutcome::default()
                 })
             }
