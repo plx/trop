@@ -21,7 +21,7 @@ use crate::verified::path_relation::PathToken;
 use crate::{Reservation, ReservationKey};
 
 use super::plan::{OperationPlan, PlanAction};
-use super::release::guard_cwd_tokens;
+use super::release::path_guard;
 
 /// Options for migration operation.
 #[derive(Debug, Clone)]
@@ -283,20 +283,16 @@ impl MigratePlan {
         // lexical relation to the current directory itself and consulting the
         // database's single-path check as the physical fallback.
         let keys = KeyTable::intern(&self.migrations);
-        let force = self.options.force;
-        let allow_unrelated_path = self.options.allow_unrelated_path;
-        let cwd = guard_cwd_tokens(force, allow_unrelated_path, !keys.keys.is_empty())?;
+        let guard = path_guard(
+            self.options.force,
+            self.options.allow_unrelated_path,
+            !keys.keys.is_empty(),
+        )?;
         let key_paths: Vec<Vec<PathToken>> =
             keys.keys.iter().map(|key| path_tokens(&key.path)).collect();
-        guard_moves(
-            force,
-            allow_unrelated_path,
-            &cwd,
-            &key_paths,
-            &keys.sources,
-            &keys.dests,
-            &|id| Database::validate_path_relationship(&keys.keys[id].path, false).err(),
-        )
+        guard_moves(&guard, &key_paths, &keys.sources, &keys.dests, &|id| {
+            Database::validate_path_relationship(&keys.keys[id].path, false).err()
+        })
         .map_err(|error| match error {
             MoveGuardError::Refused(failure) => {
                 let position = failure.index;

@@ -8,10 +8,9 @@ use std::path::PathBuf;
 use crate::database::Database;
 use crate::error::Result;
 use crate::path::relationship::path_tokens;
-use crate::verified::path_relation::PathToken;
 use crate::verified::release::{
     guard_paths, plan_flags, requires_path_check, select_and_guard, selector_from_plan,
-    tag_selector, ReleaseRow, TagSelector,
+    tag_selector, PathGuard, ReleaseRow, TagSelector,
 };
 use crate::ReservationKey;
 use rusqlite::Connection;
@@ -168,21 +167,15 @@ impl ReleasePlan {
     pub fn build_plan(&self, conn: &Connection) -> Result<OperationPlan> {
         let mut plan = OperationPlan::new(format!("Release reservation for {}", self.options.key));
         let target = &self.options.key.path;
-        let force = self.options.force;
-        let allow_unrelated_path = self.options.allow_unrelated_path;
 
         // Step 1: Validate the requested path's relationship. The kernel
         // decides the lexical relation to the current directory; the
         // database's single-path check is the physical fallback for a path
         // that is lexically unrelated.
-        let cwd = guard_cwd_tokens(force, allow_unrelated_path, true)?;
-        guard_paths(
-            force,
-            allow_unrelated_path,
-            &cwd,
-            &[path_tokens(target)],
-            &|_index| Database::validate_path_relationship(target, false).err(),
-        )
+        let guard = path_guard(self.options.force, self.options.allow_unrelated_path, true)?;
+        guard_paths(&guard, &[path_tokens(target)], &|_index| {
+            Database::validate_path_relationship(target, false).err()
+        })
         .map_err(|failure| failure.error)?;
 
         // Step 2: Read the candidate rows: every row under the path
@@ -220,9 +213,7 @@ impl ReleasePlan {
             self.recursive,
             &path_tokens(&stored_target),
             &rows,
-            force,
-            allow_unrelated_path,
-            &cwd,
+            &guard,
             &|index| {
                 Database::validate_path_relationship(&candidates[index].key().path, false).err()
             },
@@ -271,22 +262,27 @@ fn stored_tag(tag: Option<&str>) -> Option<Vec<u8>> {
         .map(|tag| tag.as_bytes().to_vec())
 }
 
-/// The current directory's component tokens for the unrelated-path guard.
+/// The unrelated-path guard's inputs for an operation.
 ///
-/// The directory is read only when the guard applies (neither `force` nor
-/// `allow_unrelated_path`) and there is a path to check; otherwise the
-/// kernels never consult it. The per-path physical fallback,
+/// The current directory is read only when the guard applies (neither
+/// `force` nor `allow_unrelated_path`) and there is a path to check;
+/// otherwise the kernels never consult it. The per-path physical fallback,
 /// [`Database::validate_path_relationship`], reads the same directory.
-pub(crate) fn guard_cwd_tokens(
+pub(crate) fn path_guard(
     force: bool,
     allow_unrelated_path: bool,
     has_paths: bool,
-) -> Result<Vec<PathToken>> {
-    if has_paths && requires_path_check(force, allow_unrelated_path) {
-        Ok(path_tokens(&std::env::current_dir()?))
+) -> Result<PathGuard> {
+    let cwd = if has_paths && requires_path_check(force, allow_unrelated_path) {
+        path_tokens(&std::env::current_dir()?)
     } else {
-        Ok(Vec::new())
-    }
+        Vec::new()
+    };
+    Ok(PathGuard {
+        force,
+        allow_unrelated: allow_unrelated_path,
+        cwd,
+    })
 }
 
 /// Which tags `trop release` selects, from its `--tag` and

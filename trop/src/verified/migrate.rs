@@ -1605,42 +1605,36 @@ pub open spec fn key_permitted<E, F: Fn(usize) -> Option<E>>(
 /// - With `--force` or `--allow-unrelated-path` the guard passes and the
 ///   fallback is never consulted.
 pub fn guard_moves<E, F: Fn(usize) -> Option<E>>(
-    force: bool,
-    allow_unrelated: bool,
-    cwd: &[super::path_relation::PathToken],
+    guard: &super::release::PathGuard,
     key_paths: &[Vec<super::path_relation::PathToken>],
     sources: &[usize],
     dests: &[usize],
     fallback: &F,
 ) -> (r: Result<(), MoveGuardError<E>>)
     requires
-        super::release::path_check_required(force, allow_unrelated) ==> forall|k: usize|
+        super::release::guard_applies(*guard) ==> forall|k: usize|
             k < key_paths.len() ==> fallback.requires((k,)),
     ensures
-        !super::release::path_check_required(force, allow_unrelated) ==> r is Ok,
-        r is Ok && super::release::path_check_required(force, allow_unrelated) ==> (forall|i: int|
+        !super::release::guard_applies(*guard) ==> r is Ok,
+        r is Ok && super::release::guard_applies(*guard) ==> (forall|i: int|
             0 <= i < sources.len() ==> key_permitted(
-                super::path_relation::tok_views(cwd@),
+                super::release::guard_cwd(*guard),
                 key_paths@,
                 *fallback,
                 #[trigger] sources@[i],
             )) && (forall|i: int|
             0 <= i < dests.len() ==> key_permitted(
-                super::path_relation::tok_views(cwd@),
+                super::release::guard_cwd(*guard),
                 key_paths@,
                 *fallback,
                 #[trigger] dests@[i],
             )),
-        r matches Err(MoveGuardError::KeyOutOfRange) ==> super::release::path_check_required(
-            force,
-            allow_unrelated,
-        ) && !(in_range(sources@, key_paths.len()) && in_range(dests@, key_paths.len())),
-        r matches Err(MoveGuardError::Refused(f)) ==> super::release::path_check_required(
-            force,
-            allow_unrelated,
-        ) && f.index < sources.len() + dests.len() && affected_ids(sources@, dests@)[f.index as int]
+        r matches Err(MoveGuardError::KeyOutOfRange) ==> super::release::guard_applies(*guard)
+            && !(in_range(sources@, key_paths.len()) && in_range(dests@, key_paths.len())),
+        r matches Err(MoveGuardError::Refused(f)) ==> super::release::guard_applies(*guard)
+            && f.index < sources.len() + dests.len() && affected_ids(sources@, dests@)[f.index as int]
             < key_paths.len() && super::release::refused(
-            super::path_relation::tok_views(cwd@),
+            super::release::guard_cwd(*guard),
             super::path_relation::tok_views(
                 key_paths@[affected_ids(sources@, dests@)[f.index as int] as int]@,
             ),
@@ -1649,16 +1643,16 @@ pub fn guard_moves<E, F: Fn(usize) -> Option<E>>(
             f.error,
         ) && forall|p: int|
             0 <= p < f.index ==> key_permitted(
-                super::path_relation::tok_views(cwd@),
+                super::release::guard_cwd(*guard),
                 key_paths@,
                 *fallback,
                 #[trigger] affected_ids(sources@, dests@)[p],
             ),
 {
-    if !super::release::requires_path_check(force, allow_unrelated) {
+    if !super::release::requires_path_check(guard.force, guard.allow_unrelated) {
         return Ok(());
     }
-    let ghost c = super::path_relation::tok_views(cwd@);
+    let ghost c = super::release::guard_cwd(*guard);
     let ghost ids = affected_ids(sources@, dests@);
     let mut chain: Vec<usize> = Vec::new();
     let mut i: usize = 0;
@@ -1701,8 +1695,8 @@ pub fn guard_moves<E, F: Fn(usize) -> Option<E>>(
             p <= chain.len(),
             chain@ == ids,
             ids == affected_ids(sources@, dests@),
-            c == super::path_relation::tok_views(cwd@),
-            super::release::path_check_required(force, allow_unrelated),
+            c == super::release::guard_cwd(*guard),
+            super::release::guard_applies(*guard),
             forall|k: usize| k < key_paths.len() ==> fallback.requires((k,)),
             forall|q: int| 0 <= q < p ==> key_permitted(c, key_paths@, *fallback, #[trigger] ids[q]),
         decreases chain.len() - p,
@@ -1720,7 +1714,12 @@ pub fn guard_moves<E, F: Fn(usize) -> Option<E>>(
             }
             return Err(MoveGuardError::KeyOutOfRange);
         }
-        if let Some(error) = super::release::gate_path(cwd, key_paths[k].as_slice(), fallback, k) {
+        if let Some(error) = super::release::gate_path(
+            guard.cwd.as_slice(),
+            key_paths[k].as_slice(),
+            fallback,
+            k,
+        ) {
             return Err(MoveGuardError::Refused(super::release::GuardFailure { index: p, error }));
         }
         p += 1;

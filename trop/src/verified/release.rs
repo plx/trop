@@ -377,8 +377,10 @@ pub proof fn lemma_component_aware_example(sel: TagSelector<Seq<u8>>, tag: Optio
 }
 
 /// Token-sequence prefix (and, at equal lengths, equality).
-fn tokens_prefix(p: &[super::path_relation::PathToken], s: &[super::path_relation::PathToken]) -> (r:
-    bool)
+fn tokens_prefix(
+    p: &[super::path_relation::PathToken],
+    s: &[super::path_relation::PathToken],
+) -> (r: bool)
     ensures
         r == super::path_relation::is_prefix_of(
             super::path_relation::tok_views(p@),
@@ -426,8 +428,10 @@ fn tokens_prefix(p: &[super::path_relation::PathToken], s: &[super::path_relatio
 }
 
 /// Token-sequence equality.
-fn tokens_eq(a: &[super::path_relation::PathToken], b: &[super::path_relation::PathToken]) -> (r:
-    bool)
+fn tokens_eq(
+    a: &[super::path_relation::PathToken],
+    b: &[super::path_relation::PathToken],
+) -> (r: bool)
     ensures
         r == (super::path_relation::tok_views(a@) == super::path_relation::tok_views(b@)),
 {
@@ -516,13 +520,8 @@ fn select_rows(
                 rows@,
                 i as int,
             ));
-            assert forall|l: int| 0 <= l < i + 1 implies (out@.contains(l as usize) <==> row_selected(
-                sel_view(*sel),
-                recursive,
-                t,
-                rows@,
-                l,
-            )) by {
+            assert forall|l: int| 0 <= l < i + 1 implies (out@.contains(l as usize)
+                <==> row_selected(sel_view(*sel), recursive, t, rows@, l)) by {
                 if l < i {
                     if out@.contains(l as usize) {
                         let j = choose|j: int| 0 <= j < out@.len() && out@[j] == l as usize;
@@ -565,6 +564,28 @@ pub fn requires_path_check(force: bool, allow_unrelated: bool) -> (b: bool)
         b == path_check_required(force, allow_unrelated),
 {
     !force && !allow_unrelated
+}
+
+/// The unrelated-path guard's inputs: the two overrides and the working
+/// directory's component tokens (the glue reads the directory only when the
+/// guard applies; otherwise it is never consulted).
+pub struct PathGuard {
+    /// `--force`.
+    pub force: bool,
+    /// `--allow-unrelated-path` (the flag or the configuration).
+    pub allow_unrelated: bool,
+    /// The working directory's components.
+    pub cwd: Vec<super::path_relation::PathToken>,
+}
+
+/// The guard applies (`path_check_required` of its overrides).
+pub open spec fn guard_applies(guard: PathGuard) -> bool {
+    path_check_required(guard.force, guard.allow_unrelated)
+}
+
+/// The working directory's components.
+pub open spec fn guard_cwd(guard: PathGuard) -> Seq<(super::path::CompKind, Seq<u8>)> {
+    super::path_relation::tok_views(guard.cwd@)
 }
 
 /// The lexical half of the per-key gate: `PathRelationship::between(path,
@@ -664,50 +685,48 @@ pub open spec fn paths_permitted<E, F: Fn(usize) -> Option<E>>(
 /// either flag the guard passes and the fallback is never consulted (its
 /// precondition is only granted when the guard applies).
 pub fn guard_paths<E, F: Fn(usize) -> Option<E>>(
-    force: bool,
-    allow_unrelated: bool,
-    cwd: &[super::path_relation::PathToken],
+    guard: &PathGuard,
     paths: &[Vec<super::path_relation::PathToken>],
     fallback: &F,
 ) -> (r: Result<(), GuardFailure<E>>)
     requires
-        path_check_required(force, allow_unrelated) ==> forall|i: usize|
+        guard_applies(*guard) ==> forall|i: usize|
             i < paths.len() ==> fallback.requires((i,)),
     ensures
-        !path_check_required(force, allow_unrelated) ==> r is Ok,
-        r is Ok && path_check_required(force, allow_unrelated) ==> paths_permitted(
-            super::path_relation::tok_views(cwd@),
+        !guard_applies(*guard) ==> r is Ok,
+        r is Ok && guard_applies(*guard) ==> paths_permitted(
+            guard_cwd(*guard),
             paths@,
             *fallback,
             paths.len() as int,
         ),
-        r matches Err(f) ==> path_check_required(force, allow_unrelated) && f.index < paths.len()
+        r matches Err(f) ==> guard_applies(*guard) && f.index < paths.len()
             && refused(
-            super::path_relation::tok_views(cwd@),
+            guard_cwd(*guard),
             super::path_relation::tok_views(paths@[f.index as int]@),
             *fallback,
             f.index,
             f.error,
         ) && paths_permitted(
-            super::path_relation::tok_views(cwd@),
+            guard_cwd(*guard),
             paths@,
             *fallback,
             f.index as int,
         ),
 {
-    if !requires_path_check(force, allow_unrelated) {
+    if !requires_path_check(guard.force, guard.allow_unrelated) {
         return Ok(());
     }
     let mut i: usize = 0;
     while i < paths.len()
         invariant
             i <= paths.len(),
-            path_check_required(force, allow_unrelated),
+            guard_applies(*guard),
             forall|j: usize| j < paths.len() ==> fallback.requires((j,)),
-            paths_permitted(super::path_relation::tok_views(cwd@), paths@, *fallback, i as int),
+            paths_permitted(guard_cwd(*guard), paths@, *fallback, i as int),
         decreases paths.len() - i,
     {
-        if let Some(error) = gate_path(cwd, paths[i].as_slice(), fallback, i) {
+        if let Some(error) = gate_path(guard.cwd.as_slice(), paths[i].as_slice(), fallback, i) {
             return Err(GuardFailure { index: i, error });
         }
         i += 1;
@@ -738,22 +757,19 @@ pub open spec fn row_permitted<E, F: Fn(usize) -> Option<E>>(
 ///   before it was permitted.
 /// - With `--force` or `--allow-unrelated-path` the release proceeds and the
 ///   fallback is never consulted.
-#[allow(clippy::too_many_arguments)]  // one argument per independent input of the decision
 pub fn select_and_guard<E, F: Fn(usize) -> Option<E>>(
     sel: &TagSelector<Vec<u8>>,
     recursive: bool,
     target: &[super::path_relation::PathToken],
     rows: &[ReleaseRow],
-    force: bool,
-    allow_unrelated: bool,
-    cwd: &[super::path_relation::PathToken],
+    guard: &PathGuard,
     fallback: &F,
 ) -> (r: Result<Vec<usize>, GuardFailure<E>>)
     requires
-        path_check_required(force, allow_unrelated) ==> forall|i: usize|
+        guard_applies(*guard) ==> forall|i: usize|
             i < rows.len() ==> fallback.requires((i,)),
     ensures
-        !path_check_required(force, allow_unrelated) ==> r is Ok,
+        !guard_applies(*guard) ==> r is Ok,
         r matches Ok(v) ==> is_selection(
             v@,
             sel_view(*sel),
@@ -761,15 +777,15 @@ pub fn select_and_guard<E, F: Fn(usize) -> Option<E>>(
             super::path_relation::tok_views(target@),
             rows@,
         ),
-        r is Ok && path_check_required(force, allow_unrelated) ==> forall|i: int|
+        r is Ok && guard_applies(*guard) ==> forall|i: int|
             0 <= i < rows.len() && #[trigger] row_selected(
                 sel_view(*sel),
                 recursive,
                 super::path_relation::tok_views(target@),
                 rows@,
                 i,
-            ) ==> row_permitted(super::path_relation::tok_views(cwd@), rows@, *fallback, i as usize),
-        r matches Err(f) ==> path_check_required(force, allow_unrelated) && f.index < rows.len()
+            ) ==> row_permitted(guard_cwd(*guard), rows@, *fallback, i as usize),
+        r matches Err(f) ==> guard_applies(*guard) && f.index < rows.len()
             && row_selected(
             sel_view(*sel),
             recursive,
@@ -777,7 +793,7 @@ pub fn select_and_guard<E, F: Fn(usize) -> Option<E>>(
             rows@,
             f.index as int,
         ) && refused(
-            super::path_relation::tok_views(cwd@),
+            guard_cwd(*guard),
             row_path(rows@[f.index as int]),
             *fallback,
             f.index,
@@ -789,31 +805,32 @@ pub fn select_and_guard<E, F: Fn(usize) -> Option<E>>(
                 super::path_relation::tok_views(target@),
                 rows@,
                 i,
-            ) ==> row_permitted(super::path_relation::tok_views(cwd@), rows@, *fallback, i as usize),
+            ) ==> row_permitted(guard_cwd(*guard), rows@, *fallback, i as usize),
 {
     let ghost t = super::path_relation::tok_views(target@);
-    let ghost c = super::path_relation::tok_views(cwd@);
+    let ghost c = guard_cwd(*guard);
     let selected = select_rows(sel, recursive, target, rows);
-    if !requires_path_check(force, allow_unrelated) {
+    if !requires_path_check(guard.force, guard.allow_unrelated) {
         return Ok(selected);
     }
     let mut j: usize = 0;
     while j < selected.len()
         invariant
             j <= selected.len(),
-            path_check_required(force, allow_unrelated),
+            guard_applies(*guard),
             forall|i: usize| i < rows.len() ==> fallback.requires((i,)),
             is_selection(selected@, sel_view(*sel), recursive, t, rows@),
             t == super::path_relation::tok_views(target@),
-            c == super::path_relation::tok_views(cwd@),
-            forall|p: int| 0 <= p < j ==> row_permitted(c, rows@, *fallback, #[trigger] selected@[p]),
+            c == guard_cwd(*guard),
+            forall|p: int|
+                0 <= p < j ==> row_permitted(c, rows@, *fallback, #[trigger] selected@[p]),
         decreases selected.len() - j,
     {
         let i = selected[j];
         proof {
             assert(selected@[j as int] < rows.len());
         }
-        if let Some(error) = gate_path(cwd, rows[i].path.as_slice(), fallback, i) {
+        if let Some(error) = gate_path(guard.cwd.as_slice(), rows[i].path.as_slice(), fallback, i) {
             proof {
                 assert(selected@.contains(i));
                 assert forall|l: int|
