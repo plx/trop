@@ -19,7 +19,6 @@ clap_complete = "4.5"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-chrono = { workspace = true }
 home = "0.5"
 
 [dev-dependencies]

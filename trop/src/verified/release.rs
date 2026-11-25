@@ -11,15 +11,17 @@
 //!   order: rows at the target path (or, recursively, at a component
 //!   descendant of it) whose tag the selector accepts (`release_selects`).
 //!   Paths are component-token sequences, so `/work/ab` is never under
-//!   `/work/a` (`lemma_component_aware`). The target is given by its stored
-//!   identity (`target_view`): its tokens when it is spelled as a stored
-//!   key's path (canonical form), and `None` otherwise, which
-//!   selects nothing in every mode (`lemma_unstored_target_selects_nothing`),
-//!   as the exact-text lookups find nothing for it. The non-recursive
-//!   selection is contained in the recursive one and every selector's in
-//!   `AllTags`'.
-//!   The unrelated-path guard is applied in the same step to exactly the
-//!   selected rows.
+//!   `/work/a` (`lemma_component_aware`). The target is given as an
+//!   optional token sequence (`target_view`), and `None` selects nothing in
+//!   every mode (`lemma_unstored_target_selects_nothing`). The kernel never
+//!   sees the target's text: that the glue passes `None` exactly for a
+//!   target not spelled as a stored key's path (canonical form), as the
+//!   exact-text lookups find nothing for it, is unverified glue
+//!   (`stored_target` in `crate::operations::release`, pinned by the unit
+//!   test `test_noncanonical_target_selects_nothing_in_every_mode`). The
+//!   non-recursive selection is contained in the recursive one and every
+//!   selector's in `AllTags`'. The unrelated-path guard is applied in the
+//!   same step to exactly the selected rows.
 //! - The unrelated-path guard (`guard_paths`, `select_and_guard`, and
 //!   `super::migrate::guard_moves`): with neither `--force` nor
 //!   `--allow-unrelated-path`, an operation may proceed only if every key it
@@ -245,13 +247,18 @@ pub open spec fn tag_view(t: Option<Vec<u8>>) -> Option<Seq<u8>> {
     }
 }
 
-/// The release target's stored identity: the components of the target path
-/// when it is spelled as a stored key's path (the form the storage kernel's
-/// write-side check accepts; on Unix exactly the canonical absolute
-/// spellings), and `None` otherwise. Stored keys are compared by their
-/// exact text, and in that form equal text is equal components, so a target
-/// spelled any other way (`/w/a/`, `/w/./a`, `/w//a`) names no stored
-/// reservation.
+/// The release target as the selection sees it: the components of the
+/// given token sequence, or `None` when no target identity was given.
+///
+/// This is only the view of the kernel's input. The kernel does not see the
+/// target's text, so nothing here ties `Some` to a canonical spelling. The
+/// glue (`stored_target` in `crate::operations::release`, unverified and
+/// pinned by `test_noncanonical_target_selects_nothing_in_every_mode`)
+/// passes tokens only when the target is spelled as a stored key's path (the
+/// form the storage kernel's write-side check accepts; on Unix exactly the
+/// canonical absolute spellings) and `None` otherwise, because stored keys
+/// are compared by their exact text and a target spelled any other way
+/// (`/w/a/`, `/w/./a`, `/w//a`) names no stored reservation.
 pub open spec fn target_view(
     target: Option<&[super::path_relation::PathToken]>,
 ) -> Option<Seq<(super::path::CompKind, Seq<u8>)>> {
@@ -300,11 +307,11 @@ pub open spec fn is_selection(
         ))
 }
 
-/// A target that is not spelled in stored (canonical) form selects nothing,
-/// whatever the mode (exact key, all tags, recursive) and the selector:
-/// the only selection of any candidate rows is empty. (With canonical
-/// spellings, the exact-text candidate queries and the token comparison
-/// agree, so the three modes identify the target the same way.)
+/// A `None` target selects nothing, whatever the mode (exact key, all tags,
+/// recursive) and the selector: the only selection of any candidate rows is
+/// empty. This follows from `row_selected`'s definition. That a target not
+/// spelled in stored (canonical) form reaches the kernel as `None` is the
+/// glue's `stored_target`, which is unverified (see `target_view`).
 pub proof fn lemma_unstored_target_selects_nothing(
     v: Seq<usize>,
     sel: TagSelector<Seq<u8>>,
@@ -803,9 +810,9 @@ pub open spec fn row_permitted<E, F: Fn(usize) -> Option<E>>(
 ///
 /// - Selection: on success, exactly the selected rows (`is_selection`:
 ///   strictly increasing, each candidate listed iff `row_selected`). A
-///   target without a stored identity (`target` is `None`: the path is not
-///   in canonical form) selects nothing in every mode
-///   (`lemma_unstored_target_selects_nothing`).
+///   `None` target selects nothing in every mode
+///   (`lemma_unstored_target_selects_nothing`); the glue passes `None` for a
+///   path not in canonical form (unverified, see `target_view`).
 /// - Soundness: when the guard applies, every selected row is lexically
 ///   related to the working directory or permitted by the physical fallback
 ///   (`row_permitted`), so a release never deletes a reservation sideways

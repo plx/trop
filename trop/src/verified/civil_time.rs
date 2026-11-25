@@ -495,8 +495,9 @@ pub open spec fn floor_unix_seconds(before_epoch: bool, secs: u64, nanos: u32) -
     instant_nanos(before_epoch, secs, nanos) / 1_000_000_000
 }
 
-/// The Unix times this kernel converts: every floor of a `Duration`-sized
-/// instant (at most about `2^64` seconds either side of the epoch).
+/// The Unix times this kernel converts: at most `2^65` seconds either side
+/// of the epoch. That over-approximates the floors of `Duration`-sized
+/// instants, which are within about `2^64` seconds of the epoch.
 pub open spec fn supported_seconds(s: int) -> bool {
     -0x2_0000_0000_0000_0000 <= s <= 0x2_0000_0000_0000_0000
 }
@@ -954,9 +955,14 @@ pub fn civil_text_string(c: CivilDateTime) -> (text: String)
 
 /// The UTC `%Y-%m-%d %H:%M:%S` text of the second containing an instant,
 /// given as `SystemTime::duration_since(UNIX_EPOCH)` reports it (see
-/// `civil_from_instant`). Total.
+/// `civil_from_instant`). Total. The ensures also state that the `choose`
+/// in `utc_civil` has a witness here (a valid civil date-time at that
+/// second), so a caller can unfold the text with the `civil_text` lemmas.
 pub fn format_unix_instant(before_epoch: bool, secs: u64, nanos: u32) -> (text: String)
     ensures
+        utc_civil(floor_unix_seconds(before_epoch, secs, nanos)).is_valid(),
+        utc_civil(floor_unix_seconds(before_epoch, secs, nanos)).unix_seconds()
+            == floor_unix_seconds(before_epoch, secs, nanos),
         vstd::utf8::encode_utf8(text@) == civil_text(
             utc_civil(floor_unix_seconds(before_epoch, secs, nanos)),
         ),

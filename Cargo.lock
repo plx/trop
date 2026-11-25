@@ -2599,7 +2599,6 @@ name = "trop-cli"
 version = "0.2.0"
 dependencies = [
  "assert_cmd",
- "chrono",
  "clap",
  "clap_complete",
  "clap_mangen",

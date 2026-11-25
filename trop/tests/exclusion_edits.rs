@@ -418,6 +418,14 @@ fn excluded_ports_in_reads_documents_exactly_as_the_loader_does() {
         "!foo null\n",
         "--- !foo\n",
         "!!null ''\n",
+        "!!null",
+        "!!null\n",
+        "--- !!null\n",
+        "!!null null\n",
+        "!!null ~\n",
+        "!!str",
+        "!!str\n",
+        "--- !!str\n",
         "''\n",
         "project: demo\n",
         "excluded_ports: [1]\n",
@@ -437,15 +445,15 @@ fn excluded_ports_in_reads_documents_exactly_as_the_loader_does() {
             (Err(_), Err(_)) => {}
             _ => panic!("{document:?}: loader {loaded:?}, excluded_ports_in {read:?}"),
         }
-        // The rewrite reads the original the same way: it refuses exactly
-        // the documents the loader rejects.
+        // The rewrite reads the original the same way: on these documents
+        // it refuses exactly the ones the loader rejects.
         assert_eq!(
             rewrite_excluded_ports(document, &[single(8080)]).is_ok(),
             loaded.is_ok(),
             "{document:?}"
         );
     }
-    for document in ["null", "~", "!foo null\n"] {
+    for document in ["null", "~", "!foo null\n", "!!null null\n", "!!null ~\n"] {
         assert!(excluded_ports_in(document).is_err(), "{document:?}");
         assert!(
             rewrite_excluded_ports(document, &[single(8080)]).is_err(),
@@ -454,6 +462,17 @@ fn excluded_ports_in_reads_documents_exactly_as_the_loader_does() {
     }
     for document in ["", "# only a comment\n", "---\n"] {
         assert_eq!(excluded_ports_in(document).unwrap(), None, "{document:?}");
+    }
+    // Regression: the loader reads a tagged empty scalar as the default
+    // configuration, so `trop exclude` must be able to rewrite it (it used to
+    // fail with "Invalid YAML" or "not a YAML mapping").
+    for document in ["!!null", "!!null\n", "!!str\n"] {
+        assert_eq!(excluded_ports_in(document).unwrap(), None, "{document:?}");
+        assert_eq!(
+            rewrite_excluded_ports(document, &[single(8080)]).unwrap(),
+            "excluded_ports:\n- 8080\n",
+            "{document:?}"
+        );
     }
 }
 

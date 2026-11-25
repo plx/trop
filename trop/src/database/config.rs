@@ -102,15 +102,22 @@ impl DatabaseConfig {
     }
 
     /// Reject a busy timeout `SQLite` cannot store (more than `i32::MAX`
-    /// milliseconds, as `Duration::as_millis` counts them). Decided by the
-    /// verified kernel's `busy_timeout_ok` over the duration's parts, which
-    /// also proves every configuration-validated `maximum_lock_wait_seconds`
-    /// passes.
+    /// milliseconds, as `Duration::as_millis` counts them). See
+    /// [`Self::check_busy_timeout`].
     pub(super) fn validate_busy_timeout(&self) -> Result<()> {
-        if !crate::verified::config::busy_timeout_ok(
-            self.busy_timeout.as_secs(),
-            self.busy_timeout.subsec_nanos(),
-        ) {
+        Self::check_busy_timeout(self.busy_timeout)
+    }
+
+    /// Reject a busy timeout `SQLite` cannot store (more than `i32::MAX`
+    /// milliseconds, as `Duration::as_millis` counts them), with the
+    /// validation error `Database::open` reports. Decided by the verified
+    /// kernel's `busy_timeout_ok` over the duration's parts, which also proves
+    /// every configuration-validated `maximum_lock_wait_seconds` passes.
+    ///
+    /// The group dry run's snapshot opener calls this too, so it rejects
+    /// exactly the timeouts, with exactly the error, a live open does.
+    pub(crate) fn check_busy_timeout(timeout: Duration) -> Result<()> {
+        if !crate::verified::config::busy_timeout_ok(timeout.as_secs(), timeout.subsec_nanos()) {
             return Err(Error::Validation {
                 field: "maximum_lock_wait_seconds".into(),
                 message: format!(

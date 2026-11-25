@@ -1641,10 +1641,22 @@ pub enum FileKind {
     Local,
 }
 
+/// The role of a file loaded at precedence `p` (`kind_for_precedence`).
+pub open spec fn spec_kind_for_precedence(p: u8) -> FileKind {
+    if p == USER_PRECEDENCE {
+        FileKind::User
+    } else if p == LOCAL_PRECEDENCE {
+        FileKind::Local
+    } else {
+        FileKind::Project
+    }
+}
+
 /// The role of a file loaded at precedence `p`: 1 is the user file, 3 the
 /// private project file, anything else a project file.
 pub const fn kind_for_precedence(p: u8) -> (k: FileKind)
     ensures
+        k == spec_kind_for_precedence(p),
         k == (if p == USER_PRECEDENCE {
             FileKind::User
         } else if p == LOCAL_PRECEDENCE {
@@ -1875,11 +1887,20 @@ pub const fn level_file_precedence(file: LevelFile) -> (p: u8)
     }
 }
 
-/// A level file's precedence gives it its role: by `kind_for_precedence`'s
-/// specification, `trop.yaml` is read as a project file and
-/// `trop.local.yaml` as a private project file, never as the user file.
+/// The two kernels production composes agree on the level files' roles:
+/// `kind_for_precedence` (the builder) maps the precedence
+/// `level_file_precedence` (the loader) assigns `trop.yaml` to a project
+/// file and the one it assigns `trop.local.yaml` to a private project file,
+/// never to the user file. Passing the precedence from the loader's source to
+/// the builder's `kind_for_precedence` call is glue.
 pub proof fn lemma_level_file_kinds()
     ensures
+        spec_kind_for_precedence(spec_level_file_precedence(LevelFile::Project))
+            == FileKind::Project,
+        spec_kind_for_precedence(spec_level_file_precedence(LevelFile::Local)) == FileKind::Local,
+        forall|file: LevelFile|
+            spec_kind_for_precedence(#[trigger] spec_level_file_precedence(file))
+                != FileKind::User,
         spec_level_file_precedence(LevelFile::Project) != USER_PRECEDENCE,
         spec_level_file_precedence(LevelFile::Project) != LOCAL_PRECEDENCE,
         spec_level_file_precedence(LevelFile::Local) == LOCAL_PRECEDENCE,
@@ -1889,8 +1910,11 @@ pub proof fn lemma_level_file_kinds()
 /// The files of a configuration level to load, in load order: exactly the
 /// files present (`trop.yaml` when `has_project`, `trop.local.yaml` when
 /// `has_local`), each once, in strictly ascending precedence. So the level's
-/// `trop.yaml` is loaded before its `trop.local.yaml`, and the later, higher
-/// precedence file overlays the earlier one.
+/// `trop.yaml` is loaded before its `trop.local.yaml`, which is the order
+/// `ConfigLoader::discover_project_configs` returns. The builder's overlay
+/// order is not decided here: its callers (`load_all_effective`,
+/// `load_with_project_file`) re-sort the loaded sources by these
+/// precedences in glue before overlaying them.
 pub fn level_load_order(has_project: bool, has_local: bool) -> (order: Vec<LevelFile>)
     ensures
         order@.contains(LevelFile::Project) <==> has_project,

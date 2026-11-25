@@ -415,12 +415,19 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 /// corrupt.
 ///
 /// This is the one message table for a `Corruption` verdict: opening, the
-/// post-lock recheck, and validation all report the same text for the same
-/// metadata. The wording matches the other stored-value diagnostics
-/// (`expected TEXT, found ...`, `stored TEXT is not valid UTF-8`).
+/// post-lock recheck, and validation (`validation::schema_version_verdict`)
+/// all call it, so they report the same text for the same metadata. The
+/// wording matches the other stored-value diagnostics (`expected TEXT, found
+/// ...`, `stored TEXT is not valid UTF-8`).
 pub(crate) fn version_corruption(corruption: Corruption) -> Error {
     let reason = match corruption {
-        Corruption::MissingMetadataTable => "the metadata table is missing",
+        // The kernel reports this on open only when a reservations table
+        // exists (with neither table, the database is initialized).
+        // Validation never reaches it: it first reports the missing
+        // key/value columns of the metadata table.
+        Corruption::MissingMetadataTable => {
+            "the metadata table is missing although a reservations table exists"
+        }
         Corruption::MissingVersionRow | Corruption::MultipleVersionRows => {
             "exactly one schema_version row is required"
         }
@@ -433,7 +440,7 @@ pub(crate) fn version_corruption(corruption: Corruption) -> Error {
         Corruption::NotUtf8 => "stored TEXT is not valid UTF-8",
         Corruption::NotAnInteger => "schema_version must be a base-10 signed integer",
     };
-    Error::corrupt_stored_value("metadata", "value", "key=\"schema_version\"", reason)
+    Error::corrupt_stored_value("metadata", "value", "\"schema_version\"", reason)
 }
 
 /// The error for an older stored version that has no ordered migration.
@@ -446,7 +453,7 @@ fn no_migration_path(version: i32) -> Error {
 }
 
 /// The error for a schema newer than this client (opening, the post-lock
-/// recheck, and validation).
+/// recheck, and validation all call this).
 pub(crate) fn unsupported_version(version: i32) -> Error {
     Error::UnsupportedSchemaVersion {
         expected: u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or_default(),

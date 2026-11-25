@@ -269,7 +269,8 @@ impl<'conn> PlanExecutor<'conn> {
                 occupancy_config,
             } => {
                 // Reconciliation, then a fresh allocation with one automatic
-                // cleanup and retry on exhaustion, as for single reservations.
+                // cleanup on exhaustion and, if it freed anything, one retry,
+                // as for single reservations.
                 let outcome = execute_group_allocation(
                     self.conn,
                     request,

@@ -387,3 +387,74 @@ fn dry_run_checks_that_the_database_directory_can_be_created() {
         "the obstruction is left alone"
     );
 }
+
+/// `check_database_directory_creatable` is trusted glue that models the live
+/// run's `create_dir_all` with an `lstat` walk. Pin it differentially on the
+/// cases where such a walk is most likely to diverge from `mkdir`: symlinks
+/// (dangling, to a file, to a directory, in a loop) and `..` after a file.
+/// Each case builds the same tree twice; the dry check runs on one copy and
+/// the live open (which creates the directory) on the other, and the two
+/// must agree on success.
+#[cfg(unix)]
+#[test]
+fn dry_directory_check_agrees_with_the_live_open_on_symlinks_and_dot_dot() {
+    use std::os::unix::fs::symlink;
+    use trop::operations::reserve_group::check_database_directory_creatable;
+
+    fn tree(root: &Path) {
+        fs::write(root.join("plain-file"), "not a directory").unwrap();
+        fs::create_dir(root.join("realdir")).unwrap();
+        symlink(root.join("missing-target"), root.join("dangling")).unwrap();
+        symlink(root.join("plain-file"), root.join("link-to-file")).unwrap();
+        symlink(root.join("realdir"), root.join("link-to-dir")).unwrap();
+        symlink(root.join("loop-b"), root.join("loop-a")).unwrap();
+        symlink(root.join("loop-a"), root.join("loop-b")).unwrap();
+    }
+
+    // (database path below the tree root, whether the live run succeeds)
+    let cases: [(&str, bool); 12] = [
+        ("dangling/trop.db", false),
+        ("dangling/data/trop.db", false),
+        ("link-to-file/trop.db", false),
+        ("link-to-file/data/trop.db", false),
+        ("link-to-dir/trop.db", true),
+        ("link-to-dir/new/trop.db", true),
+        ("loop-a/trop.db", false),
+        ("loop-a/data/trop.db", false),
+        ("plain-file/../data/trop.db", false),
+        ("realdir/../data/trop.db", true),
+        ("missing/../data/trop.db", true),
+        ("realdir/./new/trop.db", true),
+    ];
+    for (relative, live_succeeds) in cases {
+        let dry_root = TempDir::new().unwrap();
+        let live_root = TempDir::new().unwrap();
+        tree(dry_root.path());
+        tree(live_root.path());
+
+        let dry = check_database_directory_creatable(&dry_root.path().join(relative));
+        let live = Database::open(DatabaseConfig::new(live_root.path().join(relative)));
+        assert_eq!(
+            live.is_ok(),
+            live_succeeds,
+            "{relative}: unexpected live result {:?}",
+            live.as_ref().err()
+        );
+        assert_eq!(
+            dry.is_ok(),
+            live.is_ok(),
+            "{relative}: dry {:?}, live {:?}",
+            dry.as_ref().err(),
+            live.as_ref().err()
+        );
+        if let Err(error) = &dry {
+            assert!(matches!(error, Error::Io(_)), "{relative}: {error}");
+        }
+        assert!(
+            !dry_root.path().join("data").exists()
+                && !dry_root.path().join("missing").exists()
+                && !dry_root.path().join("realdir").join("new").exists(),
+            "{relative}: the dry check created something"
+        );
+    }
+}

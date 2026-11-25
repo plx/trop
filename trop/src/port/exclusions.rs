@@ -365,9 +365,10 @@ where
 ///
 /// A document with no content (empty, only comments, or only a `---`
 /// marker) reads as the default configuration, because `serde_yaml` reads it
-/// as an empty mapping. A document whose content is an explicit null
-/// (`null`, `~`, or a tagged null) is not a mapping, and is rejected here as
-/// it is by the loader.
+/// as an empty mapping; so does a document whose only content is a tagged
+/// empty plain scalar, such as `!!null` or `!!str`. A document whose content
+/// is an explicit null scalar (`null` or `~`, tagged or not) is not a
+/// mapping, and is rejected here as it is by the loader.
 ///
 /// The error message is `serde_yaml`'s description of the problem, under the
 /// field `configuration`.
@@ -431,7 +432,11 @@ pub fn excluded_ports_in(document: &str) -> crate::Result<Option<Vec<PortExclusi
 /// leaving every other top-level key exactly as it was.
 ///
 /// The document is read as a YAML mapping (an empty document is an empty
-/// mapping; a tag on the document is kept). The verified
+/// mapping; a tag on the document is kept). A document the loader reads as
+/// the default configuration although it is not a mapping (only a tagged
+/// empty scalar such as `!!null` or `!!str`) is rewritten as an untagged
+/// empty mapping, so every document the loader accepts can be rewritten
+/// unless a check below refuses it. The verified
 /// `verified::config_rewrite` kernel plans the result over the entries'
 /// "is `excluded_ports`" marks: every other entry is copied unchanged and in
 /// order, and `excluded_ports` is replaced in place, or appended when
@@ -484,8 +489,18 @@ pub fn rewrite_excluded_ports(
     // How the loader reads the document now (this also rejects documents
     // that are not configurations, and documents with a repeated key).
     let before = read_configuration(document)?;
-    let parsed: Value = serde_yaml::from_str(document)
-        .map_err(|error| invalid(format!("Invalid YAML: {error}")))?;
+    // The loader reads a document whose only content is a tagged empty plain
+    // scalar (`!!null`, `!!str`) as the default configuration, but such a
+    // document is not a YAML mapping (`serde_yaml` cannot even read `!!null`
+    // as a `Value`). It has no entries to keep, so it is rewritten as an
+    // untagged empty mapping. The loader check below still requires the
+    // result to read as `before` with only `excluded_ports` replaced.
+    let no_content = before.config == Config::default() && before.reservations.is_none();
+    let parsed: Value = match serde_yaml::from_str(document) {
+        Ok(parsed) => parsed,
+        Err(_) if no_content => Value::Null,
+        Err(error) => return Err(invalid(format!("Invalid YAML: {error}"))),
+    };
     // A tagged document reads like an untagged one; its tag is kept.
     let (tag, root) = match parsed {
         Value::Tagged(tagged) => {
@@ -494,9 +509,10 @@ pub fn rewrite_excluded_ports(
         }
         root => (None, root),
     };
-    let original = match root {
-        Value::Null => Mapping::new(),
-        Value::Mapping(mapping) => mapping,
+    let (tag, original) = match root {
+        Value::Null => (tag, Mapping::new()),
+        Value::Mapping(mapping) => (tag, mapping),
+        _ if no_content => (None, Mapping::new()),
         _ => return Err(invalid("the configuration is not a YAML mapping".into())),
     };
     let key = Value::from(EXCLUDED_PORTS_KEY);

@@ -1,12 +1,14 @@
 //! Group allocation runs the automatic cleanup step on exhaustion.
 //!
 //! The specification's allocation algorithm prunes and/or expires
-//! reservations when no port is available and retries once, and adds: "When
-//! allocating a port group, we do the same thing". These tests pin that a
-//! fresh group whose fallback pattern is exhausted runs exactly one cleanup
-//! (respecting `disable_autoprune`/`disable_autoexpire`) and one re-scan, that
-//! the cleanup is rolled back when the retry still fails, and that the cleanup
-//! never runs when both switches disable it.
+//! reservations when no port is available and, "If anything got freed up",
+//! retries once, and adds: "When allocating a port group, we do the same
+//! thing". These tests pin that a fresh group whose fallback pattern is
+//! exhausted runs exactly one cleanup (respecting
+//! `disable_autoprune`/`disable_autoexpire`) and, when that cleanup freed
+//! something, one re-scan (none when it freed nothing), that the cleanup is
+//! rolled back when the retry still fails, and that the cleanup never runs
+//! when both switches disable it.
 
 use std::fs;
 use std::path::{Path, PathBuf};

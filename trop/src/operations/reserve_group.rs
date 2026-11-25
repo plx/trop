@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::config::{
     CleanupConfig, Config, ConfigField, ConfigLoader, ConfigValidator, EffectiveConfig, PortConfig,
 };
-use crate::database::{check_schema_compatibility, Database};
+use crate::database::{check_schema_compatibility, Database, DatabaseConfig};
 use crate::error::{Error, Result};
 use crate::output::{OutputFormat, ShellType};
 use crate::port::allocator::{allocator_from_config, port_span_from_config};
@@ -358,11 +358,12 @@ impl ReserveGroupPlan {
     ///
     /// The plan is built and executed exactly as a live run builds and
     /// executes it -- reconciliation, the fresh allocation, the automatic
-    /// cleanup and single retry -- but inside a transaction on a private
-    /// in-memory copy of the database (`open_dry_run_snapshot`), which is
-    /// then discarded. The result therefore reports the ports a live run on
-    /// the same snapshot would reserve or refresh, with its warnings, and the
-    /// dry run fails with exactly the error such a live run would report.
+    /// cleanup and, if it freed anything, the single retry -- but inside a
+    /// transaction on a private in-memory copy of the database
+    /// (`open_dry_run_snapshot`), which is then discarded. The result
+    /// therefore reports the ports a live run on the same snapshot would
+    /// reserve or refresh, with its warnings, and the dry run fails with
+    /// exactly the error such a live run would report.
     /// `database` is the database file, or `None` when none exists yet.
     ///
     /// # Errors
@@ -528,8 +529,10 @@ pub(crate) fn execute_group_allocation(
 /// the contents never change.
 ///
 /// Like `Database::open`, it first rejects a `busy_timeout` `SQLite` cannot
-/// store (more than `i32::MAX` milliseconds) with the same validation error,
-/// whether or not a database file exists.
+/// store (more than `i32::MAX` milliseconds) through the same
+/// `DatabaseConfig::check_busy_timeout`, so with the same validation error,
+/// whether or not a database file exists. Without this check, rusqlite's
+/// `busy_timeout` panics on such a value.
 ///
 /// # Errors
 ///
@@ -540,7 +543,7 @@ pub fn open_dry_run_snapshot(
     database: Option<&Path>,
     busy_timeout: Duration,
 ) -> Result<Connection> {
-    validate_busy_timeout(busy_timeout)?;
+    DatabaseConfig::check_busy_timeout(busy_timeout)?;
     let snapshot = Connection::open_in_memory()?;
     if let Some(path) = database {
         let source = Connection::open_with_flags(
@@ -618,23 +621,6 @@ pub fn check_database_directory_creatable(db_path: &Path) -> Result<()> {
             }
         }
     }
-}
-
-/// Rejects a busy timeout `SQLite` cannot store, exactly as `Database::open`
-/// does: the verified `verified::config::busy_timeout_ok` over the
-/// duration's parts, with the same validation error. Without this check,
-/// rusqlite's `busy_timeout` panics on such a value.
-fn validate_busy_timeout(timeout: Duration) -> Result<()> {
-    if crate::verified::config::busy_timeout_ok(timeout.as_secs(), timeout.subsec_nanos()) {
-        return Ok(());
-    }
-    Err(Error::Validation {
-        field: "maximum_lock_wait_seconds".into(),
-        message: format!(
-            "Timeout must not exceed {} milliseconds",
-            crate::verified::config::MAX_BUSY_TIMEOUT_MILLIS
-        ),
-    })
 }
 
 /// Copies every table (with its rows), index, trigger, and view of `source`

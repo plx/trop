@@ -458,9 +458,11 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     }
 
     /// Whether `port` is reserved by a key other than `ignored_key` (the key
-    /// being replaced). The glue only looks up the port's holder and compares
-    /// its key with `ignored_key`; the verified `reserved_by_other` decides
-    /// that only another key's reservation blocks.
+    /// being replaced). The glue looks up the port's holder and compares its
+    /// whole key (path and tag) with `ignored_key`; that comparison is
+    /// trusted, pinned by `test_reserved_by_other_glue_exempts_only_the_replaced_key`.
+    /// The verified `reserved_by_other` then maps the holder to the answer
+    /// (only an `OtherKey` holder blocks).
     fn is_reserved_by_other(
         conn: &Connection,
         port: Port,

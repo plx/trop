@@ -896,7 +896,9 @@ impl Database {
         // columns from `encode_storage_key`, the new project, task and last
         // use from `encode_metadata_update`, which checks them exactly as
         // `encode_record` does. A last use before the epoch has no `u64`
-        // seconds and is reported first, as in `encode_reservation`.
+        // seconds for the kernel, so it is reported here, after the key and
+        // before the project and task (a last use past the storable range is
+        // the kernel's, reported after them).
         let stored = storable_key(key)?;
         let last_used_secs = secs_since_epoch(last_used_at)?;
         let update =
@@ -1916,6 +1918,49 @@ mod tests {
         assert_eq!(cleared.project(), None);
         assert_eq!(cleared.task(), None);
         assert_eq!(stored_last_use(), 7);
+    }
+
+    /// Pins the error order for a last use before the epoch: after the key,
+    /// before the project and task (it has no `u64` seconds to hand the
+    /// kernel). Nothing is written.
+    #[test]
+    fn metadata_update_reports_a_pre_epoch_last_use_after_the_key() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let db = create_test_database();
+        let reservation = create_test_reservation("/test/metadata", 5000);
+        Database::create_reservation_simple(db.connection(), &reservation).unwrap();
+        let before = Database::get_reservation(db.connection(), reservation.key())
+            .unwrap()
+            .unwrap();
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
+        let field = |key: &ReservationKey, project: Option<&str>, task: Option<&str>| {
+            match Database::update_metadata_and_last_used_simple(
+                db.connection(),
+                key,
+                project,
+                task,
+                pre_epoch,
+            ) {
+                Err(Error::Validation { field, .. }) => field,
+                other => panic!("expected a validation error, got {other:?}"),
+            }
+        };
+        let unstorable_key = ReservationKey {
+            path: PathBuf::from("/test/metadata/"),
+            tag: None,
+        };
+
+        assert_eq!(field(&unstorable_key, Some(" p"), None), "path");
+        assert_eq!(field(reservation.key(), Some(" p"), None), "timestamp");
+        assert_eq!(field(reservation.key(), None, Some(" t")), "timestamp");
+        assert_eq!(field(reservation.key(), Some("p"), Some("t")), "timestamp");
+        assert_eq!(
+            Database::get_reservation(db.connection(), reservation.key())
+                .unwrap()
+                .unwrap(),
+            before
+        );
     }
 
     /// Exact-path lookups match the path's own text: a corrupt row stored

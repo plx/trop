@@ -1019,8 +1019,10 @@ fn check_base<E, F: Fn(u16) -> Result<bool, E>>(
 /// Error precedence is part of the contract (`search_failed_at`): an error
 /// comes from some base `c >= range_min` such that every lower base was
 /// rejected, from the probe of a pattern port of `c` whose earlier pattern
-/// ports were usable. So an error never pre-empts a lower base that fits,
-/// and the ascending order is proved, not just implemented.
+/// ports were usable. So an error never pre-empts a lower base that fits:
+/// which base or error is reported is proved. The call order itself, and the
+/// absence of extra probes whose answers are discarded, are implemented but
+/// not specified (the `Fn`-oracle limitation, as for `allocation`).
 pub fn find_pattern_base<E, F: Fn(u16) -> Result<bool, E>>(
     range_min: u16,
     range_max: u16,
@@ -2114,8 +2116,11 @@ fn classify_services<E, G: Fn(u16) -> Result<PreferredVerdict, E>>(
 /// of a service after every earlier service was classified
 /// (`preferred_failed_at`), or the scan probe at a base every lower base of
 /// which was rejected, on a fallback port whose earlier fallback ports at
-/// that base were usable (`scan_failed_at`). No probe runs before the
-/// classification, and an error never pre-empts a lower base that fits.
+/// that base were usable (`scan_failed_at`). So an error never pre-empts a
+/// lower base that fits: which plan or error is reported is proved. That the
+/// scan probe runs only after the classification, in ascending order, with
+/// no extra probes whose answers are discarded, is implemented but not
+/// specified (the `Fn`-oracle limitation, as for `allocation`).
 pub fn plan_fresh_group<E, G, F>(
     shape: &ValidatedGroupShape,
     span: PortSpan,

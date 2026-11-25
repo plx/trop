@@ -253,6 +253,16 @@ fn dry_run_of_a_deferred_allocation_says_it_cannot_predict_the_outcome() {
     assert!(stdout(&dry).is_empty(), "{}", stdout(&dry));
     assert!(stderr(&dry).contains("automatic cleanup after exhaustion"));
     assert!(
+        stderr(&dry).contains("if that freed anything, retry once"),
+        "the dry run must not claim an unconditional retry: {}",
+        stderr(&dry)
+    );
+    assert!(
+        stderr(&dry).contains("if it freed anything, retry reservation for"),
+        "{}",
+        stderr(&dry)
+    );
+    assert!(
         stderr(&dry).contains("cannot predict the port"),
         "{}",
         stderr(&dry)

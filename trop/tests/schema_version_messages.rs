@@ -57,6 +57,75 @@ fn open_and_validate_report_the_same_schema_version_corruption() {
         assert_eq!(opened, validated, "{value_sql}");
         assert!(opened.contains(reason), "{value_sql}: {opened}");
         assert!(opened.contains("table=metadata"), "{value_sql}: {opened}");
+        // Regression: the key used to be prefixed twice
+        // (`key=key="schema_version"`).
+        assert!(
+            opened.contains("field=value, key=\"schema_version\": "),
+            "{value_sql}: {opened}"
+        );
+    }
+}
+
+/// The row-count verdicts (`MissingVersionRow`, `MultipleVersionRows`) also
+/// come from the one message table, opening and validating alike.
+#[test]
+fn open_and_validate_report_the_same_schema_version_row_count_corruption() {
+    let cases = [
+        (
+            "missing row",
+            "DROP TABLE metadata;
+             CREATE TABLE metadata (key TEXT PRIMARY KEY NOT NULL, value);",
+        ),
+        (
+            "two rows",
+            "DROP TABLE metadata;
+             CREATE TABLE metadata (key TEXT NOT NULL, value);
+             INSERT INTO metadata VALUES ('schema_version', '2');
+             INSERT INTO metadata VALUES ('schema_version', '2');",
+        ),
+    ];
+    for (what, sql) in cases {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("trop.db");
+        drop(Database::open(DatabaseConfig::new(&path)).unwrap());
+        Connection::open(&path).unwrap().execute_batch(sql).unwrap();
+
+        let opened =
+            corruption_details(Database::open(DatabaseConfig::new(&path)).map(|_| ()), what);
+        let validated = corruption_details(Database::validate(&DatabaseConfig::new(&path)), what);
+        assert_eq!(opened, validated, "{what}");
+        assert!(
+            opened.starts_with(
+                "table=metadata, field=value, key=\"schema_version\": \
+                 exactly one schema_version row is required."
+            ),
+            "{what}: {opened}"
+        );
+    }
+}
+
+/// Regression: metadata row diagnostics named the key twice
+/// (`key=key="other"`); they now read like the schema version's.
+#[test]
+fn metadata_row_diagnostics_name_the_key_once() {
+    let cases = [
+        (
+            "INSERT INTO metadata VALUES ('other', CAST(X'FF' AS TEXT));",
+            "table=metadata, field=value, key=\"other\": stored TEXT is not valid UTF-8.",
+        ),
+        (
+            "INSERT INTO metadata VALUES (CAST(X'FF' AS TEXT), 'x');",
+            "table=metadata, field=key, key=<invalid UTF-8>: stored TEXT is not valid UTF-8.",
+        ),
+    ];
+    for (sql, expected) in cases {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("trop.db");
+        drop(Database::open(DatabaseConfig::new(&path)).unwrap());
+        Connection::open(&path).unwrap().execute_batch(sql).unwrap();
+
+        let validated = corruption_details(Database::validate(&DatabaseConfig::new(&path)), sql);
+        assert!(validated.starts_with(expected), "{sql}: {validated}");
     }
 }
 
@@ -100,5 +169,11 @@ fn opening_reports_a_missing_metadata_table() {
         Database::open(DatabaseConfig::new(&path)).map(|_| ()),
         "missing metadata",
     );
-    assert!(opened.contains("the metadata table is missing"), "{opened}");
+    assert!(
+        opened.starts_with(
+            "table=metadata, field=value, key=\"schema_version\": \
+             the metadata table is missing although a reservations table exists."
+        ),
+        "{opened}"
+    );
 }
