@@ -103,6 +103,12 @@ impl EnvironmentVariableName {
     }
 
     /// Returns the portable, ASCII-case-insensitive collision key.
+    ///
+    /// Production collision checks run inside the verified kernels
+    /// (`verified::config::check_config_group`,
+    /// `verified::render::render_group`); the reference models in tests use
+    /// this key.
+    #[cfg(test)]
     pub(crate) fn collision_key(&self) -> String {
         env_name::env_collision_key(&self.0)
     }

@@ -3,8 +3,6 @@
 //! This module implements the release planning logic, including
 //! path validation and idempotent behavior.
 
-use std::path::PathBuf;
-
 use crate::database::Database;
 use crate::error::Result;
 use crate::path::relationship::path_tokens;
@@ -193,10 +191,11 @@ impl ReleasePlan {
 
         // Step 3: The kernel selects the rows the release deletes and applies
         // the unrelated-path guard to exactly those rows. Selection compares
-        // stored identities: the target as the database stores its path, and
-        // the requested tag as the database stores it (an empty tag is the
+        // stored identities: the target's exact path (the database stores a
+        // path as its own text and holds no non-UTF-8 path), and the
+        // requested tag as the database stores it (an empty tag is the
         // untagged sentinel).
-        let stored_target = PathBuf::from(self.options.key.path_as_string());
+        let stored_target = self.options.key.path.clone();
         let selector = selector_from_plan(
             stored_tag(self.options.key.tag.as_deref()),
             self.all_exact_path_tags,
@@ -255,11 +254,16 @@ impl ReleasePlan {
     }
 }
 
-/// A tag's bytes as the database stores it: the empty tag is the untagged
-/// sentinel, so it denotes the untagged reservation.
+/// A key's tag as the release selector compares it: `None` is the untagged
+/// reservation, and a tag its bytes.
+///
+/// Decoded rows never carry `Some("")` (the stored empty tag is the untagged
+/// sentinel and decodes to `None`), so a requested `Some("")` tag, which no
+/// valid key has, selects nothing; it never aliases the untagged
+/// reservation, exactly as `Database::get_reservation` (the verified
+/// `storage::lookup_key`) finds nothing for it.
 fn stored_tag(tag: Option<&str>) -> Option<Vec<u8>> {
-    tag.filter(|tag| !tag.is_empty())
-        .map(|tag| tag.as_bytes().to_vec())
+    tag.map(|tag| tag.as_bytes().to_vec())
 }
 
 /// The unrelated-path guard's inputs for an operation.
@@ -994,10 +998,10 @@ mod tests {
         ));
     }
 
-    /// A key whose tag is the empty string denotes the untagged reservation,
-    /// as it does in storage.
+    /// A struct-literal `Some("")` tag (which no valid key has) selects
+    /// nothing in any mode: it never aliases the untagged reservation.
     #[test]
-    fn test_empty_tag_key_releases_the_untagged_reservation() {
+    fn test_empty_tag_key_never_aliases_the_untagged_reservation() {
         let mut db = create_test_database();
         let path = PathBuf::from("/test/path");
         let untagged = ReservationKey::new(path.clone(), None).unwrap();
@@ -1010,56 +1014,54 @@ mod tests {
             path,
             tag: Some(String::new()),
         };
-        let options = ReleaseOptions::new(empty_tag).with_allow_unrelated_path(true);
-        let plan = ReleasePlan::new(options)
-            .build_plan(db.connection())
-            .unwrap();
-        assert_eq!(plan.actions.len(), 1);
-        assert_eq!(plan.warnings, Vec::<String>::new());
-        let mut executor = crate::operations::PlanExecutor::new(db.connection());
-        executor.execute(&plan).unwrap();
+        for recursive in [false, true] {
+            let options = ReleaseOptions::new(empty_tag.clone()).with_allow_unrelated_path(true);
+            let plan = ReleasePlan::new(options)
+                .with_recursive(recursive)
+                .build_plan(db.connection())
+                .unwrap();
+            assert!(plan.actions.is_empty(), "recursive={recursive}");
+            let mut executor = crate::operations::PlanExecutor::new(db.connection());
+            executor.execute(&plan).unwrap();
+        }
         assert!(Database::get_reservation(db.connection(), &untagged)
             .unwrap()
-            .is_none());
+            .is_some());
     }
 
-    /// A key path that is not valid UTF-8 is stored lossily; release selects
-    /// its stored row in every non-recursive mode.
+    /// A key path that is not valid UTF-8 has no stored text, so release
+    /// selects nothing for it in every non-recursive mode, and never the
+    /// row stored under its lossy spelling.
     #[test]
     #[cfg(unix)]
-    fn test_non_utf8_key_path_is_released() {
+    fn test_non_utf8_key_path_never_aliases_its_lossy_spelling() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
         let mut db = create_test_database();
-        let path = PathBuf::from(OsStr::from_bytes(b"/test/\xff"));
-        let key = ReservationKey {
-            path: path.clone(),
-            tag: None,
-        };
-        let reservation = Reservation::builder(key.clone(), Port::try_from(8080).unwrap())
+        let lossy = ReservationKey::new(PathBuf::from("/test/\u{FFFD}"), None).unwrap();
+        let reservation = Reservation::builder(lossy.clone(), Port::try_from(8080).unwrap())
             .build()
             .unwrap();
         db.create_reservation(&reservation).unwrap();
 
+        let key = ReservationKey {
+            path: PathBuf::from(OsStr::from_bytes(b"/test/\xff")),
+            tag: None,
+        };
         for all_tags in [false, true] {
             let options = ReleaseOptions::new(key.clone()).with_allow_unrelated_path(true);
             let plan = ReleasePlan::new(options)
                 .with_all_exact_path_tags(all_tags)
                 .build_plan(db.connection())
                 .unwrap();
-            assert_eq!(plan.actions.len(), 1, "all_tags={all_tags}");
-            assert!(plan.warnings.is_empty(), "all_tags={all_tags}");
+            assert!(plan.actions.is_empty(), "all_tags={all_tags}");
+            let mut executor = crate::operations::PlanExecutor::new(db.connection());
+            executor.execute(&plan).unwrap();
         }
-        let options = ReleaseOptions::new(key.clone()).with_allow_unrelated_path(true);
-        let plan = ReleasePlan::new(options)
-            .build_plan(db.connection())
-            .unwrap();
-        let mut executor = crate::operations::PlanExecutor::new(db.connection());
-        executor.execute(&plan).unwrap();
-        assert!(Database::get_reservation(db.connection(), &key)
+        assert!(Database::get_reservation(db.connection(), &lossy)
             .unwrap()
-            .is_none());
+            .is_some());
     }
 
     /// Exact-key release (`--tag` or `--untagged-only`) selects only the

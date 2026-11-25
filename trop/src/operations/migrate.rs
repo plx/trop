@@ -373,8 +373,8 @@ fn same_reservation_data(a: &Reservation, b: &Reservation) -> bool {
 }
 
 /// Reservation keys interned to dense ids by their database identity (the
-/// stored path text and the stored tag text), so equal ids mean the same
-/// stored row.
+/// exact path, which is its stored text when it can be stored at all, and
+/// the stored tag text), so equal ids mean the same stored row.
 struct KeyTable {
     /// The source id of each item.
     sources: Vec<usize>,
@@ -386,10 +386,13 @@ struct KeyTable {
 
 impl KeyTable {
     fn intern(items: &[MigrationItem]) -> Self {
-        let mut ids: BTreeMap<(String, String), usize> = BTreeMap::new();
+        let mut ids: BTreeMap<(std::ffi::OsString, String), usize> = BTreeMap::new();
         let mut keys = Vec::new();
         let mut id_of = |key: &ReservationKey| {
-            let identity = (key.path_as_string(), key.tag.clone().unwrap_or_default());
+            let identity = (
+                key.path.as_os_str().to_os_string(),
+                key.tag.clone().unwrap_or_default(),
+            );
             *ids.entry(identity).or_insert_with(|| {
                 keys.push(key.clone());
                 keys.len() - 1
