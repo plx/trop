@@ -5,6 +5,9 @@
 
 use crate::config::schema::Config;
 use crate::error::{Error, Result};
+use crate::verified::config::{
+    first_config_level, GroupOverlay, LOCAL_PRECEDENCE, PROJECT_PRECEDENCE, USER_PRECEDENCE,
+};
 use crate::PathResolver;
 use serde::Deserialize;
 use std::fs;
@@ -51,6 +54,28 @@ pub(crate) enum ReservationOverlay {
     Replace,
     /// The document explicitly clears the effective group with YAML `null`.
     Clear,
+}
+
+impl ReservationOverlay {
+    /// The verified kernel's code for this overlay (a variant-for-variant
+    /// copy).
+    pub(crate) const fn code(self) -> GroupOverlay {
+        match self {
+            Self::Inherit => GroupOverlay::Inherit,
+            Self::Replace => GroupOverlay::Replace,
+            Self::Clear => GroupOverlay::Clear,
+        }
+    }
+
+    /// The overlay with the verified kernel's `code` (a variant-for-variant
+    /// copy).
+    pub(crate) const fn from_code(code: GroupOverlay) -> Self {
+        match code {
+            GroupOverlay::Inherit => Self::Inherit,
+            GroupOverlay::Replace => Self::Replace,
+            GroupOverlay::Clear => Self::Clear,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -168,20 +193,26 @@ impl ConfigLoader {
         if !project_file.exists() {
             // Preserve the explicit-file contract even when a canonically
             // named sibling happens to exist.
-            Self::load_effective_source(project_file, 2)?;
+            Self::load_effective_source(project_file, PROJECT_PRECEDENCE)?;
         }
 
         match project_file.file_name().and_then(|name| name.to_str()) {
             Some("trop.yaml" | "trop.local.yaml") => {
                 let parent = project_file.parent().unwrap_or_else(|| Path::new(""));
-                for (name, precedence) in [("trop.yaml", 2), ("trop.local.yaml", 3)] {
+                for (name, precedence) in [
+                    ("trop.yaml", PROJECT_PRECEDENCE),
+                    ("trop.local.yaml", LOCAL_PRECEDENCE),
+                ] {
                     let path = parent.join(name);
                     if path.exists() {
                         sources.push(Self::load_effective_source(&path, precedence)?);
                     }
                 }
             }
-            _ => sources.push(Self::load_effective_source(project_file, 2)?),
+            _ => sources.push(Self::load_effective_source(
+                project_file,
+                PROJECT_PRECEDENCE,
+            )?),
         }
         sources.sort_by_key(|source| source.precedence);
         Ok(sources)
@@ -208,7 +239,7 @@ impl ConfigLoader {
             return Ok(None);
         }
 
-        Self::load_effective_source(&config_path, 1).map(Some)
+        Self::load_effective_source(&config_path, USER_PRECEDENCE).map(Some)
     }
 
     /// Discover project configurations by walking up directories.
@@ -232,31 +263,37 @@ impl ConfigLoader {
     }
 
     fn discover_project_configs_effective(start_dir: &Path) -> Result<Vec<EffectiveConfigSource>> {
-        let mut configs = Vec::new();
-        let mut current = PathResolver::new()
+        let start = PathResolver::new()
             .resolve_implicit(start_dir)?
             .into_path_buf();
+        // Level 0 is the start directory and level `k + 1` the parent of
+        // level `k`, up to the root (the directories `PathBuf::pop` visits).
+        let levels: Vec<&Path> = start.ancestors().collect();
+        let has_files = |level: usize| {
+            let dir = levels[level];
+            (
+                dir.join("trop.yaml").exists(),
+                dir.join("trop.local.yaml").exists(),
+            )
+        };
 
-        loop {
-            let mut found_any = false;
-
-            // Check for trop.yaml
-            let trop_yaml = current.join("trop.yaml");
-            if trop_yaml.exists() {
-                configs.push(Self::load_effective_source(&trop_yaml, 2)?);
-                found_any = true;
+        // The verified kernel picks the nearest level holding either file.
+        let mut configs = Vec::new();
+        if let Some((level, has_project, has_local)) = first_config_level(levels.len(), &has_files)
+        {
+            let dir = levels[level];
+            // trop.yaml first: trop.local.yaml has the higher precedence.
+            if has_project {
+                configs.push(Self::load_effective_source(
+                    &dir.join("trop.yaml"),
+                    PROJECT_PRECEDENCE,
+                )?);
             }
-
-            // Check for trop.local.yaml (higher precedence)
-            let trop_local = current.join("trop.local.yaml");
-            if trop_local.exists() {
-                configs.push(Self::load_effective_source(&trop_local, 3)?);
-                found_any = true;
-            }
-
-            // Stop if we found configs or can't go up anymore
-            if found_any || !current.pop() {
-                break;
+            if has_local {
+                configs.push(Self::load_effective_source(
+                    &dir.join("trop.local.yaml"),
+                    LOCAL_PRECEDENCE,
+                )?);
             }
         }
 

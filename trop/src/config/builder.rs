@@ -9,6 +9,10 @@ use crate::config::schema::{CleanupConfig, Config, OccupancyConfig, OutputFormat
 use crate::config::validator::ConfigValidator;
 use crate::config::{ConfigField, ConfigFileKind, ConfigValueSource, EffectiveConfig};
 use crate::error::Result;
+use crate::verified::config::{
+    kind_for_precedence, FileKind, DEFAULT_EXPIRE_AFTER_DAYS, DEFAULT_LOCK_WAIT_SECONDS,
+    DEFAULT_OUTPUT_FORMAT, PROJECT_PRECEDENCE,
+};
 use std::collections::BTreeSet;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -216,35 +220,30 @@ impl ConfigBuilder {
         let is_tropfile = self.additional_config.is_some()
             || self.cli_config.is_some()
             || self.project_file.is_some()
-            || sources.iter().any(|source| source.precedence >= 2);
+            || sources
+                .iter()
+                .any(|source| source.precedence >= PROJECT_PRECEDENCE);
 
         let mut effective = EffectiveConfig::from_defaults(Self::default_config());
 
         for source in sources {
-            let kind = match source.precedence {
-                1 => ConfigFileKind::User,
-                3 => ConfigFileKind::Local,
-                _ => ConfigFileKind::Project,
+            let kind = match kind_for_precedence(source.precedence) {
+                FileKind::User => ConfigFileKind::User,
+                FileKind::Project => ConfigFileKind::Project,
+                FileKind::Local => ConfigFileKind::Local,
             };
             let value_source = ConfigValueSource::File {
                 kind,
                 path: source.path.clone(),
             };
-            let reservation_overlay = if kind == ConfigFileKind::User
-                && source.reservations == ReservationOverlay::Clear
-            {
-                // Existing generated global files can contain null for
-                // absent optional fields. User config cannot own a group,
-                // so this is inert rather than a project-level clear.
-                ReservationOverlay::Inherit
-            } else {
-                source.reservations
-            };
-
-            ConfigValidator::validate_source_document(
+            // The placement rules (verified) also make a user file's
+            // `reservations: null` inert: existing generated global files can
+            // contain null for absent optional fields, and user config cannot
+            // own a group, so it is not a project-level clear.
+            let reservation_overlay = ConfigValidator::validate_source_document(
                 &source.config,
                 &value_source,
-                reservation_overlay != ReservationOverlay::Inherit,
+                source.reservations,
             )?;
             effective.record_file(kind, source.path);
             effective.merge_config(&source.config, &value_source);
@@ -321,8 +320,10 @@ impl ConfigBuilder {
             // kernel (which proves it valid).
             ports: Some(PortConfig::default()),
             excluded_ports: None,
+            // The remaining defaults are the verified configuration kernel's
+            // constants (`lemma_builtin_defaults_valid`).
             cleanup: Some(CleanupConfig {
-                expire_after_days: Some(30),
+                expire_after_days: Some(DEFAULT_EXPIRE_AFTER_DAYS),
             }),
             occupancy_check: Some(OccupancyConfig {
                 skip: Some(false),
@@ -340,8 +341,8 @@ impl ConfigBuilder {
             allow_change_project: Some(false),
             allow_change_task: Some(false),
             allow_change: Some(false),
-            maximum_lock_wait_seconds: Some(5),
-            output_format: Some(OutputFormat::Table),
+            maximum_lock_wait_seconds: Some(DEFAULT_LOCK_WAIT_SECONDS),
+            output_format: Some(OutputFormat::from_code(DEFAULT_OUTPUT_FORMAT)),
         }
     }
 }

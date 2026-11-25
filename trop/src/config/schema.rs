@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
+use crate::verified::config::{output_format_keyword, parse_output_format, OutputFormatCode};
 use crate::verified::exclusions::{find_range_separator, parse_u16};
 use crate::verified::port_bounds::{
     check_override_bounds, default_port_bounds, PortBounds, PortBoundsViolation,
@@ -474,14 +475,42 @@ pub enum OutputFormat {
     Table,
 }
 
-impl std::fmt::Display for OutputFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl OutputFormat {
+    /// The verified kernel's code for this format (a variant-for-variant
+    /// copy).
+    pub(crate) const fn code(self) -> OutputFormatCode {
         match self {
-            Self::Json => write!(f, "json"),
-            Self::Csv => write!(f, "csv"),
-            Self::Tsv => write!(f, "tsv"),
-            Self::Table => write!(f, "table"),
+            Self::Json => OutputFormatCode::Json,
+            Self::Csv => OutputFormatCode::Csv,
+            Self::Tsv => OutputFormatCode::Tsv,
+            Self::Table => OutputFormatCode::Table,
         }
+    }
+
+    /// The format with the verified kernel's `code` (a variant-for-variant
+    /// copy).
+    pub(crate) const fn from_code(code: OutputFormatCode) -> Self {
+        match code {
+            OutputFormatCode::Json => Self::Json,
+            OutputFormatCode::Csv => Self::Csv,
+            OutputFormatCode::Tsv => Self::Tsv,
+            OutputFormatCode::Table => Self::Table,
+        }
+    }
+
+    /// Parses a format keyword (`json`, `csv`, `tsv`, `table`), ignoring
+    /// ASCII case, as `TROP_OUTPUT_FORMAT` does. The decision is the verified
+    /// kernel's, which proves that every format's `Display` text parses back
+    /// to it.
+    pub(crate) fn parse_keyword(text: &str) -> Option<Self> {
+        parse_output_format(text.as_bytes()).map(Self::from_code)
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    /// Writes the format's keyword (`json`, `csv`, `tsv`, or `table`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(output_format_keyword(self.code()))
     }
 }
 
