@@ -1883,8 +1883,9 @@ explaining that Verus cannot see inside `b"..."` literals.
   crate is fresh, cargo replays its cached output instead of running the
   verifier; the replay has no results line and ignores which module was
   asked for. Both recipes therefore drop the harness crate's cached build
-  before running (dependencies stay cached) and fail unless every results
-  line reports 0 errors and at least one is printed. Calling `cargo verus`
+  before running (dependencies stay cached) and fail, through
+  `scripts/check-verus-results.sh`, unless every results line reports 0
+  errors and at least one is printed. Calling `cargo verus`
   directly does neither, and one checkout's cached result can then be
   replayed for another, so give each checkout (and each git worktree) its
   own `CARGO_TARGET_DIR`.

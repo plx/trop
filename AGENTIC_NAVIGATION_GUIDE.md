@@ -27,6 +27,7 @@
     - production-readiness-work-selection.md # Live GitHub scheduling contract and selector operations
 - scripts/ # Dependency-free maintainer automation
   - get_next_production_readiness_issue.py # Selects one ready audit issue from complete live GitHub snapshots
+  - check-verus-results.sh # Fails a Verus run whose log has no clean "verification results:: N verified, 0 errors" line
   - install-verus.sh # Installs the pinned, checksum-verified Verus release and its Rust toolchain
   - tests/test_get_next_production_readiness_issue.py # Selector taxonomy, dependency, PR-coverage, race, and CLI tests
 - reference/ # Authoritative project specifications (DO NOT MODIFY)

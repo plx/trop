@@ -49,78 +49,32 @@ install-verus:
 verify *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Succeeds only if Verus prints a `verification results:: N verified,
-    # 0 errors` line: a zero exit alone is not proof, because cargo can
-    # replay a fresh crate's cached output without running the verifier. The
-    # output stays visible, and a failing exit status is kept.
     verus_bin="$(./scripts/install-verus.sh --print-path)"
     cd trop-verification
-    # A replay has no results line, so drop the harness crate's cached build
-    # to make the verifier run; dependencies stay cached. (`cargo verus`
-    # checks freshness by content checksum, so touching a file is not
-    # enough.) The arguments that choose the build directory are passed on,
-    # so the build this run would replay is the one dropped.
-    clean_args=()
-    take=0
-    for arg in "$@"; do
-        if [ "$take" -eq 1 ]; then
-            clean_args+=("$arg")
-            take=0
-            continue
-        fi
-        case "$arg" in
-            --) break ;;
-            -r|--release) clean_args+=("$arg") ;;
-            --profile|--target|--target-dir|--config) clean_args+=("$arg"); take=1 ;;
-            --profile=*|--target=*|--target-dir=*|--config=*) clean_args+=("$arg") ;;
-        esac
-    done
-    cargo clean --quiet --package trop-verification ${clean_args[@]+"${clean_args[@]}"}
+    # Cargo replays a fresh crate's cached output without running the
+    # verifier (`cargo verus` checks freshness by content checksum), so drop
+    # the harness crate's own build first; dependencies stay cached.
+    cargo clean --quiet --package trop-verification
     log="$(mktemp)"
     trap 'rm -f "$log"' EXIT
-    status=0
-    PATH="$verus_bin:$PATH" cargo verus verify "$@" 2>&1 | tee "$log" || status=$?
-    if [ "$status" -ne 0 ]; then
-        exit "$status"
-    fi
-    results="$(sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -E 'verification results:: [0-9]+ verified, [0-9]+ errors?' || true)"
-    if [ -z "$results" ] || printf '%s\n' "$results" | grep -Evq ', 0 errors( |$)'; then
-        echo "error: Verus printed no clean 'verification results:: N verified, 0 errors' line, so nothing was proved" >&2
-        exit 1
-    fi
+    PATH="$verus_bin:$PATH" cargo verus verify "$@" 2>&1 | tee "$log"
+    ../scripts/check-verus-results.sh "$log"
 
 # Verify one kernel module while iterating, e.g. `just verify-module exclusions`
 verify-module module *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    # The same results-line check as `verify`.
     shift # "$1" is the module; the rest are extra verifier arguments
     verus_bin="$(./scripts/install-verus.sh --print-path)"
     cd trop-verification
-    # As in `verify`, drop the harness crate's cached build (`cargo verus
-    # focus` builds under `<target>/verus-partial`): a replay would also
-    # ignore which module was asked for. The target directory is read from
-    # `cargo metadata`, undoing JSON escapes (Windows backslashes, quotes).
+    # As in `verify`; `cargo verus focus` builds under `<target>/verus-partial`.
     target_dir="$(cargo metadata --no-deps --format-version 1 \
-        | sed -nE 's/.*"target_directory":"((\\.|[^"\\])*)".*/\1/p' \
-        | sed -E 's/\\(.)/\1/g')"
-    if [ -z "$target_dir" ]; then
-        echo "error: could not read cargo's target directory" >&2
-        exit 1
-    fi
+        | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
     cargo clean --quiet --package trop-verification --target-dir "$target_dir/verus-partial"
     log="$(mktemp)"
     trap 'rm -f "$log"' EXIT
-    status=0
-    PATH="$verus_bin:$PATH" cargo verus focus -- --verify-module "verified::{{module}}" "$@" 2>&1 | tee "$log" || status=$?
-    if [ "$status" -ne 0 ]; then
-        exit "$status"
-    fi
-    results="$(sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -E 'verification results:: [0-9]+ verified, [0-9]+ errors?' || true)"
-    if [ -z "$results" ] || printf '%s\n' "$results" | grep -Evq ', 0 errors( |$)'; then
-        echo "error: Verus printed no clean 'verification results:: N verified, 0 errors' line, so nothing was proved" >&2
-        exit 1
-    fi
+    PATH="$verus_bin:$PATH" cargo verus focus -- --verify-module "verified::{{module}}" "$@" 2>&1 | tee "$log"
+    ../scripts/check-verus-results.sh "$log"
 
 # Build the project in debug mode
 build:
