@@ -9,8 +9,8 @@ use clap::Args;
 use std::path::PathBuf;
 use std::time::Duration;
 use trop::{
-    Config, Database, DatabaseConfig, PlanExecutor, Port, ReservationKey, ReserveOptions,
-    ReservePlan,
+    Config, Database, DatabaseConfig, PlanAction, PlanExecutor, Port, ReservationKey,
+    ReserveOptions, ReservePlan,
 };
 
 /// Reserve a port for a directory.
@@ -216,16 +216,34 @@ impl ReserveCommand {
 /// stderr (unless quiet) and the port a live run would report goes to
 /// stdout. Planning errors (an unrelated path, a sticky-field change, an
 /// exhausted range without automatic cleanup) fail the dry run exactly as
-/// they fail a live run. A missing database is never created: the dry run
-/// says so and succeeds.
+/// they fail a live run.
+///
+/// What a dry run cannot do, it says (unless quiet) instead of guessing, and
+/// succeeds:
+/// - a missing database is never created (with auto-init disabled the dry
+///   run fails like the live run instead);
+/// - a database that needs initialization or a schema migration is never
+///   migrated;
+/// - an allocation deferred to automatic cleanup is never attempted, so its
+///   port and outcome are unknown.
+///
+/// Opening an existing WAL-mode database, even read-only, can leave the
+/// `trop.db-wal` and `trop.db-shm` files beside it until the next writer
+/// closes; the database contents never change.
 fn dry_run(
     context: &InvocationContext,
     options: ReserveOptions,
     config: &Config,
     quiet: bool,
 ) -> Result<(), CliError> {
-    let db_path = context.data_dir()?.join("trop.db");
+    let effective = context.effective()?;
+    let db_path = context.database_path()?;
     if !db_path.exists() {
+        // The same check a live run makes before it would create the
+        // database.
+        if effective.disable_autoinit() {
+            return Err(CliError::NoDataDirectory);
+        }
         if !quiet {
             eprintln!("Dry run - would perform the following actions:");
             eprintln!("  1. Reserve port");
@@ -237,13 +255,39 @@ fn dry_run(
         return Ok(());
     }
 
-    let timeout = Duration::from_secs(context.effective()?.maximum_lock_wait_seconds());
-    let db = Database::open(
+    let timeout = Duration::from_secs(effective.maximum_lock_wait_seconds());
+    let db = match Database::open(
         DatabaseConfig::new(&db_path)
             .with_busy_timeout(timeout)
             .read_only(),
-    )
-    .map_err(CliError::from)?;
+    ) {
+        Ok(db) => db,
+        // A live run initializes or migrates the database before it plans;
+        // a dry run must not, so it cannot plan.
+        Err(trop::Error::MigrationRequired { found, target, .. }) => {
+            if !quiet {
+                eprintln!("Dry run - would perform the following actions:");
+                eprintln!("  1. Reserve port");
+                if found == 0 {
+                    eprintln!(
+                        "The database at {} is not initialized yet; a live run would \
+                         initialize it first.",
+                        db_path.display()
+                    );
+                } else {
+                    eprintln!(
+                        "The database at {} has schema version {found} and needs a \
+                         migration to version {target}, which a dry run does not perform; \
+                         a live run would attempt the migration first, so this dry run \
+                         cannot predict its outcome.",
+                        db_path.display()
+                    );
+                }
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(CliError::from(error)),
+    };
     // A deferred (read) transaction gives planning one consistent snapshot;
     // dropping it rolls back, and the read-only connection cannot write.
     let tx = db
@@ -268,11 +312,30 @@ fn dry_run(
         for warning in &result.warnings {
             eprintln!("Warning: {warning}");
         }
+        if plan.actions.iter().any(allocates_after_cleanup) {
+            eprintln!(
+                "The range is exhausted: a live run would run automatic cleanup and \
+                 retry once, which a dry run does not do, so it cannot predict the port \
+                 or whether the reservation would succeed."
+            );
+        }
     }
     if let Some(port) = result.port {
         println!("{}", port.value());
     }
     Ok(())
+}
+
+/// The action allocates at execution, after automatic cleanup.
+fn allocates_after_cleanup(action: &PlanAction) -> bool {
+    match action {
+        PlanAction::CreateReservation(reservation) | PlanAction::UpdateReservation(reservation) => {
+            reservation.requires_allocation_at_execution()
+        }
+        PlanAction::UpdateLastUsed(_)
+        | PlanAction::DeleteReservation(_)
+        | PlanAction::AllocateGroup { .. } => false,
+    }
 }
 
 /// Parse a port number from a string, validating it's in the valid range (1-65535).

@@ -15,8 +15,11 @@
 //!   from the request flags; `--force` dominates every protection and the
 //!   policy is monotone in the permissive flags.
 //! - **Cleanup-then-retry** (`allocate_with_cleanup_retry`): generic over the
-//!   allocation and cleanup oracles; at most one cleanup, only after an
-//!   exhausted first allocation, and only when cleanup is possible.
+//!   allocation, cleanup, and retry oracles. Its contract covers when each
+//!   oracle may run (`retry_discipline`, stated as the oracles' own
+//!   preconditions): at most one cleanup, only after an exhausted first
+//!   allocation and only when cleanup is possible, and at most one retry,
+//!   only after a successful cleanup.
 //! - **Deferred reconciliation** (`deferred_step`): the execution-time replay
 //!   of the existing-reservation decision for a plan that deferred allocation.
 //! - **The reported port** (`reported_port`): the port a reserve plan reports,
@@ -345,6 +348,11 @@ pub proof fn lemma_policy_monotone(a: ReserveFlags, b: ReserveFlags)
 
 /// What a reserve request does to the reservation already stored under its
 /// key.
+///
+/// The kernel decides which of these applies. Carrying a decision out is the
+/// glue's job and is not part of this contract: the glue stores the resolved
+/// metadata, keeps the row's `created_at` when it rewrites the row, and
+/// excludes the row's own key from the occupancy check when it reallocates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExistingDecision {
     /// Rejected: the project would change without permission.
@@ -352,9 +360,9 @@ pub enum ExistingDecision {
     /// Rejected: the task would change without permission (the project
     /// check passed).
     StickyTask,
-    /// Allocate a new port; store the resolved metadata, keep `created_at`.
+    /// Allocate a new port for the key and store the resolved metadata.
     Reallocate,
-    /// Keep the port; store the resolved metadata, keep `created_at`.
+    /// Keep the port and store the resolved metadata.
     UpdateMetadata,
     /// Nothing changes: refresh `last_used_at` and report the stored port.
     Touch,
@@ -816,24 +824,43 @@ pub enum Retry<P, C> {
     Exhausted { cleanup: Option<C> },
 }
 
-/// `allocate(after_cleanup)` was observed to return `answer`.
-pub open spec fn allocation_returned<P, E, A: Fn(bool) -> Result<Fallback<P>, E>>(
-    allocate: A,
-    after_cleanup: bool,
-    answer: Result<Fallback<P>, E>,
-) -> bool {
-    allocate.ensures((after_cleanup,), answer)
-}
-
 /// The first allocation was exhausted and cleanup was possible, so the
 /// cleanup ran and returned `counts`.
-pub open spec fn cleaned_up<P, C, E, A: Fn(bool) -> Result<Fallback<P>, E>, K: FnOnce() -> Result<
+pub open spec fn cleaned_up<
+    P,
     C,
     E,
->>(cleanup_possible: bool, allocate: A, cleanup: K, counts: C) -> bool {
+    A: FnOnce() -> Result<Fallback<P>, E>,
+    K: FnOnce() -> Result<C, E>,
+>(cleanup_possible: bool, allocate: A, cleanup: K, counts: C) -> bool {
     &&& cleanup_possible
-    &&& allocation_returned(allocate, false, Ok(Fallback::Exhausted))
+    &&& allocate.ensures((), Ok::<Fallback<P>, E>(Fallback::Exhausted))
     &&& cleanup.ensures((), Ok::<C, E>(counts))
+}
+
+/// The call discipline of `allocate_with_cleanup_retry`, stated as the
+/// oracles' preconditions (a body that calls an oracle out of turn does not
+/// verify against oracles whose preconditions are exactly these):
+///
+/// - the first allocation may always run;
+/// - the cleanup may run only when cleanup is possible and the first
+///   allocation was exhausted;
+/// - the retry may run only after the cleanup succeeded.
+///
+/// Each oracle is an `FnOnce`, so each runs at most once. Ordinary Rust
+/// closures have no preconditions, so production glue meets these.
+pub open spec fn retry_discipline<
+    P,
+    C,
+    E,
+    A: FnOnce() -> Result<Fallback<P>, E>,
+    K: FnOnce() -> Result<C, E>,
+    B: FnOnce() -> Result<Fallback<P>, E>,
+>(cleanup_possible: bool, allocate: A, cleanup: K, retry: B) -> bool {
+    &&& allocate.requires(())
+    &&& (cleanup_possible && allocate.ensures((), Ok::<Fallback<P>, E>(Fallback::Exhausted)))
+        ==> cleanup.requires(())
+    &&& forall|counts: C| #[trigger] cleanup.ensures((), Ok::<C, E>(counts)) ==> retry.requires(())
 }
 
 /// `r` is a correct result of one allocation with at most one
@@ -850,66 +877,70 @@ pub open spec fn cleaned_up<P, C, E, A: Fn(bool) -> Result<Fallback<P>, E>, K: F
 /// - an error is an oracle's error, unchanged: from the first allocation, or
 ///   — only after an exhausted first allocation with cleanup possible — from
 ///   the cleanup or the retry.
-pub open spec fn retried<P, C, E, A: Fn(bool) -> Result<Fallback<P>, E>, K: FnOnce() -> Result<
+pub open spec fn retried<
+    P,
     C,
     E,
->>(cleanup_possible: bool, allocate: A, cleanup: K, r: Result<Retry<P, C>, E>) -> bool {
+    A: FnOnce() -> Result<Fallback<P>, E>,
+    K: FnOnce() -> Result<C, E>,
+    B: FnOnce() -> Result<Fallback<P>, E>,
+>(cleanup_possible: bool, allocate: A, cleanup: K, retry: B, r: Result<Retry<P, C>, E>) -> bool {
     match r {
-        Ok(Retry::Allocated { port, cleanup: None }) => allocation_returned(
-            allocate,
-            false,
-            Ok(Fallback::Allocated(port)),
+        Ok(Retry::Allocated { port, cleanup: None }) => allocate.ensures(
+            (),
+            Ok::<Fallback<P>, E>(Fallback::Allocated(port)),
         ),
         Ok(Retry::Allocated { port, cleanup: Some(counts) }) => cleaned_up(
             cleanup_possible,
             allocate,
             cleanup,
             counts,
-        ) && allocation_returned(allocate, true, Ok(Fallback::Allocated(port))),
-        Ok(Retry::Exhausted { cleanup: None }) => !cleanup_possible && allocation_returned(
-            allocate,
-            false,
-            Ok(Fallback::Exhausted),
+        ) && retry.ensures((), Ok::<Fallback<P>, E>(Fallback::Allocated(port))),
+        Ok(Retry::Exhausted { cleanup: None }) => !cleanup_possible && allocate.ensures(
+            (),
+            Ok::<Fallback<P>, E>(Fallback::Exhausted),
         ),
         Ok(Retry::Exhausted { cleanup: Some(counts) }) => cleaned_up(
             cleanup_possible,
             allocate,
             cleanup,
             counts,
-        ) && allocation_returned(allocate, true, Ok(Fallback::Exhausted)),
-        Err(e) => allocation_returned(allocate, false, Err(e)) || (cleanup_possible
-            && allocation_returned(allocate, false, Ok(Fallback::Exhausted)) && (cleanup.ensures(
-            (),
-            Err::<C, E>(e),
-        ) || allocation_returned(allocate, true, Err(e)))),
+        ) && retry.ensures((), Ok::<Fallback<P>, E>(Fallback::Exhausted)),
+        Err(e) => allocate.ensures((), Err::<Fallback<P>, E>(e)) || (cleanup_possible
+            && allocate.ensures((), Ok::<Fallback<P>, E>(Fallback::Exhausted)) && (
+        cleanup.ensures((), Err::<C, E>(e)) || retry.ensures((), Err::<Fallback<P>, E>(e)))),
     }
 }
 
 /// Allocates; when the range is exhausted and cleanup is possible, runs the
 /// cleanup once and retries once (see `retried`).
 ///
-/// The body is straight-line: `allocate(false)` runs first; `cleanup` (an
-/// `FnOnce`, so at most once) runs only after it returned `Exhausted` with
-/// `cleanup_possible`; `allocate(true)` runs only after the cleanup
-/// succeeded. Generic over the port type, the cleanup's result, and the
-/// error, so the group path can reuse it.
+/// The oracles are the first allocation `allocate`, the destructive
+/// `cleanup` (prune/expire), and the `retry` allocation. Their call
+/// discipline is verified through `retry_discipline`: `cleanup` runs only
+/// when `cleanup_possible` and after `allocate` returned `Exhausted`, and
+/// `retry` only after `cleanup` succeeded; each runs at most once
+/// (`FnOnce`). Generic over the port type, the cleanup's result, and the
+/// error, so the group path can reuse it. Production passes the same
+/// allocation closure as `allocate` and `retry`.
 pub fn allocate_with_cleanup_retry<
     P,
     C,
     E,
-    A: Fn(bool) -> Result<Fallback<P>, E>,
+    A: FnOnce() -> Result<Fallback<P>, E>,
     K: FnOnce() -> Result<C, E>,
->(cleanup_possible: bool, allocate: &A, cleanup: K) -> (r: Result<Retry<P, C>, E>)
+    B: FnOnce() -> Result<Fallback<P>, E>,
+>(cleanup_possible: bool, allocate: A, cleanup: K, retry: B) -> (r: Result<Retry<P, C>, E>)
     requires
-        allocate.requires((false,)),
-        allocate.requires((true,)),
-        cleanup.requires(()),
+        // Only the oracles' own (conditional) preconditions: see
+        // `retry_discipline`.
+        retry_discipline(cleanup_possible, allocate, cleanup, retry),
     ensures
-        retried(cleanup_possible, *allocate, cleanup, r),
+        retried(cleanup_possible, allocate, cleanup, retry, r),
         !cleanup_possible ==> !(r matches Ok(Retry::Allocated { cleanup: Some(_), .. })),
         !cleanup_possible ==> !(r matches Ok(Retry::Exhausted { cleanup: Some(_) })),
 {
-    match allocate(false)? {
+    match allocate()? {
         Fallback::Allocated(port) => {
             return Ok(Retry::Allocated { port, cleanup: None });
         },
@@ -919,7 +950,7 @@ pub fn allocate_with_cleanup_retry<
         return Ok(Retry::Exhausted { cleanup: None });
     }
     let counts = cleanup()?;
-    match allocate(true)? {
+    match retry()? {
         Fallback::Allocated(port) => Ok(Retry::Allocated { port, cleanup: Some(counts) }),
         Fallback::Exhausted => Ok(Retry::Exhausted { cleanup: Some(counts) }),
     }
@@ -935,8 +966,9 @@ pub enum DeferredStep<R> {
     /// The key holds no reservation now: allocate a fresh one. Its metadata
     /// is re-inferred when a reservation existed at planning (the plan's
     /// placeholder carries that reservation's metadata), and otherwise taken
-    /// from the placeholder (resolved at planning for a new key). Nothing is
-    /// ignored and no `created_at` is kept.
+    /// from the placeholder (resolved at planning for a new key). (The glue
+    /// then excludes no key from the occupancy check and keeps no
+    /// `created_at`; that is not part of this contract.)
     AllocateFresh {
         /// Re-infer the metadata instead of using the placeholder's.
         reinfer: bool,
@@ -988,9 +1020,11 @@ pub fn deferred_step<R>(
     }
 }
 
-/// Planning and deferred execution agree on an existing key: a request that
-/// reallocates replaces the row (ignoring its own key, keeping
-/// `created_at`), and one that does not completes without allocating.
+/// Planning and deferred execution agree on an existing key: a non-sticky
+/// decision reallocates exactly when the flags ask for reallocation, and is
+/// otherwise a metadata update or a refresh, which completes without
+/// allocating. (How a reallocation treats the row, keeping its `created_at`
+/// and excluding its own key, is glue; see `ExistingDecision`.)
 pub proof fn lemma_deferred_existing_agrees_with_planning(
     d: ExistingDecision,
     stored_project: Option<Seq<u8>>,
@@ -1018,8 +1052,9 @@ pub proof fn lemma_deferred_existing_agrees_with_planning(
 pub enum ReportedPort<P> {
     /// A reservation written with this port at planning time.
     Static(P),
-    /// A refresh of a reservation whose port, recorded at planning time, is
-    /// this one.
+    /// A refresh of a reservation that holds this port: as read when live
+    /// execution refreshed it, or as stored when a dry run reports it. The
+    /// two agree when both run in the same snapshot.
     Touch(P),
     /// An allocation deferred to execution: the port it produced (live
     /// execution), or `None` (a dry run, or no port).
@@ -1028,12 +1063,13 @@ pub enum ReportedPort<P> {
     NoPort,
 }
 
-/// The action carries a planning-time port.
+/// The action carries a port of its own (a written reservation's port, or a
+/// refreshed reservation's port), not one a deferred allocation produces.
 pub open spec fn is_planned<P>(a: ReportedPort<P>) -> bool {
     a is Static || a is Touch
 }
 
-/// The planning-time port of an action that carries one.
+/// The own port of an action that carries one (see `is_planned`).
 pub open spec fn planned_port<P>(a: ReportedPort<P>) -> P
     recommends
         is_planned(a),
@@ -1059,7 +1095,7 @@ pub open spec fn last_deferred<P>(actions: Seq<ReportedPort<P>>) -> Option<P>
     }
 }
 
-/// The planning-time port of the first action that carries one.
+/// The own port of the first action that carries one (see `is_planned`).
 pub open spec fn first_planned<P>(actions: Seq<ReportedPort<P>>) -> Option<P>
     decreases actions.len(),
 {
@@ -1078,8 +1114,8 @@ pub open spec fn first_planned<P>(actions: Seq<ReportedPort<P>>) -> Option<P>
 }
 
 /// The port a plan reports: a port produced at execution by a deferred
-/// action wins (the last one); otherwise the planning-time port of the first
-/// action that carries one, in plan order.
+/// action wins (the last one); otherwise the own port of the first action
+/// that carries one, in plan order.
 pub open spec fn reported<P>(actions: Seq<ReportedPort<P>>) -> Option<P> {
     match last_deferred(actions) {
         Some(port) => Some(port),
@@ -1126,7 +1162,7 @@ pub fn reported_port<P: Copy>(actions: &[ReportedPort<P>]) -> (r: Option<P>)
     }
 }
 
-/// `first_planned` is the first action that carries a planning-time port.
+/// `first_planned` is the first action that carries a port of its own.
 pub proof fn lemma_first_planned_is_first<P>(actions: Seq<ReportedPort<P>>, i: int)
     requires
         0 <= i < actions.len(),
@@ -1143,7 +1179,7 @@ pub proof fn lemma_first_planned_is_first<P>(actions: Seq<ReportedPort<P>>, i: i
     }
 }
 
-/// No action carries a planning-time port: `first_planned` is `None`.
+/// No action carries a port of its own: `first_planned` is `None`.
 pub proof fn lemma_no_planned_prefix<P>(actions: Seq<ReportedPort<P>>)
     requires
         forall|j: int| 0 <= j < actions.len() ==> !is_planned(#[trigger] actions[j]),
@@ -1200,7 +1236,7 @@ pub proof fn lemma_no_deferred_port<P>(actions: Seq<ReportedPort<P>>)
     }
 }
 
-/// A plan whose first action carries a planning-time port, and in which no
+/// A plan whose first action carries a port of its own, and in which no
 /// deferred action produced a port, reports that port. In particular every
 /// reserve plan without a deferred allocation (one `Create`/`Update` or one
 /// `Touch`) reports a port, in live execution and dry runs alike.
@@ -1226,7 +1262,8 @@ pub open spec fn dry_run_view<P>(a: ReportedPort<P>) -> ReportedPort<P> {
 }
 
 /// Dry runs and live execution report the same port whenever no deferred
-/// action produced a port at execution.
+/// action produced a port at execution (and the refreshes carry the same
+/// ports in both, as they do when both run in the same snapshot).
 pub proof fn lemma_dry_run_agrees<P>(live: Seq<ReportedPort<P>>, dry: Seq<ReportedPort<P>>)
     requires
         live.len() == dry.len(),

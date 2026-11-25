@@ -215,3 +215,104 @@ fn dry_run_without_a_database_creates_nothing() {
         "a dry run created the data directory"
     );
 }
+
+/// With auto-init disabled a live run refuses to create the database, so
+/// the dry run fails the same way instead of claiming that a live run would
+/// create it.
+#[test]
+fn dry_run_without_a_database_and_auto_init_fails_like_a_live_run() {
+    let env = TestEnv::new();
+    let path = env.create_dir("noinit");
+    let dry = reserve(&env, &path, &["--disable-autoinit", "--dry-run"]);
+    let live = reserve(&env, &path, &["--disable-autoinit"]);
+    assert_same_failure(&dry, &live);
+    assert!(!stderr(&dry).contains("a live run would create it"));
+    assert!(
+        !env.data_dir.join("trop.db").exists(),
+        "a run with auto-init disabled created the database"
+    );
+}
+
+/// An exhausted range with automatic cleanup enabled defers allocation to
+/// execution. The dry run cannot clean up, so it says that it cannot predict
+/// the port or the outcome, prints no port, and changes nothing.
+#[test]
+fn dry_run_of_a_deferred_allocation_says_it_cannot_predict_the_outcome() {
+    let env = TestEnv::new();
+    let range = ["--min", "5000", "--max", "5000", "--skip-occupancy-check"];
+    let holder = env.create_dir("holder");
+    let first = reserve(&env, &holder, &range);
+    assert!(first.status.success(), "{}", stderr(&first));
+    let before = snapshot(&env);
+
+    let other = env.create_dir("other");
+    let mut args = range.to_vec();
+    args.push("--dry-run");
+    let dry = reserve(&env, &other, &args);
+    assert!(dry.status.success(), "{}", stderr(&dry));
+    assert!(stdout(&dry).is_empty(), "{}", stdout(&dry));
+    assert!(stderr(&dry).contains("automatic cleanup after exhaustion"));
+    assert!(
+        stderr(&dry).contains("cannot predict the port"),
+        "{}",
+        stderr(&dry)
+    );
+    assert_eq!(snapshot(&env), before, "a dry run changed the database");
+}
+
+/// A database file that has never been initialized is not initialized by a
+/// dry run (a read-only connection cannot): the dry run says so and
+/// succeeds, and the live run then initializes it.
+#[test]
+fn dry_run_on_an_uninitialized_database_leaves_it_alone() {
+    let env = TestEnv::new();
+    std::fs::create_dir_all(&env.data_dir).unwrap();
+    let database = env.data_dir.join("trop.db");
+    std::fs::write(&database, b"").unwrap();
+    let path = env.create_dir("uninitialized");
+
+    let dry = reserve(&env, &path, &["--dry-run"]);
+    assert!(dry.status.success(), "{}", stderr(&dry));
+    assert!(stdout(&dry).is_empty());
+    assert!(
+        stderr(&dry).contains("is not initialized yet; a live run would initialize it first"),
+        "{}",
+        stderr(&dry)
+    );
+    assert_eq!(std::fs::metadata(&database).unwrap().len(), 0);
+
+    let live = reserve(&env, &path, &[]);
+    assert!(live.status.success(), "{}", stderr(&live));
+    parse_port(&stdout(&live));
+}
+
+/// A database at an older schema version is not migrated by a dry run: the
+/// dry run says that a live run would attempt the migration first, and
+/// leaves the file untouched.
+#[test]
+fn dry_run_on_a_database_needing_migration_leaves_it_alone() {
+    let env = TestEnv::new();
+    std::fs::create_dir_all(&env.data_dir).unwrap();
+    let database = env.data_dir.join("trop.db");
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
+                 INSERT INTO metadata (key, value) VALUES ('schema_version', '1');",
+            )
+            .unwrap();
+    }
+    let before = std::fs::read(&database).unwrap();
+    let path = env.create_dir("old-schema");
+
+    let dry = reserve(&env, &path, &["--dry-run"]);
+    assert!(dry.status.success(), "{}", stderr(&dry));
+    assert!(stdout(&dry).is_empty());
+    assert!(
+        stderr(&dry).contains("has schema version 1 and needs a migration to version"),
+        "{}",
+        stderr(&dry)
+    );
+    assert_eq!(std::fs::read(&database).unwrap(), before);
+}

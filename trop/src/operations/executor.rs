@@ -182,7 +182,8 @@ impl<'conn> PlanExecutor<'conn> {
     pub fn execute(&mut self, plan: &OperationPlan) -> Result<ExecutionResult> {
         if self.dry_run {
             // A dry run executes nothing: deferred allocations have produced
-            // no port, and every other port comes from the plan itself.
+            // no port; a written reservation's port comes from the plan and
+            // a refreshed reservation's port is read as stored.
             let produced = vec![None; plan.actions.len()];
             let port = self.reported_port(plan, &produced)?;
             let allocated_ports = Self::extract_allocated_ports_dry_run(plan);
@@ -245,13 +246,17 @@ impl<'conn> PlanExecutor<'conn> {
             }
             PlanAction::UpdateLastUsed(key) => {
                 // Refreshing a reservation that no longer exists must not
-                // report success (or the port recorded for it).
+                // report success.
                 if !Database::update_last_used_simple(self.conn, key)? {
-                    return Err(Error::NotFound {
-                        resource: format!("reservation for {key}"),
-                    });
+                    return Err(Self::missing_reservation(key));
                 }
-                Ok(ActionOutcome::default())
+                // The refresh reports the port the row holds as it is
+                // refreshed (the port planning saw, unless the key was
+                // reallocated after planning). A failed read is an error.
+                Ok(ActionOutcome {
+                    port: Some(self.stored_port(key)?),
+                    ..ActionOutcome::default()
+                })
             }
             PlanAction::DeleteReservation(key) => {
                 Database::delete_reservation_simple(self.conn, key)?;
@@ -281,12 +286,12 @@ impl<'conn> PlanExecutor<'conn> {
     /// The port a plan reports, chosen by the verified
     /// `verified::reserve::reported_port`: the last port a deferred
     /// allocation produced at execution (`produced[i]` for action `i`),
-    /// otherwise the planning-time port of the first action that carries
-    /// one. Live execution and dry runs both use it.
+    /// otherwise the port of the first action that carries one in plan
+    /// order. Live execution and dry runs both use it.
     ///
-    /// A refresh reports the port recorded at planning time. A plan
-    /// assembled by hand records none; its stored port is read instead, and
-    /// a failed read is an error, never a silently missing port.
+    /// A refresh carries the port its reservation holds: in live execution
+    /// as read when it was refreshed (`produced[i]`), in a dry run as stored
+    /// now. A failed read is an error, never a silently missing port.
     fn reported_port(
         &self,
         plan: &OperationPlan,
@@ -303,7 +308,10 @@ impl<'conn> PlanExecutor<'conn> {
                     }
                 }
                 PlanAction::UpdateLastUsed(key) => {
-                    ReportedPort::Touch(self.refresh_port(plan, key)?)
+                    ReportedPort::Touch(match produced.get(index).copied().flatten() {
+                        Some(port) => port,
+                        None => self.stored_port(key)?,
+                    })
                 }
                 PlanAction::DeleteReservation(_) | PlanAction::AllocateGroup { .. } => {
                     // Release operations and group allocations don't return a single port
@@ -314,17 +322,18 @@ impl<'conn> PlanExecutor<'conn> {
         Ok(reserve_kernel::reported_port(&actions))
     }
 
-    /// The port a refresh of `key` reports: recorded at planning time, or
-    /// (for a plan assembled by hand) read from the database.
-    fn refresh_port(&self, plan: &OperationPlan, key: &ReservationKey) -> Result<Port> {
-        if let Some(port) = plan.recorded_refresh_port(key) {
-            return Ok(port);
-        }
+    /// The port stored for `key`; a missing reservation or a failed read is
+    /// an error.
+    fn stored_port(&self, key: &ReservationKey) -> Result<Port> {
         Database::get_reservation(self.conn, key)?
             .map(|reservation| reservation.port())
-            .ok_or_else(|| Error::NotFound {
-                resource: format!("reservation for {key}"),
-            })
+            .ok_or_else(|| Self::missing_reservation(key))
+    }
+
+    fn missing_reservation(key: &ReservationKey) -> Error {
+        Error::NotFound {
+            resource: format!("reservation for {key}"),
+        }
     }
 
     /// Extracts allocated ports from a plan's group allocation actions (dry-run).
@@ -549,14 +558,17 @@ mod tests {
 
     /// Regression: the refreshed reservation's port used to be re-read after
     /// execution with every read error swallowed, so a successful `trop
-    /// reserve` could report no port at all (exit 0, empty stdout). The port
-    /// is now the one recorded at planning time.
+    /// reserve` could report no port at all (exit 0, empty stdout). The
+    /// refresh now reports the port the row holds, and a failed read fails
+    /// the execution.
     #[test]
-    fn refresh_reports_the_port_recorded_at_planning() {
+    fn refresh_reports_the_stored_port_and_propagates_read_errors() {
         let mut db = create_test_database();
         let key = ReservationKey::new(PathBuf::from("/test/refresh"), None).unwrap();
         let port = stored(&mut db, &key, 5003);
         let plan = refresh_plan(&db, &key);
+        let result = PlanExecutor::new(db.connection()).execute(&plan).unwrap();
+        assert_eq!(result.port, Some(port));
 
         // Make the stored row unreadable (an invalid identifier) while the
         // refresh itself still succeeds.
@@ -565,8 +577,49 @@ mod tests {
             .unwrap();
         assert!(Database::get_reservation(db.connection(), &key).is_err());
 
+        assert!(PlanExecutor::new(db.connection()).execute(&plan).is_err());
+    }
+
+    /// A refresh planned before the key was reallocated (a plan executed
+    /// outside the snapshot it was built in) reports the port the
+    /// reservation holds when it is refreshed, never the stale port planning
+    /// saw; so does a dry run of that plan.
+    #[test]
+    fn refresh_after_a_reallocation_reports_the_current_port() {
+        let mut db = create_test_database();
+        let key = ReservationKey::new(PathBuf::from("/test/moved"), None).unwrap();
+        stored(&mut db, &key, 5003);
+        let plan = refresh_plan(&db, &key);
+        db.connection()
+            .execute("UPDATE reservations SET port = 5009", [])
+            .unwrap();
+        let moved = Some(Port::try_from(5009).unwrap());
+
+        let dry = PlanExecutor::new(db.connection())
+            .dry_run()
+            .execute(&plan)
+            .unwrap();
+        assert_eq!(dry.port, moved);
+        let live = PlanExecutor::new(db.connection()).execute(&plan).unwrap();
+        assert_eq!(live.port, moved);
+    }
+
+    /// A hand-built plan that refreshes a reservation and then deletes it
+    /// reports the port the reservation held when it was refreshed.
+    #[test]
+    fn hand_built_refresh_then_delete_reports_the_refreshed_port() {
+        let mut db = create_test_database();
+        let key = ReservationKey::new(PathBuf::from("/test/refdel"), None).unwrap();
+        let port = stored(&mut db, &key, 5002);
+        let plan = OperationPlan::new("Test")
+            .add_action(PlanAction::UpdateLastUsed(key.clone()))
+            .add_action(PlanAction::DeleteReservation(key.clone()));
+
         let result = PlanExecutor::new(db.connection()).execute(&plan).unwrap();
         assert_eq!(result.port, Some(port));
+        assert!(Database::get_reservation(db.connection(), &key)
+            .unwrap()
+            .is_none());
     }
 
     /// Regression: a refresh of a reservation that disappeared after
@@ -585,8 +638,9 @@ mod tests {
         assert!(matches!(error, Error::NotFound { .. }), "{error:?}");
     }
 
-    /// Regression: for a plan assembled by hand (no recorded port), a failed
-    /// read of the refreshed reservation is an error, not a missing port.
+    /// Regression: for a plan assembled by hand, a failed read of the
+    /// refreshed reservation is an error, not a missing port, in both
+    /// modes.
     #[test]
     fn hand_built_refresh_propagates_read_errors() {
         let mut db = create_test_database();

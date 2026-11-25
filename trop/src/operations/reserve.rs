@@ -579,9 +579,9 @@ impl<'a> ReservePlan<'a> {
             // A compatible request without overwrite keeps the stable port and
             // only refreshes its last-used timestamp. An explicit preferred
             // port remains a hint and does not relocate an existing key. The
-            // plan records the stored port, which is the port it reports.
+            // refresh reports the stored port.
             ExistingDecision::Touch => {
-                Ok(plan.add_refresh(self.options.key.clone(), existing.port()))
+                Ok(plan.add_action(PlanAction::UpdateLastUsed(self.options.key.clone())))
             }
         }
     }
@@ -604,7 +604,8 @@ impl<'a> ReservePlan<'a> {
                 replaced_key,
             )
         };
-        allocation_kernel::allocate_with_fallback(self.preferred_port(), &attempt)
+        // The same oracle answers the request and the fallback request.
+        allocation_kernel::allocate_with_fallback(self.preferred_port(), attempt, attempt)
     }
 
     fn plan_cleanup_retry(
@@ -864,8 +865,7 @@ where
                 ignored_key,
             )
         };
-        let allocate =
-            |_after_cleanup: bool| allocation_kernel::allocate_with_fallback(preferred, &attempt);
+        let allocate = || allocation_kernel::allocate_with_fallback(preferred, attempt, attempt);
         let cleanup = || {
             let default_cleanup = CleanupConfig {
                 expire_after_days: Some(30),
@@ -881,12 +881,13 @@ where
         };
 
         // The verified kernel runs the first allocation, and only after an
-        // exhausted one with cleanup enabled the single cleanup and the
-        // single retry.
+        // exhausted one with cleanup enabled the single cleanup, and only
+        // after a successful cleanup the single retry (the same allocation).
         match kernel::allocate_with_cleanup_retry(
             policy.cleanup.retry_possible(),
-            &allocate,
+            allocate,
             cleanup,
+            allocate,
         )? {
             Retry::Allocated {
                 port,
@@ -2340,14 +2341,15 @@ mod tests {
         }
     }
 
-    /// The fallback kernel over a scripted allocator: at most two requests,
-    /// the second without a preference and only after the preference was
-    /// reported unavailable; a contract violation is exhaustion, not a panic.
+    /// The fallback kernel over a scripted allocator, passed as both oracles
+    /// as production does: at most two requests, the second without a
+    /// preference and only after a given preference was reported
+    /// unavailable; a contract violation is exhaustion, not a panic.
     #[test]
     fn fallback_asks_again_only_after_an_unavailable_preference() {
-        let preferred = Some(Port::try_from(6000).unwrap());
+        let wanted = Some(Port::try_from(6000).unwrap());
         let scanned = Port::try_from(5000).unwrap();
-        let script = |first: Attempt<Port>, second: Attempt<Port>| {
+        let script = |preferred: Option<Port>, first: Attempt<Port>, second: Attempt<Port>| {
             let calls = Cell::new(Vec::new());
             let outcome = {
                 let attempt = |requested: Option<Port>| -> Result<Attempt<Port>> {
@@ -2362,87 +2364,135 @@ mod tests {
                     calls.set(seen);
                     Ok(answer)
                 };
-                allocation_kernel::allocate_with_fallback(preferred, &attempt).unwrap()
+                allocation_kernel::allocate_with_fallback(preferred, attempt, attempt).unwrap()
             };
             (outcome, calls.take())
         };
 
-        let (outcome, calls) = script(Attempt::Allocated(scanned), Attempt::Exhausted);
+        let (outcome, calls) = script(wanted, Attempt::Allocated(scanned), Attempt::Exhausted);
         assert!(matches!(outcome, Fallback::Allocated(port) if port == scanned));
-        assert_eq!(calls, vec![preferred]);
+        assert_eq!(calls, vec![wanted]);
 
-        let (outcome, calls) = script(Attempt::PreferredUnavailable, Attempt::Allocated(scanned));
+        let (outcome, calls) = script(
+            wanted,
+            Attempt::PreferredUnavailable,
+            Attempt::Allocated(scanned),
+        );
         assert!(matches!(outcome, Fallback::Allocated(port) if port == scanned));
-        assert_eq!(calls, vec![preferred, None]);
+        assert_eq!(calls, vec![wanted, None]);
 
-        let (outcome, calls) = script(Attempt::PreferredUnavailable, Attempt::Exhausted);
+        let (outcome, calls) = script(wanted, Attempt::PreferredUnavailable, Attempt::Exhausted);
         assert!(matches!(outcome, Fallback::Exhausted));
-        assert_eq!(calls, vec![preferred, None]);
+        assert_eq!(calls, vec![wanted, None]);
 
         // The allocator contract forbids this; it is reported as exhaustion.
-        let (outcome, calls) = script(Attempt::PreferredUnavailable, Attempt::PreferredUnavailable);
+        let (outcome, calls) = script(
+            wanted,
+            Attempt::PreferredUnavailable,
+            Attempt::PreferredUnavailable,
+        );
         assert!(matches!(outcome, Fallback::Exhausted));
-        assert_eq!(calls, vec![preferred, None]);
+        assert_eq!(calls, vec![wanted, None]);
+
+        // Without a preference there is never a second request, even when
+        // the oracle (in violation of its contract) reports one unavailable.
+        let (outcome, calls) = script(None, Attempt::Exhausted, Attempt::Allocated(scanned));
+        assert!(matches!(outcome, Fallback::Exhausted));
+        assert_eq!(calls, vec![None]);
+
+        let (outcome, calls) = script(
+            None,
+            Attempt::PreferredUnavailable,
+            Attempt::Allocated(scanned),
+        );
+        assert!(matches!(outcome, Fallback::Exhausted));
+        assert_eq!(calls, vec![None]);
+
+        let (outcome, calls) = script(None, Attempt::Allocated(scanned), Attempt::Exhausted);
+        assert!(matches!(outcome, Fallback::Allocated(port) if port == scanned));
+        assert_eq!(calls, vec![None]);
     }
 
     /// The retry kernel over scripted oracles: cleanup runs at most once,
-    /// only after an exhausted first allocation and only when possible;
-    /// allocation runs at most twice.
+    /// only after an exhausted first allocation and only when possible; the
+    /// retry runs at most once, only after a successful cleanup.
     #[test]
     fn cleanup_retry_runs_cleanup_at_most_once() {
         let port = Port::try_from(5000).unwrap();
-        let run = |possible: bool, first: Fallback<Port>, second: Fallback<Port>| {
-            let allocations = Cell::new(Vec::new());
-            let cleanups = Cell::new(0);
+        let run = |possible: bool, first: Fallback<Port>, cleaned: bool, second: Fallback<Port>| {
+            let calls = Cell::new(Vec::new());
+            let log = |call: &'static str| {
+                let mut seen = calls.take();
+                seen.push(call);
+                calls.set(seen);
+            };
+            let answer = |fallback: &Fallback<Port>| match fallback {
+                Fallback::Allocated(port) => Fallback::Allocated(*port),
+                Fallback::Exhausted => Fallback::Exhausted,
+            };
             let outcome = {
-                let allocate = |after_cleanup: bool| -> Result<Fallback<Port>> {
-                    let mut seen = allocations.take();
-                    seen.push(after_cleanup);
-                    let answer = if seen.len() == 1 { &first } else { &second };
-                    let answer = match answer {
-                        Fallback::Allocated(port) => Fallback::Allocated(*port),
-                        Fallback::Exhausted => Fallback::Exhausted,
-                    };
-                    allocations.set(seen);
-                    Ok(answer)
+                let allocate = || -> Result<Fallback<Port>> {
+                    log("allocate");
+                    Ok(answer(&first))
                 };
                 let cleanup = || -> Result<(usize, usize)> {
-                    cleanups.set(cleanups.get() + 1);
-                    Ok((1, 2))
+                    log("cleanup");
+                    if cleaned {
+                        Ok((1, 2))
+                    } else {
+                        Err(Error::Validation {
+                            field: "cleanup".into(),
+                            message: "scripted failure".into(),
+                        })
+                    }
                 };
-                allocate_with_cleanup_retry(possible, &allocate, cleanup).unwrap()
+                let retry = || -> Result<Fallback<Port>> {
+                    log("retry");
+                    Ok(answer(&second))
+                };
+                allocate_with_cleanup_retry(possible, allocate, cleanup, retry)
             };
-            (outcome, allocations.take(), cleanups.get())
+            (outcome, calls.take())
         };
 
         for possible in [false, true] {
-            let (outcome, allocations, cleanups) =
-                run(possible, Fallback::Allocated(port), Fallback::Exhausted);
-            assert!(matches!(outcome, Retry::Allocated { cleanup: None, .. }));
-            assert_eq!((allocations, cleanups), (vec![false], 0));
+            let (outcome, calls) = run(
+                possible,
+                Fallback::Allocated(port),
+                true,
+                Fallback::Exhausted,
+            );
+            assert!(matches!(
+                outcome,
+                Ok(Retry::Allocated { cleanup: None, .. })
+            ));
+            assert_eq!(calls, vec!["allocate"]);
         }
 
-        let (outcome, allocations, cleanups) =
-            run(false, Fallback::Exhausted, Fallback::Allocated(port));
-        assert!(matches!(outcome, Retry::Exhausted { cleanup: None }));
-        assert_eq!((allocations, cleanups), (vec![false], 0));
+        let (outcome, calls) = run(false, Fallback::Exhausted, true, Fallback::Allocated(port));
+        assert!(matches!(outcome, Ok(Retry::Exhausted { cleanup: None })));
+        assert_eq!(calls, vec!["allocate"]);
 
-        let (outcome, allocations, cleanups) =
-            run(true, Fallback::Exhausted, Fallback::Allocated(port));
+        let (outcome, calls) = run(true, Fallback::Exhausted, true, Fallback::Allocated(port));
         assert!(matches!(
             outcome,
-            Retry::Allocated { port: allocated, cleanup: Some((1, 2)) } if allocated == port
+            Ok(Retry::Allocated { port: allocated, cleanup: Some((1, 2)) }) if allocated == port
         ));
-        assert_eq!((allocations, cleanups), (vec![false, true], 1));
+        assert_eq!(calls, vec!["allocate", "cleanup", "retry"]);
 
-        let (outcome, allocations, cleanups) = run(true, Fallback::Exhausted, Fallback::Exhausted);
+        let (outcome, calls) = run(true, Fallback::Exhausted, true, Fallback::Exhausted);
         assert!(matches!(
             outcome,
-            Retry::Exhausted {
+            Ok(Retry::Exhausted {
                 cleanup: Some((1, 2))
-            }
+            })
         ));
-        assert_eq!((allocations, cleanups), (vec![false, true], 1));
+        assert_eq!(calls, vec!["allocate", "cleanup", "retry"]);
+
+        // A failed cleanup is the result; there is no retry.
+        let (outcome, calls) = run(true, Fallback::Exhausted, false, Fallback::Allocated(port));
+        assert!(matches!(outcome, Err(Error::Validation { .. })));
+        assert_eq!(calls, vec!["allocate", "cleanup"]);
     }
 
     #[test]
