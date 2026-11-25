@@ -162,41 +162,66 @@ kernel's (valid) members as `Port`; `add_range` passes the range's
 `PortSpan`; `PortExclusion::from_str` splits at the kernel's separator index,
 trims each side with `str::trim`, and parses each side with `parse_u16`.
 
-### `verified::port_bounds` — configured port-range bounds
+### `verified::port_bounds` — configured port bounds: validation, resolution, layering, defaults, and `reservations.base`
 
-Glue: `trop/src/port/allocator.rs` (`port_range_from_config`, used by
-`allocator_from_config`), `trop-cli/src/commands/scan.rs`
-(`ScanCommand::determine_range`).
+Glue (where production code calls the kernel):
+- `trop/src/port/allocator.rs`: `port_range_from_config` and `port_span_from_config`. These are used by `allocator_from_config`, `trop scan`'s `determine_range`, and `reserve-group`.
+- `trop/src/config/validator.rs`:
+  - `validate_port_config`.
+  - `validate_group_base_in_range`.
+  - `validate` / `validate_effective`: they differ only in the base rule.
+- `trop/src/config/merger.rs`: `merge_port_config`.
+- `trop/src/config/effective.rs`:
+  - `apply_port_layer`, called by `apply_precise`.
+  - `validate_configured_group_base`.
+  - `BUILT_IN_PORTS`.
+  - the transactional `apply_cli_config`.
+- `trop/src/config/environment.rs`: `apply_port_overrides`.
+- `trop/src/config/schema.rs`:
+  - `DEFAULT_MIN_PORT`/`DEFAULT_MAX_PORT`.
+  - `PortConfig::default`.
+  - `PortConfig::bounds`/`from_bounds`.
+  - `PortConfig::check_command_line_bounds`.
+- `trop/src/config/builder.rs`:
+  - `default_config`.
+  - the configured-range base check after the file layers.
+  - per-document validation of the programmatic layer.
+- `trop/src/operations/reserve_group.rs`: `config_with_group_base_as_scan_start`.
+- `trop-cli/src/cli.rs`: `set_port_overrides` and `parse_port_flag`.
 
-- `resolve_port_bounds` (resolution, used by the allocator and `trop scan`):
-  succeeds exactly when the requested upper bound forms a valid range with
-  `min`. The requested bound is the explicit `max`, otherwise
-  `min + max_offset` in unbounded arithmetic. On success it returns exactly
-  `min..=that bound`, with no `u16` overflow. Errors follow
-  `allocator_from_config`'s historical order: `InvalidMin`; then, for an
-  explicit `max`, `InvalidMax` before `MaxBelowMin`; otherwise
-  `OffsetOverflow` or `MissingMax`. The glue maps each error to the
-  historical `Error` value, and a differential test against the previous
-  code checks this. Resolution is lenient: an explicit `max` wins over
-  `max_offset`, and `max_offset == 0` gives `min..=min`. `trop scan` now
-  resolves through it; it used to ignore `max_offset`.
-- `check_port_bounds` (configuration-file rules; written for
-  `ConfigValidator::validate_port_config` to adopt): succeeds exactly for
-  strictly valid bounds. That means a valid `min`; an explicit `max` that is
-  valid and `>= min`; a `max_offset >= 1` that lands on a valid port; and not
-  both `max` and `max_offset`. It returns the named range, or `None` when
-  neither bound is given, which validation allows. Violations follow the
-  validator's order: `InvalidMin`, `InvalidMax`, `MaxBelowMin`, `ZeroOffset`,
-  `OffsetOverflow`, `BothMaxAndOffset`. A differential test checks the kernel
-  against the current validator.
-- Lemmas:
-  - Each error table is consistent with its semantics.
-  - The validator's "offset would create invalid max port" branch is
-    unreachable.
-  - Every validated configuration that names a bound resolves to the same
-    range. One that names neither fails resolution only with `MissingMax`.
-  - Resolution accepts exactly two shapes that validation rejects: both
-    `max` and `max_offset` are given, or `max_offset == 0`.
+What the glue does: it copies `PortConfig` field for field into `PortBounds`/`PortLayer`. It builds the command-line layer from the selected `ConfigField`s; trop-cli's layer never sets `max_offset`. It records provenance from the returned `LayerLeaves`, and maps each kernel error to its historical `(field, message)`.
+
+- `resolve_port_bounds` (resolution): unchanged. It is the one resolution behind the allocator, `trop scan`, and `reserve-group`'s base narrowing. `verified::group::group_scan_bounds`, a second copy, was removed.
+- `check_port_bounds` (document rules): `ConfigValidator::validate_port_config` delegates to it. A differential test shows every `(field, message)` is byte-identical to the previous validator. The unreachable "Offset would create invalid max port" branch was deleted (`lemma_validated_offset_max_is_valid_port`).
+- `lemma_resolution_leniency` is an iff. A resolvable configuration is strictly valid exactly when it is neither "both `max` and `max_offset`" nor "`max_offset == 0`".
+- `overlay_port_bounds` lays one configuration layer over the section below. A layer is a YAML document, the `TROP_PORT_*` environment, a programmatic override, or the command line. The order is defaults < user < project < local < environment < programmatic < command line.
+  - The result's `min` is the layer's own, otherwise the one below.
+  - A layer that sets an upper bound determines it, anchored at the `min` in effect at that layer.
+  - A layer that sets no upper bound keeps a resolved upper bound below unchanged.
+  - Results are normalized: a resolvable `max_offset` is stored as the absolute `max` it names.
+  - Shapes validation rejects (both forms, or a zero or overflowing offset) are kept, and validation of the next state rejects them.
+  - Such an unresolvable offset is the one value a later `min`-only layer re-evaluates. `ConfigBuilder` validates every file and the programmatic layer on their own and checks the environment's declaration, and `apply_cli_config` is transactional, so only a bare `ConfigMerger` merge can produce it.
+- Theorems:
+  - `{min: m, max_offset: o}` and `{min: m, max: m + o}` are interchangeable in every layer stack (`lemma_offset_form_interchangeable`).
+  - Every effective section that passes validation holds exactly one absolute `max` (`lemma_validated_overlay_is_canonical`; `lemma_overlay_all_canonical` gives the same before validation). So "Either max or max_offset must be specified" and the offset errors are unreachable for effective configurations (`lemma_canonical_bounds_checks`).
+  - A complete valid document yields exactly its own range over anything below (`lemma_valid_document_layer`).
+  - Layering is associative for layers that anchor their offsets at their own `min`, over sections without an unresolvable offset (`lemma_overlay_compose`).
+- `check_upper_declaration` is the environment layer's self-check. It requires that the layer does not set both forms, and that an offset `>= 1` lands on a port at the `min` in effect. Validation rejects every document this check rejects. When a document's first violation is an upper-bound rule, both report the same error (`lemma_upper_declaration_agrees_with_validation`).
+- `check_override_bounds` checks `trop reserve`/`trop scan` `--min`/`--max`. Each value must be a valid port and `min <= max`, with the document rules' order (`lemma_override_matches_document_rules`). An accepted pair becomes exactly the effective range (`lemma_override_pair_is_effective_range`). Both commands exit 4 on a bad pair.
+- `group_scan_span` gives reserve-group's scan range. Without a base it is the configured span. With base `b` it exists exactly when `b` lies in the span, and is then `b..=span.max`: the span's ports `>= b`, in order, never `b + max_offset`.
+- `group_base_outside_range` is the `reservations.base` rule for one section. A strictly valid section admits `min..=requested_max`, or `min..` when it names no upper bound (`base_within_section`), and the rule reports exactly a base outside that. `lemma_base_rule_predicts_document_layer`: a rejected base is outside the range of that document laid over any section. The rule is applied in three places:
+  - by `ConfigValidator::validate` to each document (`trop validate`, every loaded file, the programmatic layer);
+  - by `ConfigBuilder` to the section the configuration files name (`EffectiveConfig::validate_configured_group_base`, attributed to the newest of the group's and the port bounds' sources);
+  - by `reserve-group` to the effective range it scans.
+
+  Environment and command-line port overrides do not invalidate a group's base for other commands.
+- `DEFAULT_MIN_PORT`/`DEFAULT_MAX_PORT` (5000/7000) are kernel constants. `default_port_bounds` (proved canonical and valid by `lemma_defaults_valid`) is the source of `PortConfig::default` and `EffectiveConfig`'s built-in fallback.
+- Not proved:
+  - unconditional associativity;
+  - re-anchoring of an unresolvable `max_offset` by a bare `ConfigMerger` merge (historical);
+  - per-document prediction of the base for documents without a complete `ports` section;
+  - the glue mappings, provenance and attribution, pinned by `trop/tests/port_bounds_layering.rs` and `trop-cli/tests/port_bounds_cli.rs`.
+
 
 ### `verified::allocation` — availability classification and allocation scans
 
@@ -266,11 +291,28 @@ Every result is specified relative to the oracles' answers
 Trusted for these kernels:
 - The oracle closures are total (no panics) on valid ports. The kernels'
   `requires` states only their preconditions.
-- `#[allow(dead_code)]` appears on `check_port_bounds`, which is not yet
-  called, and on `ScanFailure::port`, a witness that only the specs read.
-  Neither is a verification escape. This Verus version cannot prove
+- `#[allow(dead_code)]` appears on `ScanFailure::port`, a witness that only
+  the specs read. It is not a verification escape. This Verus version cannot prove
   existential postconditions over a generic error type, so the scans return
   the failing port as a witness.
+
+#### The preferred-then-scan fallback (`allocate_with_fallback`)
+
+Glue: `trop/src/operations/reserve.rs`. `single_attempt` is the oracle; it
+wraps `PortAllocator::allocate_single`/`_replacing` and is passed as both the
+request and the fallback request.
+
+- `allocate_with_fallback` (`fallen_back`): asks for the preferred port.
+  Only after a given preference is reported unavailable (`fell_back`) does it
+  make the fallback request, with no preference. This call discipline is
+  verified through the oracles' preconditions (`fallback_discipline`), and
+  each oracle is `FnOnce`. `Fallback` cannot represent "preferred
+  unavailable", which removed three `unreachable!()` arms. An oracle that
+  violates its contract is reported as exhaustion, not a panic.
+- `lemma_allocator_keeps_fallback_contract`: the verified `allocate_single`
+  never reports a preferred port unavailable without a preference, and never
+  reports the range exhausted with one. So, with the production allocator,
+  `Exhausted` means the scan found every port of the range blocked.
 
 ### `verified::occupancy` — occupancy-check policy
 
@@ -341,10 +383,10 @@ to messages, and performs the database writes.
 - `decide_group_reconciliation`: no stored rows means allocate fresh. A
   compatible group is refreshed. Only `--force` replaces a group, and only one
   that conflicts. Other errors are never overridden.
-- `group_scan_bounds`: with `reservations.base`, the scan runs from the base to
-  the configured maximum (`max`, else `min + max_offset` without overflow,
-  always computed from the configured `min`). The base must lie in the
-  configured range, and rebasing only narrows the range.
+- The `reservations.base` scan range is `verified::port_bounds::group_scan_span`
+  over the one verified resolution of the configured bounds: it runs from the
+  base to the configured maximum, the base must lie in the configured range,
+  and rebasing only narrows the range.
 - `select_highest_precedence` (last maximum, like `Iterator::max_by_key`),
   `first_present`, and `config_service_offset` (omitted offsets default to 0).
   Together with `lemma_offsets_exclude_missing_fallbacks`, this makes the
@@ -367,6 +409,13 @@ of `trop/src/operations/reserve.rs`, so that path can delegate to it.
 - `replacement_metadata`: a forced shape replacement uses the explicit value,
   or the value every stored row agrees on. Otherwise it reports the first
   disagreeing row. It never invents or mixes metadata.
+
+#### Shared with single reservations
+
+`can_change_field` is now also the single-reservation rule:
+`reserve::decide_existing` applies it to each field. The
+`trop/src/operations/reserve.rs` `can_change_field` helper is a test-only
+delegate.
 
 ### `verified::identifier` — whitespace trimming, the identifier rule, stored tags
 
@@ -519,6 +568,133 @@ Filesystem and environment answers (`exists`, `canonicalize`, `current_dir`,
 `home_dir`) are trusted as observed. The oracle closures are total; their
 preconditions are conditional, so they also restrict which oracle calls the
 kernels may make.
+
+### `verified::reserve` — single-reservation decisions
+
+Glue: `trop/src/operations/reserve.rs` (`MetadataIntent::{kernel_intent,
+kernel_bytes, resolve_existing, resolve_new}`, `ReservePlan::{flags, policy,
+preferred_port, decide_existing, build_plan, plan_existing, allocate_port,
+plan_cleanup_retry}`, `single_attempt`, `reconcile_deferred_key`,
+`execute_reserve_after_cleanup_with_barrier`, `cleanup_status`),
+`trop/src/operations/executor.rs` (`PlanExecutor::{reported_port,
+stored_port}` and the `UpdateLastUsed` arm), and
+`trop-cli/src/commands/reserve.rs` (`--dry-run`). The glue copies flags
+field for field, trims `Set` values with `str::trim`, and passes stored values
+as `as_bytes()`. It maps each decision to the historical error, action, or
+message. It also performs the database, allocator, cleanup, and git effects.
+Keeping `created_at` and excluding the row's own key when reallocating are
+glue, not kernel outputs.
+
+- **Metadata intents.** `resolve` resolves `Preserve` to the fallback (the
+  stored value, or the inferred value of a new reservation), `Set(v)` to `v`,
+  and `Clear` to nothing. `uses_fallback` is true exactly for `Preserve`.
+  Explicit intents resolve the same way for every fallback
+  (`lemma_explicit_intent_ignores_fallback`), so git inference runs only for
+  fields the request leaves unset. Resolution is idempotent.
+- **`decide_existing`** (`existing_decided`): the project is checked first.
+  The result is `StickyProject` exactly when the resolved project differs from
+  the stored one without `--force` or `--allow-project-change`, then
+  `StickyTask` by the same rule; both use `sticky::change_permitted`.
+  Otherwise `--overwrite`/`--force` reallocate. Otherwise the metadata is
+  updated exactly when it changes, and the reservation is only refreshed
+  (`Touch`) when it does not. The clauses determine the decision
+  (`lemma_existing_decision_unique`). Lemmas:
+  - `--force` always reallocates.
+  - Omitted metadata is never rejected and never changes stored values.
+  - Clearing a stored value is a protected change.
+  - Without permission, a stored value never changes.
+  - Adding permissions never turns an accepted request into a rejection.
+  - Idempotence (`lemma_repeat_request_touches`): once a request has been
+    applied, by any writer whose normalization fixes the explicit values (the
+    reservation builder trims), repeating it without `--overwrite`/`--force`
+    is a `Touch`. This holds for creates too.
+  - Agreement with the group path (`lemma_decision_matches_group_row`):
+    `trop reserve` and `reserve-group`'s `plan_group_metadata` reject the same
+    requests, name the same field first, and store the same metadata.
+  Planning (`build_plan`) and deferred execution (`deferred_step`) both call
+  it.
+- **`reserve_policy`**: the path check applies unless `--force` or
+  `--allow-unrelated-path` is given. `--force` implies reallocation and both
+  preferred-port relaxations (`lemma_force_dominates`), and the policy is
+  monotone in the permissive flags (`lemma_policy_monotone`).
+  `CleanupPolicy::retry_possible` (prune or expire) is the one predicate that
+  both plan time (defer or fail) and execution (clean up or fail) use.
+  `choose_preferred`: an explicit `--port` wins over the configured hint.
+- **`allocate_with_cleanup_retry`** (generic over the port type, the cleanup
+  result, the error, and three single-use oracles `allocate`, `cleanup`,
+  `retry`). The call discipline is verified: the precondition
+  `retry_discipline` states only the oracles' own preconditions, which
+  ordinary closures always meet. It says that `cleanup` (prune/expire, which
+  is destructive) may run only when cleanup is possible and `allocate`
+  returned `Exhausted`, and that `retry` may run only after `cleanup`
+  succeeded. Each oracle is `FnOnce`, so each runs at most once. Production
+  passes the same allocation closure as `allocate` and `retry`. Results
+  (`retried`):
+  - `Allocated { cleanup: None }`: the first allocation succeeded.
+  - `Allocated { cleanup: Some(c) }`: the first allocation was exhausted,
+    cleanup was possible and returned `c`, and the retry succeeded.
+  - `Exhausted { cleanup: None }`: the first allocation was exhausted and
+    cleanup was not possible, so it never ran.
+  - `Exhausted { cleanup: Some(c) }`: the retry after the cleanup was
+    exhausted too.
+  - Errors are an oracle's own, unchanged.
+
+  The glue reports `tried_cleanup` and the counts exactly when a cleanup ran,
+  and zero counts otherwise.
+- **`deferred_step`**: a key that vanished after planning is allocated fresh.
+  Its metadata is re-inferred when a reservation existed at planning, and
+  otherwise comes from the placeholder. A key that still exists gets exactly
+  the planning decision (`lemma_deferred_existing_agrees_with_planning`).
+- **`reported_port`** (`reported`): the last port that a deferred allocation
+  produced at execution, otherwise the own port of the first create, update,
+  or refresh in plan order. A refresh carries the port its reservation holds:
+  in live execution it is read right after the refresh, and in a dry run it
+  is read as stored. Read errors propagate. Live runs and dry runs both call
+  it. Lemmas:
+  - Every plan whose first action carries its own port, with no deferred
+    port, reports that port. In particular, every successful reserve plan
+    without a deferred allocation reports one.
+  - A dry run reports the same port as live execution whenever no deferred
+    action produced one and both run in the same snapshot.
+
+Bugs fixed with this kernel:
+- The executor used to swallow errors when it re-read a refreshed
+  reservation's port, so `trop reserve` could exit 0 with empty stdout. A
+  refresh of a vanished reservation now fails with `NotFound`, read errors
+  propagate, and a plan run after a concurrent reallocation reports the
+  current port.
+- An explicit `--project`/`--task` no longer triggers git discovery.
+- `trop reserve --dry-run` now plans on a read-only connection inside a
+  rolled-back transaction. It fails exactly like a live run, prints the plan
+  and the port, and never creates, initializes, or migrates a database. With
+  auto-init disabled, a missing database fails as in a live run. A dry run
+  says when it cannot predict the outcome: a database that is uninitialized
+  or needs migration, or an allocation deferred to automatic cleanup. Opening
+  a WAL database read-only may leave `trop.db-wal`/`trop.db-shm` behind; the
+  contents never change.
+
+Trusted: `str::trim` and its idempotence, pinned by
+`trimmed_intent_values_are_fixed_points`. `str`/byte equality is checked by
+the exhaustive differential test `existing_decision_matches_the_previous_rules`.
+The oracle closures are total. The dry run's read-only connection cannot
+write.
+
+### `verified::inference` — project and task names from repository facts
+
+Glue: `trop/src/operations/inference.rs` (`repository_name`, `branch_name`,
+used by `infer_project` and `infer_task`). Discovery, canonicalization, and
+the HEAD lookup stay in the glue, as do trimming and validating the result.
+
+- `repository_name_prefix`: the parent directory's name when the canonical
+  common directory is `.git`, and otherwise the common directory's own name
+  (a bare repository), with exactly one trailing `.git` removed
+  (`repo.git.git` becomes `repo.git`). The result is `None` exactly when the
+  common directory is `.git` and its parent has no usable name.
+- `branch_name_start`: `Some(11)` exactly for references under
+  `refs/heads/`. The branch is the rest of the reference, slashes kept; other
+  references name no branch.
+- Every returned length or offset sits next to an ASCII byte, so it is a
+  UTF-8 character boundary of the glue's `&str`, which slices with `str::get`.
 
 ## Working on verified code
 

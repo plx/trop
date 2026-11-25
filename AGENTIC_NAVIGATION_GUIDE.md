@@ -56,16 +56,18 @@
     - reservation.rs # Reservation and ReservationKey types
     - verified/ # Verus-verified kernels (specs + proofs); production code delegates to these
       - mod.rs # Kernel list and the rules for code in this tree
-      - allocation.rs # Port availability classification, forward scan, single-port allocation, exhaustion blockers (oracle-generic)
+      - allocation.rs # Port availability classification, forward scan, single-port allocation, preferred-then-scan fallback, exhaustion blockers (oracle-generic)
       - env_name.rs # Portable env-var grammar + shell-inertness, tag derivation, explicit-mapping resolution, collision keys
       - exclusions.rs # Exclusion validation, ExclusionSet (canonical run list), minimal/unique compaction, exclusion-text parsing
       - group.rs # Group request validation, offset-pattern search, fresh plans, stored-group matching/compatibility, reconciliation, scan bounds
       - identifier.rs # Unicode trim spec + verified &str trim, identifier rule (blank > NUL > 255 bytes), canonical form, stored-tag sentinel lemmas
+      - inference.rs # Git inference name steps: repository name (.git parent rule, one .git suffix) and refs/heads/ branch names
       - occupancy.rs # Occupancy policy: effective skip flags, probe matrix (set/order/count), fail-closed probe fold, ascending range scan, owner status
       - path.rs # Path normalization: `.`/`..` stack, Unix byte normalizer + canonical-form recognizer, tilde classifier/join, deepest-existing-prefix search, provenance policy
       - path_relation.rs # Path relationships (Same/Ancestor/Descendant/Unrelated over lexically resolved paths), component prefix and rebasing on canonical paths
       - port.rs # Port validity/arithmetic, PortSpan (range invariant), PortCursor (iteration)
-      - port_bounds.rs # PortConfig bounds: allocator resolution (min + max | max_offset) and strict validator rules
+      - port_bounds.rs # Configured port bounds: validation, resolution, layer overlay (max_offset anchoring), env/CLI checks, defaults, reservations.base rules
+      - reserve.rs # Single-reservation decisions: metadata intents, sticky decision table, reserve policy, cleanup-then-retry call discipline, deferred step, reported port
       - sticky.rs # Sticky project/task rules for group refresh and forced replacement (shared can_change_field)
       - text.rs # ASCII case folding, ASCII/UTF-8 bridging lemmas, char-offset &str slicing
   - tests/ # Integration tests

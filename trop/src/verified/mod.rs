@@ -35,6 +35,10 @@
 //! Run `just verify` to check the proofs (requires `just install-verus`).
 
 pub mod allocation;
+pub mod cleanup;
+pub mod cli;
+pub mod config;
+pub mod config_rewrite;
 pub mod env_name;
 pub mod escape;
 pub mod exclusions;
