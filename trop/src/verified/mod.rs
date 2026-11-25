@@ -36,13 +36,24 @@
 
 pub mod allocation;
 pub mod env_name;
+pub mod escape;
 pub mod exclusions;
+pub mod expiry;
 pub mod group;
 pub mod identifier;
+pub mod inference;
+pub mod migrate;
 pub mod occupancy;
 pub mod path;
 pub mod path_relation;
 pub mod port;
 pub mod port_bounds;
+pub mod release;
+pub mod render;
+pub mod reserve;
+pub mod schema_version;
+pub mod shell;
 pub mod sticky;
+pub mod storage;
 pub mod text;
+pub mod verbosity;
