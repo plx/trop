@@ -1,11 +1,32 @@
 //! Verified kernel: exclusion entries, the canonical excluded-port set, and
 //! compaction.
 //!
-//! Production glue: `crate::port::exclusions` (`ExclusionManager`, list
-//! validation and compaction), `crate::config::validator`
-//! (`excluded_ports` validation), `crate::config::schema`
-//! (`PortExclusion` text parsing), and `crate::cli_support`
-//! (`unreserved_ports`, the ports `scan --autoexclude` may exclude).
+//! Production glue:
+//!
+//! - `crate::port::exclusions`: `ExclusionManager` (the excluded-port set),
+//!   `validate_exclusions`, `compact_exclusions`, `is_compact`, and the
+//!   list edits `add_exclusion_to_list` (`add_exclusion`),
+//!   `add_ports_to_list` (`add_ports`) and `first_reserved_port`.
+//! - `crate::config::validator` (`excluded_ports` validation).
+//! - `crate::config::schema` (`PortExclusion` text parsing:
+//!   `find_range_separator` and `parse_u16`) and
+//!   `crate::config::environment` (`TROP_EXCLUDED_PORTS`, through the same
+//!   parser; `parse_u16` also decides `TROP_PORT_MIN`, `TROP_PORT_MAX` and
+//!   `TROP_PORT_MAX_OFFSET`).
+//! - `crate::cli_support` (`unreserved_ports`, the ports
+//!   `scan --autoexclude` may exclude).
+//!
+//! The CLI reaches these through `trop::port::exclusions` and
+//! `PortExclusion`'s `FromStr`: `trop-cli/src/commands/exclude.rs` (its
+//! argument, `add_exclusion_to_list`, `first_reserved_port`),
+//! `trop-cli/src/commands/compact_exclusions.rs`
+//! (`compact_exclusions`, `is_compact`), and `trop-cli/src/commands/scan.rs`
+//! (`add_ports_to_list`, `compact_exclusions`, `is_compact`).
+//!
+//! The decimal parsers decide the kernel's own syntax (`is_unsigned_text`).
+//! That this is also the syntax of the unsigned `from_str` implementations
+//! is not proved (`vstd` does not specify `from_str`); it is trusted and
+//! pinned by differential tests in the glue.
 
 use vstd::prelude::*;
 
@@ -840,7 +861,129 @@ pub open spec fn first_invalid(es: Seq<ExclusionEntry>, i: int, err: ExclusionEr
     0 <= i < es.len() && entry_error(es[i]) == Some(err) && all_valid(es.take(i))
 }
 
+/// The lowest port of each entry, as sort keys.
+fn low_ports(es: &[ExclusionEntry]) -> (keys: Vec<u64>)
+    ensures
+        keys@.len() == es@.len(),
+        forall|j: int| 0 <= j < es@.len() ==> keys@[j] as int == entry_lo(#[trigger] es@[j]),
+{
+    let mut keys: Vec<u64> = Vec::new();
+    let mut index: usize = 0;
+    while index < es.len()
+        invariant
+            index <= es@.len(),
+            keys@.len() == index,
+            forall|j: int| 0 <= j < index ==> keys@[j] as int == entry_lo(#[trigger] es@[j]),
+        decreases es@.len() - index,
+    {
+        keys.push(u64::from(entry_bounds(es[index]).0));
+        index += 1;
+    }
+    keys
+}
+
+/// Adds the ports `lo..=hi` to the canonical run list `runs`, whose last run
+/// starts no later than `lo`: they extend the last run when they start no
+/// later than one past its end, and form a new last run otherwise.
+fn extend_runs(runs: &mut Vec<ExclusionEntry>, lo: u16, hi: u16)
+    requires
+        canonical(old(runs)@),
+        1 <= lo <= hi,
+        old(runs)@.len() > 0 ==> entry_lo(old(runs)@.last()) <= lo,
+    ensures
+        canonical(final(runs)@),
+        final(runs)@.len() > 0,
+        entry_lo(final(runs)@.last()) <= lo,
+        forall|p: int| #[trigger]
+            covers(final(runs)@, p) <==> (covers(old(runs)@, p) || lo <= p <= hi),
+{
+    let len = runs.len();
+    if len == 0 || u32::from(entry_bounds(runs[len - 1]).1) + 1 < u32::from(lo) {
+        // A gap separates the ports from every run: they form a new run.
+        let run = run_entry(lo, hi);
+        proof {
+            lemma_canonical_join(runs@, run, Seq::empty());
+            assert(runs@.push(run) + Seq::<ExclusionEntry>::empty() =~= runs@.push(run));
+            assert forall|p: int| #[trigger]
+                covers(runs@.push(run), p) <==> (covers(runs@, p) || lo <= p <= hi) by {
+                lemma_covers_push(runs@, run, p);
+            }
+        }
+        runs.push(run);
+    } else {
+        // The ports start at or after the last run's start and no later
+        // than one past its end: the union is one run.
+        let ghost before = runs@;
+        let (last_lo, last_hi) = entry_bounds(runs[len - 1]);
+        let top = if hi > last_hi {
+            hi
+        } else {
+            last_hi
+        };
+        proof {
+            lemma_canonical_valid(before);
+            assert(entry_valid(before[len - 1]));
+        }
+        let run = run_entry(last_lo, top);
+        proof {
+            let init = before.subrange(0, len - 1);
+            lemma_canonical_subrange(before, 0, len - 1);
+            if len > 1 {
+                assert(entry_hi(before[len - 2]) + 1 < entry_lo(before[len - 1]));
+                assert(init.last() == before[len - 2]);
+            }
+            assert(before =~= init.push(before[len - 1]));
+            assert(before.update(len - 1, run) =~= init.push(run));
+            lemma_canonical_join(init, run, Seq::empty());
+            assert(init.push(run) + Seq::<ExclusionEntry>::empty() =~= init.push(run));
+            assert forall|p: int| #[trigger]
+                covers(init.push(run), p) <==> (covers(before, p) || lo <= p <= hi) by {
+                lemma_covers_push(init, run, p);
+                lemma_covers_push(init, before[len - 1], p);
+            }
+        }
+        runs[len - 1] = run;
+    }
+}
+
+/// The entries of `es` at the positions `order` lists, in that order.
+pub open spec fn in_order(es: Seq<ExclusionEntry>, order: Seq<usize>) -> Seq<ExclusionEntry> {
+    Seq::new(order.len(), |b: int| es[order[b] as int])
+}
+
+/// A list in stable sorted order excludes the same ports as the list.
+proof fn lemma_in_order_coverage(es: Seq<ExclusionEntry>, keys: Seq<u64>, order: Seq<usize>)
+    requires
+        keys.len() == es.len(),
+        super::sort::is_stable_order(keys, order),
+    ensures
+        same_coverage(in_order(es, order), es),
+{
+    let s = in_order(es, order);
+    assert forall|p: int| covers(s, p) == covers(es, p) by {
+        if covers(s, p) {
+            let b = choose|b: int| 0 <= b < s.len() && #[trigger] entry_covers(s[b], p);
+            let k = order[b] as int;
+            assert(0 <= k < es.len());
+            assert(entry_covers(es[k], p));
+        }
+        if covers(es, p) {
+            let k = choose|k: int| 0 <= k < es.len() && #[trigger] entry_covers(es[k], p);
+            assert(super::render::occurs(order, k));
+            let b = choose|b: int| 0 <= b < order.len() && order[b] as int == k;
+            assert(s[b] == es[k]);
+            assert(entry_covers(s[b], p));
+        }
+    }
+}
+
 /// Builds the canonical run list of a valid exclusion list.
+///
+/// The entries are validated, put in ascending order of their lowest port
+/// by the verified stable merge sort (`super::sort::stable_order`), and
+/// merged in one pass (`extend_runs`): each entry either extends the last
+/// run or starts a new one. That is `O(n log n)` for `n` entries, instead of
+/// one copy of the run list per entry.
 fn canonical_runs(es: &[ExclusionEntry]) -> (r: Result<
     Vec<ExclusionEntry>,
     (usize, ExclusionError),
@@ -850,32 +993,64 @@ fn canonical_runs(es: &[ExclusionEntry]) -> (r: Result<
         r matches Ok(out) ==> is_compaction(out@, es@),
         r matches Err((i, err)) ==> first_invalid(es@, i as int, err),
 {
+    validate_entries(es)?;
+    let keys = low_ports(es);
+    let order = super::sort::stable_order(keys.as_slice());
     let mut runs: Vec<ExclusionEntry> = Vec::new();
-    let mut i: usize = 0;
-    while i < es.len()
+    let mut pos: usize = 0;
+    proof {
+        assert(order@.take(0) =~= Seq::<usize>::empty());
+        assert(in_order(es@, order@.take(0)) =~= Seq::<ExclusionEntry>::empty());
+    }
+    while pos < order.len()
         invariant
-            i <= es@.len(),
+            all_valid(es@),
+            keys@.len() == es@.len(),
+            forall|j: int| 0 <= j < es@.len() ==> keys@[j] as int == entry_lo(#[trigger] es@[j]),
+            super::sort::is_stable_order(keys@, order@),
+            pos <= order@.len() == es@.len(),
             canonical(runs@),
-            all_valid(es@.take(i as int)),
-            same_coverage(runs@, es@.take(i as int)),
-        decreases es@.len() - i,
+            same_coverage(runs@, in_order(es@, order@.take(pos as int))),
+            (runs@.len() == 0) == (pos == 0),
+            pos > 0 ==> entry_lo(runs@.last()) <= keys@[order@[pos - 1] as int],
+        decreases es@.len() - pos,
     {
-        let e = es[i];
-        if let Err(err) = validate_entry(e) {
-            return Err((i, err));
-        }
-        let (lo, hi) = entry_bounds(e);
-        let next = insert_run(runs.as_slice(), lo, hi);
+        let at = order[pos];
         proof {
-            assert(es@.take(i as int + 1) =~= es@.take(i as int).push(e));
-            assert forall|p: int| covers(next@, p) == covers(es@.take(i as int + 1), p) by {
-                lemma_covers_push(es@.take(i as int), e, p);
+            assert(0 <= order@[pos as int] < es@.len());
+        }
+        let entry = es[at];
+        let (lo, hi) = entry_bounds(entry);
+        let ghost before = runs@;
+        let ghost prefix = in_order(es@, order@.take(pos as int));
+        proof {
+            assert(entry_valid(es@[at as int]));
+            assert(keys@[at as int] as int == entry_lo(entry));
+            if pos > 0 {
+                // Sorted: the previous entry's lowest port is at most this
+                // one's.
+                assert(super::sort::key_before(
+                    keys@,
+                    order@[pos - 1] as int,
+                    order@[pos as int] as int,
+                ));
+            }
+            assert(order@.take(pos + 1) =~= order@.take(pos as int).push(at));
+            assert(in_order(es@, order@.take(pos + 1)) =~= prefix.push(entry));
+        }
+        extend_runs(&mut runs, lo, hi);
+        proof {
+            assert forall|p: int| #[trigger]
+                covers(runs@, p) == covers(prefix.push(entry), p) by {
+                lemma_covers_push(prefix, entry, p);
             }
         }
-        runs = next;
-        i += 1;
+        pos += 1;
     }
-    assert(es@.take(i as int) =~= es@);
+    proof {
+        assert(order@.take(es@.len() as int) =~= order@);
+        lemma_in_order_coverage(es@, keys@, order@);
+    }
     Ok(runs)
 }
 
@@ -973,9 +1148,14 @@ pub struct ExclusionSet {
 }
 
 impl Clone for ExclusionSet {
+    /// A copy with the same run list, and so the same excluded ports.
     // Copies the run list entry by entry (a derived `clone` could not be
     // checked against the type invariant).
-    fn clone(&self) -> Self {
+    fn clone(&self) -> (res: Self)
+        ensures
+            res.spec_runs() == self.spec_runs(),
+            res@ == self@,
+    {
         proof {
             use_type_invariant(self);
         }
@@ -1392,10 +1572,15 @@ pub open spec fn unsigned_digits(s: Seq<u8>) -> Seq<u8> {
     }
 }
 
-/// `s` is the decimal text of the `u16` value `v` in the syntax that
-/// `u16::from_str` accepts: an optional `+`, then one or more ASCII digits
-/// (leading zeros allowed) whose value is at most 65535. No whitespace, no
-/// `-`.
+/// `s` is the decimal text of the `u16` value `v`: an optional `+`, then
+/// one or more ASCII digits (leading zeros allowed) whose value is at most
+/// 65535. No whitespace, no `-`.
+///
+/// This is meant to be the syntax `u16::from_str` accepts. That
+/// correspondence is not proved (`vstd` does not specify `from_str`): it is
+/// trusted, and pinned by differential tests in the glue
+/// (`test_parse_u16_kernel_matches_from_str`,
+/// `prop_decimal_parsers_match_std`).
 pub open spec fn is_u16_text(s: Seq<u8>, v: int) -> bool {
     let d = unsigned_digits(s);
     d.len() > 0 && all_digits(d) && decimal_value(d) == v && v <= 65535
@@ -1450,22 +1635,28 @@ proof fn lemma_decimal_value_monotone(s: Seq<u8>, k: int)
     }
 }
 
-/// `s` is the decimal text of `v` in the syntax that the unsigned integer
-/// `from_str` implementations accept (an optional `+`, then one or more ASCII
+/// `s` is the decimal text of `v` (an optional `+`, then one or more ASCII
 /// digits, leading zeros allowed; no whitespace, no `-`), and `v` is at most
 /// `max`. `is_u16_text(s, v)` is `is_unsigned_text(s, v, 65535)`.
+///
+/// This is meant to be the syntax of the unsigned integer `from_str`
+/// implementations. That correspondence is trusted and pinned by
+/// differential tests, not proved.
 pub open spec fn is_unsigned_text(s: Seq<u8>, v: int, max: int) -> bool {
     let d = unsigned_digits(s);
     d.len() > 0 && all_digits(d) && decimal_value(d) == v && v <= max
 }
 
-/// Parses an unsigned decimal number of at most `max` with exactly the syntax
-/// of the unsigned integer `from_str` implementations (for any byte input),
+/// Parses an unsigned decimal number of at most `max` (for any byte input),
 /// without overflow: the result is the value of the text exactly when the
-/// text is well formed and its value is at most `max`.
+/// text is well formed (`is_unsigned_text`) and its value is at most `max`.
 ///
-/// With `max` equal to `u16::MAX`, `u32::MAX` or `u64::MAX` this is exactly
-/// `u16::from_str`, `u32::from_str` or `u64::from_str`.
+/// With `max` equal to `u16::MAX`, `u32::MAX` or `u64::MAX` this is meant to
+/// agree with `u16::from_str`, `u32::from_str` or `u64::from_str`. Only the
+/// agreement with `is_unsigned_text` is proved; the agreement with `from_str`
+/// is trusted and pinned by differential tests
+/// (`test_parse_u16_kernel_matches_from_str`,
+/// `prop_decimal_parsers_match_std`).
 pub fn parse_unsigned(s: &[u8], max: u64) -> (r: Option<u64>)
     ensures
         r matches Some(v) ==> is_unsigned_text(s@, v as int, max as int),
@@ -1553,8 +1744,10 @@ pub fn parse_unsigned(s: &[u8], max: u64) -> (r: Option<u64>)
     }
 }
 
-/// Parses a `u16` with exactly the syntax and range of `u16::from_str`
-/// (for any byte input).
+/// Parses a `u16`: accepts exactly `is_u16_text` (for any byte input).
+///
+/// That this is `u16::from_str`'s syntax and range is trusted and pinned by
+/// differential tests, not proved.
 pub fn parse_u16(s: &[u8]) -> (r: Option<u16>)
     ensures
         r matches Some(v) ==> is_u16_text(s@, v as int),

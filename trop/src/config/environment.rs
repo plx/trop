@@ -333,12 +333,14 @@ impl EnvironmentConfig {
     /// Supports both individual ports (e.g., "5001") and ranges (e.g., "5000..5010").
     /// Each item uses the same parser as the YAML string form and
     /// `trop exclude` (`PortExclusion`'s `FromStr`), so whitespace around
-    /// each side of `..` is ignored here too.
+    /// each side of `..` is ignored here too. Items are trimmed with the
+    /// same verified whitespace trim (equal to `str::trim`); blank items are
+    /// skipped.
     fn parse_excluded_ports(s: &str) -> Result<Vec<PortExclusion>> {
         let mut exclusions = Vec::new();
 
         for part in s.split(',') {
-            let part = part.trim();
+            let part = crate::identifier::trim_identifier(part);
             if part.is_empty() {
                 continue;
             }
@@ -426,6 +428,34 @@ mod tests {
             }
         );
         assert_eq!(result[2], PortExclusion::Single(5020));
+    }
+
+    /// `TROP_EXCLUDED_PORTS` items are trimmed with the verified whitespace
+    /// trim. Pins that this is exactly the previous `str::trim` behavior:
+    /// with every Unicode scalar value as padding, the items, and which of
+    /// them are blank, are what the `str::trim` reference reads.
+    #[test]
+    fn test_parse_excluded_ports_trim_matches_str_trim() {
+        fn reference(s: &str) -> Option<Vec<PortExclusion>> {
+            s.split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(|part| part.parse().ok())
+                .collect()
+        }
+        for c in (0..=0x0010_FFFF_u32).filter_map(char::from_u32) {
+            for text in [format!("{c}5001{c},{c},5002..{c}5003"), format!("{c}")] {
+                assert_eq!(
+                    EnvironmentConfig::parse_excluded_ports(&text).ok(),
+                    reference(&text),
+                    "{text:?}"
+                );
+            }
+        }
+        assert_eq!(
+            EnvironmentConfig::parse_excluded_ports("\u{3000},\u{2028}5001\u{85}").unwrap(),
+            [PortExclusion::Single(5001)]
+        );
     }
 
     #[test]

@@ -6,7 +6,8 @@
 use crate::config::schema::Config;
 use crate::error::{Error, Result};
 use crate::verified::config::{
-    first_config_level, GroupOverlay, LOCAL_PRECEDENCE, PROJECT_PRECEDENCE, USER_PRECEDENCE,
+    first_config_level, level_file_precedence, level_load_order, GroupOverlay, LevelFile,
+    PROJECT_PRECEDENCE, USER_PRECEDENCE,
 };
 use crate::PathResolver;
 use serde::Deserialize;
@@ -123,6 +124,22 @@ where
     })
 }
 
+/// The file name of a project file of a configuration level.
+const fn level_file_name(file: LevelFile) -> &'static str {
+    match file {
+        LevelFile::Project => "trop.yaml",
+        LevelFile::Local => "trop.local.yaml",
+    }
+}
+
+/// Which project files exist in `dir`: (`trop.yaml`, `trop.local.yaml`).
+fn level_files_present(dir: &Path) -> (bool, bool) {
+    (
+        dir.join(level_file_name(LevelFile::Project)).exists(),
+        dir.join(level_file_name(LevelFile::Local)).exists(),
+    )
+}
+
 /// Loads configuration from various sources.
 ///
 /// # Examples
@@ -199,15 +216,8 @@ impl ConfigLoader {
         match project_file.file_name().and_then(|name| name.to_str()) {
             Some("trop.yaml" | "trop.local.yaml") => {
                 let parent = project_file.parent().unwrap_or_else(|| Path::new(""));
-                for (name, precedence) in [
-                    ("trop.yaml", PROJECT_PRECEDENCE),
-                    ("trop.local.yaml", LOCAL_PRECEDENCE),
-                ] {
-                    let path = parent.join(name);
-                    if path.exists() {
-                        sources.push(Self::load_effective_source(&path, precedence)?);
-                    }
-                }
+                let (has_project, has_local) = level_files_present(parent);
+                sources.extend(Self::load_level(parent, has_project, has_local)?);
             }
             _ => sources.push(Self::load_effective_source(
                 project_file,
@@ -269,35 +279,34 @@ impl ConfigLoader {
         // Level 0 is the start directory and level `k + 1` the parent of
         // level `k`, up to the root (the directories `PathBuf::pop` visits).
         let levels: Vec<&Path> = start.ancestors().collect();
-        let has_files = |level: usize| {
-            let dir = levels[level];
-            (
-                dir.join("trop.yaml").exists(),
-                dir.join("trop.local.yaml").exists(),
-            )
-        };
+        let has_files = |level: usize| level_files_present(levels[level]);
 
         // The verified kernel picks the nearest level holding either file.
-        let mut configs = Vec::new();
-        if let Some((level, has_project, has_local)) = first_config_level(levels.len(), &has_files)
-        {
-            let dir = levels[level];
-            // trop.yaml first: trop.local.yaml has the higher precedence.
-            if has_project {
-                configs.push(Self::load_effective_source(
-                    &dir.join("trop.yaml"),
-                    PROJECT_PRECEDENCE,
-                )?);
+        match first_config_level(levels.len(), &has_files) {
+            Some((level, has_project, has_local)) => {
+                Self::load_level(levels[level], has_project, has_local)
             }
-            if has_local {
-                configs.push(Self::load_effective_source(
-                    &dir.join("trop.local.yaml"),
-                    LOCAL_PRECEDENCE,
-                )?);
-            }
+            None => Ok(Vec::new()),
         }
+    }
 
-        Ok(configs)
+    /// Loads the project files present in `dir`, in the verified kernel's
+    /// load order: `trop.yaml` (project precedence) before `trop.local.yaml`
+    /// (local precedence), each only when reported present.
+    fn load_level(
+        dir: &Path,
+        has_project: bool,
+        has_local: bool,
+    ) -> Result<Vec<EffectiveConfigSource>> {
+        level_load_order(has_project, has_local)
+            .into_iter()
+            .map(|file| {
+                Self::load_effective_source(
+                    &dir.join(level_file_name(file)),
+                    level_file_precedence(file),
+                )
+            })
+            .collect()
     }
 
     /// Load and parse a YAML configuration file.
@@ -430,6 +439,66 @@ mod tests {
         let configs = ConfigLoader::discover_project_configs(&child).unwrap();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].config.project, Some("parent".to_string()));
+    }
+
+    /// A level's files are loaded in the verified kernel's order: exactly the
+    /// files present, `trop.yaml` (precedence 2) before `trop.local.yaml`
+    /// (precedence 3), both by discovery and for a nominated project file.
+    #[test]
+    fn test_level_files_load_in_kernel_order() {
+        for (project, local) in [(false, false), (true, false), (false, true), (true, true)] {
+            let temp_dir = TempDir::new().unwrap();
+            let dir = temp_dir.path();
+            if project {
+                fs::write(dir.join("trop.yaml"), "project: main\n").unwrap();
+            }
+            if local {
+                fs::write(dir.join("trop.local.yaml"), "project: local\n").unwrap();
+            }
+            let mut expected = Vec::new();
+            if project {
+                expected.push((dir.join("trop.yaml"), 2, Some("main".to_string())));
+            }
+            if local {
+                expected.push((dir.join("trop.local.yaml"), 3, Some("local".to_string())));
+            }
+            let summary = |sources: Vec<EffectiveConfigSource>| -> Vec<_> {
+                sources
+                    .into_iter()
+                    .map(|source| (source.path, source.precedence, source.config.project))
+                    .collect()
+            };
+
+            let discovered = ConfigLoader::discover_project_configs_effective(dir).unwrap();
+            let canonical = dir.canonicalize().unwrap();
+            let rebase = |entries: Vec<(PathBuf, u8, Option<String>)>| -> Vec<_> {
+                entries
+                    .into_iter()
+                    .map(|(path, precedence, project)| {
+                        (
+                            canonical.join(path.file_name().unwrap()),
+                            precedence,
+                            project,
+                        )
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                summary(discovered),
+                rebase(expected.clone()),
+                "{project} {local}"
+            );
+
+            for nominated in ["trop.yaml", "trop.local.yaml"] {
+                let file = dir.join(nominated);
+                if !file.exists() {
+                    continue;
+                }
+                let user_data = dir.join("no-user-config");
+                let loaded = ConfigLoader::load_with_project_file(&file, Some(&user_data)).unwrap();
+                assert_eq!(summary(loaded), expected, "{nominated} {project} {local}");
+            }
+        }
     }
 
     #[test]

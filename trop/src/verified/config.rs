@@ -17,8 +17,8 @@
 //! - Layering: the per-leaf overlay of configuration layers (exec), lemmas
 //!   about spec-only models of its fold, of accumulated exclusions and of
 //!   the reservation-group overlay (no exec code is checked against these
-//!   models), file placement rules, and the choice of the project-file level
-//!   over an existence oracle.
+//!   models), file placement rules, the choice of the project-file level
+//!   over an existence oracle, and the load order of that level's files.
 //!
 //! Production glue: `crate::config` (`environment`, `validator`, `merger`,
 //! `effective`, `builder`, `loader`, `schema`) and `crate::database::config`.
@@ -1796,8 +1796,7 @@ pub open spec fn no_config_below<F: Fn(usize) -> (bool, bool)>(has_files: F, k: 
 /// Finds the nearest directory holding a project file: the first of `levels`
 /// directories (from the starting directory up to the root) at which the
 /// oracle reports `trop.yaml` or `trop.local.yaml`, with what it reported.
-/// It loads nothing; the glue loads the level's `trop.yaml`
-/// (`PROJECT_PRECEDENCE`) before its `trop.local.yaml` (`LOCAL_PRECEDENCE`).
+/// It loads nothing; `level_load_order` orders the level's files.
 pub fn first_config_level<F: Fn(usize) -> (bool, bool)>(levels: usize, has_files: &F) -> (r:
     Option<(usize, bool, bool)>)
     requires
@@ -1838,12 +1837,99 @@ pub fn first_config_level<F: Fn(usize) -> (bool, bool)>(levels: usize, has_files
     None
 }
 
-/// A check of the constants: user < project < local. The load order itself
-/// is the glue's (push order, then a stable sort by precedence).
+/// A check of the constants: user < project < local. The order in which a
+/// level's files are loaded is `level_load_order`'s.
 pub proof fn lemma_precedence_order()
     ensures
         USER_PRECEDENCE < PROJECT_PRECEDENCE < LOCAL_PRECEDENCE,
 {
+}
+
+/// A project file of a configuration level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LevelFile {
+    /// The level's `trop.yaml`.
+    Project,
+    /// The level's `trop.local.yaml`.
+    Local,
+}
+
+/// The precedence a level file is loaded at.
+pub open spec fn spec_level_file_precedence(file: LevelFile) -> u8 {
+    match file {
+        LevelFile::Project => PROJECT_PRECEDENCE,
+        LevelFile::Local => LOCAL_PRECEDENCE,
+    }
+}
+
+/// The precedence a level file is loaded at: `trop.yaml` is a project file
+/// and `trop.local.yaml` a private project file
+/// (`lemma_level_file_kinds`).
+pub const fn level_file_precedence(file: LevelFile) -> (p: u8)
+    ensures
+        p == spec_level_file_precedence(file),
+{
+    match file {
+        LevelFile::Project => PROJECT_PRECEDENCE,
+        LevelFile::Local => LOCAL_PRECEDENCE,
+    }
+}
+
+/// A level file's precedence gives it its role: by `kind_for_precedence`'s
+/// specification, `trop.yaml` is read as a project file and
+/// `trop.local.yaml` as a private project file, never as the user file.
+pub proof fn lemma_level_file_kinds()
+    ensures
+        spec_level_file_precedence(LevelFile::Project) != USER_PRECEDENCE,
+        spec_level_file_precedence(LevelFile::Project) != LOCAL_PRECEDENCE,
+        spec_level_file_precedence(LevelFile::Local) == LOCAL_PRECEDENCE,
+{
+}
+
+/// The files of a configuration level to load, in load order: exactly the
+/// files present (`trop.yaml` when `has_project`, `trop.local.yaml` when
+/// `has_local`), each once, in strictly ascending precedence. So the level's
+/// `trop.yaml` is loaded before its `trop.local.yaml`, and the later, higher
+/// precedence file overlays the earlier one.
+pub fn level_load_order(has_project: bool, has_local: bool) -> (order: Vec<LevelFile>)
+    ensures
+        order@.contains(LevelFile::Project) <==> has_project,
+        order@.contains(LevelFile::Local) <==> has_local,
+        order@.len() == (if has_project {
+            1int
+        } else {
+            0int
+        }) + (if has_local {
+            1int
+        } else {
+            0int
+        }),
+        forall|i: int, j: int|
+            0 <= i < j < order@.len() ==> spec_level_file_precedence(#[trigger] order@[i])
+                < spec_level_file_precedence(#[trigger] order@[j]),
+{
+    let mut order: Vec<LevelFile> = Vec::new();
+    if has_project {
+        order.push(LevelFile::Project);
+    }
+    if has_local {
+        order.push(LevelFile::Local);
+    }
+    proof {
+        if has_project {
+            assert(order@[0] == LevelFile::Project);
+        }
+        if has_local {
+            assert(order@[order@.len() - 1] == LevelFile::Local);
+        }
+        if !has_project {
+            assert forall|i: int| 0 <= i < order@.len() implies order@[i] != LevelFile::Project by {}
+        }
+        if !has_local {
+            assert forall|i: int| 0 <= i < order@.len() implies order@[i] != LevelFile::Local by {}
+        }
+    }
+    order
 }
 
 } // verus!

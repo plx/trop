@@ -11,7 +11,6 @@ use crate::verified::config::{
     check_config_group, check_placement, expire_after_days_ok, lock_wait_seconds_ok, GroupIssue,
     PlacementError, ServiceEntry,
 };
-use crate::verified::env_name::EnvNameError;
 use crate::verified::port_bounds::{
     check_port_bounds, group_base_outside_range, PortBoundsViolation,
 };
@@ -364,11 +363,11 @@ impl ConfigValidator {
                 ),
                 GroupIssue::InvalidEnv { error, .. } => (
                     "reservations.services.env",
-                    env_name_message(error).to_owned(),
+                    crate::identifier::environment_variable_name_message(error).to_owned(),
                 ),
                 GroupIssue::NonConvertibleTag { .. } => (
                     "reservations.services.tag",
-                    NON_CONVERTIBLE_TAG_MESSAGE.to_owned(),
+                    crate::identifier::NON_CONVERTIBLE_SERVICE_TAG_MESSAGE.to_owned(),
                 ),
                 GroupIssue::DuplicateEnv { .. } => (
                     "reservations.services.env",
@@ -399,23 +398,6 @@ impl ConfigValidator {
             })
     }
 }
-
-/// The diagnostic for an explicit environment-variable name that breaks the
-/// portable grammar: the messages `EnvironmentVariableName::parse` reports
-/// (pinned by `group_env_messages_match_the_shared_grammar_messages`). They
-/// never echo the input.
-const fn env_name_message(error: EnvNameError) -> &'static str {
-    match error {
-        EnvNameError::Empty => "must not be empty and must match [A-Za-z_][A-Za-z0-9_]*",
-        EnvNameError::TooLong => "must not exceed 255 bytes",
-        EnvNameError::BadFirst => "must start with an ASCII letter or underscore",
-        EnvNameError::BadRest => "must contain only ASCII letters, digits, and underscores",
-    }
-}
-
-/// The diagnostic for an unmapped tag that derives no portable name (the
-/// message `EnvironmentVariableName::resolve` reports).
-const NON_CONVERTIBLE_TAG_MESSAGE: &str = "service tag cannot be converted to a portable environment-variable name; provide an explicit valid env mapping";
 
 #[cfg(test)]
 mod tests {
@@ -1143,34 +1125,64 @@ mod tests {
         }
     }
 
-    #[test]
-    fn group_env_messages_match_the_shared_grammar_messages() {
-        use crate::identifier::EnvironmentVariableName;
-
-        for (name, error) in [
-            ("", EnvNameError::Empty),
-            ("A".repeat(256).as_str(), EnvNameError::TooLong),
-            ("1A", EnvNameError::BadFirst),
-            ("A-B", EnvNameError::BadRest),
-        ] {
-            let Err(Error::Validation { message, .. }) = EnvironmentVariableName::parse(name)
-            else {
-                panic!("{name:?} must be rejected");
-            };
-            assert_eq!(env_name_message(error), message);
-        }
-        let Err(Error::Validation { field, message }) =
-            EnvironmentVariableName::resolve("not portable", None)
-        else {
-            panic!("a tag with a space derives no name");
-        };
-        assert_eq!(field, "reservations.services.tag");
-        assert_eq!(message, NON_CONVERTIBLE_TAG_MESSAGE);
-    }
-
     /// Regression: the reported violation of a group with several violations
     /// used to depend on `HashMap` iteration order (random per map). Services
     /// are now checked in tag order, so every map reports the same error.
+    /// The group checks report the env-name diagnostics from the one message
+    /// table in `crate::identifier`; pins the exact field and text of each.
+    #[test]
+    fn group_env_diagnostics_have_the_shared_field_and_text() {
+        let check = |tag: &str, env: Option<&str>, field: &str, message: &str| {
+            let group = ReservationGroup {
+                base: Some(5000),
+                services: HashMap::from([(
+                    tag.to_string(),
+                    ServiceDefinition {
+                        offset: Some(0),
+                        preferred: None,
+                        env: env.map(str::to_string),
+                    },
+                )]),
+            };
+            let error = ConfigValidator::validate_reservation_group(&group).unwrap_err();
+            assert_eq!(
+                verdict(&Err(error)),
+                Some((field.to_string(), message.to_string())),
+                "{tag:?} {env:?}"
+            );
+        };
+        let long = "A".repeat(256);
+        for (env, message) in [
+            (
+                "",
+                "must not be empty and must match [A-Za-z_][A-Za-z0-9_]*",
+            ),
+            (long.as_str(), "must not exceed 255 bytes"),
+            ("1A", "must start with an ASCII letter or underscore"),
+            (
+                "A-B",
+                "must contain only ASCII letters, digits, and underscores",
+            ),
+        ] {
+            check("web", Some(env), "reservations.services.env", message);
+            // The same text `EnvironmentVariableName::parse` reports.
+            let Err(Error::Validation {
+                message: parsed, ..
+            }) = crate::identifier::EnvironmentVariableName::parse(env)
+            else {
+                panic!("{env:?} must be rejected");
+            };
+            assert_eq!(parsed, message);
+        }
+        check(
+            "not portable",
+            None,
+            "reservations.services.tag",
+            "service tag cannot be converted to a portable environment-variable name; \
+             provide an explicit valid env mapping",
+        );
+    }
+
     #[test]
     fn group_with_several_violations_reports_the_same_error_every_time() {
         for _ in 0..64 {

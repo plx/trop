@@ -392,6 +392,71 @@ fn rewrite_refuses_documents_that_are_not_configurations() {
     }
 }
 
+/// Regression: `excluded_ports_in` and the rewrite's loader-style reader
+/// read a document whose content is an explicit null (`null`, `~`, a tagged
+/// null) as the default configuration, while `ConfigLoader` rejects it. They
+/// now read every document exactly as the loader does: documents with no
+/// content are the default configuration, explicit nulls are errors.
+#[test]
+fn excluded_ports_in_reads_documents_exactly_as_the_loader_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trop.yaml");
+    let documents = [
+        "",
+        "\n",
+        "# only a comment\n",
+        "---\n",
+        "--- # a comment\n",
+        "---\n...\n",
+        "null",
+        "null\n",
+        "~",
+        "~\n",
+        "Null\n",
+        "NULL\n",
+        "--- null\n",
+        "!foo null\n",
+        "--- !foo\n",
+        "!!null ''\n",
+        "''\n",
+        "project: demo\n",
+        "excluded_ports: [1]\n",
+        "excluded_ports: null\n",
+        "--- !foo\nexcluded_ports: [2]\n",
+        "unknown_key: 1\n",
+        "- 1\n",
+    ];
+    for document in documents {
+        std::fs::write(&path, document).unwrap();
+        let loaded = trop::config::ConfigLoader::load_file(&path);
+        let read = excluded_ports_in(document);
+        match (&loaded, &read) {
+            (Ok(config), Ok(excluded)) => {
+                assert_eq!(&config.excluded_ports, excluded, "{document:?}");
+            }
+            (Err(_), Err(_)) => {}
+            _ => panic!("{document:?}: loader {loaded:?}, excluded_ports_in {read:?}"),
+        }
+        // The rewrite reads the original the same way: it refuses exactly
+        // the documents the loader rejects.
+        assert_eq!(
+            rewrite_excluded_ports(document, &[single(8080)]).is_ok(),
+            loaded.is_ok(),
+            "{document:?}"
+        );
+    }
+    for document in ["null", "~", "!foo null\n"] {
+        assert!(excluded_ports_in(document).is_err(), "{document:?}");
+        assert!(
+            rewrite_excluded_ports(document, &[single(8080)]).is_err(),
+            "{document:?}"
+        );
+    }
+    for document in ["", "# only a comment\n", "---\n"] {
+        assert_eq!(excluded_ports_in(document).unwrap(), None, "{document:?}");
+    }
+}
+
 #[test]
 fn excluded_ports_in_validates_the_configuration_shape() {
     assert!(excluded_ports_in("unknown_key: 1\n").is_err());

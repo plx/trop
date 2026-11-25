@@ -42,26 +42,34 @@ impl ExcludeCommand {
         };
         let config_path = context.config_file_for_write(scope)?;
 
-        // 3. Check if any ports are reserved (unless --force)
+        // 3. Add the exclusion to the file's list (merging overlapping
+        //    entries). The verified kernel decides whether this changes the
+        //    list: it does not when an existing entry already excludes every
+        //    port of the new one (an identical entry included).
         let db = context.open_database()?;
-        if !self.force {
-            self.check_reserved(&db, &exclusion)?;
-        }
-
-        // 4. Add the exclusion (merging overlapping entries) and rewrite only
-        //    the `excluded_ports` key of the file.
         let document = read_config_document(&config_path)?;
         let current = current_exclusions(&config_path, &document)?;
         let (updated, changed) = add_exclusion_to_list(&current, &exclusion)
             .map_err(|error| CliError::Config(format!("{}: {error}", config_path.display())))?;
 
-        if changed {
-            write_exclusions(&config_path, &document, &updated)?;
+        // An identical (or covered) exclusion is a no-op, so the reserved-port
+        // guard does not apply to it: nothing is excluded that was not
+        // excluded before.
+        if !changed {
             if !quiet {
-                println!("Added exclusion to {}", config_path.display());
+                println!("Ports already excluded in {}", config_path.display());
             }
-        } else if !quiet {
-            println!("Ports already excluded in {}", config_path.display());
+            return Ok(());
+        }
+
+        // 4. Check if any ports are reserved (unless --force), then rewrite
+        //    only the `excluded_ports` key of the file.
+        if !self.force {
+            self.check_reserved(&db, &exclusion)?;
+        }
+        write_exclusions(&config_path, &document, &updated)?;
+        if !quiet {
+            println!("Added exclusion to {}", config_path.display());
         }
 
         Ok(())
