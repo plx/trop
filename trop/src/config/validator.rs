@@ -8,6 +8,9 @@ use crate::config::{ConfigFileKind, ConfigValueSource};
 use crate::error::{Error, Result};
 use crate::identifier::EnvironmentVariableName;
 use crate::port::Port;
+use crate::verified::port_bounds::{
+    check_port_bounds, group_base_outside_range, PortBoundsViolation,
+};
 use std::collections::HashSet;
 
 /// Validates configuration according to spec rules.
@@ -96,6 +99,7 @@ impl ConfigValidator {
                 });
             }
             Self::validate_reservation_group(reservations)?;
+            Self::validate_group_base_in_range(reservations, config.ports.as_ref())?;
         }
 
         // Validate port configuration
@@ -194,63 +198,43 @@ impl ConfigValidator {
 
     /// Validate port configuration.
     ///
-    /// Ensures min and max are valid ports, max >= min, and that max and
-    /// `max_offset` are not both specified.
+    /// Ensures min and max are valid ports, max >= min, `max_offset` is
+    /// strictly positive and lands on a valid port, and that max and
+    /// `max_offset` are not both specified. The decision (and the precedence
+    /// among errors) is made by the verified port-bounds kernel; this maps
+    /// each violation to its historical field and message.
     fn validate_port_config(config: &PortConfig) -> Result<()> {
-        // Validate min port
-        Port::try_from(config.min).map_err(|_| Error::Validation {
-            field: "ports.min".into(),
-            message: format!("Invalid port number: {}", config.min),
-        })?;
-
-        // Validate max if present
-        if let Some(max) = config.max {
-            Port::try_from(max).map_err(|_| Error::Validation {
-                field: "ports.max".into(),
-                message: format!("Invalid port number: {max}"),
-            })?;
-
-            if max < config.min {
-                return Err(Error::Validation {
-                    field: "ports".into(),
-                    message: "max must be >= min".into(),
-                });
-            }
-        }
-
-        // Validate max_offset if present
-        if let Some(offset) = config.max_offset {
-            if offset == 0 {
-                return Err(Error::Validation {
-                    field: "ports.max_offset".into(),
-                    message: "max_offset must be > 0".into(),
-                });
-            }
-
-            let Some(computed_max) = config.min.checked_add(offset) else {
-                return Err(Error::Validation {
-                    field: "ports.max_offset".into(),
-                    message: format!(
-                        "Offset {} would overflow when added to min port {}",
-                        offset, config.min
+        check_port_bounds(config.min, config.max, config.max_offset)
+            .map(drop)
+            .map_err(|violation| {
+                let (field, message) = match violation {
+                    PortBoundsViolation::InvalidMin => {
+                        ("ports.min", format!("Invalid port number: {}", config.min))
+                    }
+                    PortBoundsViolation::InvalidMax => (
+                        "ports.max",
+                        format!("Invalid port number: {}", config.max.unwrap_or_default()),
                     ),
-                });
-            };
-            Port::try_from(computed_max).map_err(|_| Error::Validation {
-                field: "ports.max_offset".into(),
-                message: format!("Offset would create invalid max port: {computed_max}"),
-            })?;
-        }
-
-        // Can't have both max and max_offset
-        if config.max.is_some() && config.max_offset.is_some() {
-            return Err(Error::Validation {
-                field: "ports".into(),
-                message: "Cannot specify both max and max_offset".into(),
-            });
-        }
-
-        Ok(())
+                    PortBoundsViolation::MaxBelowMin => ("ports", "max must be >= min".into()),
+                    PortBoundsViolation::ZeroOffset => {
+                        ("ports.max_offset", "max_offset must be > 0".into())
+                    }
+                    PortBoundsViolation::OffsetOverflow { offset } => (
+                        "ports.max_offset",
+                        format!(
+                            "Offset {offset} would overflow when added to min port {}",
+                            config.min
+                        ),
+                    ),
+                    PortBoundsViolation::BothMaxAndOffset => {
+                        ("ports", "Cannot specify both max and max_offset".into())
+                    }
+                };
+                Error::Validation {
+                    field: field.into(),
+                    message,
+                }
+            })
     }
 
     /// Validate excluded ports list.
@@ -273,6 +257,33 @@ impl ConfigValidator {
             }
         }
         Ok(())
+    }
+
+    /// Validate that a reservation group's base lies within the range the
+    /// same configuration's `ports` section names.
+    ///
+    /// Decided by the verified port-bounds kernel. A `ports` section that is
+    /// invalid, or that names no upper bound, is left to its own checks (and,
+    /// for a single document, to validation of the effective configuration,
+    /// whose `ports` section always names one).
+    fn validate_group_base_in_range(
+        group: &ReservationGroup,
+        ports: Option<&PortConfig>,
+    ) -> Result<()> {
+        match ports.and_then(|ports| {
+            group_base_outside_range(group.base, ports.min, ports.max, ports.max_offset)
+        }) {
+            Some(outside) => Err(Error::Validation {
+                field: "reservations.base".into(),
+                message: format!(
+                    "Base port {} must be within port range {}..{}",
+                    outside.base,
+                    outside.range.min(),
+                    outside.range.max()
+                ),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Validate reservation group.

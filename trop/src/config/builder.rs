@@ -305,11 +305,9 @@ impl ConfigBuilder {
     fn default_config() -> Config {
         Config {
             project: None,
-            ports: Some(PortConfig {
-                min: 5000,
-                max: Some(7000),
-                max_offset: None,
-            }),
+            // The built-in range, defined once by the verified port-bounds
+            // kernel (which proves it valid).
+            ports: Some(PortConfig::default()),
             excluded_ports: None,
             cleanup: Some(CleanupConfig {
                 expire_after_days: Some(30),
@@ -543,9 +541,11 @@ mod tests {
             .build()
             .unwrap();
 
+        // The document's offset is resolved against its own min into the
+        // absolute max it names; it replaces the default max.
         let ports = config.ports.unwrap();
         assert_eq!(ports.min, 8000);
-        assert_eq!(ports.max, None);
-        assert_eq!(ports.max_offset, Some(25));
+        assert_eq!(ports.max, Some(8025));
+        assert_eq!(ports.max_offset, None);
     }
 }

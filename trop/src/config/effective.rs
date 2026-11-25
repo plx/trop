@@ -13,6 +13,7 @@ use crate::config::schema::{
 };
 use crate::config::validator::ConfigValidator;
 use crate::error::Result;
+use crate::verified::port_bounds::{overlay_port_bounds, PortLayer};
 
 static BUILT_IN_PORTS: PortConfig = PortConfig {
     min: DEFAULT_MIN_PORT,
@@ -554,6 +555,47 @@ impl EffectiveConfig {
             .map(FieldProvenance::winner)
     }
 
+    /// Lay the selected port leaves of `source_config` over the effective
+    /// `ports` section as one layer, and record the leaves it set.
+    ///
+    /// The overlay is decided by the verified port-bounds kernel
+    /// (`overlay_port_bounds`): a selected `max_offset` is resolved against the
+    /// `min` in effect at this layer, and an upper bound this layer does not
+    /// set stays where it is when only `min` changes.
+    fn apply_port_layer(
+        &mut self,
+        source_config: &Config,
+        fields: &BTreeSet<ConfigField>,
+        source: &ConfigValueSource,
+    ) {
+        let Some(source_ports) = &source_config.ports else {
+            return;
+        };
+        let layer = PortLayer {
+            min: fields
+                .contains(&ConfigField::PortsMin)
+                .then_some(source_ports.min),
+            max: source_ports
+                .max
+                .filter(|_| fields.contains(&ConfigField::PortsMax)),
+            max_offset: source_ports
+                .max_offset
+                .filter(|_| fields.contains(&ConfigField::PortsMaxOffset)),
+        };
+        let lower = self.config.ports.clone().unwrap_or_default();
+        let (bounds, leaves) = overlay_port_bounds(lower.bounds(), layer);
+        if leaves.min || leaves.upper {
+            self.config.ports = Some(PortConfig::from_bounds(bounds));
+        }
+        if leaves.min {
+            self.record(ConfigField::PortsMin, source.clone());
+        }
+        if leaves.upper {
+            self.record(ConfigField::PortsMax, source.clone());
+            self.record(ConfigField::PortsMaxOffset, source.clone());
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn apply_precise(
         &mut self,
@@ -561,12 +603,7 @@ impl EffectiveConfig {
         fields: BTreeSet<ConfigField>,
         source: &ConfigValueSource,
     ) {
-        let both_port_bounds = fields.contains(&ConfigField::PortsMax)
-            && fields.contains(&ConfigField::PortsMaxOffset)
-            && source_config
-                .ports
-                .as_ref()
-                .is_some_and(|ports| ports.max.is_some() && ports.max_offset.is_some());
+        self.apply_port_layer(source_config, &fields, source);
 
         for field in fields {
             let mut changed = Vec::new();
@@ -578,7 +615,12 @@ impl EffectiveConfig {
                         changed.push(field);
                     }
                 }
-                ConfigField::Task => {}
+                // Task is not a `Config` field. The selected port leaves form
+                // one layer, applied above by `apply_port_layer`.
+                ConfigField::Task
+                | ConfigField::PortsMin
+                | ConfigField::PortsMax
+                | ConfigField::PortsMaxOffset => {}
                 ConfigField::DisableAutoinit => {
                     if let Some(value) = source_config.disable_autoinit {
                         self.config.disable_autoinit = Some(value);
@@ -631,41 +673,6 @@ impl EffectiveConfig {
                     if let Some(value) = source_config.maximum_lock_wait_seconds {
                         self.config.maximum_lock_wait_seconds = Some(value);
                         changed.push(field);
-                    }
-                }
-                ConfigField::PortsMin => {
-                    if let Some(source_ports) = &source_config.ports {
-                        self.config
-                            .ports
-                            .get_or_insert_with(PortConfig::default)
-                            .min = source_ports.min;
-                        changed.push(field);
-                    }
-                }
-                ConfigField::PortsMax => {
-                    if let Some(value) = source_config.ports.as_ref().and_then(|ports| ports.max) {
-                        let ports = self.config.ports.get_or_insert_with(PortConfig::default);
-                        ports.max = Some(value);
-                        changed.push(ConfigField::PortsMax);
-                        if !both_port_bounds {
-                            ports.max_offset = None;
-                            changed.push(ConfigField::PortsMaxOffset);
-                        }
-                    }
-                }
-                ConfigField::PortsMaxOffset => {
-                    if let Some(value) = source_config
-                        .ports
-                        .as_ref()
-                        .and_then(|ports| ports.max_offset)
-                    {
-                        let ports = self.config.ports.get_or_insert_with(PortConfig::default);
-                        ports.max_offset = Some(value);
-                        changed.push(ConfigField::PortsMaxOffset);
-                        if !both_port_bounds {
-                            ports.max = None;
-                            changed.push(ConfigField::PortsMax);
-                        }
                     }
                 }
                 ConfigField::ExcludedPorts => {

@@ -7,16 +7,18 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, ConfigField, ConfigLoader, ConfigValidator, EffectiveConfig};
+use crate::config::{
+    Config, ConfigField, ConfigLoader, ConfigValidator, EffectiveConfig, PortConfig,
+};
 use crate::database::Database;
 use crate::error::{Error, Result};
+use crate::port::allocator::port_span_from_config;
 use crate::port::group::{
     GroupAllocationRequest, GroupReconciliationPolicy, ServiceAllocationRequest,
 };
 use crate::port::occupancy::OccupancyCheckConfig;
-use crate::verified::group::{
-    config_service_offset, group_scan_bounds, ConfiguredPorts, GroupScanBounds, ScanBoundsError,
-};
+use crate::verified::group::config_service_offset;
+use crate::verified::port_bounds::group_scan_span;
 use crate::{PathResolver, Port};
 use rusqlite::Connection;
 
@@ -381,58 +383,44 @@ impl ReserveGroupPlan {
 
     /// Returns configuration adjusted so `reservations.base` is the group scan start.
     ///
-    /// The bounds are decided by the verified kernel
-    /// `verified::group::group_scan_bounds`: the scan runs from the base to the
-    /// configured maximum, and the base must lie inside the configured range.
+    /// The configured range is resolved exactly as the allocator resolves it
+    /// (`port_range_from_config`), and the verified kernel
+    /// `verified::port_bounds::group_scan_span` narrows it: the scan runs from
+    /// the base to the configured maximum, and the base must lie inside the
+    /// configured range. Without a base the configuration is unchanged.
     fn config_with_group_base_as_scan_start(
         &self,
         group: &crate::config::ReservationGroup,
     ) -> Result<Config> {
-        let configured = self.config.ports.as_ref().map(|ports| ConfiguredPorts {
-            min: ports.min,
-            max: ports.max,
-            max_offset: ports.max_offset,
-        });
-
-        match group_scan_bounds(group.base, configured) {
-            Ok(GroupScanBounds::Unchanged) => Ok(self.config.clone()),
-            Ok(GroupScanBounds::Rebased { min, max }) => {
-                let mut config = self.config.clone();
-                if let Some(ports) = config.ports.as_mut() {
-                    ports.min = min;
-                    ports.max = Some(max);
-                    ports.max_offset = None;
-                }
-                Ok(config)
-            }
-            Err(ScanBoundsError::MissingPorts) => Err(Error::Validation {
+        if group.base.is_none() {
+            return Ok(self.config.clone());
+        }
+        let ports = self
+            .config
+            .ports
+            .as_ref()
+            .ok_or_else(|| Error::Validation {
                 field: "ports".to_string(),
                 message: "Port configuration is required when reservations.base is set".to_string(),
-            }),
-            Err(ScanBoundsError::MaxOffsetOverflow) => {
-                let (min, max_offset) = configured
-                    .map(|ports| (ports.min, ports.max_offset.unwrap_or_default()))
-                    .unwrap_or_default();
-                Err(Error::Validation {
-                    field: "ports.max_offset".to_string(),
-                    message: format!(
-                        "Offset {max_offset} would overflow when added to min port {min}"
-                    ),
-                })
-            }
-            Err(ScanBoundsError::MissingMax) => Err(Error::Validation {
-                field: "ports".to_string(),
-                message: "Either max or max_offset must be specified".to_string(),
-            }),
-            Err(ScanBoundsError::BaseOutOfRange { max }) => {
-                let base = group.base.unwrap_or_default();
-                let min = configured.map(|ports| ports.min).unwrap_or_default();
-                Err(Error::Validation {
-                    field: "reservations.base".to_string(),
-                    message: format!("Base port {base} must be within port range {min}..{max}"),
-                })
-            }
-        }
+            })?;
+        let configured = port_span_from_config(ports)?;
+        let scan = group_scan_span(group.base, configured).ok_or_else(|| Error::Validation {
+            field: "reservations.base".to_string(),
+            message: format!(
+                "Base port {} must be within port range {}..{}",
+                group.base.unwrap_or_default(),
+                configured.min(),
+                configured.max()
+            ),
+        })?;
+
+        let mut config = self.config.clone();
+        config.ports = Some(PortConfig {
+            min: scan.min(),
+            max: Some(scan.max()),
+            max_offset: None,
+        });
+        Ok(config)
     }
 }
 
@@ -786,15 +774,30 @@ reservations:
       offset: 0
 ";
         let config_path = create_test_config_file(&temp_dir, config_content);
-        let options = ReserveGroupOptions::new(config_path);
-        let planner = ReserveGroupPlan::new(options).unwrap();
-        let group = planner.config.reservations.as_ref().unwrap();
 
+        // Validation of the document now rejects the base (it used to be
+        // accepted until the plan was built) ...
+        let err = ReserveGroupPlan::new(ReserveGroupOptions::new(config_path))
+            .err()
+            .expect("an out-of-range base is a validation error");
+        assert!(
+            matches!(&err, Error::Validation { field, message }
+                if field == "reservations.base"
+                    && message == "Base port 6500 must be within port range 5000..6000"),
+            "{err:?}"
+        );
+
+        // ... and the scan-start narrowing still refuses it on its own.
+        let planner = planner_with_ports(&temp_dir, "  min: 5000\n  max: 6000");
         let err = planner
-            .config_with_group_base_as_scan_start(group)
+            .config_with_group_base_as_scan_start(&group_with_base(Some(6500)))
             .unwrap_err();
-
-        assert!(matches!(err, Error::Validation { field, .. } if field == "reservations.base"));
+        assert!(
+            matches!(&err, Error::Validation { field, message }
+                if field == "reservations.base"
+                    && message == "Base port 6500 must be within port range 5000..6000"),
+            "{err:?}"
+        );
     }
 
     fn planner_with_ports(dir: &TempDir, ports: &str) -> ReserveGroupPlan {

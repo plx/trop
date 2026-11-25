@@ -9,12 +9,18 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::verified::exclusions::{find_range_separator, parse_u16};
+use crate::verified::port_bounds::{
+    check_override_bounds, default_port_bounds, PortBounds, PortBoundsViolation,
+};
 
 /// Default minimum port for port allocation ranges.
-pub const DEFAULT_MIN_PORT: u16 = 5000;
+///
+/// The built-in range `DEFAULT_MIN_PORT..=DEFAULT_MAX_PORT` is defined once,
+/// in the verified port-bounds kernel, which proves it valid.
+pub const DEFAULT_MIN_PORT: u16 = crate::verified::port_bounds::DEFAULT_MIN_PORT;
 
 /// Default maximum port for port allocation ranges.
-pub const DEFAULT_MAX_PORT: u16 = 7000;
+pub const DEFAULT_MAX_PORT: u16 = crate::verified::port_bounds::DEFAULT_MAX_PORT;
 
 /// Complete configuration structure.
 ///
@@ -92,6 +98,13 @@ pub struct Config {
 /// Specifies the range of ports available for allocation. Either `max` or
 /// `max_offset` can be specified, but not both.
 ///
+/// When configuration sources are layered (see
+/// [`crate::config::ConfigBuilder`]), a `max_offset` is resolved against the
+/// `min` in effect at the layer that sets it and stored as the absolute
+/// `max` it names, so a higher layer that changes only `min` never moves it.
+/// An effective configuration therefore always holds `max` and no
+/// `max_offset`.
+///
 /// # Examples
 ///
 /// ```
@@ -118,11 +131,75 @@ pub struct PortConfig {
 
 impl Default for PortConfig {
     fn default() -> Self {
-        Self {
-            min: DEFAULT_MIN_PORT,
-            max: Some(DEFAULT_MAX_PORT),
-            max_offset: None,
+        Self::from_bounds(default_port_bounds())
+    }
+}
+
+impl PortConfig {
+    /// The section's bounds as the verified port-bounds kernel sees them
+    /// (a field-for-field copy).
+    pub(crate) const fn bounds(&self) -> PortBounds {
+        PortBounds {
+            min: self.min,
+            max: self.max,
+            max_offset: self.max_offset,
         }
+    }
+
+    /// The section holding `bounds` (a field-for-field copy).
+    pub(crate) const fn from_bounds(bounds: PortBounds) -> Self {
+        Self {
+            min: bounds.min,
+            max: bounds.max,
+            max_offset: bounds.max_offset,
+        }
+    }
+
+    /// Check command-line `--min` / `--max` port overrides.
+    ///
+    /// Each given bound must be a valid port (1-65535) and, when both are
+    /// given, `min <= max` — the rules a `ports` section with these bounds
+    /// must satisfy. The decision is made by a verified kernel (see
+    /// `docs/verification.md`). Used by the `trop` CLI; not a stable API.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Validation`] whose message names the offending
+    /// flag.
+    #[doc(hidden)]
+    pub fn check_command_line_bounds(
+        min: Option<u16>,
+        max: Option<u16>,
+    ) -> crate::error::Result<()> {
+        const PORT_ZERO: &str = "Invalid port number: port 0 is reserved and cannot be used";
+        check_override_bounds(min, max).map_err(|violation| {
+            let (field, message) = match violation {
+                PortBoundsViolation::InvalidMin => {
+                    ("ports.min", format!("invalid --min value: {PORT_ZERO}"))
+                }
+                PortBoundsViolation::InvalidMax => {
+                    ("ports.max", format!("invalid --max value: {PORT_ZERO}"))
+                }
+                // `MaxBelowMin` is reported only when both bounds are given.
+                // The kernel never reports the `max_offset` violations for
+                // command-line overrides (they set no offset).
+                PortBoundsViolation::MaxBelowMin
+                | PortBoundsViolation::ZeroOffset
+                | PortBoundsViolation::OffsetOverflow { .. }
+                | PortBoundsViolation::BothMaxAndOffset => (
+                    "ports",
+                    format!(
+                        "Invalid port range: min ({}) must be less than or equal to max ({})",
+                        min.unwrap_or_default(),
+                        max.unwrap_or_default()
+                    ),
+                ),
+            };
+            crate::error::Error::Validation {
+                field: field.into(),
+                message,
+            }
+        })
     }
 }
 
