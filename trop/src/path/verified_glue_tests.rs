@@ -177,6 +177,9 @@ pub(super) fn generated_paths(pieces: &[&str], max_len: usize) -> Vec<String> {
 }
 
 /// Every string of length at most `max_len` over `alphabet`.
+// Its remaining users are Unix-only; the stored-path tests that also used it
+// moved to `database::operations` with the decoder they check.
+#[cfg(unix)]
 fn generated_strings(alphabet: &[char], max_len: usize) -> Vec<String> {
     let mut layer = vec![String::new()];
     let mut out = Vec::new();
@@ -377,36 +380,6 @@ fn canonical_recognizer_accepts_exactly_the_fixed_points_of_normalize() {
         assert_eq!(
             NormalizedPath::new(path.to_path_buf(), PathProvenance::Explicit).is_ok(),
             fixed_point,
-            "{input:?}"
-        );
-    }
-}
-
-/// The Windows-portable stored-path predicate of `database::operations`
-/// (`slash_rooted_path_is_lexically_normal`), as a reference for the
-/// kernel's `backslash_forbidden` mode.
-///
-/// This is a copy: the original is private to `database::operations`, which
-/// this package does not touch. When the storage package makes that function
-/// delegate to `is_canonical_abs_path`, this test should move next to it and
-/// call the real function (or be dropped), so the two cannot drift apart.
-fn slash_rooted_reference(path: &str) -> bool {
-    path == "/"
-        || path.strip_prefix('/').is_some_and(|suffix| {
-            !suffix.is_empty()
-                && !suffix.contains('\\')
-                && suffix
-                    .split('/')
-                    .all(|part| !part.is_empty() && part != "." && part != "..")
-        })
-}
-
-#[test]
-fn backslash_forbidden_recognizer_matches_slash_rooted_predicate() {
-    for input in generated_strings(&['/', '.', 'a', '\\'], 7) {
-        assert_eq!(
-            crate::verified::path::is_canonical_abs_path(input.as_bytes(), true),
-            slash_rooted_reference(&input),
             "{input:?}"
         );
     }

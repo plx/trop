@@ -206,13 +206,22 @@ impl ReservationKey {
         Self::new(resolved_path.into_path_buf(), tag).map_err(crate::error::Error::from)
     }
 
-    /// Converts the path to a string for database operations.
+    /// The key's stored form: the `path` and `tag` columns of its row.
     ///
-    /// This helper provides a consistent way to convert paths to strings
-    /// for storage in the database. It uses `to_string_lossy()` to handle
-    /// paths that may contain invalid UTF-8.
-    pub(crate) fn path_as_string(&self) -> String {
-        self.path.to_string_lossy().to_string()
+    /// The verified storage kernel decides (`encode_storage_key`): the path
+    /// must be valid UTF-8 and in canonical absolute form, and the tag absent
+    /// or exact trimmed non-empty text, which is exactly what the database
+    /// accepts when it reads a row back. The stored path is the path's own
+    /// text, so distinct keys never share a stored key (no lossy UTF-8
+    /// conversion), and no tag aliases the untagged sentinel `""`.
+    pub(crate) fn storage_key(
+        &self,
+    ) -> Result<crate::verified::storage::StoredKey<'_>, crate::verified::storage::KeyError> {
+        crate::verified::storage::encode_storage_key(
+            self.path.to_str(),
+            crate::path::storage_platform(&self.path),
+            self.tag.as_deref(),
+        )
     }
 }
 
@@ -310,6 +319,10 @@ impl Reservation {
     }
 
     /// Returns whether this reservation is sticky.
+    ///
+    /// The flag is not persisted: the database schema has no column for it,
+    /// so a reservation read back from the database always reports `false`,
+    /// whatever was set when it was built.
     #[must_use]
     pub const fn sticky(&self) -> bool {
         self.sticky
@@ -371,9 +384,17 @@ impl Reservation {
     /// ```
     #[must_use]
     pub fn is_expired(&self, max_age: Duration) -> bool {
+        // A last use in the future has no age and is never expired.
         SystemTime::now()
             .duration_since(self.last_used_at)
-            .is_ok_and(|age| age > max_age)
+            .is_ok_and(|age| {
+                crate::verified::expiry::duration_exceeds(
+                    age.as_secs(),
+                    age.subsec_nanos(),
+                    max_age.as_secs(),
+                    max_age.subsec_nanos(),
+                )
+            })
     }
 }
 
@@ -443,6 +464,9 @@ impl ReservationBuilder {
     }
 
     /// Sets whether the reservation is sticky.
+    ///
+    /// The flag lives only in memory: it is not persisted, so the database
+    /// stores and reads back the reservation with `sticky() == false`.
     #[must_use]
     pub const fn sticky(mut self, sticky: bool) -> Self {
         self.sticky = sticky;

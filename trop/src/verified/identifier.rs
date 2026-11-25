@@ -10,12 +10,11 @@
 //!   most 255 UTF-8 bytes, with errors reported in exactly that precedence.
 //! - `is_canonical` characterizes stored identifiers (non-empty and already
 //!   trimmed); `is_canonical_identifier` decides it.
-//! - The stored-tag sentinel section is SPECIFICATION ONLY: it proves that
-//!   the schema-v2 encoding of an optional tag (`None` as the empty string)
-//!   is injective and round-trips on valid tags, but no executable kernel
-//!   function encodes or decodes stored tags yet. The database code does that
-//!   itself, so these lemmas are not yet a property of the shipped storage
-//!   layer.
+//! - The stored-tag sentinel section specifies the schema-v2 encoding of an
+//!   optional tag (`None` as the empty string) and proves it injective and
+//!   round-tripping on valid tags. The executable encoder and decoder live in
+//!   `super::storage` (`encode_storage_key`, `decode_stored_tag`), whose
+//!   postconditions are stated with these specifications.
 //!
 //! Production glue: `crate::identifier` (`trim_identifier`,
 //! `check_identifier`, `is_canonical_identifier`), used by `ReservationKey`
@@ -489,8 +488,9 @@ pub proof fn lemma_valid_identifier_has_no_nul(s: Seq<char>)
 }
 
 // ---------------------------------------------------------------------------
-// Schema-v2 stored-tag sentinel (specification only: no exec code here
-// encodes or decodes stored tags; the database layer does that unverified)
+// Schema-v2 stored-tag sentinel (specification; the executable encoder and
+// decoder are `super::storage::encode_storage_key` and
+// `super::storage::decode_stored_tag`)
 // ---------------------------------------------------------------------------
 
 /// A domain tag is valid when absent, or canonical when present.

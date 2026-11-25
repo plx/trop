@@ -6,7 +6,12 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{Error, Result};
+use crate::verified::schema_version::{
+    classify_for_validation, parse_i32_decimal, ColumnFacts, Corruption, ValidateDisposition,
+};
+use crate::verified::storage::SqlType;
 
+use super::migrations::observe_metadata;
 use super::operations::row_to_reservation;
 use super::schema::{CREATE_METADATA_TABLE, CREATE_RESERVATIONS_TABLE, CURRENT_SCHEMA_VERSION};
 
@@ -53,6 +58,17 @@ impl ColumnSpec {
             primary_key_position,
         }
     }
+
+    /// The expected column as the verified layout check sees it.
+    const fn facts(&self) -> ColumnFacts<'static> {
+        ColumnFacts {
+            name: self.name,
+            declared_type: self.declared_type,
+            not_null: self.not_null,
+            primary_key_position: self.primary_key_position,
+            hidden: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +78,19 @@ struct ActualColumn {
     not_null: bool,
     primary_key_position: i64,
     hidden: i64,
+}
+
+impl ActualColumn {
+    /// The column as the verified layout check sees it.
+    fn facts(&self) -> ColumnFacts<'_> {
+        ColumnFacts {
+            name: &self.name,
+            declared_type: &self.declared_type,
+            not_null: self.not_null,
+            primary_key_position: self.primary_key_position,
+            hidden: self.hidden,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,60 +172,57 @@ fn validate_current_database_inner(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Checks the stored schema version (verified kernel
+/// `classify_for_validation`, which agrees with opening: a database opens as
+/// current exactly when it validates).
 fn validate_schema_version(conn: &Connection) -> Result<()> {
-    let mut statement = conn.prepare(
-        "SELECT value FROM metadata
-         WHERE key = 'schema_version'",
-    )?;
-    let mut rows = statement.query([])?;
-    let Some(row) = rows.next()? else {
-        return Err(Error::corrupt_stored_value(
-            "metadata",
-            "value",
-            "key=\"schema_version\"",
-            "exactly one schema_version row is required",
-        ));
-    };
-    let value = text_value(
-        row.get_ref(0)?,
-        "metadata",
-        "value",
-        "key=\"schema_version\"",
-    )?;
-    let version = value.parse::<i32>().map_err(|_| {
-        Error::corrupt_stored_value(
-            "metadata",
-            "value",
-            "key=\"schema_version\"",
-            "schema_version must be a base-10 signed integer",
-        )
-    })?;
-    if rows.next()?.is_some() {
-        return Err(Error::corrupt_stored_value(
-            "metadata",
-            "value",
-            "key=\"schema_version\"",
-            "exactly one schema_version row is required",
-        ));
-    }
-
-    if version > CURRENT_SCHEMA_VERSION {
-        return Err(Error::UnsupportedSchemaVersion {
+    let observed = observe_metadata(conn)?;
+    match classify_for_validation(observed.state()) {
+        ValidateDisposition::Valid => Ok(()),
+        ValidateDisposition::Future(version) => Err(Error::UnsupportedSchemaVersion {
             expected: u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or_default(),
             found: u32::try_from(version).unwrap_or(u32::MAX),
-        });
-    }
-    if version < CURRENT_SCHEMA_VERSION {
-        return Err(Error::MigrationRequired {
+        }),
+        ValidateDisposition::MigrationRequired(version) => Err(Error::MigrationRequired {
             found: version,
             target: CURRENT_SCHEMA_VERSION,
             action: "validation is read-only; reopen the database writable to apply the ordered \
                      migration, or validate a writable migrated copy"
                 .into(),
-        });
+        }),
+        ValidateDisposition::Corrupt(corruption) => {
+            let kind;
+            let reason = match corruption {
+                Corruption::MissingMetadataTable => "the metadata table is missing",
+                Corruption::MissingVersionRow | Corruption::MultipleVersionRows => {
+                    "exactly one schema_version row is required"
+                }
+                Corruption::NotText(sql_type) => {
+                    kind = format!("expected TEXT, found {}", sql_type_name(sql_type));
+                    &kind
+                }
+                Corruption::NotUtf8 => "stored TEXT is not valid UTF-8",
+                Corruption::NotAnInteger => "schema_version must be a base-10 signed integer",
+            };
+            Err(Error::corrupt_stored_value(
+                "metadata",
+                "value",
+                "key=\"schema_version\"",
+                reason,
+            ))
+        }
     }
+}
 
-    Ok(())
+/// The name `typeof` reports for a storage class, in upper case.
+const fn sql_type_name(sql_type: SqlType) -> &'static str {
+    match sql_type {
+        SqlType::Null => "NULL",
+        SqlType::Integer => "INTEGER",
+        SqlType::Real => "REAL",
+        SqlType::Text => "TEXT",
+        SqlType::Blob => "BLOB",
+    }
 }
 
 fn validate_metadata_rows(conn: &Connection) -> Result<()> {
@@ -224,7 +250,7 @@ fn validate_metadata_rows(conn: &Connection) -> Result<()> {
         ));
     }
 
-    if schema_versions[0].parse::<i32>().is_err() {
+    if parse_i32_decimal(schema_versions[0].as_bytes()).is_none() {
         return Err(Error::corrupt_stored_value(
             "metadata",
             "value",
@@ -487,24 +513,22 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<ActualColumn>> {
     Ok(columns)
 }
 
+/// The column layout check (verified kernel `columns_match`): equal lengths,
+/// and position by position the same name, the same declared type ignoring
+/// ASCII case, the same `NOT NULL`, no hidden column, and (with `check_pk`)
+/// the same primary-key position.
+fn layout_matches(actual: &[ActualColumn], expected: &[ColumnSpec], check_pk: bool) -> bool {
+    let actual = actual.iter().map(ActualColumn::facts).collect::<Vec<_>>();
+    let expected = expected.iter().map(ColumnSpec::facts).collect::<Vec<_>>();
+    crate::verified::schema_version::columns_match(&actual, &expected, check_pk, true)
+}
+
 fn column_shapes_match(actual: &[ActualColumn], expected: &[ColumnSpec]) -> bool {
-    actual.len() == expected.len()
-        && actual.iter().zip(expected).all(|(actual, expected)| {
-            actual.name == expected.name
-                && actual
-                    .declared_type
-                    .eq_ignore_ascii_case(expected.declared_type)
-                && actual.not_null == expected.not_null
-                && actual.hidden == 0
-        })
+    layout_matches(actual, expected, false)
 }
 
 fn columns_match(actual: &[ActualColumn], expected: &[ColumnSpec]) -> bool {
-    column_shapes_match(actual, expected)
-        && actual
-            .iter()
-            .zip(expected)
-            .all(|(actual, expected)| actual.primary_key_position == expected.primary_key_position)
+    layout_matches(actual, expected, true)
 }
 
 fn table_is_strict(conn: &Connection, table: &str) -> Result<bool> {
@@ -546,8 +570,10 @@ fn metadata_key_context(value: ValueRef<'_>) -> String {
     }
 }
 
+/// `char::escape_default` of every char (verified kernel `escape_default`:
+/// printable ASCII only, no unescaped `"`, injective).
 fn escape_text(value: &str) -> String {
-    value.chars().flat_map(char::escape_default).collect()
+    crate::verified::escape::escape_default(value)
 }
 
 fn value_kind(value: ValueRef<'_>) -> &'static str {

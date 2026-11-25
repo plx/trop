@@ -8,8 +8,8 @@ use crate::error::Result;
 use crate::{Reservation, ReservationKey};
 
 use super::connection::Database;
-use super::operations::systemtime_to_unix_secs;
-use super::schema::{encode_tag, DELETE_RESERVATION, INSERT_RESERVATION};
+use super::operations::{encode_reservation, storable_key};
+use super::schema::{DELETE_RESERVATION, INSERT_RESERVATION};
 
 impl Database {
     /// Creates multiple reservations in a single transaction.
@@ -18,9 +18,14 @@ impl Database {
     /// or none are. This is more efficient than creating reservations
     /// individually when you have multiple reservations to create.
     ///
+    /// Every reservation is checked by the verified storage kernel before
+    /// any SQL runs, exactly as [`Database::create_reservation`] checks one.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - Any reservation cannot be stored (a validation error; nothing is
+    ///   written)
     /// - The transaction cannot be started
     /// - Any insert fails
     /// - The transaction cannot be committed
@@ -55,6 +60,10 @@ impl Database {
     }
 
     fn batch_create_reservations_inner(&mut self, reservations: &[Reservation]) -> Result<()> {
+        let rows = reservations
+            .iter()
+            .map(encode_reservation)
+            .collect::<Result<Vec<_>>>()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -62,23 +71,16 @@ impl Database {
         {
             let mut delete_stmt = tx.prepare(DELETE_RESERVATION)?;
             let mut insert_stmt = tx.prepare(INSERT_RESERVATION)?;
-            for reservation in reservations {
-                delete_stmt.execute(params![
-                    reservation.key().path_as_string(),
-                    encode_tag(reservation.key().tag.as_deref()),
-                ])?;
-
-                let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
-                let last_used_secs = systemtime_to_unix_secs(reservation.last_used_at())?;
-
+            for row in &rows {
+                delete_stmt.execute(params![row.path, row.tag])?;
                 insert_stmt.execute(params![
-                    reservation.key().path_as_string(),
-                    encode_tag(reservation.key().tag.as_deref()),
-                    reservation.port().value(),
-                    reservation.project(),
-                    reservation.task(),
-                    created_secs,
-                    last_used_secs,
+                    row.path,
+                    row.tag,
+                    row.port,
+                    row.project,
+                    row.task,
+                    row.created_at,
+                    row.last_used_at,
                 ])?;
             }
         }
@@ -92,9 +94,13 @@ impl Database {
     /// This operation is atomic - either all reservations are deleted
     /// or none are. Returns the total number of reservations actually deleted.
     ///
+    /// Every key is checked by the verified storage kernel before any SQL
+    /// runs, exactly as [`Database::delete_reservation`] checks one.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - Any key cannot be stored (a validation error; nothing is deleted)
     /// - The transaction cannot be started
     /// - Any delete fails
     /// - The transaction cannot be committed
@@ -124,6 +130,7 @@ impl Database {
     }
 
     fn batch_delete_reservations_inner(&mut self, keys: &[ReservationKey]) -> Result<usize> {
+        let stored = keys.iter().map(storable_key).collect::<Result<Vec<_>>>()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -131,12 +138,8 @@ impl Database {
         let mut total_deleted = 0;
         {
             let mut stmt = tx.prepare(DELETE_RESERVATION)?;
-            for key in keys {
-                let rows_affected = stmt.execute(params![
-                    key.path_as_string(),
-                    encode_tag(key.tag.as_deref())
-                ])?;
-                total_deleted += rows_affected;
+            for key in &stored {
+                total_deleted += stmt.execute(params![key.path, key.tag])?;
             }
         }
 

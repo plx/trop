@@ -2,6 +2,14 @@
 //!
 //! This module implements all create, read, update, and delete operations
 //! for port reservations in the database.
+//!
+//! Every value crosses the storage boundary through the verified storage
+//! kernel (`verified::storage`): writes encode a reservation with
+//! `encode_record` (keys with `encode_storage_key`), and the row decoder
+//! checks paths, tags, ports, identifiers and timestamps with the matching
+//! kernel decoders. The kernel proves that the write predicate and the read
+//! predicate are the same set, so nothing trop writes is later reported as
+//! corruption, and that the stored key is injective.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -13,50 +21,294 @@ use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 use crate::error::{Error, Result};
 use crate::path::PathRelationship;
+use crate::verified::storage::{
+    Cell, KeyError, PathVerdict, RecordError, RecordFields, SecsDecodeError, SecsEncodeError,
+    StoredKey, StoredRow, TagDecode,
+};
 use crate::{Port, PortRange, Reservation, ReservationKey};
 
 use super::connection::Database;
-use super::schema::{encode_tag, DELETE_RESERVATION, INSERT_RESERVATION};
+use super::schema::{DELETE_RESERVATION, INSERT_RESERVATION};
 
-/// Converts a `SystemTime` to Unix epoch seconds for database storage.
-///
-/// # Errors
-///
-/// Returns an error if the time is before the Unix epoch.
-pub(super) fn systemtime_to_unix_secs(time: SystemTime) -> Result<i64> {
-    let seconds = time
+/// Whole seconds since the Unix epoch of `time`.
+fn secs_since_epoch(time: SystemTime) -> Result<u64> {
+    Ok(time
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|error| crate::error::Error::Validation {
+        .map_err(|error| Error::Validation {
             field: "timestamp".into(),
             message: format!("Invalid timestamp: {error}"),
         })?
-        .as_secs();
-    let seconds = i64::try_from(seconds).map_err(|_| crate::error::Error::Validation {
-        field: "timestamp".into(),
-        message: "timestamp exceeds SQLite's signed 64-bit representation".into(),
-    })?;
-    if chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0).is_none() {
-        return Err(crate::error::Error::Validation {
-            field: "timestamp".into(),
-            message: "timestamp is outside the supported display and serialization range".into(),
-        });
-    }
-    Ok(seconds)
+        .as_secs())
 }
 
-/// Converts stored Unix epoch seconds to a representable `SystemTime`.
+/// The validation error for a timestamp the storage kernel refuses.
+fn timestamp_error(error: SecsEncodeError) -> Error {
+    Error::Validation {
+        field: "timestamp".into(),
+        message: match error {
+            SecsEncodeError::ExceedsI64 => {
+                "timestamp exceeds SQLite's signed 64-bit representation".into()
+            }
+            SecsEncodeError::OutsideSupportedRange => {
+                "timestamp is outside the supported display and serialization range".into()
+            }
+        },
+    }
+}
+
+/// Converts a `SystemTime` to Unix epoch seconds for database storage
+/// (verified kernel `encode_unix_secs`).
+///
+/// # Errors
+///
+/// Returns an error if the time is before the Unix epoch, or beyond the
+/// storable range.
+pub(super) fn systemtime_to_unix_secs(time: SystemTime) -> Result<i64> {
+    crate::verified::storage::encode_unix_secs(secs_since_epoch(time)?).map_err(timestamp_error)
+}
+
+/// The validation error for a key the storage kernel refuses to store. It
+/// names the same rule the row decoder enforces when reading rows back.
+pub(super) fn key_error(error: KeyError) -> Error {
+    let (field, message) = match error {
+        KeyError::PathNotUtf8 => (
+            "path",
+            "path is not valid UTF-8, so it has no exact stored text",
+        ),
+        KeyError::Path(PathVerdict::Empty) => ("path", "path must be nonempty"),
+        KeyError::Path(PathVerdict::NotAbsolute) => ("path", "path must be absolute"),
+        KeyError::Path(PathVerdict::NotNormal | PathVerdict::Canonical) => (
+            "path",
+            "path must already be in its absolute lexical-normal form",
+        ),
+        KeyError::TagNotCanonical => ("tag", "tag must be absent or exact trimmed nonempty text"),
+    };
+    Error::Validation {
+        field: field.into(),
+        message: message.into(),
+    }
+}
+
+/// The validation error for a reservation the storage kernel refuses to
+/// store.
+fn record_error(error: RecordError) -> Error {
+    match error {
+        RecordError::Key(error) => key_error(error),
+        RecordError::InvalidPort => Error::Validation {
+            field: "port".into(),
+            message: "port must be an integer in 1..=65535".into(),
+        },
+        RecordError::ProjectNotCanonical => Error::Validation {
+            field: "project".into(),
+            message: "project must be absent or exact trimmed nonempty text".into(),
+        },
+        RecordError::TaskNotCanonical => Error::Validation {
+            field: "task".into(),
+            message: "task must be absent or exact trimmed nonempty text".into(),
+        },
+        RecordError::CreatedAt(error) | RecordError::LastUsedAt(error) => timestamp_error(error),
+    }
+}
+
+/// The row to write for `reservation`: every persisted field checked and
+/// encoded by the verified storage kernel (`encode_record`), before any SQL
+/// runs. The `sticky` flag is not persisted.
+///
+/// # Errors
+///
+/// Returns a validation error for a key, project, task or timestamp that the
+/// database could not read back.
+pub(super) fn encode_reservation(reservation: &Reservation) -> Result<StoredRow<'_>> {
+    let key = reservation.key();
+    let fields = RecordFields {
+        path: key.path.to_str(),
+        platform: crate::path::storage_platform(&key.path),
+        tag: key.tag.as_deref(),
+        port: reservation.port().value(),
+        project: reservation.project(),
+        task: reservation.task(),
+        created_secs: secs_since_epoch(reservation.created_at())?,
+        last_used_secs: secs_since_epoch(reservation.last_used_at())?,
+    };
+    crate::verified::storage::encode_record(&fields).map_err(record_error)
+}
+
+/// The stored form of a key that is about to be written or deleted.
+///
+/// # Errors
+///
+/// Returns a validation error for a key the database could not read back.
+pub(super) fn storable_key(key: &ReservationKey) -> Result<StoredKey<'_>> {
+    key.storage_key().map_err(key_error)
+}
+
+/// Checks an optional project or task identifier before it is written: it
+/// must be absent or canonical, as the row decoder requires.
+fn check_stored_identifier(value: Option<&str>, field: &str) -> Result<()> {
+    match value {
+        Some(value) if !crate::identifier::is_canonical_identifier(value) => {
+            Err(Error::Validation {
+                field: field.into(),
+                message: format!("{field} must be absent or exact trimmed nonempty text"),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A stored SQLite value as the verified kernels see it: valid UTF-8 text,
+/// or the storage class otherwise.
+pub(super) fn cell_of(value: ValueRef<'_>) -> Cell<'_> {
+    match value {
+        ValueRef::Null => Cell::Null,
+        ValueRef::Integer(value) => Cell::Integer(value),
+        ValueRef::Real(_) => Cell::Real,
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes).map_or(Cell::InvalidText, Cell::Text),
+        ValueRef::Blob(_) => Cell::Blob,
+    }
+}
+
+/// An owned copy of a stored value, for when the row it came from cannot
+/// stay borrowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OwnedCell {
+    Null,
+    Integer(i64),
+    Real,
+    Text(String),
+    InvalidText,
+    Blob,
+}
+
+impl OwnedCell {
+    /// Copies a stored value.
+    pub(super) fn copy_of(value: ValueRef<'_>) -> Self {
+        match cell_of(value) {
+            Cell::Null => Self::Null,
+            Cell::Integer(value) => Self::Integer(value),
+            Cell::Real => Self::Real,
+            Cell::Text(text) => Self::Text(text.to_owned()),
+            Cell::InvalidText => Self::InvalidText,
+            Cell::Blob => Self::Blob,
+        }
+    }
+
+    /// The value as the verified kernels see it.
+    pub(super) fn cell(&self) -> Cell<'_> {
+        match self {
+            Self::Null => Cell::Null,
+            Self::Integer(value) => Cell::Integer(*value),
+            Self::Real => Cell::Real,
+            Self::Text(text) => Cell::Text(text),
+            Self::InvalidText => Cell::InvalidText,
+            Self::Blob => Cell::Blob,
+        }
+    }
+}
+
+/// The stored text of a path that is looked up exactly, or `None` when no
+/// stored row can have that path: it is not valid UTF-8 or not storable
+/// (every row the decoder accepts has a storable path).
+fn stored_path_text(path: &Path) -> Option<&str> {
+    let text = path.to_str()?;
+    let verdict = crate::verified::storage::classify_stored_path(
+        text.as_bytes(),
+        crate::path::storage_platform(path),
+    );
+    matches!(verdict, PathVerdict::Canonical).then_some(text)
+}
+
+/// Writes `row`, replacing the row stored under the same key (and only that
+/// row: the stored key is injective, and a port held by another key makes
+/// the plain `INSERT` fail).
+fn replace_row(conn: &Connection, row: &StoredRow<'_>) -> Result<()> {
+    conn.execute(DELETE_RESERVATION, params![row.path, row.tag])?;
+    conn.execute(
+        INSERT_RESERVATION,
+        params![
+            row.path,
+            row.tag,
+            row.port,
+            row.project,
+            row.task,
+            row.created_at,
+            row.last_used_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// The reservations whose stored path starts with `prefix`, component-wise.
+///
+/// The verified kernel `prefix_query` turns the prefix into its canonical
+/// key: on stored (canonical) paths, "has the key as a component prefix"
+/// (`canonical_is_component_prefix`, the post-filter) is exactly
+/// `Path::starts_with(prefix)`, and every such path starts with the key's
+/// bytes, so the SQL prefilter `path LIKE key || '%'` (a superset of the
+/// byte-prefix matches: `%` and `_` in the key only widen it, and ASCII
+/// letters match without case) never drops a match.
+#[cfg(unix)]
+fn reservations_under(conn: &Connection, prefix: &Path) -> Result<Vec<Reservation>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    use crate::verified::storage::PrefixQuery;
+
+    let key = match crate::verified::storage::prefix_query(prefix.as_os_str().as_bytes()) {
+        PrefixQuery::Nothing => return Ok(Vec::new()),
+        PrefixQuery::Everything => None,
+        // A component prefix of a UTF-8 path ends before a `/` or at the
+        // end, so it is UTF-8 itself: a key that is not matches nothing.
+        PrefixQuery::Under(key) => match String::from_utf8(key) {
+            Ok(key) => Some(key),
+            Err(_) => return Ok(Vec::new()),
+        },
+    };
+    let mut stmt = conn.prepare(SELECT_BY_PATH_PREFIX)?;
+    let mut rows = stmt.query([key.as_deref().unwrap_or("")])?;
+    let mut reservations = Vec::new();
+    while let Some(row) = rows.next()? {
+        let reservation = row_to_reservation(row)?;
+        let stored = reservation.key().path.as_os_str().as_bytes();
+        let selected = key.as_ref().map_or(true, |key| {
+            crate::verified::path_relation::canonical_is_component_prefix(key.as_bytes(), stored)
+        });
+        if selected {
+            reservations.push(reservation);
+        }
+    }
+    Ok(reservations)
+}
+
+/// The reservations whose stored path starts with `prefix`, component-wise.
+///
+/// Outside Unix, stored paths may be native (`C:\...`) or `/`-rooted
+/// spellings written on Unix, so no single text key prefilters both: every
+/// row is read and filtered with [`Path::starts_with`].
+#[cfg(not(unix))]
+fn reservations_under(conn: &Connection, prefix: &Path) -> Result<Vec<Reservation>> {
+    Ok(Database::list_all_reservations(conn)?
+        .into_iter()
+        .filter(|reservation| reservation.key().path.starts_with(prefix))
+        .collect())
+}
+
+/// Converts stored Unix epoch seconds to a representable `SystemTime`
+/// (verified kernel `decode_unix_secs`; the platform's `SystemTime` range is
+/// checked here).
 fn unix_secs_to_systemtime(secs: i64, field: &str, key: &str) -> Result<SystemTime> {
-    let seconds = u64::try_from(secs).map_err(|_| {
-        Error::corrupt_stored_value("reservations", field, key, "timestamp must be nonnegative")
-    })?;
-    if chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).is_none() {
-        return Err(Error::corrupt_stored_value(
+    let seconds = crate::verified::storage::decode_unix_secs(secs).map_err(|error| {
+        Error::corrupt_stored_value(
             "reservations",
             field,
             key,
-            "timestamp is outside the supported display and serialization range",
-        ));
-    }
+            match error {
+                SecsDecodeError::Negative => "timestamp must be nonnegative",
+                SecsDecodeError::OutsideSupportedRange => {
+                    "timestamp is outside the supported display and serialization range"
+                }
+            },
+        )
+    })?;
     SystemTime::UNIX_EPOCH
         .checked_add(Duration::from_secs(seconds))
         .ok_or_else(|| {
@@ -72,32 +324,30 @@ fn unix_secs_to_systemtime(secs: i64, field: &str, key: &str) -> Result<SystemTi
 /// Helper function to deserialize a reservation from a database row.
 ///
 /// Expects row fields in this order: path, tag, port, project, task, `created_at`, `last_used_at`
+///
+/// Each value is decoded by the verified storage kernel; the checks together
+/// are `verified::storage::row_decodes`, which accepts exactly the rows the
+/// write path produces.
 pub(super) fn row_to_reservation(row: &rusqlite::Row<'_>) -> Result<Reservation> {
     let key_context = reservation_key_context(row);
     let path = required_text(row.get_ref(0)?, "path", &key_context)?;
     let path = validate_stored_path(path, &key_context)?;
     let tag = decode_stored_tag(row.get_ref(1)?, &key_context)?;
-    let key = ReservationKey::new(path, tag).map_err(|error| {
-        Error::corrupt_stored_value("reservations", &error.field, &key_context, &error.message)
-    })?;
+    // Both parts were decoded exactly: the tag is canonical, so no trimming
+    // or other normalization applies.
+    let key = ReservationKey { path, tag };
 
     let port_value = required_integer(row.get_ref(2)?, "port", &key_context)?;
-    let port_value = u16::try_from(port_value).map_err(|_| {
-        Error::corrupt_stored_value(
-            "reservations",
-            "port",
-            &key_context,
-            "port must be an integer in 1..=65535",
-        )
-    })?;
-    let port = Port::try_from(port_value).map_err(|_| {
-        Error::corrupt_stored_value(
-            "reservations",
-            "port",
-            &key_context,
-            "port must be an integer in 1..=65535",
-        )
-    })?;
+    let port = crate::verified::storage::decode_stored_port(port_value)
+        .and_then(|port| Port::try_from(port).ok())
+        .ok_or_else(|| {
+            Error::corrupt_stored_value(
+                "reservations",
+                "port",
+                &key_context,
+                "port must be an integer in 1..=65535",
+            )
+        })?;
 
     let project = optional_identifier(row.get_ref(3)?, "project", &key_context)?;
     let task = optional_identifier(row.get_ref(4)?, "task", &key_context)?;
@@ -117,82 +367,41 @@ pub(super) fn row_to_reservation(row: &rusqlite::Row<'_>) -> Result<Reservation>
         })
 }
 
+/// Checks a stored path with the verified storage kernel
+/// (`classify_stored_path`), the same predicate the write path applies.
 fn validate_stored_path(path: &str, key: &str) -> Result<PathBuf> {
-    if path.is_empty() {
-        return Err(Error::corrupt_stored_value(
-            "reservations",
-            "path",
-            key,
-            "path must be nonempty",
-        ));
-    }
-
-    let path_buf = PathBuf::from(path);
-    if !stored_path_is_absolute(&path_buf, path) {
-        return Err(Error::corrupt_stored_value(
-            "reservations",
-            "path",
-            key,
-            "path must be absolute",
-        ));
-    }
-
-    if !stored_path_is_lexically_normal(&path_buf, path) {
-        return Err(Error::corrupt_stored_value(
-            "reservations",
-            "path",
-            key,
-            "path must already be in its absolute lexical-normal form",
-        ));
-    }
-
-    Ok(path_buf)
+    let verdict = crate::verified::storage::classify_stored_path(
+        path.as_bytes(),
+        crate::path::storage_platform(Path::new(path)),
+    );
+    let reason = match verdict {
+        PathVerdict::Canonical => return Ok(PathBuf::from(path)),
+        PathVerdict::Empty => "path must be nonempty",
+        PathVerdict::NotAbsolute => "path must be absolute",
+        PathVerdict::NotNormal => "path must already be in its absolute lexical-normal form",
+    };
+    Err(Error::corrupt_stored_value(
+        "reservations",
+        "path",
+        key,
+        reason,
+    ))
 }
 
-fn stored_path_is_absolute(path: &Path, stored: &str) -> bool {
-    path.is_absolute() || cfg!(windows) && stored.starts_with('/')
-}
-
-fn stored_path_is_lexically_normal(path: &Path, stored: &str) -> bool {
-    // Schema v2 can contain a slash-rooted path written on Unix and later read
-    // on Windows. Treat that persisted spelling as a portable absolute lexical
-    // form without silently rewriting the stored key.
-    if cfg!(windows) && !path.is_absolute() && stored.starts_with('/') {
-        return slash_rooted_path_is_lexically_normal(stored);
-    }
-
-    crate::path::normalize::resolve_components(path)
-        .ok()
-        .and_then(|normalized| normalized.to_str().map(|value| value == stored))
-        .unwrap_or(false)
-}
-
-fn slash_rooted_path_is_lexically_normal(path: &str) -> bool {
-    path == "/"
-        || path.strip_prefix('/').is_some_and(|suffix| {
-            !suffix.is_empty()
-                && !suffix.contains('\\')
-                && suffix
-                    .split('/')
-                    .all(|part| !part.is_empty() && part != "." && part != "..")
-        })
-}
-
+/// Decodes a stored tag with the verified storage kernel: `""` is untagged,
+/// canonical text is the tag, anything else is corrupt.
 fn decode_stored_tag(value: ValueRef<'_>, key: &str) -> Result<Option<String>> {
     let tag = text_value(value, "tag", key)?;
-    if tag.is_empty() {
-        return Ok(None);
-    }
-    let trimmed = tag.trim();
-    if trimmed.is_empty() || trimmed != tag {
-        return Err(Error::corrupt_stored_value(
+    match crate::verified::storage::decode_stored_tag(tag) {
+        TagDecode::Untagged => Ok(None),
+        TagDecode::Tagged => Ok(Some(tag.to_owned())),
+        TagDecode::Corrupt => Err(Error::corrupt_stored_value(
             "reservations",
             "tag",
             key,
             "tag must be the empty untagged sentinel or exact trimmed nonempty text",
-        ));
+        )),
     }
-    Ok(Some(tag.to_owned()))
 }
 
 fn optional_identifier(value: ValueRef<'_>, field: &str, key: &str) -> Result<Option<String>> {
@@ -200,7 +409,7 @@ fn optional_identifier(value: ValueRef<'_>, field: &str, key: &str) -> Result<Op
         return Ok(None);
     }
     let identifier = text_value(value, field, key)?;
-    if identifier.is_empty() || identifier.trim() != identifier {
+    if !crate::identifier::is_canonical_identifier(identifier) {
         return Err(Error::corrupt_stored_value(
             "reservations",
             field,
@@ -266,8 +475,10 @@ fn describe_key_text(value: ValueRef<'_>) -> String {
     }
 }
 
+/// `char::escape_default` of every char (verified kernel `escape_default`:
+/// printable ASCII only, no unescaped `"`, injective).
 fn escape_text(value: &str) -> String {
-    value.chars().flat_map(char::escape_default).collect()
+    crate::verified::escape::escape_default(value)
 }
 
 fn value_kind(value: ValueRef<'_>) -> &'static str {
@@ -323,6 +534,8 @@ const SELECT_RESERVED_PORTS: &str = r"
     ORDER BY port
 ";
 
+// Only the Unix prefix query binds a text key.
+#[cfg_attr(not(unix), allow(dead_code))]
 const SELECT_BY_PATH_PREFIX: &str = r"
     SELECT path, tag, port, project, task, created_at, last_used_at
     FROM reservations
@@ -397,8 +610,11 @@ impl Database {
     ) -> Result<T> {
         let timeout_millis =
             conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))?;
-        // SQLite clamps negative busy timeouts to zero, so this never truncates.
-        let timeout = Duration::from_millis(u64::try_from(timeout_millis).unwrap_or(0));
+        // SQLite treats negative busy timeouts as zero (verified kernel
+        // `busy_timeout_millis`).
+        let timeout = Duration::from_millis(crate::verified::storage::busy_timeout_millis(
+            timeout_millis,
+        ));
 
         if !conn.is_autocommit() {
             return Self::with_savepoint(conn, savepoint_name, operation).map_err(|error| {
@@ -438,9 +654,17 @@ impl Database {
     /// This operation uses a transaction with IMMEDIATE mode to ensure
     /// atomicity and prevent conflicts.
     ///
+    /// The reservation is checked before any SQL runs: its key, project, task
+    /// and timestamps must be storable exactly as the database reads rows
+    /// back (see [`Error::Validation`]). The `sticky` flag is not persisted.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The reservation cannot be stored: a path that is not valid UTF-8 or
+    ///   not in canonical absolute form, a blank or untrimmed tag, project or
+    ///   task, or a timestamp outside the storable range (a validation error;
+    ///   nothing is written)
     /// - The transaction cannot be started
     /// - The insert fails
     /// - The transaction cannot be committed
@@ -469,34 +693,11 @@ impl Database {
     }
 
     fn create_reservation_inner(&mut self, reservation: &Reservation) -> Result<()> {
+        let row = encode_reservation(reservation)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        tx.execute(
-            DELETE_RESERVATION,
-            params![
-                reservation.key().path_as_string(),
-                encode_tag(reservation.key().tag.as_deref())
-            ],
-        )?;
-
-        let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
-        let last_used_secs = systemtime_to_unix_secs(reservation.last_used_at())?;
-
-        tx.execute(
-            INSERT_RESERVATION,
-            params![
-                reservation.key().path_as_string(),
-                encode_tag(reservation.key().tag.as_deref()),
-                reservation.port().value(),
-                reservation.project(),
-                reservation.task(),
-                created_secs,
-                last_used_secs,
-            ],
-        )?;
-
+        replace_row(&tx, &row)?;
         tx.commit()?;
         Ok(())
     }
@@ -508,7 +709,9 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// Returns an error if the insert fails.
+    /// Returns a validation error, before any SQL runs, if the reservation
+    /// cannot be stored (as for [`Database::create_reservation`]), or an
+    /// error if the insert fails.
     ///
     /// # Examples
     ///
@@ -529,32 +732,9 @@ impl Database {
     /// tx.commit().unwrap();
     /// ```
     pub fn create_reservation_simple(conn: &Connection, reservation: &Reservation) -> Result<()> {
+        let row = encode_reservation(reservation)?;
         Self::with_savepoint(conn, "trop_create_reservation", |conn| {
-            conn.execute(
-                DELETE_RESERVATION,
-                params![
-                    reservation.key().path_as_string(),
-                    encode_tag(reservation.key().tag.as_deref())
-                ],
-            )?;
-
-            let created_secs = systemtime_to_unix_secs(reservation.created_at())?;
-            let last_used_secs = systemtime_to_unix_secs(reservation.last_used_at())?;
-
-            conn.execute(
-                INSERT_RESERVATION,
-                params![
-                    reservation.key().path_as_string(),
-                    encode_tag(reservation.key().tag.as_deref()),
-                    reservation.port().value(),
-                    reservation.project(),
-                    reservation.task(),
-                    created_secs,
-                    last_used_secs,
-                ],
-            )?;
-
-            Ok(())
+            replace_row(conn, &row)
         })
     }
 
@@ -567,7 +747,8 @@ impl Database {
     /// # Returns
     ///
     /// - `Ok(Some(reservation))` if the reservation exists
-    /// - `Ok(None)` if the reservation doesn't exist
+    /// - `Ok(None)` if the reservation doesn't exist, including when the key
+    ///   could not be stored at all (no stored row has such a key)
     /// - `Err(_)` if a database error occurs
     ///
     /// # Examples
@@ -584,11 +765,14 @@ impl Database {
     /// let reservation = Database::get_reservation(db.connection(), &key).unwrap();
     /// ```
     pub fn get_reservation(conn: &Connection, key: &ReservationKey) -> Result<Option<Reservation>> {
+        // Every row the decoder accepts has a storable key, so a key that
+        // cannot be stored has no reservation (and is never looked up by a
+        // lossy or aliasing spelling).
+        let Ok(stored) = key.storage_key() else {
+            return Ok(None);
+        };
         let mut stmt = conn.prepare(SELECT_RESERVATION)?;
-        let mut rows = stmt.query(params![
-            key.path_as_string(),
-            encode_tag(key.tag.as_deref())
-        ])?;
+        let mut rows = stmt.query(params![stored.path, stored.tag])?;
         rows.next()?.map(row_to_reservation).transpose()
     }
 
@@ -596,7 +780,9 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// Returns an error if the transaction or update fails.
+    /// Returns a validation error, before any SQL runs, if the key cannot be
+    /// stored (as for [`Database::create_reservation`]), or an error if the
+    /// transaction or update fails.
     ///
     /// # Returns
     ///
@@ -624,16 +810,14 @@ impl Database {
     }
 
     fn update_last_used_inner(&mut self, key: &ReservationKey) -> Result<bool> {
+        let stored = storable_key(key)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let now = systemtime_to_unix_secs(SystemTime::now())?;
 
-        let rows_affected = tx.execute(
-            UPDATE_LAST_USED,
-            params![now, key.path_as_string(), encode_tag(key.tag.as_deref())],
-        )?;
+        let rows_affected = tx.execute(UPDATE_LAST_USED, params![now, stored.path, stored.tag])?;
 
         tx.commit()?;
         Ok(rows_affected > 0)
@@ -643,7 +827,9 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// Returns an error if the transaction or delete fails.
+    /// Returns a validation error, before any SQL runs, if the key cannot be
+    /// stored (as for [`Database::create_reservation`]), or an error if the
+    /// transaction or delete fails.
     ///
     /// # Returns
     ///
@@ -670,14 +856,12 @@ impl Database {
     }
 
     fn delete_reservation_inner(&mut self, key: &ReservationKey) -> Result<bool> {
+        let stored = storable_key(key)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let rows_affected = tx.execute(
-            DELETE_RESERVATION,
-            params![key.path_as_string(), encode_tag(key.tag.as_deref())],
-        )?;
+        let rows_affected = tx.execute(DELETE_RESERVATION, params![stored.path, stored.tag])?;
 
         tx.commit()?;
         Ok(rows_affected > 0)
@@ -690,13 +874,14 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// Returns an error if the timestamp conversion fails or the database update fails.
+    /// Returns a validation error, before any SQL runs, if the key cannot be
+    /// stored, or an error if the timestamp conversion fails or the database
+    /// update fails.
     pub fn update_last_used_simple(conn: &Connection, key: &ReservationKey) -> Result<bool> {
+        let stored = storable_key(key)?;
         let now = systemtime_to_unix_secs(SystemTime::now())?;
-        let rows_affected = conn.execute(
-            UPDATE_LAST_USED,
-            params![now, key.path_as_string(), encode_tag(key.tag.as_deref())],
-        )?;
+        let rows_affected =
+            conn.execute(UPDATE_LAST_USED, params![now, stored.path, stored.tag])?;
         Ok(rows_affected > 0)
     }
 
@@ -709,16 +894,13 @@ impl Database {
         task: Option<&str>,
         last_used_at: SystemTime,
     ) -> Result<bool> {
+        let stored = storable_key(key)?;
+        check_stored_identifier(project, "project")?;
+        check_stored_identifier(task, "task")?;
         let last_used_at = systemtime_to_unix_secs(last_used_at)?;
         let rows_affected = conn.execute(
             UPDATE_METADATA_AND_LAST_USED,
-            params![
-                project,
-                task,
-                last_used_at,
-                key.path_as_string(),
-                encode_tag(key.tag.as_deref())
-            ],
+            params![project, task, last_used_at, stored.path, stored.tag],
         )?;
         Ok(rows_affected > 0)
     }
@@ -730,12 +912,11 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// Returns an error if the database deletion fails.
+    /// Returns a validation error, before any SQL runs, if the key cannot be
+    /// stored, or an error if the database deletion fails.
     pub fn delete_reservation_simple(conn: &Connection, key: &ReservationKey) -> Result<bool> {
-        let rows_affected = conn.execute(
-            DELETE_RESERVATION,
-            params![key.path_as_string(), encode_tag(key.tag.as_deref())],
-        )?;
+        let stored = storable_key(key)?;
+        let rows_affected = conn.execute(DELETE_RESERVATION, params![stored.path, stored.tag])?;
         Ok(rows_affected > 0)
     }
 
@@ -749,18 +930,17 @@ impl Database {
         conn: &Connection,
         reservation: &Reservation,
     ) -> Result<bool> {
-        let created_at = systemtime_to_unix_secs(reservation.created_at())?;
-        let last_used_at = systemtime_to_unix_secs(reservation.last_used_at())?;
+        let row = encode_reservation(reservation)?;
         let rows_affected = conn.execute(
             DELETE_RESERVATION_IF_UNCHANGED,
             params![
-                reservation.key().path_as_string(),
-                encode_tag(reservation.key().tag.as_deref()),
-                reservation.port().value(),
-                reservation.project(),
-                reservation.task(),
-                created_at,
-                last_used_at,
+                row.path,
+                row.tag,
+                row.port,
+                row.project,
+                row.task,
+                row.created_at,
+                row.last_used_at,
             ],
         )?;
         Ok(rows_affected > 0)
@@ -833,6 +1013,10 @@ impl Database {
     /// Gets all reservations whose paths start with the given prefix.
     ///
     /// This is useful for finding all reservations under a directory tree.
+    /// Matching is component-wise, like [`Path::starts_with`]: `/a/b` selects
+    /// `/a/b` and `/a/b/c` but not `/a/bc`, and redundant separators or `.`
+    /// components in the prefix (`/a/b/`, `/a//b`, `/a/./b`) do not change
+    /// the result.
     ///
     /// # Errors
     ///
@@ -854,17 +1038,7 @@ impl Database {
         conn: &Connection,
         prefix: &Path,
     ) -> Result<Vec<Reservation>> {
-        let mut stmt = conn.prepare(SELECT_BY_PATH_PREFIX)?;
-        let mut rows = stmt.query([prefix.to_string_lossy().to_string()])?;
-        let mut reservations = Vec::new();
-        while let Some(row) = rows.next()? {
-            let reservation = row_to_reservation(row)?;
-            if reservation.key().path.starts_with(prefix) {
-                reservations.push(reservation);
-            }
-        }
-
-        Ok(reservations)
+        reservations_under(conn, prefix)
     }
 
     /// Returns every tagged and untagged reservation at one exact path.
@@ -874,8 +1048,11 @@ impl Database {
         conn: &Connection,
         path: &Path,
     ) -> Result<Vec<Reservation>> {
+        let Some(stored) = stored_path_text(path) else {
+            return Ok(Vec::new());
+        };
         let mut stmt = conn.prepare_cached(SELECT_BY_EXACT_PATH)?;
-        let mut rows = stmt.query([path.to_string_lossy().to_string()])?;
+        let mut rows = stmt.query([stored])?;
         let mut reservations = Vec::new();
         while let Some(row) = rows.next()? {
             reservations.push(row_to_reservation(row)?);
@@ -892,8 +1069,11 @@ impl Database {
         conn: &Connection,
         path: &Path,
     ) -> Result<Vec<Reservation>> {
+        let Some(stored) = stored_path_text(path) else {
+            return Ok(Vec::new());
+        };
         let mut stmt = conn.prepare_cached(SELECT_TAGGED_BY_EXACT_PATH)?;
-        let mut rows = stmt.query([path.to_string_lossy().to_string()])?;
+        let mut rows = stmt.query([stored])?;
         let mut reservations = Vec::new();
         while let Some(row) = rows.next()? {
             reservations.push(row_to_reservation(row)?);
@@ -926,9 +1106,9 @@ impl Database {
         max_age: Duration,
     ) -> Result<Vec<Reservation>> {
         let now_secs = systemtime_to_unix_secs(SystemTime::now())?;
-        #[allow(clippy::cast_possible_wrap)]
-        let max_age_secs = max_age.as_secs() as i64;
-        let cutoff = now_secs.saturating_sub(max_age_secs);
+        // Exact for every stored timestamp, including maximum ages beyond
+        // `i64::MAX` seconds (verified kernel `expiry_cutoff`).
+        let cutoff = crate::verified::expiry::expiry_cutoff(now_secs, max_age.as_secs());
 
         let mut stmt = conn.prepare(SELECT_EXPIRED)?;
         let mut rows = stmt.query([cutoff])?;
@@ -1147,6 +1327,232 @@ mod tests {
     #[cfg(feature = "property-tests")]
     use proptest::prelude::*;
 
+    // -----------------------------------------------------------------------
+    // Glue and trusted-assumption checks for the verified storage kernels
+    // -----------------------------------------------------------------------
+
+    /// Every string over `alphabet` of length at most `max_len`.
+    fn generated_strings(alphabet: &[char], max_len: usize) -> Vec<String> {
+        let mut all = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for &c in alphabet {
+                    let mut s = prefix.clone();
+                    s.push(c);
+                    next.push(s);
+                }
+            }
+            all.extend(next.iter().cloned());
+            frontier = next;
+        }
+        all
+    }
+
+    /// The trusted chrono bound behind `MAX_STORABLE_UNIX_SECS`: the largest
+    /// timestamp chrono can represent (the write path used to ask chrono).
+    #[test]
+    fn max_storable_secs_is_chronos_maximum() {
+        let max = crate::verified::storage::MAX_STORABLE_UNIX_SECS;
+        let max = i64::try_from(max).unwrap();
+        assert!(chrono::DateTime::<chrono::Utc>::from_timestamp(max, 0).is_some());
+        assert!(chrono::DateTime::<chrono::Utc>::from_timestamp(max + 1, 0).is_none());
+        assert_eq!(chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp(), max);
+        // Every non-negative timestamp up to it is representable (chrono's
+        // range is an interval).
+        assert!(chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).is_some());
+    }
+
+    /// The write path's timestamp conversion at its boundaries.
+    #[test]
+    fn timestamp_codec_boundaries() {
+        use crate::verified::storage::{
+            decode_unix_secs, encode_unix_secs, MAX_STORABLE_UNIX_SECS,
+        };
+        let max = i64::try_from(MAX_STORABLE_UNIX_SECS).unwrap();
+        assert_eq!(encode_unix_secs(0), Ok(0));
+        assert_eq!(encode_unix_secs(MAX_STORABLE_UNIX_SECS), Ok(max));
+        assert_eq!(
+            encode_unix_secs(MAX_STORABLE_UNIX_SECS + 1),
+            Err(SecsEncodeError::OutsideSupportedRange)
+        );
+        assert_eq!(
+            encode_unix_secs(i64::MAX as u64),
+            Err(SecsEncodeError::OutsideSupportedRange)
+        );
+        assert_eq!(
+            encode_unix_secs(i64::MAX as u64 + 1),
+            Err(SecsEncodeError::ExceedsI64)
+        );
+        assert_eq!(encode_unix_secs(u64::MAX), Err(SecsEncodeError::ExceedsI64));
+        assert_eq!(decode_unix_secs(0), Ok(0));
+        assert_eq!(decode_unix_secs(max), Ok(MAX_STORABLE_UNIX_SECS));
+        assert_eq!(decode_unix_secs(-1), Err(SecsDecodeError::Negative));
+        assert_eq!(decode_unix_secs(i64::MIN), Err(SecsDecodeError::Negative));
+        assert_eq!(
+            decode_unix_secs(max + 1),
+            Err(SecsDecodeError::OutsideSupportedRange)
+        );
+        assert_eq!(
+            decode_unix_secs(i64::MAX),
+            Err(SecsDecodeError::OutsideSupportedRange)
+        );
+        let past = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+        assert!(matches!(
+            systemtime_to_unix_secs(past),
+            Err(Error::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn stored_port_boundaries() {
+        use crate::verified::storage::decode_stored_port;
+        for (value, expected) in [
+            (i64::MIN, None),
+            (-1, None),
+            (0, None),
+            (1, Some(1)),
+            (65535, Some(65535)),
+            (65536, None),
+            (i64::MAX, None),
+        ] {
+            assert_eq!(decode_stored_port(value), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn busy_timeout_readback_clamps_negative_values() {
+        use crate::verified::storage::busy_timeout_millis;
+        assert_eq!(busy_timeout_millis(i64::MIN), 0);
+        assert_eq!(busy_timeout_millis(-1), 0);
+        assert_eq!(busy_timeout_millis(0), 0);
+        assert_eq!(busy_timeout_millis(5000), 5000);
+        assert_eq!(busy_timeout_millis(i64::MAX), i64::MAX as u64);
+    }
+
+    /// The expiry cutoff against an independent 128-bit reference, at the
+    /// edges of the `i64` and `u64` ranges.
+    #[test]
+    fn expiry_cutoff_matches_wide_arithmetic() {
+        use crate::verified::expiry::expiry_cutoff;
+        let nows = [i64::MIN, -1, 0, 1, 1_700_000_000, i64::MAX];
+        let ages = [
+            0,
+            1,
+            1_700_000_000,
+            i64::MAX as u64,
+            i64::MAX as u64 + 1,
+            u64::MAX,
+        ];
+        for now in nows {
+            for age in ages {
+                let exact = i128::from(now) - i128::from(age);
+                let expected = i64::try_from(exact).unwrap_or(i64::MIN);
+                let cutoff = expiry_cutoff(now, age);
+                assert_eq!(cutoff, expected, "now {now}, age {age}");
+                for t in [i64::MIN, -1, 0, 1, now, i64::MAX] {
+                    let expired = i128::from(now) - i128::from(t) > i128::from(age);
+                    assert_eq!(t < cutoff, expired, "now {now}, age {age}, t {t}");
+                }
+            }
+        }
+    }
+
+    /// The read predicate is unchanged: on Unix the kernel's stored-path
+    /// verdict agrees with the previous decoder (`PathBuf::is_absolute`, then
+    /// a `resolve_components` round trip) on every short string over the
+    /// path-relevant alphabet.
+    #[test]
+    #[cfg(unix)]
+    fn stored_path_verdict_matches_previous_decoder() {
+        for input in generated_strings(&['/', '.', 'a', '\\'], 7) {
+            let path = PathBuf::from(&input);
+            let previous = if input.is_empty() {
+                PathVerdict::Empty
+            } else if !path.is_absolute() {
+                PathVerdict::NotAbsolute
+            } else if crate::path::normalize::resolve_components(&path)
+                .ok()
+                .and_then(|normalized| normalized.to_str().map(|value| value == input))
+                .unwrap_or(false)
+            {
+                PathVerdict::Canonical
+            } else {
+                PathVerdict::NotNormal
+            };
+            assert_eq!(
+                crate::verified::storage::classify_stored_path(
+                    input.as_bytes(),
+                    crate::path::storage_platform(&path)
+                ),
+                previous,
+                "{input:?}"
+            );
+        }
+    }
+
+    /// The Windows-portable stored-path predicate the decoder used before the
+    /// storage kernel (`slash_rooted_path_is_lexically_normal`), kept as a
+    /// reference for the kernel's slash-rooted branch, which Linux CI never
+    /// reaches through the glue.
+    fn previous_slash_rooted_path_is_lexically_normal(path: &str) -> bool {
+        path == "/"
+            || path.strip_prefix('/').is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && !suffix.contains('\\')
+                    && suffix
+                        .split('/')
+                        .all(|part| !part.is_empty() && part != "." && part != "..")
+            })
+    }
+
+    #[test]
+    fn slash_rooted_branch_matches_previous_predicate() {
+        use crate::verified::storage::{classify_stored_path, PathPlatform};
+        for input in generated_strings(&['/', '.', 'a', '\\'], 7) {
+            assert_eq!(
+                crate::verified::path::is_canonical_abs_path(input.as_bytes(), true),
+                previous_slash_rooted_path_is_lexically_normal(&input),
+                "{input:?}"
+            );
+            // A path `std` does not consider absolute is judged by that form.
+            if !input.is_empty() && input.starts_with('/') {
+                let platform = PathPlatform::Native {
+                    absolute: false,
+                    normal: false,
+                };
+                assert_eq!(
+                    classify_stored_path(input.as_bytes(), platform) == PathVerdict::Canonical,
+                    previous_slash_rooted_path_is_lexically_normal(&input),
+                    "{input:?}"
+                );
+            }
+        }
+    }
+
+    /// The trusted link between the escaping kernel and
+    /// `char::escape_default`, for every `char`.
+    #[test]
+    fn escape_kernel_matches_std_for_every_char() {
+        for code in 0..=u32::from(char::MAX) {
+            let Some(c) = char::from_u32(code) else {
+                continue;
+            };
+            let text = c.to_string();
+            let expected: String = c.escape_default().collect();
+            assert_eq!(escape_text(&text), expected, "U+{code:04X}");
+        }
+        let mixed = "pa\"th\\\n\u{1b}[31m\u{0}é\u{10ffff}'";
+        assert_eq!(
+            escape_text(mixed),
+            mixed
+                .chars()
+                .flat_map(char::escape_default)
+                .collect::<String>()
+        );
+    }
+
     fn decode_values(values: &[Value]) -> Result<Reservation> {
         let conn = Connection::open_in_memory().unwrap();
         let mut statement = conn.prepare("SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7").unwrap();
@@ -1336,8 +1742,8 @@ mod tests {
                  SET last_used_at = last_used_at + 1
                  WHERE path = ? AND tag = ?",
                 params![
-                    snapshot.key().path_as_string(),
-                    encode_tag(snapshot.key().tag.as_deref())
+                    snapshot.key().storage_key().unwrap().path,
+                    snapshot.key().storage_key().unwrap().tag
                 ],
             )
             .unwrap();

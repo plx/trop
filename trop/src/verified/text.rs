@@ -464,6 +464,69 @@ pub fn ascii_uppercase(s: &str) -> (upper: String)
     upper
 }
 
+/// `u8::to_ascii_uppercase`. Total.
+fn upper_byte(b: u8) -> (u: u8)
+    ensures
+        u == ascii_upper(b),
+{
+    match b {
+        b'a'..=b'z' => b - 0x20,
+        _ => b,
+    }
+}
+
+/// Byte-wise equality (`<[u8]>::eq`). Total.
+pub fn bytes_equal(a: &[u8], b: &[u8]) -> (equal: bool)
+    ensures
+        equal == (a@ == b@),
+{
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len()
+        invariant
+            a.len() == b.len(),
+            0 <= i <= a.len(),
+            forall|j: int| 0 <= j < i ==> a@[j] == b@[j],
+        decreases a.len() - i,
+    {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    proof {
+        assert(a@ =~= b@);
+    }
+    true
+}
+
+/// `<[u8]>::eq_ignore_ascii_case`: equal lengths, and byte-wise equal after
+/// ASCII uppercasing. Total.
+pub fn bytes_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> (equal: bool)
+    ensures
+        equal == eq_ignore_ascii_case(a@, b@),
+{
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len()
+        invariant
+            a.len() == b.len(),
+            0 <= i <= a.len(),
+            forall|j: int| 0 <= j < i ==> ascii_upper(#[trigger] a@[j]) == ascii_upper(b@[j]),
+        decreases a.len() - i,
+    {
+        if upper_byte(a[i]) != upper_byte(b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// The string whose `char`s have the given bytes as code points. For ASCII
 /// input this is the exact inverse of UTF-8 encoding (see
 /// `lemma_ascii_bytes_round_trip`).
