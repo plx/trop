@@ -8,10 +8,12 @@
 //! connection, the exclusion manager, and the occupancy checker:
 //!
 //! - `reserved: Fn(u16) -> Result<bool, E>` — reserved by a key other than the
-//!   one being replaced. The ownership rule behind that answer (a port held by
-//!   the replaced key never blocks; any other holder always does) is
-//!   `reserved_by_other`, which the glue's oracle calls; the glue only looks
-//!   up the holder and compares its key with the replaced one;
+//!   one being replaced. The glue's oracle classifies the port's holder as a
+//!   [`Holder`] and returns `reserved_by_other` of it, which fixes only that
+//!   an `OtherKey` holder blocks and a `ReplacedKey` holder does not. Which
+//!   stored reservation counts as the replaced key (the same path *and* the
+//!   same tag) is decided by that trusted glue comparison, pinned by the unit
+//!   test `test_reserved_by_other_glue_exempts_only_the_replaced_key`;
 //! - `excluded: Fn(u16) -> bool` — on the exclusion list;
 //! - `occupied: Fn(u16) -> Result<bool, E>` — the occupancy probe.
 //!
@@ -530,12 +532,15 @@ pub open spec fn held_by_other(holder: Holder) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The reservation oracle's answer for a port with this holder
-/// (`held_by_other`): blocked exactly when another key holds it.
+/// (`held_by_other`): blocked exactly when the holder is `OtherKey`.
 ///
 /// Production's reservation oracle (`PortAllocator::is_reserved_by_other`)
 /// looks up the port's holder, compares its key with the replaced key, and
-/// returns this. With `lemma_other_holder_always_blocks`, a port another key
-/// holds is never classified `Available`, whatever the ignore flags say.
+/// returns this. That comparison, which decides whether a holder is
+/// `ReplacedKey` or `OtherKey`, is trusted glue (pinned by a unit test), not
+/// part of this kernel. With `lemma_other_holder_always_blocks`, a port whose
+/// holder the glue classified `OtherKey` is never classified `Available`,
+/// whatever the ignore flags say.
 pub const fn reserved_by_other(holder: Holder) -> (blocks: bool)
     ensures
         blocks == held_by_other(holder),
@@ -859,12 +864,18 @@ pub fn exhaustion_blockers<
 // Lemmas
 // ---------------------------------------------------------------------------
 
-/// "No flag can take a port owned by another reservation key": when the
-/// reservation oracle reports the answer `reserved_by_other` gives for a port
-/// another key holds (and, in a consistent snapshot, only that answer), the
-/// port is classified `Reserved` under every combination of ignore flags
+/// No ignore flag overrides a reservation block: when the reservation oracle
+/// reports the answer `reserved_by_other` gives for an `OtherKey` holder,
+/// that is `true` (and, in a consistent snapshot, only that answer), the port
+/// is classified `Reserved` under every combination of ignore flags
 /// (`--force` included), or `Excluded` when it is outside the scope. It is
 /// never `Available`, and no probe error is reported for it.
+///
+/// The premise unfolds to `answered(reserved, p, true)`, so the lemma is the
+/// `Reserved` arm of `classified` under a consistent snapshot. It does not
+/// tie [`Holder`] to the oracle closure: that the oracle reports `true` for
+/// every port held by a key other than the replaced one is the trusted glue
+/// comparison in `PortAllocator::is_reserved_by_other`.
 pub proof fn lemma_other_holder_always_blocks<
     E,
     R: Fn(u16) -> Result<bool, E>,

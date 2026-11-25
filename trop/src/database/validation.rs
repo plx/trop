@@ -5,12 +5,12 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{Error, Result};
 use crate::verified::schema_version::{
-    classify_for_validation, ColumnFacts, Corruption, MetadataState, ValidateDisposition,
+    classify_for_validation, ColumnFacts, MetadataState, ValidateDisposition,
 };
 use crate::verified::sql_schema::{normalize_schema_sql, token_run_contains, tokenize_schema_sql};
-use crate::verified::storage::{Cell, SqlType};
+use crate::verified::storage::Cell;
 
-use super::migrations::observe_metadata;
+use super::migrations::{observe_metadata, unsupported_version, version_corruption};
 use super::operations::row_to_reservation;
 use super::schema::{CREATE_METADATA_TABLE, CREATE_RESERVATIONS_TABLE, CURRENT_SCHEMA_VERSION};
 
@@ -181,14 +181,13 @@ fn validate_schema_version(conn: &Connection) -> Result<()> {
 
 /// Validation's verdict on observed schema metadata (verified kernel
 /// `classify_for_validation`), as an error for anything but a current,
-/// well-formed version.
+/// well-formed version. A newer or corrupt version is reported through the
+/// one message table opening uses (`migrations::unsupported_version` and
+/// `migrations::version_corruption`).
 fn schema_version_verdict(state: MetadataState<'_>) -> Result<()> {
     match classify_for_validation(state) {
         ValidateDisposition::Valid => Ok(()),
-        ValidateDisposition::Future(version) => Err(Error::UnsupportedSchemaVersion {
-            expected: u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or_default(),
-            found: u32::try_from(version).unwrap_or(u32::MAX),
-        }),
+        ValidateDisposition::Future(version) => Err(unsupported_version(version)),
         ValidateDisposition::MigrationRequired(version) => Err(Error::MigrationRequired {
             found: version,
             target: CURRENT_SCHEMA_VERSION,
@@ -196,38 +195,7 @@ fn schema_version_verdict(state: MetadataState<'_>) -> Result<()> {
                      migration, or validate a writable migrated copy"
                 .into(),
         }),
-        ValidateDisposition::Corrupt(corruption) => {
-            let kind;
-            let reason = match corruption {
-                Corruption::MissingMetadataTable => "the metadata table is missing",
-                Corruption::MissingVersionRow | Corruption::MultipleVersionRows => {
-                    "exactly one schema_version row is required"
-                }
-                Corruption::NotText(sql_type) => {
-                    kind = format!("expected TEXT, found {}", sql_type_name(sql_type));
-                    &kind
-                }
-                Corruption::NotUtf8 => "stored TEXT is not valid UTF-8",
-                Corruption::NotAnInteger => "schema_version must be a base-10 signed integer",
-            };
-            Err(Error::corrupt_stored_value(
-                "metadata",
-                "value",
-                "key=\"schema_version\"",
-                reason,
-            ))
-        }
-    }
-}
-
-/// The name `typeof` reports for a storage class, in upper case.
-const fn sql_type_name(sql_type: SqlType) -> &'static str {
-    match sql_type {
-        SqlType::Null => "NULL",
-        SqlType::Integer => "INTEGER",
-        SqlType::Real => "REAL",
-        SqlType::Text => "TEXT",
-        SqlType::Blob => "BLOB",
+        ValidateDisposition::Corrupt(corruption) => Err(version_corruption(corruption)),
     }
 }
 
@@ -566,13 +534,16 @@ fn text_value<'a>(value: ValueRef<'a>, table: &str, field: &str, key: &str) -> R
     })
 }
 
+/// How a metadata row's key is named in a diagnostic. `corrupt_stored_value`
+/// adds the `key=` label, so this is only the key's text (as the schema
+/// version table in `migrations::version_corruption` names it).
 fn metadata_key_context(value: ValueRef<'_>) -> String {
     match value {
         ValueRef::Text(bytes) => std::str::from_utf8(bytes).map_or_else(
-            |_| "key=<invalid UTF-8>".to_string(),
-            |key| format!("key=\"{}\"", escape_text(key)),
+            |_| "<invalid UTF-8>".to_string(),
+            |key| format!("\"{}\"", escape_text(key)),
         ),
-        other => format!("key=<{}>", value_kind(other)),
+        other => format!("<{}>", value_kind(other)),
     }
 }
 

@@ -727,6 +727,12 @@ proof fn lemma_insert_sorted(kv: Seq<Seq<u8>>, old: Seq<usize>, p: int, i: usize
 }
 
 /// The stable sort of positions by key: the unique sorted order.
+///
+/// An insertion sort (a linear scan for each key's place, then
+/// `Vec::insert`), so `O(n^2)` for `n` keys. Its callers sort the services
+/// of one reservation group (the export, dotenv, human-readable and JSON
+/// formats), which are a handful; `super::sort::stable_order` is the
+/// `O(n log n)` merge sort over `u64` keys.
 pub fn sort_order(keys: &[&[u8]]) -> (order: Vec<usize>)
     ensures
         is_sorted_order(keys_view(keys@), order@),

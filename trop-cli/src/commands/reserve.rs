@@ -315,9 +315,9 @@ fn dry_run(
         }
         if plan.actions.iter().any(allocates_after_cleanup) {
             eprintln!(
-                "The range is exhausted: a live run would run automatic cleanup and \
-                 retry once, which a dry run does not do, so it cannot predict the port \
-                 or whether the reservation would succeed."
+                "The range is exhausted: a live run would run automatic cleanup and, \
+                 if that freed anything, retry once. A dry run does neither, so it \
+                 cannot predict the port or whether the reservation would succeed."
             );
         }
     }

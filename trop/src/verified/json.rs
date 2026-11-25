@@ -391,7 +391,7 @@ pub open spec fn strictly_sorted(s: Seq<(Seq<char>, u16)>) -> bool {
 
 /// The sorted entries are exactly the input entries (each input entry at
 /// some position, each position some input entry).
-proof fn lemma_sorted_entries_members(entries: Seq<(&str, u16)>)
+pub proof fn lemma_sorted_entries_members(entries: Seq<(&str, u16)>)
     requires
         entries.len() <= usize::MAX,
     ensures
@@ -629,7 +629,7 @@ pub open spec fn digits_value(t: Seq<char>, i: int, j: int) -> int
     }
 }
 
-/// RFC 8259 §4 `int` at position `i` (`0`, or a non-zero digit followed by
+/// RFC 8259 §6 `int` at position `i` (`0`, or a non-zero digit followed by
 /// digits): its value and its length. Negative numbers, fractions and
 /// exponents are outside this reader (a `.` or `e` after the digits is not
 /// a valid continuation, so the object reader rejects them).
@@ -1617,7 +1617,9 @@ fn push_port(out: &mut String, port: u16)
 /// Renders a port map as `serde_json`'s `to_string_pretty` renders a
 /// `BTreeMap<String, u16>`: the entries in byte order of their keys (ties
 /// by position), each key a JSON string token and each port its canonical
-/// decimal text. Total.
+/// decimal text. Total. The order comes from `render::sort_order`, an
+/// `O(n^2)` insertion sort, which is fine for a group's few services (the
+/// former `BTreeMap` path was `O(n log n)`).
 pub fn render_port_map_pretty(entries: &[(&str, u16)]) -> (out: String)
     ensures
         out@ == port_map_text(entries@),

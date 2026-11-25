@@ -24,6 +24,7 @@ use crate::verified::exclusions::{
     is_compact as entries_are_compact, validate_entries, ExclusionEntry, ExclusionError,
     ExclusionSet,
 };
+use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_yaml::value::TaggedValue;
 use serde_yaml::{Mapping, Value};
@@ -365,9 +366,10 @@ where
 ///
 /// A document with no content (empty, only comments, or only a `---`
 /// marker) reads as the default configuration, because `serde_yaml` reads it
-/// as an empty mapping. A document whose content is an explicit null
-/// (`null`, `~`, or a tagged null) is not a mapping, and is rejected here as
-/// it is by the loader.
+/// as an empty mapping; so does a document whose only content is a tagged
+/// empty plain scalar, such as `!!null` or `!!str`. A document whose content
+/// is an explicit null scalar (`null` or `~`, tagged or not) is not a
+/// mapping, and is rejected here as it is by the loader.
 ///
 /// The error message is `serde_yaml`'s description of the problem, under the
 /// field `configuration`.
@@ -382,6 +384,53 @@ fn read_configuration(document: &str) -> crate::Result<LoadedDocument> {
             .map_err(unreadable)?
             .reservations,
     })
+}
+
+/// Whether the document's root, read the way the configuration loader reads
+/// it, is a mapping with no entries: a document with no content, or whose
+/// only content is an empty plain scalar (tagged or not), or an empty
+/// mapping. `false` if the root is not read as a mapping at all.
+///
+/// The loader reads the root with `deserialize_struct`, which `serde_yaml`
+/// implements as `deserialize_map`; the entries are counted through the same
+/// call, reading every key and value as `IgnoredAny`.
+fn root_has_no_entries(document: &str) -> bool {
+    /// The root as an entry-less marker: `true` when it has no entries.
+    struct NoEntries(bool);
+
+    impl<'de> Deserialize<'de> for NoEntries {
+        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct Entries;
+
+            impl<'de> serde::de::Visitor<'de> for Entries {
+                type Value = NoEntries;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    formatter.write_str("a mapping")
+                }
+
+                fn visit_map<A>(self, mut map: A) -> std::result::Result<NoEntries, A::Error>
+                where
+                    A: serde::de::MapAccess<'de>,
+                {
+                    // Every entry is read (the deserializer refuses a map
+                    // whose entries were not all consumed).
+                    let mut empty = true;
+                    while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {
+                        empty = false;
+                    }
+                    Ok(NoEntries(empty))
+                }
+            }
+
+            deserializer.deserialize_map(Entries)
+        }
+    }
+
+    serde_yaml::from_str::<NoEntries>(document).is_ok_and(|NoEntries(empty)| empty)
 }
 
 /// Whether two documents are equal with their top-level mapping keys in the
@@ -431,7 +480,15 @@ pub fn excluded_ports_in(document: &str) -> crate::Result<Option<Vec<PortExclusi
 /// leaving every other top-level key exactly as it was.
 ///
 /// The document is read as a YAML mapping (an empty document is an empty
-/// mapping; a tag on the document is kept). The verified
+/// mapping; a tag on the document is kept). A document whose only content
+/// is an empty plain scalar with a core tag, such as `!!null` or `!!str`, is
+/// not a mapping, but the loader reads it as a mapping with no entries; it
+/// is rewritten as an untagged empty mapping (a core tag names the type of
+/// the scalar, so it is not kept). This applies only to a document with no
+/// entries. A mapping holding a key or value that `serde_yaml` cannot read as
+/// a YAML value, such as `cleanup: !!bool` or `!!int project:`, is refused
+/// as invalid YAML although the loader reads it, because its entries could
+/// not be kept. The verified
 /// `verified::config_rewrite` kernel plans the result over the entries'
 /// "is `excluded_ports`" marks: every other entry is copied unchanged and in
 /// order, and `excluded_ports` is replaced in place, or appended when
@@ -484,8 +541,22 @@ pub fn rewrite_excluded_ports(
     // How the loader reads the document now (this also rejects documents
     // that are not configurations, and documents with a repeated key).
     let before = read_configuration(document)?;
-    let parsed: Value = serde_yaml::from_str(document)
-        .map_err(|error| invalid(format!("Invalid YAML: {error}")))?;
+    // The loader reads a document whose only content is an empty plain
+    // scalar with a core tag (`!!null`, `!!str`) as a mapping with no
+    // entries, but such a document is not a YAML mapping (`serde_yaml`
+    // cannot even read `!!null` as a `Value`). It has no entries to keep, so
+    // it is rewritten as an empty mapping. This applies only when the root
+    // has no entries: a mapping holding an entry `serde_yaml` cannot read as
+    // a `Value` (`!!null allow_change:`, `cleanup: !!bool`) is refused as
+    // invalid YAML, because its entries cannot be kept. The loader check
+    // below still requires the result to read as `before` with only
+    // `excluded_ports` replaced.
+    let no_entries = root_has_no_entries(document);
+    let parsed: Value = match serde_yaml::from_str(document) {
+        Ok(parsed) => parsed,
+        Err(_) if no_entries => Value::Null,
+        Err(error) => return Err(invalid(format!("Invalid YAML: {error}"))),
+    };
     // A tagged document reads like an untagged one; its tag is kept.
     let (tag, root) = match parsed {
         Value::Tagged(tagged) => {
@@ -497,6 +568,7 @@ pub fn rewrite_excluded_ports(
     let original = match root {
         Value::Null => Mapping::new(),
         Value::Mapping(mapping) => mapping,
+        _ if no_entries => Mapping::new(),
         _ => return Err(invalid("the configuration is not a YAML mapping".into())),
     };
     let key = Value::from(EXCLUDED_PORTS_KEY);

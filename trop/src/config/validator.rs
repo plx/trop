@@ -1125,9 +1125,6 @@ mod tests {
         }
     }
 
-    /// Regression: the reported violation of a group with several violations
-    /// used to depend on `HashMap` iteration order (random per map). Services
-    /// are now checked in tag order, so every map reports the same error.
     /// The group checks report the env-name diagnostics from the one message
     /// table in `crate::identifier`; pins the exact field and text of each.
     #[test]
@@ -1183,6 +1180,9 @@ mod tests {
         );
     }
 
+    /// Regression: the reported violation of a group with several violations
+    /// used to depend on `HashMap` iteration order (random per map). Services
+    /// are now checked in tag order, so every map reports the same error.
     #[test]
     fn group_with_several_violations_reports_the_same_error_every_time() {
         for _ in 0..64 {

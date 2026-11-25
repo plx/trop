@@ -6,7 +6,9 @@
 //!
 //! Ordering, name resolution checks, line rendering, shell detection, and
 //! the escaping of user text are decided by the formally verified kernels
-//! `verified::render` and `verified::shell` (see `docs/verification.md`).
+//! `verified::render` and `verified::shell`; the JSON port map is rendered by
+//! `verified::json`, and `format_utc_timestamp`'s text by
+//! `verified::civil_time` (see `docs/verification.md`).
 
 mod formatters;
 mod shell;
@@ -82,7 +84,8 @@ pub fn tab_row(fields: &[&str]) -> String {
 }
 
 /// Formats a point in time as UTC `YYYY-MM-DD HH:MM:SS` (chrono's
-/// `%Y-%m-%d %H:%M:%S`), truncated to the second.
+/// `%Y-%m-%d %H:%M:%S`) of the second that contains it (rounded down, also
+/// before the epoch).
 ///
 /// Dates are proleptic Gregorian with astronomical years. A year outside
 /// `0..=9999` is written with a sign, as chrono writes it (`+10000-01-01

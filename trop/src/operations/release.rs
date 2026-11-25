@@ -271,6 +271,10 @@ impl ReleasePlan {
 /// spelled any other way (`/w/a/`, `/w/./a`, or a path that is not UTF-8)
 /// names no stored reservation: the kernel then selects nothing in every
 /// mode, exactly as the exact-text queries find nothing for it.
+///
+/// This gate is trusted glue: the kernel only proves that `None` selects
+/// nothing. The unit test
+/// `test_noncanonical_target_selects_nothing_in_every_mode` pins it.
 fn stored_target(path: &Path) -> Option<Vec<PathToken>> {
     let text = path.to_str()?;
     matches!(

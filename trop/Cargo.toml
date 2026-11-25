@@ -18,7 +18,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
-chrono = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
 home = { workspace = true }
@@ -35,6 +34,9 @@ libc = "0.2"
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
+# Differential oracle for the verified timestamp formatter and the stored
+# timestamp bound (tests only; production formats with `verified::civil_time`).
+chrono = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 proptest = "1.0"

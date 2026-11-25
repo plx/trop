@@ -985,7 +985,10 @@ pub open spec fn spec_component_prefix(p: Seq<u8>, s: Seq<u8>) -> bool {
 /// Decides `spec_component_prefix(p, s)`: `p` is a byte prefix of `s` that
 /// ends at a component boundary. Total. On canonical absolute strings this
 /// is segment prefix, i.e. `Path::starts_with` (`lemma_component_prefix_iff_segs`).
-// Only the Unix glue (stored-path prefix queries) calls this.
+// Called by the Unix-only stored-path prefix query glue
+// (`reservations_under` in `crate::database::operations`) and by
+// `migrate::rebase_canonical`, whose only production caller
+// (`calculate_new_path`) is Unix-only too.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn canonical_is_component_prefix(p: &[u8], s: &[u8]) -> (r: bool)
     ensures

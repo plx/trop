@@ -6,8 +6,10 @@
 //! not resolve or collides, ignoring ASCII case, with an earlier one, and
 //! renders one statement per line. The human-readable format orders tags
 //! with the kernel's `sort_order` and escapes them with `display_field`.
-//! This module only resolves names through `crate::identifier` and maps
-//! kernel errors onto trop's errors.
+//! The JSON format is rendered entirely by the verified kernel
+//! `verified::json` (`render_port_map_pretty`). This module only resolves
+//! names through `crate::identifier` and maps kernel errors onto trop's
+//! errors.
 
 use std::collections::HashMap;
 
@@ -132,7 +134,9 @@ impl OutputFormatter for ExportFormatter {
 /// byte order (so identical mappings are byte-stable across processes with
 /// independently randomized `HashMap` iteration order), each tag a JSON
 /// string token that decodes back to exactly the tag, each port its decimal
-/// text, in `serde_json`'s pretty layout. Formatting never fails.
+/// text, in `serde_json`'s pretty layout. Formatting never fails. Ordering
+/// costs `O(n^2)` in the number of services (the kernel's insertion sort, as
+/// for the other formats), which is negligible at group sizes.
 pub struct JsonFormatter;
 
 impl OutputFormatter for JsonFormatter {

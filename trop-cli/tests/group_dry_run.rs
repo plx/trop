@@ -5,8 +5,9 @@
 //! executes exactly as a live run does against a private in-memory copy of
 //! the database: it fails with the live run's exit code, prints the ports the
 //! live run would print in the requested format, and never creates or changes
-//! the database. Exhausted group allocations prune/expire once and retry, as
-//! single reservations do, unless the configuration disables it.
+//! the database. Exhausted group allocations prune/expire once and, if that
+//! freed anything, retry once, as single reservations do, unless the
+//! configuration disables the cleanup.
 
 mod common;
 
