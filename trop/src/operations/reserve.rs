@@ -14,11 +14,13 @@
 use crate::config::{CleanupConfig, Config, ConfigValidator};
 use crate::database::Database;
 use crate::error::{Error, Result};
+use crate::path::relationship::path_tokens;
 use crate::port::allocator::{
     allocator_from_config, AllocationOptions, AllocationResult, PortAllocator,
 };
 use crate::port::occupancy::OccupancyCheckConfig;
 use crate::verified::allocation::{self as allocation_kernel, Attempt, Fallback};
+use crate::verified::release::guard_paths;
 use crate::verified::reserve::{
     self as kernel, AllocationRelaxations, CleanupSwitches, DeferredStep, ExistingDecision, Intent,
     MetadataPermissions, ReserveFlags, ReservePolicy, Retry, StoredRow,
@@ -28,6 +30,7 @@ use rusqlite::Connection;
 
 use super::cleanup::{AutocleanResult, CleanupOperations};
 use super::plan::{OperationPlan, PlanAction};
+use super::release::path_guard;
 
 /// The requested operation for one optional reservation metadata field.
 ///
@@ -467,6 +470,22 @@ impl<'a> ReservePlan<'a> {
         )
     }
 
+    /// The unrelated-path guard for the requested path, shared with release
+    /// and migrate. The verified guard decides whether the check applies
+    /// (neither `--force` nor `--allow-unrelated-path`, the same rule as
+    /// `ReservePolicy::check_path_relationship`) and the lexical relation to
+    /// the current directory (the same, an ancestor, or a descendant is
+    /// allowed); the database's single-path check is the physical fallback
+    /// for a lexically unrelated path, and its error is the refusal.
+    fn check_path_relationship(&self) -> Result<()> {
+        let path = &self.options.key.path;
+        let guard = path_guard(self.options.force, self.options.allow_unrelated_path, true)?;
+        guard_paths(&guard, &[path_tokens(path)], &|_index| {
+            Database::validate_path_relationship(path, false).err()
+        })
+        .map_err(|failure| failure.error)
+    }
+
     /// Builds an operation plan for this reserve request.
     ///
     /// This method performs all validation and determines what actions
@@ -506,9 +525,7 @@ impl<'a> ReservePlan<'a> {
         self.options.task.validate("task")?;
 
         // Step 1: Validate path relationship
-        if self.policy().check_path_relationship {
-            Database::validate_path_relationship(&self.options.key.path, false)?;
-        }
+        self.check_path_relationship()?;
 
         // Step 2: Check for existing reservation
         if let Some(existing) = Database::get_reservation(conn, &self.options.key)? {
@@ -869,10 +886,11 @@ where
         };
         let allocate = || allocation_kernel::allocate_with_fallback(preferred, attempt, attempt);
         let cleanup = || {
-            let default_cleanup = CleanupConfig {
-                expire_after_days: Some(30),
-            };
-            let cleanup_config = full_config.cleanup.as_ref().unwrap_or(&default_cleanup);
+            // Without a configured threshold (no `cleanup` section, or one
+            // without `expire_after_days`), enabled expiry uses the built-in
+            // 30-day default (verified `automatic_selection`).
+            let unconfigured = CleanupConfig::default();
+            let cleanup_config = full_config.cleanup.as_ref().unwrap_or(&unconfigured);
             CleanupOperations::automatic_cleanup_in_connection(
                 conn,
                 cleanup_config,
@@ -2528,5 +2546,88 @@ mod tests {
         let ran = cleanup_status(policy, Some(&cleanup));
         assert!(ran.attempted());
         assert_eq!((ran.pruned(), ran.expired()), (2, 1));
+    }
+
+    /// The previous unrelated-path check: the policy decides whether it
+    /// applies, and the database's single-path check decides it.
+    fn previous_path_check(options: &ReserveOptions, config: &Config) -> Result<()> {
+        if ReservePlan::new(options.clone(), config)
+            .policy()
+            .check_path_relationship
+        {
+            Database::validate_path_relationship(&options.key.path, false)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_path_guard_matches_previous_check() {
+        // Differential test of the verified guard adoption: for paths that
+        // are the working directory, an ancestor, a descendant, a sibling, or
+        // unrelated (existing or not), and every combination of `--force` and
+        // `--allow-unrelated-path`, the guard accepts and refuses exactly the
+        // same requests with the same error.
+        let config = create_test_config();
+        let cwd = std::env::current_dir().unwrap();
+        let parent = cwd.parent().unwrap().to_path_buf();
+        let mut paths = vec![
+            cwd.clone(),
+            cwd.join("child"),
+            cwd.join("child/grandchild"),
+            parent.clone(),
+            parent.join("definitely-not-a-sibling-of-trop"),
+            PathBuf::from("/definitely/unrelated/path"),
+            std::env::temp_dir(),
+            // A string prefix that is not a component prefix.
+            PathBuf::from(format!("{}-suffix", cwd.display())),
+            // `.` and `..` components, and a trailing separator.
+            cwd.join("."),
+            cwd.join("child").join(".."),
+            cwd.join("..").join(cwd.file_name().unwrap()),
+            PathBuf::from(format!("{}/", cwd.display())),
+        ];
+        if let Some(root) = cwd.ancestors().last() {
+            paths.push(root.to_path_buf());
+        }
+        for path in paths {
+            for (force, allow_unrelated_path) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let options =
+                    ReserveOptions::new(ReservationKey::new(path.clone(), None).unwrap(), None)
+                        .with_force(force)
+                        .with_allow_unrelated_path(allow_unrelated_path);
+                let guarded = ReservePlan::new(options.clone(), &config).check_path_relationship();
+                let previous = previous_path_check(&options, &config);
+                assert_eq!(
+                    guarded.as_ref().map_err(ToString::to_string),
+                    previous.as_ref().map_err(ToString::to_string),
+                    "{path:?} force={force} allow={allow_unrelated_path}"
+                );
+                if force || allow_unrelated_path {
+                    assert!(guarded.is_ok(), "an override always bypasses the guard");
+                }
+                if let Err(error) = guarded {
+                    assert!(matches!(error, Error::PathRelationshipViolation { .. }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_path_guard_refuses_unrelated_reserve_in_build_plan() {
+        let db = create_test_database();
+        let config = create_test_config();
+        let key = ReservationKey::new(PathBuf::from("/definitely/unrelated/path"), None).unwrap();
+        let refused = ReservePlan::new(ReserveOptions::new(key.clone(), None), &config)
+            .build_plan(db.connection())
+            .unwrap_err();
+        assert!(matches!(refused, Error::PathRelationshipViolation { .. }));
+        assert!(ReservePlan::new(
+            ReserveOptions::new(key, None).with_allow_unrelated_path(true),
+            &config,
+        )
+        .check_path_relationship()
+        .is_ok());
     }
 }

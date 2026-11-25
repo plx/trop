@@ -18,15 +18,16 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::config::CleanupConfig;
 use crate::database::Database;
+use crate::verified::cleanup::{
+    self as kernel, AbsenceEvidence, Candidate, CleanupReason, Deletion, Elapsed, ErrorFacts, Fate,
+    IoKindClass, Observation, PathStatusKind, ProbeOutcome, PruneErrorKind, Selection,
+};
 use crate::{Reservation, Result};
 use rusqlite::Connection;
-
-/// Number of seconds in a day, used for expiration calculations.
-const SECONDS_PER_DAY: u64 = 86400;
 
 /// Broad category for a filesystem error that made a reserved path uninspectable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,30 @@ pub enum PrunePathErrorKind {
     Unsupported,
     /// An error occurred that is not definitive evidence of absence.
     Other,
+}
+
+impl PrunePathErrorKind {
+    /// The kernel's kind, variant for variant.
+    const fn from_kernel(kind: PruneErrorKind) -> Self {
+        match kind {
+            PruneErrorKind::PermissionDenied => Self::PermissionDenied,
+            PruneErrorKind::SymlinkLoop => Self::SymlinkLoop,
+            PruneErrorKind::Transient => Self::Transient,
+            PruneErrorKind::Unsupported => Self::Unsupported,
+            PruneErrorKind::Other => Self::Other,
+        }
+    }
+
+    /// This kind as the kernel's, variant for variant.
+    const fn kernel(self) -> PruneErrorKind {
+        match self {
+            Self::PermissionDenied => PruneErrorKind::PermissionDenied,
+            Self::SymlinkLoop => PruneErrorKind::SymlinkLoop,
+            Self::Transient => PruneErrorKind::Transient,
+            Self::Unsupported => PruneErrorKind::Unsupported,
+            Self::Other => PruneErrorKind::Other,
+        }
+    }
 }
 
 impl fmt::Display for PrunePathErrorKind {
@@ -87,7 +112,17 @@ impl PrunePathStatus {
     /// Return whether this status makes a directory reservation eligible for pruning.
     #[must_use]
     pub const fn is_prunable(&self) -> bool {
-        matches!(self, Self::Missing | Self::NotDirectory)
+        kernel::status_prunable(self.kernel())
+    }
+
+    /// This status as the kernel's, variant for variant.
+    const fn kernel(&self) -> PathStatusKind {
+        match self {
+            Self::ExistingDirectory => PathStatusKind::ExistingDirectory,
+            Self::Missing => PathStatusKind::Missing,
+            Self::NotDirectory => PathStatusKind::NotDirectory,
+            Self::Uninspectable(error) => PathStatusKind::Uninspectable(error.kind.kernel()),
+        }
     }
 }
 
@@ -182,22 +217,13 @@ pub struct AutocleanResult {
 /// Operations are transactional - they either complete fully or are rolled back.
 pub struct CleanupOperations;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CleanupReason {
-    Prune,
-    Expire,
-}
-
+/// A removal candidate: the reservation as planned, its reason (`Prune` or
+/// `Expire`), and whether its path was prunable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlannedRemoval {
     reservation: Reservation,
     reason: CleanupReason,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CleanupSelection {
-    prune: bool,
-    max_age: Option<Duration>,
+    path_prunable: bool,
 }
 
 struct CleanupExecution {
@@ -253,10 +279,7 @@ impl CleanupOperations {
         let timeout = db.busy_timeout();
         let execution = Self::execute_cleanup(
             db,
-            CleanupSelection {
-                prune: true,
-                max_age: None,
-            },
+            kernel::command_selection(true, None),
             dry_run,
             probe,
             || {},
@@ -345,15 +368,10 @@ impl CleanupOperations {
             });
         };
 
-        #[allow(clippy::cast_lossless)]
-        let max_age = Duration::from_secs(expire_after_days as u64 * SECONDS_PER_DAY);
         let timeout = db.busy_timeout();
         let execution = Self::execute_cleanup(
             db,
-            CleanupSelection {
-                prune: false,
-                max_age: Some(max_age),
-            },
+            kernel::command_selection(false, Some(expire_after_days)),
             dry_run,
             Self::probe_path,
             after_candidate_discovery,
@@ -418,17 +436,10 @@ impl CleanupOperations {
         config: &CleanupConfig,
         dry_run: bool,
     ) -> Result<AutocleanResult> {
-        #[allow(clippy::cast_lossless)]
-        let max_age = config
-            .expire_after_days
-            .map(|days| Duration::from_secs(days as u64 * SECONDS_PER_DAY));
         let timeout = db.busy_timeout();
         let execution = Self::execute_cleanup(
             db,
-            CleanupSelection {
-                prune: true,
-                max_age,
-            },
+            kernel::command_selection(true, config.expire_after_days),
             dry_run,
             Self::probe_path,
             || {},
@@ -442,6 +453,11 @@ impl CleanupOperations {
 
     /// Run the enabled automatic-cleanup phases inside a transaction already
     /// owned by a reserve invocation.
+    ///
+    /// Enabled expiry uses `config.expire_after_days`, or the built-in 30-day
+    /// threshold when it is unset (verified `automatic_selection`), so a
+    /// `cleanup` section without `expire_after_days` expires exactly as a
+    /// missing section does.
     pub(crate) fn automatic_cleanup_in_connection<B>(
         conn: &Connection,
         config: &CleanupConfig,
@@ -452,17 +468,9 @@ impl CleanupOperations {
     where
         B: FnOnce(),
     {
-        #[allow(clippy::cast_lossless)]
-        let max_age = expire
-            .then(|| {
-                config
-                    .expire_after_days
-                    .map(|days| Duration::from_secs(days as u64 * SECONDS_PER_DAY))
-            })
-            .flatten();
         let execution = Self::execute_cleanup_in_connection(
             conn,
-            CleanupSelection { prune, max_age },
+            kernel::automatic_selection(prune, expire, config.expire_after_days),
             false,
             Self::probe_path,
             after_candidate_discovery,
@@ -471,17 +479,28 @@ impl CleanupOperations {
         Ok(Self::autoclean_result(execution))
     }
 
+    /// Splits the removals by reason (verified `split_by_reason`: the pruned
+    /// and expired lists partition the removals, each in removal order).
     fn autoclean_result(execution: CleanupExecution) -> AutocleanResult {
-        let mut pruned_reservations = Vec::new();
-        let mut expired_reservations = Vec::new();
-        let mut removed_reservations = Vec::with_capacity(execution.removed.len());
-        for removal in execution.removed {
-            match removal.reason {
-                CleanupReason::Prune => pruned_reservations.push(removal.reservation.clone()),
-                CleanupReason::Expire => expired_reservations.push(removal.reservation.clone()),
-            }
-            removed_reservations.push(removal.reservation);
-        }
+        let reasons: Vec<CleanupReason> = execution
+            .removed
+            .iter()
+            .map(|removal| removal.reason)
+            .collect();
+        let (pruned, expired) = kernel::split_by_reason(&reasons);
+        let reservations_at = |indices: Vec<usize>| -> Vec<Reservation> {
+            indices
+                .into_iter()
+                .map(|index| execution.removed[index].reservation.clone())
+                .collect()
+        };
+        let pruned_reservations = reservations_at(pruned);
+        let expired_reservations = reservations_at(expired);
+        let removed_reservations = execution
+            .removed
+            .into_iter()
+            .map(|removal| removal.reservation)
+            .collect::<Vec<_>>();
 
         AutocleanResult {
             considered_count: execution.considered_reservations.len(),
@@ -500,7 +519,7 @@ impl CleanupOperations {
 
     fn execute_cleanup<F, B>(
         db: &mut Database,
-        selection: CleanupSelection,
+        selection: Selection,
         dry_run: bool,
         probe: F,
         after_candidate_discovery: B,
@@ -526,7 +545,7 @@ impl CleanupOperations {
 
     fn execute_cleanup_in_connection<F, B>(
         conn: &Connection,
-        selection: CleanupSelection,
+        selection: Selection,
         dry_run: bool,
         probe: F,
         after_candidate_discovery: B,
@@ -541,136 +560,201 @@ impl CleanupOperations {
         // Probe each distinct path once inside the transaction so all tags for
         // that path share one observation. The selected reservation snapshot
         // below pairs that observation with the row version it justified.
-        let mut statuses = BTreeMap::new();
-        if selection.prune {
-            for reservation in &considered_reservations {
-                let path = &reservation.key().path;
-                statuses
-                    .entry(path.clone())
-                    .or_insert_with(|| Self::classify_path(path, &probe));
-            }
-        }
+        let (path_prunable, path_decisions) = if selection.prune {
+            Self::probe_distinct_paths(&considered_reservations, &probe)
+        } else {
+            (vec![false; considered_reservations.len()], Vec::new())
+        };
 
-        let mut preserved_reservations = Vec::new();
-        let mut planned_removals = Vec::new();
-        for reservation in &considered_reservations {
-            let prunable = selection.prune
-                && statuses
-                    .get(&reservation.key().path)
-                    .is_some_and(PrunePathStatus::is_prunable);
-            let expired = selection
-                .max_age
-                .is_some_and(|max_age| Self::is_expired_at(reservation, evaluated_at, max_age));
-
-            // Prune takes reporting precedence when both predicates match.
-            // This makes the combined candidate/result set disjoint while
-            // preserving the historical live autoclean ordering.
-            let reason = if prunable {
-                Some(CleanupReason::Prune)
-            } else if expired {
-                Some(CleanupReason::Expire)
-            } else {
-                None
-            };
-
-            if let Some(reason) = reason {
-                planned_removals.push(PlannedRemoval {
-                    reservation: reservation.clone(),
-                    reason,
-                });
-            } else {
-                preserved_reservations.push(reservation.clone());
-            }
-        }
-
-        // Preserve the public ordering of the former two-phase cleanup:
-        // prune candidates retain the path/tag order of the unified scan,
-        // followed by expiration candidates from oldest to newest. The stable
-        // sort retains path/tag order when expiration timestamps tie.
-        planned_removals.sort_by(|left, right| match (left.reason, right.reason) {
-            (CleanupReason::Prune, CleanupReason::Prune) => std::cmp::Ordering::Equal,
-            (CleanupReason::Prune, CleanupReason::Expire) => std::cmp::Ordering::Less,
-            (CleanupReason::Expire, CleanupReason::Prune) => std::cmp::Ordering::Greater,
-            (CleanupReason::Expire, CleanupReason::Expire) => left
-                .reservation
-                .last_used_at()
-                .cmp(&right.reservation.last_used_at()),
-        });
+        // The verified kernel decides each reservation's reason (prune takes
+        // precedence, so the two sets are disjoint) and splits the scan into
+        // the preserved rows and the removal candidates in removal order:
+        // prune candidates in path/tag scan order, then expiration
+        // candidates from oldest to newest, ties in scan order.
+        let candidates: Vec<Candidate> = considered_reservations
+            .iter()
+            .zip(&path_prunable)
+            .map(|(reservation, &prunable)| Candidate {
+                reason: kernel::cleanup_reason(
+                    selection.prune,
+                    prunable,
+                    selection.max_age_secs,
+                    Self::elapsed_since_last_use(reservation, evaluated_at),
+                ),
+                last_used_secs: Self::stored_unix_secs(reservation.last_used_at()),
+            })
+            .collect();
+        let plan = kernel::plan_removals(&candidates);
+        let mut preserved_reservations: Vec<Reservation> = plan
+            .keep
+            .iter()
+            .map(|&index| considered_reservations[index].clone())
+            .collect();
+        let planned_removals: Vec<PlannedRemoval> = plan
+            .removals
+            .iter()
+            .map(|&index| PlannedRemoval {
+                reservation: considered_reservations[index].clone(),
+                reason: candidates[index].reason,
+                path_prunable: path_prunable[index],
+            })
+            .collect();
 
         after_candidate_discovery();
 
-        let removed = if dry_run {
-            planned_removals
-        } else {
-            let mut removed = Vec::with_capacity(planned_removals.len());
-            for planned in planned_removals {
-                let current = Database::get_reservation(conn, planned.reservation.key())?;
-                let Some(current) = current else {
-                    // A database trigger may have removed another selected row
-                    // as part of an earlier guarded delete in this transaction.
-                    // It is still an invocation removal and must be reported.
-                    removed.push(planned);
-                    continue;
-                };
-
-                let still_eligible = match planned.reason {
-                    CleanupReason::Prune => statuses
-                        .get(&current.key().path)
-                        .is_some_and(PrunePathStatus::is_prunable),
-                    CleanupReason::Expire => selection.max_age.is_some_and(|max_age| {
-                        Self::is_expired_at(&current, evaluated_at, max_age)
-                    }),
-                };
-
-                // Revalidate the mutable predicate and the complete persisted
-                // row snapshot immediately before the guarded DELETE. A
-                // changed row is preserved rather than applying stale evidence.
-                if current != planned.reservation || !still_eligible {
-                    preserved_reservations.push(current);
-                    continue;
-                }
-
-                if Database::delete_reservation_if_unchanged(conn, &current)? {
-                    removed.push(planned);
-                } else if let Some(current) =
-                    Database::get_reservation(conn, planned.reservation.key())?
-                {
-                    preserved_reservations.push(current);
-                } else {
-                    removed.push(planned);
-                }
-            }
-            removed
+        // Revalidate the mutable predicate and the complete persisted row
+        // snapshot immediately before each guarded DELETE (verified
+        // `revalidate_all`): a changed row is preserved rather than applying
+        // stale evidence, and a delete is only requested for a row just read
+        // back unchanged and still eligible. A dry run reads and deletes
+        // nothing.
+        let eligible: Vec<bool> = planned_removals
+            .iter()
+            .map(|planned| {
+                kernel::still_eligible(
+                    planned.reason,
+                    planned.path_prunable,
+                    selection.max_age_secs,
+                    Self::elapsed_since_last_use(&planned.reservation, evaluated_at),
+                )
+            })
+            .collect();
+        let observe = |index: usize| -> Result<Observation<Reservation>> {
+            let planned = &planned_removals[index].reservation;
+            Ok(match Database::get_reservation(conn, planned.key())? {
+                // A database trigger may have removed another selected row as
+                // part of an earlier guarded delete in this transaction. It is
+                // still an invocation removal and must be reported.
+                None => Observation::Vanished,
+                Some(current) if current == *planned => Observation::Unchanged,
+                Some(current) => Observation::Changed(current),
+            })
         };
+        let delete = |index: usize| -> Result<Deletion<Reservation>> {
+            let planned = &planned_removals[index].reservation;
+            if Database::delete_reservation_if_unchanged(conn, planned)? {
+                return Ok(Deletion::Deleted);
+            }
+            Ok(match Database::get_reservation(conn, planned.key())? {
+                Some(current) => Deletion::StillPresent(current),
+                None => Deletion::Vanished,
+            })
+        };
+        let fates =
+            kernel::revalidate_all(&eligible, &observe, &delete, dry_run).map_err(|failure| {
+                log::debug!(
+                    "Cleanup revalidation failed for {}",
+                    planned_removals[failure.index].reservation.key()
+                );
+                failure.error
+            })?;
+
+        let mut removed = Vec::with_capacity(planned_removals.len());
+        for (planned, fate) in planned_removals.into_iter().zip(fates) {
+            match fate {
+                Fate::Selected | Fate::Vanished | Fate::Deleted | Fate::VanishedAtDelete => {
+                    removed.push(planned);
+                }
+                Fate::Changed(current) | Fate::Replaced(current) => {
+                    preserved_reservations.push(current);
+                }
+                Fate::Ineligible => preserved_reservations.push(planned.reservation),
+            }
+        }
 
         Ok(CleanupExecution {
             considered_reservations,
             preserved_reservations,
             removed,
-            path_decisions: statuses
-                .into_iter()
-                .map(|(path, status)| PrunePathDecision { path, status })
-                .collect(),
+            path_decisions,
         })
     }
 
-    fn is_expired_at(
-        reservation: &Reservation,
-        evaluated_at: std::time::SystemTime,
-        max_age: Duration,
-    ) -> bool {
-        evaluated_at
-            .duration_since(reservation.last_used_at())
-            .is_ok_and(|age| age > max_age)
+    /// Probes each distinct reserved path once, at its first reservation
+    /// (verified `representatives`), and returns whether each reservation's
+    /// path is prunable together with one decision per distinct path, in
+    /// path order.
+    fn probe_distinct_paths<F>(
+        considered: &[Reservation],
+        probe: &F,
+    ) -> (Vec<bool>, Vec<PrunePathDecision>)
+    where
+        F: Fn(&Path) -> io::Result<ProbedPath>,
+    {
+        // One id per distinct path (`Path` equality), numbered in order of
+        // first appearance, so every id is below `considered.len()`.
+        let mut ids_by_path: BTreeMap<&Path, usize> = BTreeMap::new();
+        let ids: Vec<usize> = considered
+            .iter()
+            .map(|reservation| {
+                let next = ids_by_path.len();
+                *ids_by_path
+                    .entry(reservation.key().path.as_path())
+                    .or_insert(next)
+            })
+            .collect();
+        let representatives = kernel::representatives(&ids);
+
+        let statuses: Vec<Option<PrunePathStatus>> = considered
+            .iter()
+            .enumerate()
+            .map(|(index, reservation)| {
+                (representatives[index] == index)
+                    .then(|| Self::classify_path(&reservation.key().path, probe))
+            })
+            .collect();
+        let path_prunable = representatives
+            .iter()
+            .map(|&first| {
+                statuses[first]
+                    .as_ref()
+                    .is_some_and(PrunePathStatus::is_prunable)
+            })
+            .collect();
+
+        let mut path_decisions: Vec<PrunePathDecision> = considered
+            .iter()
+            .zip(statuses)
+            .filter_map(|(reservation, status)| {
+                status.map(|status| PrunePathDecision {
+                    path: reservation.key().path.clone(),
+                    status,
+                })
+            })
+            .collect();
+        path_decisions.sort_by(|left, right| left.path.cmp(&right.path));
+        (path_prunable, path_decisions)
     }
 
-    fn captured_evaluation_time() -> std::time::SystemTime {
-        let now = std::time::SystemTime::now();
-        now.duration_since(std::time::SystemTime::UNIX_EPOCH)
+    /// The time since `reservation`'s last use, as `SystemTime` measures it,
+    /// or `None` when the last use lies after `evaluated_at`.
+    fn elapsed_since_last_use(
+        reservation: &Reservation,
+        evaluated_at: SystemTime,
+    ) -> Option<Elapsed> {
+        evaluated_at
+            .duration_since(reservation.last_used_at())
+            .ok()
+            .map(|age| Elapsed {
+                secs: age.as_secs(),
+                nanos: age.subsec_nanos(),
+            })
+    }
+
+    /// Whole seconds since the Unix epoch of a stored timestamp. Stored
+    /// timestamps are whole, non-negative seconds (`unix_secs_to_systemtime`),
+    /// so this is exact for every reservation read from the database.
+    fn stored_unix_secs(time: SystemTime) -> u64 {
+        time.duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since_epoch| since_epoch.as_secs())
+    }
+
+    fn captured_evaluation_time() -> SystemTime {
+        let now = SystemTime::now();
+        now.duration_since(SystemTime::UNIX_EPOCH)
             .ok()
             .and_then(|elapsed| {
-                std::time::SystemTime::UNIX_EPOCH
-                    .checked_add(Duration::from_secs(elapsed.as_secs()))
+                SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(elapsed.as_secs()))
             })
             .unwrap_or(now)
     }
@@ -685,45 +769,71 @@ impl CleanupOperations {
         })
     }
 
+    /// Probes `path` once and classifies the result (verified
+    /// `classify_probe`). The glue extracts independent facts from the
+    /// `io::Error` (the platform tables below); the kernel decides their
+    /// precedence and which outcomes are prunable.
     fn classify_path<F>(path: &Path, probe: &F) -> PrunePathStatus
     where
         F: Fn(&Path) -> io::Result<ProbedPath>,
     {
-        match probe(path) {
-            Ok(ProbedPath::Directory) => PrunePathStatus::ExistingDirectory,
-            Ok(ProbedPath::NonDirectory) => PrunePathStatus::NotDirectory,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => PrunePathStatus::Missing,
-            Err(error) if is_not_directory(&error) || is_invalid_path(&error) => {
-                PrunePathStatus::NotDirectory
-            }
-            Err(error) => PrunePathStatus::Uninspectable(PrunePathError {
-                kind: Self::classify_probe_error(&error),
-                message: error.to_string(),
-                raw_os_error: error.raw_os_error(),
+        let (outcome, failure) = match probe(path) {
+            Ok(ProbedPath::Directory) => (ProbeOutcome::Directory, None),
+            Ok(ProbedPath::NonDirectory) => (ProbeOutcome::NonDirectory, None),
+            Err(error) => (
+                ProbeOutcome::Failed(absence_evidence(&error), error_facts(&error)),
+                Some(error),
+            ),
+        };
+        match kernel::classify_probe(outcome) {
+            PathStatusKind::ExistingDirectory => PrunePathStatus::ExistingDirectory,
+            PathStatusKind::Missing => PrunePathStatus::Missing,
+            PathStatusKind::NotDirectory => PrunePathStatus::NotDirectory,
+            // The kernel reports `Uninspectable` only for a failed probe, so
+            // `failure` holds its error.
+            PathStatusKind::Uninspectable(kind) => PrunePathStatus::Uninspectable(PrunePathError {
+                kind: PrunePathErrorKind::from_kernel(kind),
+                message: failure
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                raw_os_error: failure.as_ref().and_then(io::Error::raw_os_error),
             }),
         }
     }
+}
 
-    fn classify_probe_error(error: &io::Error) -> PrunePathErrorKind {
-        if is_symlink_loop(error) {
-            return PrunePathErrorKind::SymlinkLoop;
-        }
-        if is_transient_os_error(error) {
-            return PrunePathErrorKind::Transient;
-        }
+/// The facts of a failed probe that can prove the path is not a directory.
+fn absence_evidence(error: &io::Error) -> AbsenceEvidence {
+    AbsenceEvidence {
+        not_found: error.kind() == io::ErrorKind::NotFound,
+        not_a_directory: is_not_directory(error),
+        invalid_path: is_invalid_path(error),
+    }
+}
 
-        match error.kind() {
-            io::ErrorKind::PermissionDenied => PrunePathErrorKind::PermissionDenied,
-            io::ErrorKind::Unsupported => PrunePathErrorKind::Unsupported,
-            io::ErrorKind::Interrupted
-            | io::ErrorKind::WouldBlock
-            | io::ErrorKind::TimedOut
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::NotConnected => PrunePathErrorKind::Transient,
-            _ => PrunePathErrorKind::Other,
-        }
+/// The facts that classify a failed probe that proves nothing.
+fn error_facts(error: &io::Error) -> ErrorFacts {
+    ErrorFacts {
+        symlink_loop: is_symlink_loop(error),
+        transient_os: is_transient_os_error(error),
+        kind: io_kind_class(error.kind()),
+    }
+}
+
+/// The class of an `io::ErrorKind`.
+fn io_kind_class(kind: io::ErrorKind) -> IoKindClass {
+    match kind {
+        io::ErrorKind::PermissionDenied => IoKindClass::PermissionDenied,
+        io::ErrorKind::Unsupported => IoKindClass::Unsupported,
+        io::ErrorKind::Interrupted
+        | io::ErrorKind::WouldBlock
+        | io::ErrorKind::TimedOut
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::NotConnected => IoKindClass::Transient,
+        _ => IoKindClass::Other,
     }
 }
 
@@ -852,6 +962,7 @@ mod tests {
     use crate::database::DatabaseConfig;
     use crate::operations::{PlanExecutor, ReserveOptions, ReservePlan};
     use crate::reservation::ReservationKey;
+    use crate::verified::cleanup::SECONDS_PER_DAY;
     use crate::{Port, Reservation};
     use std::path::PathBuf;
     use std::sync::mpsc;
@@ -1897,5 +2008,461 @@ mod tests {
                 .is_ok_and(|age| age < Duration::from_secs(5)),
             "the surviving row must be the fresh replacement"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Glue and trusted-assumption checks for the verified cleanup kernels
+    // -----------------------------------------------------------------------
+
+    /// A deterministic pseudo-random sequence (a linear congruential
+    /// generator), so the differential tests need no extra dependency.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % bound
+        }
+    }
+
+    fn at_unix_secs(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn reservation_last_used_at(last_used_at: SystemTime) -> Reservation {
+        let key = ReservationKey::new(PathBuf::from("/glue/expiry"), None).unwrap();
+        Reservation::builder(key, Port::try_from(5000).unwrap())
+            .last_used_at(last_used_at)
+            .build()
+            .unwrap()
+    }
+
+    /// The previous predicate: strictly older than `max_age`, and a last use
+    /// in the future never expires.
+    fn old_is_expired_at(
+        reservation: &Reservation,
+        evaluated_at: SystemTime,
+        max_age: Duration,
+    ) -> bool {
+        evaluated_at
+            .duration_since(reservation.last_used_at())
+            .is_ok_and(|age| age > max_age)
+    }
+
+    #[test]
+    fn test_glue_expiry_decision_matches_duration_comparison_at_the_boundary() {
+        let max_age_secs = 7 * SECONDS_PER_DAY;
+        let now_secs = 100 * SECONDS_PER_DAY;
+        let evaluated_at = at_unix_secs(now_secs);
+        let cases = [
+            // Exactly the maximum age: kept.
+            (at_unix_secs(now_secs - max_age_secs), false),
+            // One second, or one nanosecond, more: expired.
+            (at_unix_secs(now_secs - max_age_secs - 1), true),
+            (
+                at_unix_secs(now_secs - max_age_secs) - Duration::from_nanos(1),
+                true,
+            ),
+            // Used now, or in the future: kept.
+            (at_unix_secs(now_secs), false),
+            (at_unix_secs(now_secs + 1), false),
+            (SystemTime::UNIX_EPOCH, true),
+        ];
+        for (last_used_at, expected) in cases {
+            let reservation = reservation_last_used_at(last_used_at);
+            let age = CleanupOperations::elapsed_since_last_use(&reservation, evaluated_at);
+            let reason = kernel::cleanup_reason(false, false, Some(max_age_secs), age);
+            assert_eq!(
+                reason == CleanupReason::Expire,
+                expected,
+                "{last_used_at:?}"
+            );
+            assert_eq!(
+                old_is_expired_at(
+                    &reservation,
+                    evaluated_at,
+                    Duration::from_secs(max_age_secs)
+                ),
+                expected
+            );
+            assert_eq!(
+                kernel::still_eligible(CleanupReason::Expire, false, Some(max_age_secs), age),
+                expected
+            );
+            // Without an expire phase nothing expires.
+            assert_eq!(
+                kernel::cleanup_reason(false, false, None, age),
+                CleanupReason::Keep
+            );
+        }
+    }
+
+    #[test]
+    fn test_glue_expiry_decision_matches_old_predicate_on_random_times() {
+        let mut rng = Lcg(7);
+        for _ in 0..5_000 {
+            let now_secs = rng.below(1 << 40);
+            let evaluated_at = at_unix_secs(now_secs);
+            let last_used_at = at_unix_secs(rng.below(1 << 40))
+                + Duration::from_nanos(rng.below(2) * rng.below(1_000_000_000));
+            let max_age_secs = match rng.below(3) {
+                0 => rng.below(4),
+                1 => rng.below(1 << 32) * SECONDS_PER_DAY,
+                _ => rng.below(1 << 41),
+            };
+            let reservation = reservation_last_used_at(last_used_at);
+            let age = CleanupOperations::elapsed_since_last_use(&reservation, evaluated_at);
+            assert_eq!(
+                kernel::cleanup_reason(false, false, Some(max_age_secs), age)
+                    == CleanupReason::Expire,
+                old_is_expired_at(
+                    &reservation,
+                    evaluated_at,
+                    Duration::from_secs(max_age_secs)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn test_glue_stored_unix_secs_is_exact_for_storable_times() {
+        let max = crate::verified::storage::MAX_STORABLE_UNIX_SECS;
+        for secs in [0, 1, 86_400, 1_700_000_000, max - 1, max] {
+            assert_eq!(
+                CleanupOperations::stored_unix_secs(at_unix_secs(secs)),
+                secs
+            );
+        }
+        // Times the database never stores map to the epoch rather than
+        // panicking.
+        assert_eq!(
+            CleanupOperations::stored_unix_secs(SystemTime::UNIX_EPOCH - Duration::from_secs(5)),
+            0
+        );
+    }
+
+    #[test]
+    fn test_glue_selection_days_to_seconds() {
+        assert_eq!(kernel::days_to_secs(0), 0);
+        assert_eq!(kernel::days_to_secs(1), SECONDS_PER_DAY);
+        assert_eq!(kernel::days_to_secs(30), 30 * SECONDS_PER_DAY);
+        assert_eq!(
+            kernel::days_to_secs(u32::MAX),
+            u64::from(u32::MAX) * SECONDS_PER_DAY
+        );
+        assert_eq!(
+            kernel::command_selection(true, None),
+            Selection {
+                prune: true,
+                max_age_secs: None
+            }
+        );
+        assert_eq!(
+            kernel::command_selection(false, Some(7)).max_age_secs,
+            Some(7 * SECONDS_PER_DAY)
+        );
+        // Automatic cleanup: an unset threshold is the 30-day default, and a
+        // disabled expire phase has no threshold whatever is configured.
+        for days in [None, Some(30)] {
+            assert_eq!(
+                kernel::automatic_selection(true, true, days).max_age_secs,
+                Some(30 * SECONDS_PER_DAY)
+            );
+        }
+        assert_eq!(
+            kernel::automatic_selection(true, true, Some(2)).max_age_secs,
+            Some(2 * SECONDS_PER_DAY)
+        );
+        assert_eq!(
+            kernel::automatic_selection(false, false, Some(2)),
+            Selection {
+                prune: false,
+                max_age_secs: None
+            }
+        );
+    }
+
+    #[test]
+    fn test_automatic_cleanup_defaults_an_unset_threshold_to_thirty_days() {
+        // Regression: `cleanup: Some(CleanupConfig { expire_after_days: None })`
+        // reported automatic expiration as enabled but expired nothing.
+        let existing = std::env::current_dir().unwrap();
+        let now = SystemTime::now();
+        for config in [
+            CleanupConfig {
+                expire_after_days: None,
+            },
+            CleanupConfig {
+                expire_after_days: Some(30),
+            },
+        ] {
+            let mut db = create_test_database();
+            for (tag, port, age_days) in [("old", 5000, 31), ("young", 5001, 29)] {
+                let key = ReservationKey::new(existing.clone(), Some(tag.to_string())).unwrap();
+                let reservation = Reservation::builder(key, Port::try_from(port).unwrap())
+                    .last_used_at(now - Duration::from_secs(age_days * SECONDS_PER_DAY))
+                    .build()
+                    .unwrap();
+                db.create_reservation(&reservation).unwrap();
+            }
+
+            // A disabled expire phase never expires, whatever is configured.
+            let disabled = CleanupOperations::automatic_cleanup_in_connection(
+                db.connection(),
+                &config,
+                false,
+                false,
+                || {},
+            )
+            .unwrap();
+            assert_eq!(disabled.total_removed, 0);
+
+            let result = CleanupOperations::automatic_cleanup_in_connection(
+                db.connection(),
+                &config,
+                false,
+                true,
+                || {},
+            )
+            .unwrap();
+            assert_eq!(result.expired_count, 1, "{config:?}");
+            assert_eq!(
+                result.expired_reservations[0].key().tag.as_deref(),
+                Some("old")
+            );
+            assert_eq!(result.preserved_count, 1);
+        }
+    }
+
+    /// The previous ordering: a stable sort of the planned removals, prune
+    /// before expire, expire by last use.
+    fn old_removal_order(candidates: &[Candidate]) -> Vec<usize> {
+        let mut planned: Vec<usize> = (0..candidates.len())
+            .filter(|&index| candidates[index].reason != CleanupReason::Keep)
+            .collect();
+        planned.sort_by(|&left, &right| {
+            match (candidates[left].reason, candidates[right].reason) {
+                (CleanupReason::Expire, CleanupReason::Expire) => candidates[left]
+                    .last_used_secs
+                    .cmp(&candidates[right].last_used_secs),
+                (CleanupReason::Prune, CleanupReason::Expire) => std::cmp::Ordering::Less,
+                (CleanupReason::Expire, CleanupReason::Prune) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
+        planned
+    }
+
+    fn random_candidates(rng: &mut Lcg, length: usize) -> Vec<Candidate> {
+        let key_range = 1 + rng.below(6);
+        (0..length)
+            .map(|_| Candidate {
+                reason: match rng.below(3) {
+                    0 => CleanupReason::Keep,
+                    1 => CleanupReason::Prune,
+                    _ => CleanupReason::Expire,
+                },
+                last_used_secs: match rng.below(4) {
+                    0 => u64::MAX - rng.below(key_range),
+                    _ => rng.below(key_range),
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_glue_removal_plan_matches_old_stable_sort() {
+        let mut rng = Lcg(11);
+        for length in (0..40).chain([200, 1_000]) {
+            for _ in 0..20 {
+                let candidates = random_candidates(&mut rng, length);
+                let plan = kernel::plan_removals(&candidates);
+                assert_eq!(plan.removals, old_removal_order(&candidates));
+                let keep: Vec<usize> = (0..candidates.len())
+                    .filter(|&index| candidates[index].reason == CleanupReason::Keep)
+                    .collect();
+                assert_eq!(plan.keep, keep);
+                assert_eq!(plan.keep.len() + plan.removals.len(), candidates.len());
+
+                let reasons: Vec<CleanupReason> = plan
+                    .removals
+                    .iter()
+                    .map(|&index| candidates[index].reason)
+                    .collect();
+                let (pruned, expired) = kernel::split_by_reason(&reasons);
+                let positions_of = |reason| -> Vec<usize> {
+                    (0..reasons.len())
+                        .filter(|&index| reasons[index] == reason)
+                        .collect()
+                };
+                assert_eq!(pruned, positions_of(CleanupReason::Prune));
+                assert_eq!(expired, positions_of(CleanupReason::Expire));
+                assert_eq!(pruned.len() + expired.len(), reasons.len());
+            }
+        }
+    }
+
+    #[test]
+    fn test_glue_removal_plan_handles_a_full_port_range() {
+        // As many candidates as there are ports, all expiring, newest first:
+        // the merge sort reverses them without quadratic work.
+        let candidates: Vec<Candidate> = (0..65_535_u64)
+            .map(|index| Candidate {
+                reason: CleanupReason::Expire,
+                last_used_secs: 65_535 - index,
+            })
+            .collect();
+        let plan = kernel::plan_removals(&candidates);
+        assert_eq!(plan.keep, Vec::<usize>::new());
+        assert_eq!(plan.removals, (0..65_535).rev().collect::<Vec<usize>>());
+    }
+
+    #[test]
+    fn test_glue_representatives_match_first_seen_paths() {
+        let mut rng = Lcg(13);
+        for length in 0..60 {
+            let distinct = 1 + rng.below(8);
+            let paths: Vec<PathBuf> = (0..length)
+                .map(|_| PathBuf::from(format!("/probe-once/{}", rng.below(distinct))))
+                .collect();
+            let mut ids_by_path: BTreeMap<&Path, usize> = BTreeMap::new();
+            let ids: Vec<usize> = paths
+                .iter()
+                .map(|path| {
+                    let next = ids_by_path.len();
+                    *ids_by_path.entry(path.as_path()).or_insert(next)
+                })
+                .collect();
+            let representatives = kernel::representatives(&ids);
+            for (index, &first) in representatives.iter().enumerate() {
+                let expected = paths.iter().position(|path| *path == paths[index]).unwrap();
+                assert_eq!(first, expected);
+            }
+            assert_eq!(
+                representatives
+                    .iter()
+                    .enumerate()
+                    .filter(|&(index, &first)| index == first)
+                    .count(),
+                ids_by_path.len(),
+                "one probe per distinct path"
+            );
+        }
+        // Total for ids the glue never produces.
+        assert_eq!(
+            kernel::representatives(&[7, 3, 7, 3, 9]),
+            vec![0, 1, 0, 1, 4]
+        );
+        assert_eq!(
+            kernel::representatives(&[usize::MAX, usize::MAX]),
+            vec![0, 0]
+        );
+        assert_eq!(kernel::representatives(&[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn test_glue_io_error_kind_table() {
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::NotConnected,
+        ] {
+            assert_eq!(io_kind_class(kind), IoKindClass::Transient, "{kind:?}");
+        }
+        assert_eq!(
+            io_kind_class(io::ErrorKind::PermissionDenied),
+            IoKindClass::PermissionDenied
+        );
+        assert_eq!(
+            io_kind_class(io::ErrorKind::Unsupported),
+            IoKindClass::Unsupported
+        );
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::AlreadyExists,
+            io::ErrorKind::InvalidData,
+        ] {
+            assert_eq!(io_kind_class(kind), IoKindClass::Other, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn test_glue_probe_classification_precedence() {
+        let classify = |result: io::Result<ProbedPath>| {
+            let result = std::cell::RefCell::new(Some(result));
+            CleanupOperations::classify_path(Path::new("/glue/probe"), &|_| {
+                result.borrow_mut().take().unwrap()
+            })
+        };
+        assert_eq!(
+            classify(Ok(ProbedPath::Directory)),
+            PrunePathStatus::ExistingDirectory
+        );
+        assert_eq!(
+            classify(Ok(ProbedPath::NonDirectory)),
+            PrunePathStatus::NotDirectory
+        );
+        assert_eq!(
+            classify(Err(io::Error::from(io::ErrorKind::NotFound))),
+            PrunePathStatus::Missing
+        );
+        for kind in [io::ErrorKind::InvalidInput, io::ErrorKind::InvalidFilename] {
+            assert_eq!(
+                classify(Err(io::Error::from(kind))),
+                PrunePathStatus::NotDirectory
+            );
+        }
+        assert_eq!(
+            classify(Err(simulated_not_directory_error())),
+            PrunePathStatus::NotDirectory
+        );
+        let PrunePathStatus::Uninspectable(error) = classify(Err(simulated_symlink_loop_error()))
+        else {
+            panic!("a symlink loop must be preserved");
+        };
+        assert_eq!(error.kind, PrunePathErrorKind::SymlinkLoop);
+        assert_eq!(
+            error.raw_os_error,
+            simulated_symlink_loop_error().raw_os_error()
+        );
+        let PrunePathStatus::Uninspectable(error) = classify(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "denied",
+        ))) else {
+            panic!("a denied probe must be preserved");
+        };
+        assert_eq!(error.kind, PrunePathErrorKind::PermissionDenied);
+        assert_eq!(error.message, "denied");
+        assert_eq!(error.raw_os_error, None);
+    }
+
+    #[test]
+    fn test_glue_status_and_error_kind_round_trip_through_the_kernel() {
+        for kind in [
+            PrunePathErrorKind::PermissionDenied,
+            PrunePathErrorKind::SymlinkLoop,
+            PrunePathErrorKind::Transient,
+            PrunePathErrorKind::Unsupported,
+            PrunePathErrorKind::Other,
+        ] {
+            assert_eq!(PrunePathErrorKind::from_kernel(kind.kernel()), kind);
+            let status = PrunePathStatus::Uninspectable(PrunePathError {
+                kind,
+                message: String::new(),
+                raw_os_error: None,
+            });
+            assert!(!status.is_prunable());
+        }
+        assert!(PrunePathStatus::Missing.is_prunable());
+        assert!(PrunePathStatus::NotDirectory.is_prunable());
+        assert!(!PrunePathStatus::ExistingDirectory.is_prunable());
     }
 }

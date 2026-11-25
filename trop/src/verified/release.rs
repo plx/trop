@@ -872,4 +872,19 @@ pub fn select_and_guard<E, F: Fn(usize) -> Option<E>>(
     Ok(selected)
 }
 
+/// Reserve's unrelated-path check uses this guard: the guard applies to a
+/// reserve request exactly when its verified policy checks the path
+/// relationship (`super::reserve::reserve_policy`), and with `--force` or
+/// `--allow-unrelated-path` it never applies.
+pub proof fn lemma_reserve_guard_is_policy(flags: super::reserve::ReserveFlags)
+    ensures
+        path_check_required(flags.force, flags.allow_unrelated_path)
+            == super::reserve::policy_of(flags).check_path_relationship,
+        flags.force || flags.allow_unrelated_path ==> !path_check_required(
+            flags.force,
+            flags.allow_unrelated_path,
+        ),
+{
+}
+
 } // verus!
