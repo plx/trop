@@ -73,8 +73,9 @@ unverified. Every kernel entry point therefore follows one of three rules:
      indices below a length (`config::first_config_level`), only for an
      implicit path (`path::resolve_by_provenance`), only when the
      unrelated-path guard applies (`release::guard_paths`,
-     `release::select_and_guard`, `migrate::guard_moves`), or only after an
-     earlier answer (`allocation::fallback_discipline`,
+     `release::select_and_guard`, `migrate::guard_moves`), only when there
+     are stored rows (`group::reconcile_group`), or only after an earlier
+     answer (`allocation::fallback_discipline`,
      `reserve::retry_discipline`).
    - The restriction is load-bearing. A kernel may call a closure only where
      its precondition is granted, so the proof shows that the kernel never
@@ -112,11 +113,12 @@ trusted base too, and names the specific facts.
 - the `verus!` macro's erasure (it removes ghost code only);
 - the production glue that converts domain types to kernel inputs and back,
   and the few checks glue makes on its own. For example, a group dry run
-  without a database checks that the database's directory could be created
-  (`check_database_directory_creatable`, unverified), and every group dry
-  run checks the busy timeout before it opens its snapshot (the check is
-  the verified `config::busy_timeout_ok`; that it runs there, and its copy
-  of `Database::open`'s message, are glue);
+  without a database (with auto-init enabled) checks that the database's
+  directory could be created (`check_database_directory_creatable`,
+  unverified), and every group dry run checks the busy timeout before it
+  opens its snapshot (the check is the verified `config::busy_timeout_ok`;
+  that it runs there, and its copy of `Database::open`'s message, are
+  glue);
 - the oracle closures production code passes to oracle-generic kernels. They
   must not panic on the inputs they are given. The kernels' specifications
   are relative to the closures' answers, so they do not assume the closures
@@ -298,10 +300,12 @@ Glue:
     `!already_excluded`.
   - `trop exclude` asks the kernel first and runs the reserved-port guard only
     when `changed` holds: an identical or covered exclusion is a no-op even
-    when one of its ports is reserved (the specification's "identical
-    exclusion is a no-op"; pinned by
+    when one of its ports is reserved. The specification says "If the
+    excluded port or range is *identical* to a pre-existing exclusion, the
+    command should be a no-op." Treating a covered exclusion as a no-op too
+    is the kernel's `already_excluded` choice. Pinned by
     `exclude_of_an_already_excluded_reserved_port_is_a_no_op` in
-    `trop-cli/tests/exclusion_edits.rs`).
+    `trop-cli/tests/exclusion_edits.rs`.
 - `add_ports` (`trop scan --autoexclude`):
   - The result is the old list followed by one `Single` for each newly excluded
     valid port, each port once, in the order of its first occurrence in the
@@ -661,12 +665,12 @@ The first two are pinned by call-counting tests in
 `test_default_find_occupied_ports_stops_at_first_failure`).
 `find_occupied_reports` delegates to
 `SystemOccupancyChecker::find_occupied_reports_with(range, config,
-run_probe)`, the `scan_ports` glue with an injectable probe runner, pinned
-by
+run_probe)`, the `scan_ports` glue with an injectable probe runner. A test
+over `65532..=65535` with one enabled probe pins it:
 `test_find_occupied_reports_keeps_occupied_ports_in_order_and_stops_at_first_failure`
-over `65532..=65535` (one enabled probe): only occupied ports' reports,
-ascending, each with its in-use probe as evidence, and the scan stops at
-(and reports) the first failing port without probing later ports.
+checks that only occupied ports are reported, in ascending order, each with
+its in-use probe as evidence, and that the scan stops at (and reports) the
+first failing port without probing later ports.
 
 ### `verified::group` — group requests, offset-pattern search, fresh plans, stored groups, output selection
 
@@ -719,12 +723,15 @@ no longer trims anything: the kernel does.
   specified (`search_failed_at`): an error comes from a base `c >= min` such
   that every lower base was rejected, from the probe of a pattern port of
   `c` (in range, not avoided) whose earlier pattern ports were usable. So
-  bases are tried in ascending order by proof, and an error never pre-empts
-  a lower base that fits. An empty pattern is `Ok(None)`. (A body that
-  tried `range_max` first, or returned a probe error for an empty pattern,
-  would not verify.) The search is generic over the probe closure, and its
-  guarantees are stated in terms of the answers the probe gave, so no
-  stable oracle has to be trusted.
+  the result, given the probe's answers, is one an ascending scan gives: an
+  error never pre-empts a lower base that fits. The order of probe calls is
+  not specified (Verus specifies closures by their answers), so a body that
+  probed `range_max` first and discarded the answer would still verify. An
+  empty pattern is `Ok(None)`. (A body that returned a higher base, or a
+  higher base's probe error, before every lower base was rejected, or a
+  probe error for an empty pattern, would not verify.) The search is
+  generic over the probe closure, and its guarantees are stated in terms of
+  the answers the probe gave, so no stable oracle has to be trusted.
 - `plan_fresh_group`: a service is pinned to its preferred port only if the
   preferred probe reported it available (whole port domain, no range check).
   Every other service legitimately falls back to its offset and gets `base +
@@ -740,7 +747,10 @@ no longer trims anything: the kernel does.
   earlier fallback ports (in service order) at that base were usable
   (`scan_error_first` / `scan_failed_at`, via `lemma_scan_failure_maps`).
   The weaker `probe_error_source` is still stated. (A body that returned a
-  scan-probe error before classifying every service would not verify.)
+  scan-probe error before classifying every service would not verify.) As
+  for `find_pattern_base`, the order of probe calls, and the absence of
+  extra probes whose answers are discarded, are implemented but not
+  specified.
 - Exhaustion retry: an exhausted fresh plan (a new group, or one allocated
   after a forced replacement deleted the stored group) goes through
   `verified::reserve::allocate_with_cleanup_retry`, the control single
@@ -788,10 +798,7 @@ no longer trims anything: the kernel does.
   there are stored rows (the oracle's precondition is granted only then),
   and returns the classifier's result in the variant (`Refresh` only with a
   `Compatible` result, `Replace` only with a forced `Conflict`, `Fail` only
-  with `OtherError` or an unforced `Conflict`). The glue
-  (`plan_reconciliation`) has one arm per variant; its two `unreachable!`s
-  rest on its own mapping of `Ok` to `Compatible` and of `Err` to
-  `Conflict` or `OtherError`.
+  with `OtherError` or an unforced `Conflict`).
 - `select_group_output` (`--format`/`--shell` of `reserve-group` and
   `autoreserve`):
   - JSON, dotenv, and human output are selected whatever `--shell` says.
@@ -824,23 +831,12 @@ Bugs fixed (group-rest):
   - `open_dry_run_snapshot` builds that copy: the file is opened read-only and
     copied in one read transaction, then initialized or migrated in memory by
     the same schema check `Database::open` runs.
-  - `open_dry_run_snapshot` first rejects a busy timeout above `i32::MAX` ms
-    with the validation error `Database::open` reports (the verified
-    `config::busy_timeout_ok`), with or without a database file.
-  - Without a database, the CLI's `dry_run_database` calls
-    `check_database_directory_creatable`: when the deepest existing ancestor
-    of the database's directory is not a directory (or an ancestor cannot be
-    inspected), the dry run fails with an I/O error, the live run's error
-    class and exit code (the message describes the obstruction instead of
-    repeating the OS text), and creates nothing. Permissions are not
-    checked.
-  - The dry run fails with the live run's error (and exit code), except that
-    an uncreatable data directory gives the same error class and exit code
-    with a different message. It prints the live run's ports in the requested
-    format, simulates the automatic cleanup (and the retry, when the cleanup
-    freed something), and never creates, writes, initializes, or migrates the
-    database. Opening a WAL database read-only may leave `-wal`/`-shm` files;
-    the contents never change.
+  - The dry run fails with the live run's error and exit code (for an
+    uncreatable data directory, see fix-reserve-group below). It prints the
+    live run's ports in the requested format, simulates the automatic cleanup
+    (and the retry, when the cleanup freed something), and never creates,
+    writes, initializes, or migrates the database. Opening a WAL database
+    read-only may leave `-wal`/`-shm` files; the contents never change.
 
 Bugs fixed (fix-reserve-group):
 - A cleanup that freed nothing was followed by a re-plan, and
@@ -848,13 +844,23 @@ Bugs fixed (fix-reserve-group):
   `verified::reserve`).
 - `ReserveGroupPlan::dry_run` / `AutoreservePlan::dry_run` with a busy
   timeout above `i32::MAX` ms panicked inside rusqlite (existing database) or
-  ignored it (no database); now they report the live run's validation error.
-  Pinned by
+  ignored it (no database). Now `open_dry_run_snapshot` first rejects such a
+  timeout with the validation error `Database::open` reports (the verified
+  `config::busy_timeout_ok`), with or without a database file. Pinned by
   `dry_run_rejects_a_busy_timeout_sqlite_cannot_store_like_a_live_run`
   (`trop/tests/group_dry_run.rs`).
 - `reserve-group --dry-run` / `autoreserve --dry-run` with an uncreatable
-  `--data-dir` succeeded and printed ports while the live run failed. Pinned
-  by `dry_run_fails_like_a_live_run_when_the_data_directory_cannot_be_created`
+  `--data-dir` succeeded and printed ports while the live run failed. Now,
+  without a database and with auto-init disabled, the CLI's
+  `dry_run_database` fails with `NoDataDirectory`, as a live run does.
+  Without a database and with auto-init enabled, it calls
+  `check_database_directory_creatable`: when the deepest existing ancestor
+  of the database's directory is not a directory (or an ancestor cannot be
+  inspected), the dry run fails with an I/O error, the live run's error
+  class and exit code, and creates nothing. Only the message differs: it
+  describes the obstruction instead of repeating the OS text. Permissions
+  are not checked. Pinned by
+  `dry_run_fails_like_a_live_run_when_the_data_directory_cannot_be_created`
   (`trop-cli/tests/group_dry_run.rs`).
 
 Tests added for trusted glue:
@@ -893,7 +899,9 @@ Glue:
   `cleanup::automatic_selection`. `GroupCleanupCounts` is an alias of the
   kernel's `CleanupCounts`.
 - `plan_reconciliation` passes the compatibility check to `reconcile_group`
-  as its classifier and has one arm per `Reconciliation` variant.
+  as its classifier and has one arm per `Reconciliation` variant. Its two
+  `unreachable!`s rest on its own mapping of `Ok` to `Compatible` and of
+  `Err` to `Conflict` or `OtherError`.
 - `select_group_output` maps `GroupOutputFormat` to `FormatArg` and passes
   `ShellType::from_string`/`ShellType::detect` as the oracles.
 
@@ -945,10 +953,6 @@ Glue: `trop/src/identifier.rs` (`trim_identifier`, `check_identifier`,
   an inferred project or task is trimmed and validated by the kernel and is
   canonical. It no longer trims with `str::trim` and discards the kernel's
   result.
-- `environment_variable_name_message` and
-  `NON_CONVERTIBLE_SERVICE_TAG_MESSAGE` (crate-visible) are the one message
-  table for the env-name diagnostics, reported by `EnvironmentVariableName`
-  and by the validator's group checks.
 
 Properties:
 - `trimmed(s)` specifies `str::trim`: drop leading, then trailing, Unicode
@@ -997,6 +1001,11 @@ configuration and rendering call the kernel from other kernels:
 `config::check_config_group` uses `check_env_name`, `resolve_env_name` and
 `env_collision_key`, and `render::render_group` re-checks each name with
 `check_env_name_bytes` and compares names ignoring ASCII case itself.
+`environment_variable_name_message` (which renders an `EnvNameError`) and
+`NON_CONVERTIBLE_SERVICE_TAG_MESSAGE`, both crate-visible in
+`trop/src/identifier.rs`, are the one message table for the env-name
+diagnostics, reported by `EnvironmentVariableName` and by the validator's
+group checks.
 
 - `check_env_name` is exactly `env_name_verdict` over the name's UTF-8 bytes:
   `Empty`, then `TooLong` (more than 255 bytes), then `BadFirst`, then
@@ -1154,7 +1163,9 @@ Glue: `trop/src/path/relationship.rs` (`PathRelationship::between`,
   equivalent to segment prefix. Segment prefix implies byte prefix, so a
   byte-prefix prefilter is complete. `/` is a component prefix of every
   canonical path. `canonical_is_component_prefix` (Unix; the post-filter of
-  `storage`'s prefix query) decides `spec_component_prefix` and is total.
+  `storage`'s prefix query, and the prefix test in
+  `migrate::rebase_canonical`) decides `spec_component_prefix` and is
+  total.
 - `spec_rebase` (moving a subtree between ancestors): it round-trips, is
   injective, preserves `spec_rel`, and preserves canonical form.
 
@@ -1309,9 +1320,10 @@ message.
 
 Bugs fixed with this kernel:
 - A cleanup that freed nothing was followed by a second full scan (with
-  occupancy probes), so an exhaustion error cost two scans, a port freed
-  meanwhile by another writer could be granted where the specification
-  reports exhaustion, and the error claimed a retry. Pinned by
+  occupancy probes), so an exhaustion error cost two scans, a port that
+  became free meanwhile (for example, a process released it) could be
+  granted where the specification reports exhaustion, and the error claimed
+  a retry. Pinned by
   `test_cleanup_that_freed_nothing_is_not_retried` and
   `cleanup_retry_runs_cleanup_at_most_once`
   (`trop/src/operations/reserve.rs`).
@@ -1545,8 +1557,8 @@ Not proved:
   directly, not through `overlay_leaf`; and the cleanup leaf still
   materializes `Some(CleanupConfig { .. })` for an empty source section.
 - That `apply_precise` and `merge_into_observed` agree.
-- That the glue maps `LevelFile::Project`/`Local` to the names `trop.yaml`/
-  `trop.local.yaml` (`level_file_name`, one `match`, pinned by
+- That the glue maps `LevelFile::Project`/`Local` to the names `trop.yaml`
+  and `trop.local.yaml` (`level_file_name`, one `match`, pinned by
   `test_level_files_load_in_kernel_order`), and that `load_all_effective`'s
   stable sort by precedence keeps the plan's order (it is already
   ascending).
@@ -1851,8 +1863,7 @@ stored tag text. The same id lists feed `guard_moves`, `classify_conflicts` and
   So the key lists determine the error variant and the items it names. With
   three keys, sources `[0, 0]` and destinations `[9, 1]` give
   `DuplicateSource { first: 0, second: 1 }`, never `KeyOutOfRange`
-  (`test_key_errors_follow_scan_order`). `schedule_migration` has the same
-  error specification, without `dest_exists`.
+  (`test_key_errors_follow_scan_order`).
 
   Lemmas:
   - `lemma_conflicts_are_overwrites`: under a consistent snapshot, the
@@ -1865,8 +1876,8 @@ stored tag text. The same id lists feed `guard_moves`, `classify_conflicts` and
     conflict and changes nothing.
 - `schedule_migration` returns exactly `spec_schedule`: delete every source,
   then every destination that is not a source, then create `0..n`. Its errors
-  are specified as above (without `dest_exists`). Its
-  postcondition, for every store:
+  are specified as above (without `dest_exists`). Its postcondition, for
+  every store:
   - running the plan yields `moved`: each payload at its destination
     (overwriting what was there), the other sources gone, every other row
     untouched;
@@ -2036,10 +2047,11 @@ Unicode, and `SHELL` is read with `var_os` plus a lossy conversion. It maps
     - The order is inherited from the original detection code. It is a
       maintainer decision, not a verified property of correct detection.
     - Any of the three variables outranks `SHELL`.
-    - Windows sets `PSModulePath` in every process. So on Windows, detection
-      always answers PowerShell, even in Git Bash, MSYS2 or Cygwin with
-      `SHELL=/usr/bin/bash`. The same holds for any child of `pwsh` on Unix.
-      There a POSIX shell needs `--shell bash`.
+    - Windows defines `PSModulePath` system-wide, so processes normally
+      inherit it. So on Windows, detection normally answers PowerShell, even
+      in Git Bash, MSYS2 or Cygwin with `SHELL=/usr/bin/bash`. The same holds
+      for any child of `pwsh` on Unix. There a POSIX shell needs
+      `--shell bash`.
   - `lemma_basename_ignores_directory`: directory components never change the
     result, so `/home/selfish/bin/bash` is bash (`lemma_selfish_bash_is_bash`).
   - The result table (`lemma_program_table_posix`,
