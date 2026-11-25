@@ -38,11 +38,14 @@
 //!   every delimiter doubled, and its delimiter again
 //!   (`lemma_closed_quote_round_trip`);
 //! - the tokens are the input with whitespace between tokens removed: every
-//!   input byte is either whitespace before a token or part of exactly one
-//!   token, whose value is that raw text, ASCII-lowercased for bare words
+//!   input byte is either whitespace outside the tokens or part of exactly
+//!   one token, whose value is its raw text, ASCII-lowercased for bare words
 //!   (`lemma_tokens_cover_input`). So two texts normalize equally only if
 //!   they differ just in whitespace between tokens, the ASCII case of bare
-//!   words, and the quoting of the allowed identifier.
+//!   words, and the quoting of the allowed identifier;
+//! - conversely, inserting ASCII whitespace at any position the tokenizer
+//!   reaches (a token boundary, or whitespace between tokens) leaves the
+//!   tokens unchanged (`lemma_space_between_tokens`).
 //!
 //! Byte-level tokenizing agrees with the historical `char`-level tokenizer on
 //! every `&str`: every delimiter and operator is ASCII, every byte of a
@@ -329,6 +332,7 @@ pub proof fn lemma_block_comment_end_bounds(s: Seq<u8>, k: int)
         0 <= k <= s.len(),
     ensures
         k <= block_comment_end(s, k) <= s.len(),
+        k < s.len() ==> k < block_comment_end(s, k),
     decreases s.len() - k,
 {
     if k < s.len() && !(s[k] == b'*' && k + 1 < s.len() && s[k + 1] == b'/') {
@@ -561,6 +565,18 @@ pub proof fn lemma_encode_token_split(x: Token, y: Token, ex: Seq<u8>, ey: Seq<u
     assert(ey =~= ty.subrange(y.1.len() as int + 1, ty.len() as int));
 }
 
+/// Only the empty token stream encodes to the empty text.
+pub proof fn lemma_encode_tokens_empty(ts: Seq<Token>)
+    ensures
+        (encode_tokens(ts).len() == 0) == (ts.len() == 0),
+{
+    if ts.len() > 0 {
+        let first = encode_token(ts[0]);
+        assert(first[0] == ts[0].0);
+        assert(encode_tokens(ts) == first + encode_tokens(ts.drop_first()));
+    }
+}
+
 /// The encoding is injective: the token stream can be read back from it.
 pub proof fn lemma_encode_tokens_injective(xs: Seq<Token>, ys: Seq<Token>)
     requires
@@ -569,16 +585,13 @@ pub proof fn lemma_encode_tokens_injective(xs: Seq<Token>, ys: Seq<Token>)
         xs == ys,
     decreases xs.len(),
 {
-    if xs.len() == 0 {
-        if ys.len() != 0 {
-            assert(encode_tokens(ys) == encode_token(ys[0]) + encode_tokens(ys.drop_first()));
-            assert(encode_tokens(ys).len() >= 1);
-        }
+    lemma_encode_tokens_empty(xs);
+    lemma_encode_tokens_empty(ys);
+    if xs.len() == 0 || ys.len() == 0 {
         assert(xs =~= ys);
-    } else if ys.len() == 0 {
-        assert(encode_tokens(xs) == encode_token(xs[0]) + encode_tokens(xs.drop_first()));
-        assert(encode_tokens(xs).len() >= 1);
     } else {
+        assert(encode_tokens(xs) == encode_token(xs[0]) + encode_tokens(xs.drop_first()));
+        assert(encode_tokens(ys) == encode_token(ys[0]) + encode_tokens(ys.drop_first()));
         lemma_encode_token_split(
             xs[0],
             ys[0],
@@ -786,6 +799,357 @@ pub proof fn lemma_tokens_cover_input(s: Seq<u8>, i: int, allowed: Option<Seq<u8
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Robustness: whitespace between tokens does not matter
+// ---------------------------------------------------------------------------
+
+/// `s` with the byte `w` inserted before position `i`.
+pub open spec fn insert_byte(s: Seq<u8>, i: int, w: u8) -> Seq<u8> {
+    s.subrange(0, i) + seq![w] + s.subrange(i, s.len() as int)
+}
+
+/// The lexer, started at `j`, reaches position `i` (a token boundary or a
+/// whitespace position).
+pub open spec fn visits(s: Seq<u8>, j: int, i: int, allowed: Option<Seq<u8>>) -> bool
+    decreases s.len() - j,
+    via visits_decreases
+{
+    if j == i {
+        true
+    } else if j > i || j < 0 || j >= s.len() {
+        false
+    } else if is_sql_space(s[j]) {
+        visits(s, j + 1, i, allowed)
+    } else {
+        visits(s, scan_token(s, j, allowed).1, i, allowed)
+    }
+}
+
+#[via_fn]
+proof fn visits_decreases(s: Seq<u8>, j: int, i: int, allowed: Option<Seq<u8>>) {
+    if 0 <= j < s.len() && !is_sql_space(s[j]) {
+        lemma_scan_token_bounds(s, j, allowed);
+    }
+}
+
+/// The bytes of `insert_byte(s, i, w)`.
+pub proof fn lemma_insert_byte(s: Seq<u8>, i: int, w: u8)
+    requires
+        0 <= i <= s.len(),
+    ensures
+        insert_byte(s, i, w).len() == s.len() + 1,
+        insert_byte(s, i, w)[i] == w,
+        forall|p: int| 0 <= p < i ==> #[trigger] insert_byte(s, i, w)[p] == s[p],
+        forall|p: int| i <= p < s.len() ==> #[trigger] insert_byte(s, i, w)[p + 1] == s[p],
+{
+    let t = insert_byte(s, i, w);
+    assert forall|p: int| i <= p < s.len() implies #[trigger] t[p + 1] == s[p] by {
+        assert(t[p + 1] == s.subrange(i, s.len() as int)[p - i]);
+    }
+}
+
+// Shifting: after the inserted byte, every scanner reads the same bytes one
+// position later.
+
+proof fn lemma_word_end_shift(s: Seq<u8>, i: int, w: u8, k: int)
+    requires
+        0 <= i <= k <= s.len(),
+    ensures
+        word_end(insert_byte(s, i, w), k + 1) == word_end(s, k) + 1,
+    decreases s.len() - k,
+{
+    lemma_insert_byte(s, i, w);
+    if k < s.len() && is_word_byte(s[k]) {
+        lemma_word_end_shift(s, i, w, k + 1);
+    }
+}
+
+proof fn lemma_quote_shift(s: Seq<u8>, i: int, w: u8, k: int, d: u8)
+    requires
+        0 <= i <= k <= s.len(),
+    ensures
+        quote_scan(insert_byte(s, i, w), k + 1, d) == (
+            quote_scan(s, k, d).0 + 1,
+            quote_scan(s, k, d).1,
+        ),
+        quote_body(insert_byte(s, i, w), k + 1, d) == quote_body(s, k, d),
+    decreases s.len() - k,
+{
+    lemma_insert_byte(s, i, w);
+    if k < s.len() {
+        if s[k] == d {
+            if k + 1 < s.len() && s[k + 1] == d {
+                lemma_quote_shift(s, i, w, k + 2, d);
+            }
+        } else {
+            lemma_quote_shift(s, i, w, k + 1, d);
+        }
+    }
+}
+
+proof fn lemma_through_byte_shift(s: Seq<u8>, i: int, w: u8, k: int, b: u8)
+    requires
+        0 <= i <= k <= s.len(),
+    ensures
+        through_byte(insert_byte(s, i, w), k + 1, b) == through_byte(s, k, b) + 1,
+    decreases s.len() - k,
+{
+    lemma_insert_byte(s, i, w);
+    if k < s.len() && s[k] != b {
+        lemma_through_byte_shift(s, i, w, k + 1, b);
+    }
+}
+
+proof fn lemma_block_comment_end_shift(s: Seq<u8>, i: int, w: u8, k: int)
+    requires
+        0 <= i <= k <= s.len(),
+    ensures
+        block_comment_end(insert_byte(s, i, w), k + 1) == block_comment_end(s, k) + 1,
+    decreases s.len() - k,
+{
+    lemma_insert_byte(s, i, w);
+    if k < s.len() && !(s[k] == b'*' && k + 1 < s.len() && s[k + 1] == b'/') {
+        lemma_block_comment_end_shift(s, i, w, k + 1);
+    }
+}
+
+proof fn lemma_scan_token_shift(s: Seq<u8>, i: int, w: u8, k: int, allowed: Option<Seq<u8>>)
+    requires
+        0 <= i <= k < s.len(),
+    ensures
+        scan_token(insert_byte(s, i, w), k + 1, allowed) == (
+            scan_token(s, k, allowed).0,
+            scan_token(s, k, allowed).1 + 1,
+        ),
+{
+    let t = insert_byte(s, i, w);
+    lemma_insert_byte(s, i, w);
+    lemma_scan_token_bounds(s, k, allowed);
+    let e = scan_token(s, k, allowed).1;
+    let c = s[k];
+    assert(t[k + 1] == c);
+    if k + 1 < s.len() {
+        assert(t[k + 2] == s[k + 1]);
+    }
+    if k + 2 < s.len() {
+        assert(t[k + 3] == s[k + 2]);
+    }
+    if is_word_byte(c) {
+        lemma_word_end_shift(s, i, w, k);
+    } else if c == b'"' || c == b'\'' || c == b'`' {
+        lemma_quote_shift(s, i, w, k + 1, c);
+    } else if c == b'[' {
+        lemma_through_byte_shift(s, i, w, k + 1, b']');
+    } else if c == b'-' && k + 1 < s.len() && s[k + 1] == b'-' {
+        lemma_through_byte_shift(s, i, w, k + 2, b'\n');
+    } else if c == b'/' && k + 1 < s.len() && s[k + 1] == b'*' {
+        lemma_block_comment_end_shift(s, i, w, k + 2);
+    }
+    assert(t.subrange(k + 1, e + 1) =~= s.subrange(k, e));
+}
+
+proof fn lemma_lex_shift(s: Seq<u8>, i: int, w: u8, k: int, allowed: Option<Seq<u8>>)
+    requires
+        0 <= i <= k <= s.len(),
+    ensures
+        lex(insert_byte(s, i, w), k + 1, allowed) == lex(s, k, allowed),
+    decreases s.len() - k,
+{
+    let t = insert_byte(s, i, w);
+    lemma_insert_byte(s, i, w);
+    if k < s.len() {
+        assert(t[k + 1] == s[k]);
+        if is_sql_space(s[k]) {
+            lemma_lex_shift(s, i, w, k + 1, allowed);
+        } else {
+            lemma_scan_token_bounds(s, k, allowed);
+            lemma_scan_token_shift(s, i, w, k, allowed);
+            lemma_lex_shift(s, i, w, scan_token(s, k, allowed).1, allowed);
+        }
+    }
+}
+
+// Locality: before the inserted whitespace, every scanner that stops at or
+// before it reads the same bytes and stops at the same place.
+
+proof fn lemma_word_end_local(s: Seq<u8>, i: int, w: u8, k: int)
+    requires
+        0 <= k <= i < s.len(),
+        word_end(s, k) <= i,
+        is_sql_space(w),
+    ensures
+        word_end(insert_byte(s, i, w), k) == word_end(s, k),
+    decreases i - k,
+{
+    lemma_insert_byte(s, i, w);
+    if k < i {
+        if is_word_byte(s[k]) {
+            lemma_word_end_local(s, i, w, k + 1);
+        }
+    } else {
+        lemma_word_end_bounds(s, k);
+        if is_word_byte(s[k]) {
+            lemma_word_end_bounds(s, k + 1);
+        }
+    }
+}
+
+proof fn lemma_quote_local(s: Seq<u8>, i: int, w: u8, k: int, d: u8)
+    requires
+        0 <= k <= i < s.len(),
+        quote_scan(s, k, d).0 <= i,
+        is_sql_space(w),
+        !is_sql_space(d),
+    ensures
+        quote_scan(insert_byte(s, i, w), k, d) == quote_scan(s, k, d),
+        quote_body(insert_byte(s, i, w), k, d) == quote_body(s, k, d),
+    decreases i - k,
+{
+    lemma_insert_byte(s, i, w);
+    lemma_quote_scan_bounds(s, k, d);
+    if s[k] == d {
+        if k + 1 < s.len() && s[k + 1] == d {
+            lemma_quote_scan_bounds(s, k + 2, d);
+            lemma_quote_local(s, i, w, k + 2, d);
+        } else if k + 1 < i {
+            assert(insert_byte(s, i, w)[k + 1] == s[k + 1]);
+        }
+    } else {
+        lemma_quote_scan_bounds(s, k + 1, d);
+        lemma_quote_local(s, i, w, k + 1, d);
+    }
+}
+
+proof fn lemma_through_byte_local(s: Seq<u8>, i: int, w: u8, k: int, b: u8)
+    requires
+        0 <= k <= i < s.len(),
+        through_byte(s, k, b) <= i,
+    ensures
+        through_byte(insert_byte(s, i, w), k, b) == through_byte(s, k, b),
+    decreases i - k,
+{
+    lemma_insert_byte(s, i, w);
+    lemma_through_byte_bounds(s, k, b);
+    if s[k] != b {
+        lemma_through_byte_bounds(s, k + 1, b);
+        lemma_through_byte_local(s, i, w, k + 1, b);
+    }
+}
+
+proof fn lemma_block_comment_end_local(s: Seq<u8>, i: int, w: u8, k: int)
+    requires
+        0 <= k <= i < s.len(),
+        block_comment_end(s, k) <= i,
+    ensures
+        block_comment_end(insert_byte(s, i, w), k) == block_comment_end(s, k),
+    decreases i - k,
+{
+    lemma_insert_byte(s, i, w);
+    lemma_block_comment_end_bounds(s, k);
+    if !(s[k] == b'*' && k + 1 < s.len() && s[k + 1] == b'/') {
+        lemma_block_comment_end_bounds(s, k + 1);
+        lemma_block_comment_end_local(s, i, w, k + 1);
+    } else {
+        assert(insert_byte(s, i, w)[k + 1] == s[k + 1]);
+    }
+}
+
+proof fn lemma_scan_token_local(s: Seq<u8>, i: int, w: u8, j: int, allowed: Option<Seq<u8>>)
+    requires
+        0 <= j < i < s.len(),
+        scan_token(s, j, allowed).1 <= i,
+        is_sql_space(w),
+    ensures
+        scan_token(insert_byte(s, i, w), j, allowed) == scan_token(s, j, allowed),
+{
+    let t = insert_byte(s, i, w);
+    lemma_insert_byte(s, i, w);
+    lemma_scan_token_bounds(s, j, allowed);
+    let e = scan_token(s, j, allowed).1;
+    let c = s[j];
+    assert(t[j] == c);
+    if j + 1 < i {
+        assert(t[j + 1] == s[j + 1]);
+    }
+    if j + 2 < i {
+        assert(t[j + 2] == s[j + 2]);
+    }
+    if is_word_byte(c) {
+        lemma_word_end_local(s, i, w, j);
+    } else if c == b'"' || c == b'\'' || c == b'`' {
+        lemma_quote_scan_bounds(s, j + 1, c);
+        lemma_quote_local(s, i, w, j + 1, c);
+    } else if c == b'[' {
+        lemma_through_byte_local(s, i, w, j + 1, b']');
+    } else if c == b'-' && s[j + 1] == b'-' {
+        lemma_through_byte_bounds(s, j + 2, b'\n');
+        assert(t[j + 1] == s[j + 1]);
+        lemma_through_byte_local(s, i, w, j + 2, b'\n');
+    } else if c == b'/' && s[j + 1] == b'*' {
+        lemma_block_comment_end_bounds(s, j + 2);
+        assert(t[j + 1] == s[j + 1]);
+        lemma_block_comment_end_local(s, i, w, j + 2);
+    }
+    assert(t.subrange(j, e) =~= s.subrange(j, e));
+}
+
+proof fn lemma_lex_local(s: Seq<u8>, i: int, w: u8, j: int, allowed: Option<Seq<u8>>)
+    requires
+        0 <= j <= i < s.len(),
+        visits(s, j, i, allowed),
+        is_sql_space(w),
+    ensures
+        lex(insert_byte(s, i, w), j, allowed) == lex(s, j, allowed),
+    decreases i - j,
+{
+    let t = insert_byte(s, i, w);
+    lemma_insert_byte(s, i, w);
+    if j == i {
+        lemma_lex_shift(s, i, w, i, allowed);
+    } else if is_sql_space(s[j]) {
+        lemma_lex_local(s, i, w, j + 1, allowed);
+    } else {
+        lemma_scan_token_bounds(s, j, allowed);
+        let e = scan_token(s, j, allowed).1;
+        lemma_visits_bound(s, e, i, allowed);
+        lemma_scan_token_local(s, i, w, j, allowed);
+        lemma_lex_local(s, i, w, e, allowed);
+    }
+}
+
+/// A visited position is not before the start.
+proof fn lemma_visits_bound(s: Seq<u8>, j: int, i: int, allowed: Option<Seq<u8>>)
+    requires
+        visits(s, j, i, allowed),
+    ensures
+        j <= i,
+    decreases s.len() - j,
+{
+    if j != i && 0 <= j < s.len() && j < i {
+        if is_sql_space(s[j]) {
+            lemma_visits_bound(s, j + 1, i, allowed);
+        } else {
+            lemma_scan_token_bounds(s, j, allowed);
+            lemma_visits_bound(s, scan_token(s, j, allowed).1, i, allowed);
+        }
+    }
+}
+
+/// Inserting an ASCII whitespace byte at a position the lexer reaches (a
+/// token boundary, or inside whitespace between tokens) does not change the
+/// tokens. With `lemma_tokens_cover_input`, this makes the exact-definition
+/// check precisely "the same tokens, however they are spaced".
+pub proof fn lemma_space_between_tokens(s: Seq<u8>, i: int, w: u8, allowed: Option<Seq<u8>>)
+    requires
+        0 <= i < s.len(),
+        visits(s, 0, i, allowed),
+        is_sql_space(w),
+    ensures
+        tokenize(insert_byte(s, i, w), allowed) == tokenize(s, allowed),
+{
+    lemma_lex_local(s, i, w, 0, allowed);
 }
 
 // ---------------------------------------------------------------------------
