@@ -976,6 +976,50 @@ pub open spec fn spec_component_prefix(p: Seq<u8>, s: Seq<u8>) -> bool {
     is_prefix_of(p, s) && (p.len() == s.len() || p == seq![b'/'] || s[p.len() as int] == b'/')
 }
 
+/// Decides `spec_component_prefix(p, s)`: `p` is a byte prefix of `s` that
+/// ends at a component boundary. Total. On canonical absolute strings this
+/// is segment prefix, i.e. `Path::starts_with` (`lemma_component_prefix_iff_segs`).
+// Only the Unix glue (stored-path prefix queries) calls this.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn canonical_is_component_prefix(p: &[u8], s: &[u8]) -> (r: bool)
+    ensures
+        r == spec_component_prefix(p@, s@),
+{
+    let n = p.len();
+    if n > s.len() {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < n
+        invariant
+            n == p.len() <= s.len(),
+            0 <= i <= n,
+            forall|j: int| 0 <= j < i ==> p@[j] == s@[j],
+        decreases n - i,
+    {
+        if p[i] != s[i] {
+            proof {
+                assert(s@.subrange(0, n as int)[i as int] == s@[i as int]);
+            }
+            return false;
+        }
+        i += 1;
+    }
+    proof {
+        assert(s@.subrange(0, n as int) =~= p@);
+    }
+    let boundary = n == s.len() || (n == 1 && p[0] == b'/') || s[n] == b'/';
+    proof {
+        if n == 1 && p@[0] == b'/' {
+            assert(p@ =~= seq![b'/']);
+        }
+        if p@ == seq![b'/'] {
+            assert(p@[0] == b'/');
+        }
+    }
+    boundary
+}
+
 /// `render_tail` distributes over concatenation.
 pub proof fn lemma_render_tail_concat(a: Seq<Seq<u8>>, b: Seq<Seq<u8>>)
     ensures

@@ -1681,6 +1681,160 @@ pub fn is_canonical_abs_path(s: &[u8], backslash_forbidden: bool) -> (canonical:
 }
 
 // ===========================================================================
+// `..` segments (used by stored-path prefix queries)
+// ===========================================================================
+
+/// Some element of `st` is `..`.
+pub open spec fn has_parent_seg_spec(st: Seq<Seq<u8>>) -> bool {
+    exists|i: int| 0 <= i < st.len() && is_parent_seg(#[trigger] st[i])
+}
+
+/// Appending one element adds a `..` exactly when that element is `..`.
+proof fn lemma_has_parent_push(st: Seq<Seq<u8>>, x: Seq<u8>)
+    ensures
+        has_parent_seg_spec(st.push(x)) == (has_parent_seg_spec(st) || is_parent_seg(x)),
+{
+    let t = st.push(x);
+    if has_parent_seg_spec(st) {
+        let i = choose|i: int| 0 <= i < st.len() && is_parent_seg(#[trigger] st[i]);
+        assert(t[i] == st[i]);
+    }
+    if is_parent_seg(x) {
+        assert(t[st.len() as int] == x);
+    }
+    if has_parent_seg_spec(t) {
+        let i = choose|i: int| 0 <= i < t.len() && is_parent_seg(#[trigger] t[i]);
+        if i < st.len() {
+            assert(t[i] == st[i]);
+        }
+    }
+}
+
+/// `keep` drops no `..` piece.
+proof fn lemma_keep_has_parent(ps: Seq<Seq<u8>>)
+    ensures
+        has_parent_seg_spec(keep(ps)) == has_parent_seg_spec(ps),
+    decreases ps.len(),
+{
+    if ps.len() > 0 {
+        let p1 = ps.drop_last();
+        lemma_keep_has_parent(p1);
+        assert(p1.push(ps.last()) =~= ps);
+        lemma_has_parent_push(p1, ps.last());
+        if !is_skipped(ps.last()) {
+            assert(keep(ps) == keep(p1).push(ps.last()));
+            lemma_has_parent_push(keep(p1), ps.last());
+        } else {
+            assert(keep(ps) == keep(p1));
+            assert(!is_parent_seg(ps.last())) by {
+                if ps.last().len() == 2 {
+                    assert(ps.last() != seq![b'.']);
+                }
+            }
+        }
+    }
+}
+
+/// The segments of a string without `..` are named segments, and resolving
+/// them changes nothing.
+pub proof fn lemma_parent_free_segs(s: Seq<u8>)
+    requires
+        !has_parent_seg_spec(segs(s)),
+    ensures
+        all_normal(segs(s)),
+        resolve_segs(segs(s)) == Some(segs(s)),
+{
+    lemma_pieces_slash_free(s);
+    lemma_keep_props(pieces(s));
+    let st = segs(s);
+    assert forall|i: int| 0 <= i < st.len() implies is_normal_seg(#[trigger] st[i]) by {
+        assert(!is_skipped(st[i]));
+        assert(no_byte(st[i], b'/'));
+        if is_parent_seg(st[i]) {
+            assert(has_parent_seg_spec(st));
+        }
+    }
+    lemma_resolve_named(Seq::empty(), st);
+    assert(Seq::<Seq<u8>>::empty() + st =~= st);
+}
+
+/// Whether some segment of `s` is `..` (decides `has_parent_seg_spec(segs(s))`).
+/// Total.
+// Only the Unix glue (stored-path prefix queries) calls this.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn has_parent_segment(s: &[u8]) -> (found: bool)
+    ensures
+        found == has_parent_seg_spec(segs(s@)),
+{
+    let n = s.len();
+    let mut found = false;
+    let mut start: usize = 0;
+    let mut i: usize = 0;
+    proof {
+        lemma_segs_trivial();
+        assert(s@.subrange(0, 0) =~= Seq::<u8>::empty());
+        assert(seq![Seq::<u8>::empty()].drop_last() =~= Seq::<Seq<u8>>::empty());
+    }
+    while i < n
+        invariant
+            n == s.len(),
+            0 <= start <= i <= n,
+            pieces(s@.subrange(0, i as int)).len() >= 1,
+            pieces(s@.subrange(0, i as int)).last() == s@.subrange(start as int, i as int),
+            found == has_parent_seg_spec(pieces(s@.subrange(0, i as int)).drop_last()),
+        decreases n - i,
+    {
+        if s[i] == b'/' {
+            let parent = i - start == 2 && s[start] == b'.' && s[start + 1] == b'.';
+            proof {
+                let p = pieces(s@.subrange(0, i as int));
+                let piece = s@.subrange(start as int, i as int);
+                lemma_scan_slash(s@, i as int, start as int, false);
+                assert(p.drop_last().push(p.last()) =~= p);
+                lemma_has_parent_push(p.drop_last(), p.last());
+                assert(seq![b'.', b'.'][0] == b'.');
+                assert(seq![b'.', b'.'][1] == b'.');
+                if i - start == 2 {
+                    assert(piece[0] == s@[start as int]);
+                    assert(piece[1] == s@[start + 1]);
+                    if parent {
+                        assert(piece =~= seq![b'.', b'.']);
+                    }
+                }
+                assert(parent == is_parent_seg(piece));
+            }
+            found = found || parent;
+            start = i + 1;
+        } else {
+            proof {
+                lemma_scan_byte(s@, i as int, start as int, false);
+            };
+        }
+        i += 1;
+    }
+    let last_parent = n - start == 2 && s[start] == b'.' && s[start + 1] == b'.';
+    proof {
+        assert(s@.subrange(0, n as int) =~= s@);
+        let p = pieces(s@);
+        let piece = s@.subrange(start as int, n as int);
+        assert(p.drop_last().push(p.last()) =~= p);
+        lemma_has_parent_push(p.drop_last(), p.last());
+        assert(seq![b'.', b'.'][0] == b'.');
+        assert(seq![b'.', b'.'][1] == b'.');
+        if n - start == 2 {
+            assert(piece[0] == s@[start as int]);
+            assert(piece[1] == s@[start + 1]);
+            if last_parent {
+                assert(piece =~= seq![b'.', b'.']);
+            }
+        }
+        assert(last_parent == is_parent_seg(piece));
+        lemma_keep_has_parent(p);
+    }
+    found || last_parent
+}
+
+// ===========================================================================
 // Tilde expansion
 // ===========================================================================
 

@@ -98,6 +98,33 @@ pub(crate) fn component_kind(component: Component<'_>) -> CompKind {
     }
 }
 
+/// The platform facts the storage kernel (`verified::storage`) needs to judge
+/// `path` as a stored reservation key.
+///
+/// On Unix the byte model decides everything. Elsewhere `std` decides
+/// whether the path is absolute and whether it is a fixed point of component
+/// resolution ([`is_canonical_absolute`]); the kernel accepts `/`-rooted
+/// spellings written on Unix by their portable form.
+#[cfg(unix)]
+pub(crate) const fn storage_platform(_path: &Path) -> crate::verified::storage::PathPlatform {
+    crate::verified::storage::PathPlatform::Unix
+}
+
+/// The platform facts the storage kernel (`verified::storage`) needs to judge
+/// `path` as a stored reservation key.
+///
+/// On Unix the byte model decides everything. Elsewhere `std` decides
+/// whether the path is absolute and whether it is a fixed point of component
+/// resolution ([`is_canonical_absolute`]); the kernel accepts `/`-rooted
+/// spellings written on Unix by their portable form.
+#[cfg(not(unix))]
+pub(crate) fn storage_platform(path: &Path) -> crate::verified::storage::PathPlatform {
+    crate::verified::storage::PathPlatform::Native {
+        absolute: path.is_absolute(),
+        normal: is_canonical_absolute(path),
+    }
+}
+
 /// Whether `path` is spelled in canonical absolute form: what
 /// [`normalize::normalize`] produces.
 ///
