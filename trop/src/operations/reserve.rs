@@ -59,13 +59,15 @@ impl MetadataIntent {
 
     /// The kernel intent: the same operation, with a `Set` value trimmed.
     ///
-    /// Trimming is `str::trim` (trusted). The idempotence lemma of
-    /// `verified::reserve` relies on trimming a trimmed value changing
-    /// nothing, which `trimmed_intent_values_are_fixed_points` pins.
+    /// Trimming is the verified identifier trim (`verified::identifier::trim`),
+    /// the same function the reservation builder applies. The idempotence
+    /// lemma of `verified::reserve` needs trimming a trimmed value to change
+    /// nothing, which is `verified::identifier::lemma_trimmed_idempotent`;
+    /// `trimmed_intent_values_are_fixed_points` exercises the end-to-end path.
     fn kernel_intent(&self) -> Intent<&str> {
         match self {
             Self::Preserve => Intent::Preserve,
-            Self::Set(value) => Intent::Set(value.trim()),
+            Self::Set(value) => Intent::Set(crate::identifier::trim_identifier(value)),
             Self::Clear => Intent::Clear,
         }
     }
@@ -2176,8 +2178,8 @@ mod tests {
         assert_eq!(cases, 4 * 4 * 6 * 6 * 16);
     }
 
-    /// Pins the trusted `str::trim` fact behind the kernel's idempotence
-    /// lemma (`lemma_repeat_request_touches`): an explicit value is stored
+    /// Exercises the trim fact behind the kernel's idempotence lemma
+    /// (`lemma_repeat_request_touches`): an explicit value is stored
     /// trimmed, and trimming it again (the reservation builder trims)
     /// changes nothing, so the stored value equals the requested one.
     #[test]
