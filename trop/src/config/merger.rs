@@ -6,6 +6,7 @@
 use crate::config::loader::ConfigSource;
 use crate::config::schema::{CleanupConfig, Config, OccupancyConfig, PortConfig};
 use crate::config::ConfigField;
+use crate::verified::port_bounds::{overlay_port_bounds, LayerLeaves, PortBounds, PortLayer};
 
 /// Merges configuration sources according to precedence rules.
 ///
@@ -112,12 +113,12 @@ impl ConfigMerger {
 
         // Merge ports config
         if let Some(ref source_ports) = source.ports {
-            target.ports = Some(match &target.ports {
-                Some(target_ports) => Self::merge_port_config(target_ports, source_ports),
-                None => source_ports.clone(),
-            });
-            on_field(ConfigField::PortsMin);
-            if source_ports.max.is_some() || source_ports.max_offset.is_some() {
+            let (ports, leaves) = Self::merge_port_config(target.ports.as_ref(), source_ports);
+            target.ports = Some(ports);
+            if leaves.min {
+                on_field(ConfigField::PortsMin);
+            }
+            if leaves.upper {
                 // Selecting either upper-bound representation also clears the
                 // mutually exclusive representation.
                 on_field(ConfigField::PortsMax);
@@ -167,23 +168,37 @@ impl ConfigMerger {
 
     /// Merge port configuration.
     ///
-    /// Source values take precedence over target values.
-    fn merge_port_config(target: &PortConfig, source: &PortConfig) -> PortConfig {
-        let (max, max_offset) = if source.max.is_some() && source.max_offset.is_some() {
-            (source.max, source.max_offset)
-        } else if source.max_offset.is_some() {
-            (None, source.max_offset)
-        } else if source.max.is_some() {
-            (source.max, None)
-        } else {
-            (target.max, target.max_offset)
+    /// Source values take precedence over target values: the source's `min`
+    /// always wins, and an upper bound in the source replaces the target's.
+    /// The source's `max_offset` is resolved against the source's own `min`
+    /// into an absolute `max`, and a target upper bound the source keeps
+    /// stays where it is, so a later `min` never moves an earlier offset that
+    /// resolved. (An offset that does not resolve -- 0, or past 65535 -- is
+    /// kept as written for validation to report; this merge validates
+    /// nothing.) The decision is made by the verified port-bounds kernel
+    /// (`overlay_port_bounds`); this returns the merged section and the
+    /// leaves the source set.
+    fn merge_port_config(
+        target: Option<&PortConfig>,
+        source: &PortConfig,
+    ) -> (PortConfig, LayerLeaves) {
+        // An absent target section has no upper bound; its `min` is
+        // irrelevant because every source section sets `min`.
+        let lower = target.map_or(
+            PortBounds {
+                min: source.min,
+                max: None,
+                max_offset: None,
+            },
+            PortConfig::bounds,
+        );
+        let layer = PortLayer {
+            min: Some(source.min),
+            max: source.max,
+            max_offset: source.max_offset,
         };
-
-        PortConfig {
-            min: source.min, // Always use source
-            max,
-            max_offset,
-        }
+        let (bounds, leaves) = overlay_port_bounds(lower, layer);
+        (PortConfig::from_bounds(bounds), leaves)
     }
 
     /// Merge cleanup configuration.
@@ -316,8 +331,8 @@ mod tests {
         ConfigMerger::merge_into(&mut target, &source);
         let ports = target.ports.unwrap();
         assert_eq!(ports.min, 7000); // Always use source
-        assert_eq!(ports.max, None); // max_offset clears max
-        assert_eq!(ports.max_offset, Some(100)); // Use source
+        assert_eq!(ports.max, Some(7100)); // Source offset, resolved at source min
+        assert_eq!(ports.max_offset, None); // Stored as the absolute max
     }
 
     #[test]
@@ -342,8 +357,8 @@ mod tests {
         ConfigMerger::merge_into(&mut target, &source);
         let ports = target.ports.unwrap();
         assert_eq!(ports.min, 8000);
-        assert_eq!(ports.max, None);
-        assert_eq!(ports.max_offset, Some(25));
+        assert_eq!(ports.max, Some(8025));
+        assert_eq!(ports.max_offset, None);
     }
 
     #[test]

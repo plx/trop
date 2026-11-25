@@ -19,7 +19,6 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use trop::config::{
     CleanupConfig, ConfigField, OccupancyConfig, OutputFormat as ConfigOutputFormat, PortConfig,
-    DEFAULT_MAX_PORT, DEFAULT_MIN_PORT,
 };
 
 /// Command-line tool for managing ephemeral port reservations.
@@ -177,30 +176,9 @@ impl Command {
                     clear_task: command.clear_task,
                 });
 
-                let min = command
-                    .min
-                    .as_deref()
-                    .map(crate::commands::reserve::parse_port_string)
-                    .transpose()
-                    .map_err(|error| {
-                        CliError::InvalidArguments(format!("invalid --min value: {error}"))
-                    })?;
-                let max = command
-                    .max
-                    .as_deref()
-                    .map(crate::commands::reserve::parse_port_string)
-                    .transpose()
-                    .map_err(|error| {
-                        CliError::InvalidArguments(format!("invalid --max value: {error}"))
-                    })?;
-                if let (Some(min), Some(max)) = (min, max) {
-                    if min > max {
-                        return Err(CliError::InvalidArguments(format!(
-                            "Invalid port range: min ({min}) must be less than or equal to max ({max})"
-                        )));
-                    }
-                }
-                set_port_overrides(&mut command_line, min, max);
+                let min = parse_port_flag("--min", command.min.as_deref())?;
+                let max = parse_port_flag("--max", command.max.as_deref())?;
+                set_port_overrides(&mut command_line, min, max)?;
 
                 set_true(
                     &mut command_line,
@@ -314,7 +292,7 @@ impl Command {
                 ConfigScope::Discover
             }
             Self::Scan(command) => {
-                set_port_overrides(&mut command_line, command.min, command.max);
+                set_port_overrides(&mut command_line, command.min, command.max)?;
                 set_occupancy_overrides(
                     &mut command_line,
                     false,
@@ -403,14 +381,42 @@ impl Command {
     }
 }
 
-fn set_port_overrides(command_line: &mut CommandLineConfig, min: Option<u16>, max: Option<u16>) {
+/// Parse a `trop reserve` port flag, reporting a bad value once (not wrapped
+/// twice in "Invalid arguments").
+fn parse_port_flag(flag: &str, value: Option<&str>) -> Result<Option<u16>, CliError> {
+    value
+        .map(crate::commands::reserve::parse_port_string)
+        .transpose()
+        .map_err(|error| match error {
+            CliError::InvalidArguments(message) => {
+                CliError::InvalidArguments(format!("invalid {flag} value: {message}"))
+            }
+            other => other,
+        })
+}
+
+/// Lay `--min` / `--max` over the configuration as exactly the leaves the
+/// user typed, after checking them (each a valid port, `min <= max`) with the
+/// library's verified rule. `reserve` and `scan` share this, so both reject a
+/// bad pair as invalid arguments (exit 4).
+fn set_port_overrides(
+    command_line: &mut CommandLineConfig,
+    min: Option<u16>,
+    max: Option<u16>,
+) -> Result<(), CliError> {
+    PortConfig::check_command_line_bounds(min, max).map_err(|error| match error {
+        trop::Error::Validation { message, .. } => CliError::InvalidArguments(message),
+        other => CliError::Library(other),
+    })?;
     if min.is_none() && max.is_none() {
-        return;
+        return Ok(());
     }
 
+    // Only the recorded leaves are applied; the others are placeholders.
+    let placeholder = PortConfig::default();
     command_line.config.ports = Some(PortConfig {
-        min: min.unwrap_or(DEFAULT_MIN_PORT),
-        max: max.or(Some(DEFAULT_MAX_PORT)),
+        min: min.unwrap_or(placeholder.min),
+        max: max.or(placeholder.max),
         max_offset: None,
     });
     if min.is_some() {
@@ -420,6 +426,7 @@ fn set_port_overrides(command_line: &mut CommandLineConfig, min: Option<u16>, ma
         command_line.record(ConfigField::PortsMax);
         command_line.record(ConfigField::PortsMaxOffset);
     }
+    Ok(())
 }
 
 fn set_permissions(
@@ -631,5 +638,80 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    fn port_request(args: &[&str]) -> Result<(Option<PortConfig>, Vec<ConfigField>), CliError> {
+        let cli = Cli::try_parse_from(args).expect("port arguments should parse");
+        let request = cli.command.config_request(&globals())?;
+        let port_fields = [
+            ConfigField::PortsMin,
+            ConfigField::PortsMax,
+            ConfigField::PortsMaxOffset,
+        ];
+        let fields = request
+            .command_line
+            .fields
+            .iter()
+            .copied()
+            .filter(|field| port_fields.contains(field))
+            .collect();
+        Ok((request.command_line.config.ports, fields))
+    }
+
+    /// `reserve` and `scan` build the same port layer, recording exactly the
+    /// typed leaves (`--max` also clears `max_offset`), and reject the same
+    /// bounds as invalid arguments.
+    #[test]
+    fn reserve_and_scan_build_the_same_port_layer() {
+        for bounds in [
+            vec![],
+            vec!["--min", "6000"],
+            vec!["--max", "6100"],
+            vec!["--min", "1", "--max", "65535"],
+            vec!["--min", "6000", "--max", "6000"],
+        ] {
+            let mut reserve = vec!["trop", "reserve"];
+            reserve.extend(&bounds);
+            let mut scan = vec!["trop", "scan"];
+            scan.extend(&bounds);
+            let (ports, fields) = port_request(&reserve).unwrap();
+            assert_eq!(
+                (ports.clone(), fields.clone()),
+                port_request(&scan).unwrap()
+            );
+
+            let mut expected = Vec::new();
+            if bounds.contains(&"--min") {
+                expected.push(ConfigField::PortsMin);
+            }
+            if bounds.contains(&"--max") {
+                expected.push(ConfigField::PortsMax);
+                expected.push(ConfigField::PortsMaxOffset);
+            }
+            assert_eq!(fields, expected, "{bounds:?}");
+            assert_eq!(ports.is_some(), !bounds.is_empty(), "{bounds:?}");
+            if let Some(ports) = ports {
+                assert_eq!(ports.max_offset, None);
+            }
+        }
+
+        for bounds in [
+            ["--min", "6000", "--max", "5999"],
+            ["--min", "0", "--max", "5999"],
+            ["--min", "6000", "--max", "0"],
+        ] {
+            let mut reserve = vec!["trop", "reserve"];
+            reserve.extend(bounds);
+            let mut scan = vec!["trop", "scan"];
+            scan.extend(bounds);
+            let reserve_error = port_request(&reserve).unwrap_err();
+            let scan_error = port_request(&scan).unwrap_err();
+            assert_eq!(reserve_error.exit_code(), 4, "{bounds:?}");
+            assert_eq!(
+                scan_error.to_string(),
+                reserve_error.to_string(),
+                "{bounds:?}"
+            );
+        }
     }
 }

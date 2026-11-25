@@ -4,8 +4,11 @@
 //! override configuration file values.
 
 use crate::config::effective::ConfigField;
-use crate::config::schema::{Config, OutputFormat, PortExclusion};
+use crate::config::schema::{Config, OutputFormat, PortConfig, PortExclusion};
 use crate::error::{Error, Result};
+use crate::verified::port_bounds::{
+    check_upper_declaration, overlay_port_bounds, PortBoundsViolation, PortLayer,
+};
 use std::env;
 
 /// Handles environment variable overrides for configuration.
@@ -153,49 +156,89 @@ impl EnvironmentConfig {
     }
 
     /// Apply port-related environment variable overrides.
+    ///
+    /// `TROP_PORT_MIN`, `TROP_PORT_MAX`, and `TROP_PORT_MAX_OFFSET` form one
+    /// layer. Like a YAML document, the layer must not set both `max` and
+    /// `max_offset`, and its `max_offset` must land on a valid port above the
+    /// `min` in effect at this layer; it is then resolved to an absolute
+    /// `max`. An upper bound the layer does not set stays where it is when
+    /// only `TROP_PORT_MIN` is set. The checks and the overlay are decided by
+    /// the verified port-bounds kernel.
     fn apply_port_overrides(
         config: &mut Config,
         on_field: &mut impl FnMut(ConfigField, &'static str),
     ) -> Result<()> {
-        let mut port_config = config.ports.clone().unwrap_or_default();
-        let mut modified = false;
+        let min = Self::read_port_variable("TROP_PORT_MIN", "Invalid port number")?;
+        let max = Self::read_port_variable("TROP_PORT_MAX", "Invalid port number")?;
+        let max_offset = Self::read_port_variable("TROP_PORT_MAX_OFFSET", "Invalid port offset")?;
 
-        if let Ok(min) = env::var("TROP_PORT_MIN") {
-            port_config.min = min.parse().map_err(|_| Error::Validation {
-                field: "TROP_PORT_MIN".into(),
-                message: "Invalid port number".into(),
-            })?;
-            modified = true;
+        let lower = config.ports.clone().unwrap_or_default().bounds();
+        let layer = PortLayer {
+            min,
+            max,
+            max_offset,
+        };
+        let (bounds, leaves) = overlay_port_bounds(lower, layer);
+        // The overlay's `min` is the one in effect at this layer.
+        let anchor = bounds.min;
+        check_upper_declaration(anchor, max, max_offset).map_err(|violation| {
+            let (field, message) = match violation {
+                PortBoundsViolation::OffsetOverflow { offset } => (
+                    "ports.max_offset (TROP_PORT_MAX_OFFSET)",
+                    format!("Offset {offset} would overflow when added to min port {anchor}"),
+                ),
+                PortBoundsViolation::BothMaxAndOffset => (
+                    "ports (TROP_PORT_MAX, TROP_PORT_MAX_OFFSET)",
+                    "Cannot specify both max and max_offset".to_string(),
+                ),
+                // `ZeroOffset` is the only other violation the kernel reports
+                // for an upper-bound declaration.
+                PortBoundsViolation::ZeroOffset
+                | PortBoundsViolation::InvalidMin
+                | PortBoundsViolation::InvalidMax
+                | PortBoundsViolation::MaxBelowMin => (
+                    "ports.max_offset (TROP_PORT_MAX_OFFSET)",
+                    "max_offset must be > 0".to_string(),
+                ),
+            };
+            Error::Validation {
+                field: field.into(),
+                message,
+            }
+        })?;
+
+        if leaves.min || leaves.upper {
+            config.ports = Some(PortConfig::from_bounds(bounds));
+        }
+        if leaves.min {
             on_field(ConfigField::PortsMin, "TROP_PORT_MIN");
         }
-
-        if let Ok(max) = env::var("TROP_PORT_MAX") {
-            port_config.max = Some(max.parse().map_err(|_| Error::Validation {
-                field: "TROP_PORT_MAX".into(),
-                message: "Invalid port number".into(),
-            })?);
-            port_config.max_offset = None;
-            modified = true;
-            on_field(ConfigField::PortsMax, "TROP_PORT_MAX");
-            on_field(ConfigField::PortsMaxOffset, "TROP_PORT_MAX");
-        }
-
-        if let Ok(max_offset) = env::var("TROP_PORT_MAX_OFFSET") {
-            port_config.max_offset = Some(max_offset.parse().map_err(|_| Error::Validation {
-                field: "TROP_PORT_MAX_OFFSET".into(),
-                message: "Invalid port offset".into(),
-            })?);
-            port_config.max = None;
-            modified = true;
-            on_field(ConfigField::PortsMaxOffset, "TROP_PORT_MAX_OFFSET");
-            on_field(ConfigField::PortsMax, "TROP_PORT_MAX_OFFSET");
-        }
-
-        if modified {
-            config.ports = Some(port_config);
+        if leaves.upper {
+            // Exactly one upper-bound variable is set (the check above
+            // rejects both).
+            let upper_variable = if max_offset.is_some() {
+                "TROP_PORT_MAX_OFFSET"
+            } else {
+                "TROP_PORT_MAX"
+            };
+            on_field(ConfigField::PortsMax, upper_variable);
+            on_field(ConfigField::PortsMaxOffset, upper_variable);
         }
 
         Ok(())
+    }
+
+    /// Read and parse one port-valued `TROP_PORT_*` variable, if it is set.
+    fn read_port_variable(variable: &'static str, message: &str) -> Result<Option<u16>> {
+        env::var(variable)
+            .ok()
+            .map(|value| {
+                value.parse().map_err(|_| Error::Validation {
+                    field: variable.into(),
+                    message: message.into(),
+                })
+            })
+            .transpose()
     }
 
     /// Apply occupancy check environment variable overrides.
@@ -465,9 +508,12 @@ mod tests {
         EnvironmentConfig::apply_overrides(&mut config).unwrap();
         std::env::remove_var("TROP_PORT_MAX_OFFSET");
 
+        // The offset replaces the explicit max and is resolved against the
+        // `min` in effect (8000) into the absolute max it names.
         let ports = config.ports.unwrap();
-        assert_eq!(ports.max, None);
-        assert_eq!(ports.max_offset, Some(25));
+        assert_eq!(ports.min, 8000);
+        assert_eq!(ports.max, Some(8025));
+        assert_eq!(ports.max_offset, None);
     }
 }
 

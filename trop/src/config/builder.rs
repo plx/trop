@@ -101,7 +101,9 @@ impl ConfigBuilder {
     /// Add additional configuration to merge (highest precedence).
     ///
     /// This configuration will be merged last, giving it the highest precedence
-    /// after environment variables.
+    /// after environment variables. Like a configuration file, it must be
+    /// valid on its own; [`Self::build`] reports its first violation,
+    /// annotated with `<programmatic override>`.
     #[must_use]
     pub fn with_config(mut self, config: Config) -> Self {
         self.additional_config = Some(config);
@@ -169,9 +171,10 @@ impl ConfigBuilder {
     ///
     /// Performs the following steps:
     /// 1. Starts with default configuration
-    /// 2. Loads and merges file-based configurations (if not skipped)
+    /// 2. Loads and merges file-based configurations (if not skipped), and
+    ///    checks `reservations.base` against the port range they name
     /// 3. Applies environment variable overrides (if not skipped)
-    /// 4. Applies additional configuration (if provided)
+    /// 4. Validates and applies additional configuration (if provided)
     /// 5. Applies command-line configuration (if provided)
     /// 6. Validates the final configuration
     ///
@@ -250,6 +253,11 @@ impl ConfigBuilder {
             }
         }
 
+        // `reservations.base` must lie in the range the configuration files
+        // name. Later overrides apply to one invocation; `reserve-group`
+        // checks the base against the range it actually scans.
+        effective.validate_configured_group_base()?;
+
         if !self.skip_env {
             let mut changes = Vec::new();
             EnvironmentConfig::apply_overrides_with(effective.config_mut(), |field, variable| {
@@ -269,6 +277,10 @@ impl ConfigBuilder {
         }
 
         if let Some(additional) = self.additional_config {
+            // Like every configuration file, the programmatic layer must be
+            // valid on its own, so its port bounds resolve where it declares
+            // them and a later layer cannot rescue or re-anchor them.
+            ConfigValidator::validate_source(&additional, &ConfigValueSource::Programmatic)?;
             effective.merge_config(&additional, &ConfigValueSource::Programmatic);
         }
 
@@ -305,11 +317,9 @@ impl ConfigBuilder {
     fn default_config() -> Config {
         Config {
             project: None,
-            ports: Some(PortConfig {
-                min: 5000,
-                max: Some(7000),
-                max_offset: None,
-            }),
+            // The built-in range, defined once by the verified port-bounds
+            // kernel (which proves it valid).
+            ports: Some(PortConfig::default()),
             excluded_ports: None,
             cleanup: Some(CleanupConfig {
                 expire_after_days: Some(30),
@@ -543,9 +553,11 @@ mod tests {
             .build()
             .unwrap();
 
+        // The document's offset is resolved against its own min into the
+        // absolute max it names; it replaces the default max.
         let ports = config.ports.unwrap();
         assert_eq!(ports.min, 8000);
-        assert_eq!(ports.max, None);
-        assert_eq!(ports.max_offset, Some(25));
+        assert_eq!(ports.max, Some(8025));
+        assert_eq!(ports.max_offset, None);
     }
 }

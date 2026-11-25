@@ -10,8 +10,10 @@
 //!   checking that a stored group still has the requested shape
 //!   (`derive_compatible_base`), with the theorem that a fresh plan always
 //!   passes that check (`lemma_fresh_plan_is_compatible`);
-//! - the reconciliation decision (`decide_group_reconciliation`), the scan
-//!   bounds derived from `reservations.base`, and configuration helpers.
+//! - the reconciliation decision (`decide_group_reconciliation`) and
+//!   configuration helpers. (The scan range derived from `reservations.base`
+//!   is `super::port_bounds::group_scan_span`, next to the one resolution of
+//!   the configured bounds.)
 //!
 //! Production glue: `crate::port::group`, `crate::operations::reserve_group`,
 //! and `crate::operations::autoreserve`.
@@ -2495,130 +2497,6 @@ pub fn decide_group_reconciliation(stored_count: usize, compat: CompatClass, for
         },
         CompatClass::OtherError => GroupDecision::Fail,
     }
-}
-
-// ---------------------------------------------------------------------------
-// Scan bounds from `reservations.base`
-// ---------------------------------------------------------------------------
-
-/// The configured `ports` section.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConfiguredPorts {
-    /// `ports.min`.
-    pub min: u16,
-    /// `ports.max`.
-    pub max: Option<u16>,
-    /// `ports.max_offset`.
-    pub max_offset: Option<u16>,
-}
-
-/// Why the group scan bounds cannot be derived.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScanBoundsError {
-    /// `reservations.base` is set but there is no `ports` section.
-    MissingPorts,
-    /// `ports.min + ports.max_offset` exceeds 65535.
-    MaxOffsetOverflow,
-    /// Neither `ports.max` nor `ports.max_offset` is set.
-    MissingMax,
-    /// `reservations.base` lies outside `ports.min..=max`.
-    BaseOutOfRange {
-        /// The configured maximum.
-        max: u16,
-    },
-}
-
-/// The scan bounds of a group.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GroupScanBounds {
-    /// No `reservations.base`: the configured range is used unchanged.
-    Unchanged,
-    /// The scan runs over `min..=max`.
-    Rebased {
-        /// The scan start (`reservations.base`).
-        min: u16,
-        /// The configured maximum.
-        max: u16,
-    },
-}
-
-/// The configured upper bound: `max` wins over `max_offset`, which is
-/// relative to `min` and must not overflow.
-pub open spec fn configured_max(p: ConfiguredPorts) -> Result<int, ScanBoundsError> {
-    match p.max {
-        Some(m) => Ok(m as int),
-        None => match p.max_offset {
-            Some(o) => if p.min + o <= 65535 {
-                Ok(p.min + o)
-            } else {
-                Err(ScanBoundsError::MaxOffsetOverflow)
-            },
-            None => Err(ScanBoundsError::MissingMax),
-        },
-    }
-}
-
-/// Derives the group's scan bounds: with `reservations.base` set, the scan
-/// starts at the base and ends at the configured maximum (computed from the
-/// original `ports.min`, never from the base), and the base must lie inside
-/// the configured range. Rebasing only ever narrows the range.
-pub fn group_scan_bounds(base: Option<u16>, ports: Option<ConfiguredPorts>) -> (r: Result<
-    GroupScanBounds,
-    ScanBoundsError,
->)
-    ensures
-        base is None <==> r == Ok::<GroupScanBounds, ScanBoundsError>(GroupScanBounds::Unchanged),
-        (base is Some && ports is None) <==> r == Err::<GroupScanBounds, ScanBoundsError>(
-            ScanBoundsError::MissingPorts,
-        ),
-        base is Some && ports is Some ==> {
-            let b = base->Some_0;
-            let p = ports->Some_0;
-            match configured_max(p) {
-                Err(e) => r == Err::<GroupScanBounds, ScanBoundsError>(e),
-                Ok(hi) => if p.min <= b <= hi {
-                    r == Ok::<GroupScanBounds, ScanBoundsError>(
-                        GroupScanBounds::Rebased { min: b, max: hi as u16 },
-                    )
-                } else {
-                    r == Err::<GroupScanBounds, ScanBoundsError>(
-                        ScanBoundsError::BaseOutOfRange { max: hi as u16 },
-                    )
-                },
-            }
-        },
-        // Narrowing: the scan range is a subrange of the configured one.
-        r matches Ok(GroupScanBounds::Rebased { min, max }) ==> {
-            &&& ports is Some
-            &&& configured_max(ports->Some_0) == Ok::<int, ScanBoundsError>(max as int)
-            &&& ports->Some_0.min <= min <= max
-            &&& base == Some(min)
-        },
-{
-    let Some(b) = base else {
-        return Ok(GroupScanBounds::Unchanged);
-    };
-    let Some(p) = ports else {
-        return Err(ScanBoundsError::MissingPorts);
-    };
-    let max = match p.max {
-        Some(m) => m,
-        None => match p.max_offset {
-            Some(o) => match p.min.checked_add(o) {
-                Some(m) => m,
-                None => {
-                    return Err(ScanBoundsError::MaxOffsetOverflow);
-                },
-            },
-            None => {
-                return Err(ScanBoundsError::MissingMax);
-            },
-        },
-    };
-    if b < p.min || b > max {
-        return Err(ScanBoundsError::BaseOutOfRange { max });
-    }
-    Ok(GroupScanBounds::Rebased { min: b, max })
 }
 
 // ---------------------------------------------------------------------------

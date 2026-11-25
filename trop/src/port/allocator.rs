@@ -10,6 +10,7 @@ use crate::config::PortConfig;
 use crate::database::Database;
 use crate::error::{Error, PortUnavailableReason};
 use crate::verified::allocation::{self, Blocker, Checks, SingleOutcome};
+use crate::verified::port::PortSpan;
 use crate::verified::port_bounds::{resolve_port_bounds, PortBoundsError};
 use crate::{PortExhaustionBlockers, PortRange, ReservationKey, Result};
 
@@ -514,11 +515,15 @@ const fn reason_for(blocker: Blocker) -> PortUnavailableReason {
 /// Resolve a port configuration to the range it describes.
 ///
 /// An explicit `max` wins; otherwise the range ends at `min + max_offset`
-/// (computed without overflow). This is the resolution
-/// [`allocator_from_config`] and `trop scan` use, decided by a verified
-/// kernel (see `docs/verification.md`). It is more permissive than
-/// configuration validation, which also rejects giving both `max` and
-/// `max_offset`, and a zero `max_offset`.
+/// (computed without overflow). This is the one resolution
+/// [`allocator_from_config`], `trop scan`, and `reserve-group`'s
+/// `reservations.base` narrowing use, decided by a verified kernel (see
+/// `docs/verification.md`). It is more permissive than configuration
+/// validation, which also rejects giving both `max` and `max_offset`, and a
+/// zero `max_offset`. The `ports` section of an effective configuration
+/// (built by [`crate::config::ConfigBuilder`]) always holds exactly one
+/// absolute `max`, so the "neither bound" error below arises only for raw
+/// sections.
 ///
 /// # Errors
 ///
@@ -545,13 +550,18 @@ const fn reason_for(blocker: Blocker) -> PortUnavailableReason {
 /// assert!(port_range_from_config(&overflow).is_err());
 /// ```
 pub fn port_range_from_config(port_config: &PortConfig) -> Result<PortRange> {
-    match resolve_port_bounds(port_config.min, port_config.max, port_config.max_offset) {
-        Ok(span) => Ok(PortRange {
-            span,
-            exhaustion_details: None,
-        }),
-        Err(error) => Err(port_bounds_error(port_config.min, error)),
-    }
+    port_span_from_config(port_config).map(|span| PortRange {
+        span,
+        exhaustion_details: None,
+    })
+}
+
+/// [`port_range_from_config`]'s resolution, as the verified span (for glue
+/// that hands the range to another kernel, such as `reserve-group`'s base
+/// narrowing).
+pub(crate) fn port_span_from_config(port_config: &PortConfig) -> Result<PortSpan> {
+    resolve_port_bounds(port_config.min, port_config.max, port_config.max_offset)
+        .map_err(|error| port_bounds_error(port_config.min, error))
 }
 
 /// The error value `allocator_from_config` has always reported for each
