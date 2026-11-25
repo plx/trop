@@ -465,13 +465,47 @@ fn excluded_ports_in_reads_documents_exactly_as_the_loader_does() {
     }
     // Regression: the loader reads a tagged empty scalar as the default
     // configuration, so `trop exclude` must be able to rewrite it (it used to
-    // fail with "Invalid YAML" or "not a YAML mapping").
-    for document in ["!!null", "!!null\n", "!!str\n"] {
+    // fail with "Invalid YAML" or "not a YAML mapping"). A core tag names the
+    // scalar's type, so it is not kept on the rewritten mapping.
+    for document in ["!!null", "!!null\n", "!!str\n", "!!int\n", "!!seq\n"] {
         assert_eq!(excluded_ports_in(document).unwrap(), None, "{document:?}");
         assert_eq!(
             rewrite_excluded_ports(document, &[single(8080)]).unwrap(),
             "excluded_ports:\n- 8080\n",
             "{document:?}"
+        );
+    }
+    // Any other tag on an entry-less document is kept.
+    assert_eq!(
+        rewrite_excluded_ports("--- !foo\n", &[single(8080)]).unwrap(),
+        "!foo\nexcluded_ports:\n- 8080\n"
+    );
+}
+
+/// The fallback for documents that are not YAML mappings applies only to a
+/// document with no entries. A mapping holding a key or value `serde_yaml`
+/// cannot read as a YAML value is read by the loader (which reads such an
+/// entry as absent) but refused by the rewrite as invalid YAML: rewriting it
+/// would drop its entries, and the document's tag with them. (Review
+/// finding: a document whose keys `serde_yaml` cannot read, such as
+/// `!!int project:`, was rewritten as `excluded_ports:` alone.)
+#[test]
+fn rewrite_refuses_mappings_whose_entries_it_cannot_read() {
+    for document in [
+        "project:\n!!null allow_change:\n",
+        "!!int project:\n",
+        "!!bool disable_autoinit:\n",
+        "--- !foo\n!!int project:\n",
+        "cleanup: !!bool\n",
+        "project: !!int\n",
+        "occupancy_check: !!int\n",
+        "excluded_ports: !!int\n",
+    ] {
+        assert!(excluded_ports_in(document).is_ok(), "{document:?}");
+        let error = rewrite_excluded_ports(document, &[single(8080)]).unwrap_err();
+        assert!(
+            error.to_string().contains("Invalid YAML"),
+            "{document:?}: {error}"
         );
     }
 }

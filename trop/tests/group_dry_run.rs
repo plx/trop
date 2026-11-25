@@ -391,13 +391,15 @@ fn dry_run_checks_that_the_database_directory_can_be_created() {
 /// `check_database_directory_creatable` is trusted glue that models the live
 /// run's `create_dir_all` with an `lstat` walk. Pin it differentially on the
 /// cases where such a walk is most likely to diverge from `mkdir`: symlinks
-/// (dangling, to a file, to a directory, in a loop) and `..` after a file.
+/// (dangling, to a file, to a directory, in a loop), `..` after a file, and
+/// names too long to create (a component over `NAME_MAX`, a directory path
+/// over `PATH_MAX`; `lstat` fails with `ENAMETOOLONG` rather than `ENOENT`).
 /// Each case builds the same tree twice; the dry check runs on one copy and
 /// the live open (which creates the directory) on the other, and the two
 /// must agree on success.
 #[cfg(unix)]
 #[test]
-fn dry_directory_check_agrees_with_the_live_open_on_symlinks_and_dot_dot() {
+fn dry_directory_check_agrees_with_the_live_open_on_symlinks_dot_dot_and_long_names() {
     use std::os::unix::fs::symlink;
     use trop::operations::reserve_group::check_database_directory_creatable;
 
@@ -411,8 +413,13 @@ fn dry_directory_check_agrees_with_the_live_open_on_symlinks_and_dot_dot() {
         symlink(root.join("loop-a"), root.join("loop-b")).unwrap();
     }
 
+    // A component longer than any file system's `NAME_MAX` (255 bytes), and
+    // a directory path longer than Linux's and macOS's `PATH_MAX` (4096 and
+    // 1024 bytes) made of components that are each short enough.
+    let long_name = "x".repeat(300);
+    let long_path = vec!["y".repeat(250); 17].join("/");
     // (database path below the tree root, whether the live run succeeds)
-    let cases: [(&str, bool); 12] = [
+    let cases: Vec<(String, bool)> = [
         ("dangling/trop.db", false),
         ("dangling/data/trop.db", false),
         ("link-to-file/trop.db", false),
@@ -425,8 +432,15 @@ fn dry_directory_check_agrees_with_the_live_open_on_symlinks_and_dot_dot() {
         ("realdir/../data/trop.db", true),
         ("missing/../data/trop.db", true),
         ("realdir/./new/trop.db", true),
-    ];
+        (&format!("{long_name}/trop.db"), false),
+        (&format!("realdir/{long_name}/new/trop.db"), false),
+        (&format!("{long_path}/trop.db"), false),
+    ]
+    .into_iter()
+    .map(|(relative, live_succeeds)| (relative.to_string(), live_succeeds))
+    .collect();
     for (relative, live_succeeds) in cases {
+        let relative = relative.as_str();
         let dry_root = TempDir::new().unwrap();
         let live_root = TempDir::new().unwrap();
         tree(dry_root.path());
