@@ -319,6 +319,79 @@ fn rewritten_lists_read_back_unchanged() {
     assert_eq!(excluded_ports_in(&text).unwrap(), Some(list));
 }
 
+/// Regression (found in review): the configuration reader ignores YAML tags
+/// on keys, so `!tag excluded_ports` is the exclusion list. The rewrite used
+/// to compare keys as YAML values, left the tagged key in place and appended
+/// a second `excluded_ports`, which made the file unreadable.
+#[test]
+fn rewrite_replaces_a_tagged_excluded_ports_key() {
+    let document = "project: demo\n!foo excluded_ports: [1]\ncleanup: null\n";
+    assert_eq!(excluded_ports_in(document).unwrap(), Some(vec![single(1)]));
+    let text = rewrite_excluded_ports(document, &[single(1), single(8080)]).unwrap();
+    assert_eq!(
+        text,
+        "project: demo\nexcluded_ports:\n- 1\n- 8080\ncleanup: null\n"
+    );
+    assert_eq!(
+        excluded_ports_in(&text).unwrap(),
+        Some(vec![single(1), single(8080)])
+    );
+}
+
+/// A tagged document reads like an untagged one; the rewrite keeps its tag.
+#[test]
+fn rewrite_keeps_the_tag_of_a_tagged_document() {
+    let document = "--- !foo\nproject: demo\n";
+    assert_eq!(excluded_ports_in(document).unwrap(), None);
+    let text = rewrite_excluded_ports(document, &[single(8080)]).unwrap();
+    assert_eq!(excluded_ports_in(&text).unwrap(), Some(vec![single(8080)]));
+    let value: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let serde_yaml::Value::Tagged(tagged) = value else {
+        panic!("the tag was dropped: {text:?}");
+    };
+    assert_eq!(tagged.tag, serde_yaml::value::Tag::new("foo"));
+    assert_eq!(
+        tagged.value,
+        serde_yaml::from_str::<serde_yaml::Value>("project: demo\nexcluded_ports: [8080]\n")
+            .unwrap()
+    );
+}
+
+/// A rewrite that would change how the loader reads any other key is
+/// refused: here the unquoted project name `0x10` is a string to the
+/// configuration reader but the number 16 to a YAML value, and would be
+/// re-emitted as `16`.
+#[test]
+fn rewrite_refuses_to_change_how_other_keys_read() {
+    let document = "project: 0x10\n";
+    assert_eq!(excluded_ports_in(document).unwrap(), None);
+    let error = rewrite_excluded_ports(document, &[single(8080)]).unwrap_err();
+    assert!(
+        error.to_string().contains("only excluded_ports replaced"),
+        "{error}"
+    );
+    // Quoted, it is a string either way and the rewrite goes through.
+    assert_eq!(
+        rewrite_excluded_ports("project: '0x10'\n", &[single(8080)]).unwrap(),
+        "project: '0x10'\nexcluded_ports:\n- 8080\n"
+    );
+}
+
+/// Documents the loader would not read are refused, never rewritten.
+#[test]
+fn rewrite_refuses_documents_that_are_not_configurations() {
+    for document in [
+        "unknown_key: 1\n",
+        "excluded_ports: [1]\n!foo excluded_ports: [2]\n",
+        "project: [1, 2]\n",
+    ] {
+        assert!(
+            rewrite_excluded_ports(document, &[single(8080)]).is_err(),
+            "{document:?}"
+        );
+    }
+}
+
 #[test]
 fn excluded_ports_in_validates_the_configuration_shape() {
     assert!(excluded_ports_in("unknown_key: 1\n").is_err());
@@ -327,6 +400,15 @@ fn excluded_ports_in_validates_the_configuration_shape() {
         Some(vec![range(5000, 5002), single(7)])
     );
     assert_eq!(excluded_ports_in("project: demo\n").unwrap(), None);
+    // One message: `serde_yaml`'s description, under the field
+    // `configuration`.
+    match excluded_ports_in("bogus: 1\n") {
+        Err(trop::Error::Validation { field, message }) => {
+            assert_eq!(field, "configuration");
+            assert!(message.starts_with("unknown field `bogus`"), "{message}");
+        }
+        other => panic!("expected a validation error, got {other:?}"),
+    }
 }
 
 // ============================================================================
@@ -446,6 +528,16 @@ proptest! {
         prop_assert_eq!(added, fresh.len());
         prop_assert_eq!(out.len(), list.len() + added);
         prop_assert_eq!(&out[..list.len()], &list[..]);
+        // The appended singles follow the first occurrence of each newly
+        // excluded port.
+        let mut seen = BTreeSet::new();
+        let appended: Vec<PortExclusion> = new
+            .iter()
+            .copied()
+            .filter(|p| !before.contains(p) && seen.insert(*p))
+            .map(single)
+            .collect();
+        prop_assert_eq!(&out[list.len()..], &appended[..]);
     }
 
     /// `is_compact` holds exactly when compaction returns the list unchanged.

@@ -251,9 +251,105 @@ fn exclude_rewrites_only_excluded_ports() {
     );
 }
 
+/// Regression (found in review): the configuration reader ignores YAML tags
+/// on keys. The rewrite used to keep a tagged `excluded_ports` key and append
+/// a second one, after which every command failed with "duplicate field".
+#[test]
+fn exclude_replaces_a_tagged_excluded_ports_key() {
+    let env = TestEnv::new();
+    let dir = env.create_dir("tagged-key");
+    let config = dir.join("trop.yaml");
+    fs::write(&config, "project: demo\n!foo excluded_ports: [1]\n").unwrap();
+
+    let output = exclude(&env, &dir, &["8080"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        read(&config),
+        "project: demo\nexcluded_ports:\n- 1\n- 8080\n"
+    );
+
+    let output = exclude(&env, &dir, &["9000"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        read(&config),
+        "project: demo\nexcluded_ports:\n- 1\n- 8080\n- 9000\n"
+    );
+}
+
+/// A tagged document is read like an untagged one; `exclude` rewrites it and
+/// keeps the tag (it used to be refused as "not a YAML mapping").
+#[test]
+fn exclude_rewrites_a_tagged_document() {
+    let env = TestEnv::new();
+    let dir = env.create_dir("tagged-root");
+    let config = dir.join("trop.yaml");
+    fs::write(&config, "--- !foo\nproject: demo\n").unwrap();
+
+    let output = exclude(&env, &dir, &["8080"]);
+    assert!(output.status.success(), "{output:?}");
+    let output = exclude(&env, &dir, &["9000"]);
+    assert!(output.status.success(), "{output:?}");
+    match yaml(&config) {
+        serde_yaml::Value::Tagged(tagged) => assert_eq!(
+            tagged.value,
+            serde_yaml::from_str::<serde_yaml::Value>(
+                "project: demo\nexcluded_ports: [8080, 9000]\n"
+            )
+            .unwrap()
+        ),
+        other => panic!("the tag was dropped: {other:?}"),
+    }
+}
+
+/// A rewrite that would change how another key reads (the unquoted project
+/// name `0x10` would be re-emitted as the number `16`) is refused, and the
+/// file is left alone.
+#[test]
+fn exclude_refuses_a_rewrite_that_changes_other_keys() {
+    let env = TestEnv::new();
+    let dir = env.create_dir("canonical-scalar");
+    let config = dir.join("trop.yaml");
+    fs::write(&config, "project: 0x10\n").unwrap();
+
+    let output = exclude(&env, &dir, &["8080"]);
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    assert!(
+        stderr(&output).contains("only excluded_ports replaced"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!stdout(&output).contains("Added"), "{}", stdout(&output));
+    assert_eq!(read(&config), "project: 0x10\n");
+}
+
 // ============================================================================
 // compact-exclusions
 // ============================================================================
+
+/// A configuration error is reported once, as `serde_yaml` describes it (not
+/// wrapped in a second "validation error for 'configuration'" prefix).
+#[test]
+fn compact_exclusions_reports_parse_errors_once() {
+    let env = TestEnv::new();
+    let config = env.path().join("trop.yaml");
+    fs::write(&config, "bogus: 1\nexcluded_ports: [2, 1]\n").unwrap();
+
+    let output = env
+        .command()
+        .arg("compact-exclusions")
+        .arg(&config)
+        .output()
+        .expect("Failed to run compact-exclusions");
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let message = stderr(&output);
+    assert!(
+        message.contains("Configuration error: Parse error: unknown field `bogus`"),
+        "{message}"
+    );
+    assert!(!message.contains("validation error"), "{message}");
+    assert!(!message.contains("Invalid YAML"), "{message}");
+    assert_eq!(read(&config), "bogus: 1\nexcluded_ports: [2, 1]\n");
+}
 
 /// Regression: the rewrite decision compared entry counts, so a non-canonical
 /// list of minimal size was reported as "already optimal".
@@ -395,5 +491,62 @@ fn scan_autocompact_compacts_after_adding() {
             port - 1
         )
     );
+    drop(listener);
+}
+
+/// Regression: scan decided whether `--autocompact` rewrites by comparing
+/// entry counts, so a changed list whose compaction has the same size was
+/// left unsorted.
+#[test]
+fn scan_autocompact_canonicalizes_a_list_of_unchanged_size() {
+    let env = TestEnv::new();
+    let dir = env.create_dir("scan-canonical");
+    let config = dir.join("trop.yaml");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("Failed to bind TCP fixture");
+    let port = listener.local_addr().unwrap().port();
+    fs::write(
+        &config,
+        format!(
+            "project: scan\nexcluded_ports:\n  - {}\n  - {}\n",
+            port + 10,
+            port - 10
+        ),
+    )
+    .unwrap();
+
+    let output = scan_port(&env, &dir, port, &["--autoexclude", "--autocompact"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let message = stderr(&output);
+    let added = message.find("Added 1 exclusions").expect(&message);
+    let compacted = message.find("Compacted 3 exclusions to 3").expect(&message);
+    assert!(added < compacted, "{message}");
+    assert_eq!(
+        read(&config),
+        format!(
+            "project: scan\nexcluded_ports:\n- {}\n- {port}\n- {}\n",
+            port - 10,
+            port + 10
+        )
+    );
+    drop(listener);
+}
+
+/// "Added N exclusions" is reported only once the file has been written: a
+/// refused rewrite reports an error and nothing as added.
+#[test]
+fn scan_reports_additions_only_after_writing() {
+    let env = TestEnv::new();
+    let dir = env.create_dir("scan-refused");
+    let config = dir.join("trop.yaml");
+    fs::write(&config, "project: 0x10\n").unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("Failed to bind TCP fixture");
+    let port = listener.local_addr().unwrap().port();
+
+    let output = scan_port(&env, &dir, port, &["--autoexclude"]);
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let message = stderr(&output);
+    assert!(message.contains("Failed to rewrite config"), "{message}");
+    assert!(!message.contains("Added"), "{message}");
+    assert_eq!(read(&config), "project: 0x10\n");
     drop(listener);
 }

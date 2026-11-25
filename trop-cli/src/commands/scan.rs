@@ -169,16 +169,19 @@ impl ScanCommand {
         // Ports the list already excludes are skipped; `added` counts the
         // ports newly excluded (verified by the exclusions kernel).
         let (mut updated, added) = add_ports_to_list(&current, ports);
-        if !quiet {
-            eprintln!("Added {added} exclusions to {}", config_path.display());
-        }
         if added == 0 {
+            if !quiet {
+                eprintln!("Added 0 exclusions to {}", config_path.display());
+            }
             return Ok(());
         }
 
         // `--autocompact` compacts the list because it changed. Invalid
         // entries are reported; the list is rewritten in canonical form when
-        // it is not already canonical.
+        // it is not already canonical. (The loader validates the write
+        // target's list before any command runs, so the error is a defensive
+        // check.)
+        let mut compaction = None;
         if self.autocompact {
             let compacted = compact_exclusions(&updated).map_err(|error| {
                 CliError::Config(format!(
@@ -187,18 +190,20 @@ impl ScanCommand {
                 ))
             })?;
             if !is_compact(&updated) {
-                if !quiet {
-                    eprintln!(
-                        "Compacted {} exclusions to {}",
-                        updated.len(),
-                        compacted.len()
-                    );
-                }
+                compaction = Some((updated.len(), compacted.len()));
                 updated = compacted;
             }
         }
 
-        write_exclusions(&config_path, &document, &updated)
+        // Report only once the file has been written.
+        write_exclusions(&config_path, &document, &updated)?;
+        if !quiet {
+            eprintln!("Added {added} exclusions to {}", config_path.display());
+            if let Some((before, after)) = compaction {
+                eprintln!("Compacted {before} exclusions to {after}");
+            }
+        }
+        Ok(())
     }
 
     fn output_results(

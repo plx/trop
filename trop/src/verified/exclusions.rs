@@ -2417,6 +2417,26 @@ pub open spec fn fresh_ports(es: Seq<ExclusionEntry>, ports: Seq<u16>, fresh: Se
     &&& forall|q: u16| #[trigger] fresh.contains(q) <==> newly_excluded(es, ports).contains(q)
 }
 
+/// The ports that adding `ports` to `es` newly excludes, in the order of
+/// their first occurrence in `ports`: walking `ports` from the front, a port
+/// is taken when it is valid (not 0), `es` does not exclude it, and it was
+/// not taken before.
+pub open spec fn fresh_in_order(es: Seq<ExclusionEntry>, ports: Seq<u16>) -> Seq<u16>
+    decreases ports.len(),
+{
+    if ports.len() == 0 {
+        Seq::empty()
+    } else {
+        let earlier = fresh_in_order(es, ports.drop_last());
+        let q = ports.last();
+        if q != 0 && !covers(es, q as int) && !earlier.contains(q) {
+            earlier.push(q)
+        } else {
+            earlier
+        }
+    }
+}
+
 /// Whether some entry of `es` (any list, not necessarily canonical) excludes
 /// `p`.
 fn list_covers(es: &[ExclusionEntry], p: u16) -> (b: bool)
@@ -2487,14 +2507,15 @@ proof fn lemma_push_fresh(fresh: Seq<u16>, p: u16)
 /// returning the new list and the number of ports newly excluded.
 ///
 /// The result is `es` followed by one `Single` for each valid port of
-/// `ports` that `es` does not already exclude, each once: it excludes exactly
+/// `ports` that `es` does not already exclude, each once, in the order of
+/// their first occurrence in `ports` (`fresh_in_order`): it excludes exactly
 /// the ports `es` excluded plus every valid port of `ports`. The count is the
 /// number of entries appended, which is the number of distinct ports newly
 /// excluded. Port 0 (never a valid port) is ignored.
 pub fn add_ports(es: &[ExclusionEntry], ports: &[u16]) -> (r: (Vec<ExclusionEntry>, usize))
     ensures
-        exists|fresh: Seq<u16>|
-            #[trigger] fresh_ports(es@, ports@, fresh) && r.0@ == es@ + singles(fresh),
+        r.0@ == es@ + singles(fresh_in_order(es@, ports@)),
+        fresh_ports(es@, ports@, fresh_in_order(es@, ports@)),
         r.1 == r.0@.len() - es@.len(),
         r.1 == newly_excluded(es@, ports@).len(),
         forall|p: int| #[trigger]
@@ -2511,6 +2532,7 @@ pub fn add_ports(es: &[ExclusionEntry], ports: &[u16]) -> (r: (Vec<ExclusionEntr
             added == fresh.len(),
             added <= i,
             out@ == es@ + singles(fresh),
+            fresh == fresh_in_order(es@, ports@.take(i as int)),
             fresh.no_duplicates(),
             forall|q: u16|
                 #[trigger] fresh.contains(q) <==> (q != 0 && ports@.take(i as int).contains(q)
@@ -2533,6 +2555,22 @@ pub fn add_ports(es: &[ExclusionEntry], ports: &[u16]) -> (r: (Vec<ExclusionEntr
             let seen = ports@.take(i as int);
             assert(ports@.take(i as int + 1) =~= seen.push(p));
             lemma_push_contains(seen, p);
+            // One step of `fresh_in_order`: `p` is taken exactly when it is
+            // new.
+            assert(ports@.take(i as int + 1).drop_last() =~= seen);
+            assert(ports@.take(i as int + 1).last() == p);
+            assert(is_new == (p != 0 && !covers(es@, p as int) && !fresh.contains(p))) by {
+                if p != 0 {
+                    lemma_covers_add(es@, singles(fresh), p as int);
+                    if covers(before, p as int) && !covers(es@, p as int) {
+                        assert(seen.contains(p));
+                        assert(fresh.contains(p));
+                    }
+                    if fresh.contains(p) {
+                        assert(covers(before, p as int));
+                    }
+                }
+            }
             if is_new {
                 assert(!fresh.contains(p)) by {
                     if fresh.contains(p) {
@@ -2571,20 +2609,35 @@ pub fn add_ports(es: &[ExclusionEntry], ports: &[u16]) -> (r: (Vec<ExclusionEntr
 // ---------------------------------------------------------------------------
 // The reserved-port guard of `trop exclude`
 // ---------------------------------------------------------------------------
-/// Checks, in ascending order, whether a valid port of `e` is reserved, and
-/// returns the lowest one.
+/// The oracle of `first_reserved_port` may be consulted at the valid ports
+/// `e` names, and the requirement grants nothing more.
+pub open spec fn callable_on_entry<E, F: Fn(u16) -> Result<bool, E>>(
+    is_reserved: F,
+    e: ExclusionEntry,
+) -> bool {
+    forall|q: u16| 1 <= q && entry_covers(e, q as int) ==> #[trigger] is_reserved.requires((q,))
+}
+
+/// Checks whether a valid port of `e` is reserved, and returns the lowest
+/// one.
 ///
-/// The oracle is consulted only at valid ports (`1..=65535`) that `e`
-/// names, from the lowest upward, and the scan stops at the first port
-/// reported reserved or at the first failure; errors are returned, never
-/// treated as "not reserved". The cursor never overflows, including for
-/// entries that end at 65535.
+/// The precondition grants the oracle's own precondition only at the valid
+/// ports (`1..=65535`) that `e` names, and a generic oracle can be called
+/// only where its precondition is known to hold, so the oracle is consulted
+/// at no other port (a call at any other port fails verification). Errors
+/// are returned, never treated as "not reserved". The cursor never
+/// overflows, including for entries that end at 65535.
+///
+/// The body scans from the lowest such port upward, consulting each port
+/// once and stopping at the first port reported reserved or at the first
+/// failure. That order is not part of the specification (closure calls
+/// leave no trace in it); it is pinned by the glue's unit tests.
 pub fn first_reserved_port<E, F: Fn(u16) -> Result<bool, E>>(
     e: ExclusionEntry,
     is_reserved: &F,
 ) -> (r: Result<Option<u16>, super::allocation::ScanFailure<E>>)
     requires
-        forall|q: u16| 1 <= q ==> is_reserved.requires((q,)),
+        callable_on_entry(*is_reserved, e),
     ensures
         r matches Ok(None) ==> forall|q: u16|
             1 <= q && entry_covers(e, q as int) ==> #[trigger] super::allocation::answered(
@@ -2629,7 +2682,7 @@ pub fn first_reserved_port<E, F: Fn(u16) -> Result<bool, E>>(
                 entry_lo(e)
             },
             hi == entry_hi(e),
-            forall|q: u16| 1 <= q ==> is_reserved.requires((q,)),
+            callable_on_entry(*is_reserved, e),
             forall|q: u16|
                 start <= q < p ==> #[trigger] super::allocation::answered(*is_reserved, q, false),
         decreases hi - p,

@@ -90,10 +90,11 @@ impl ExcludeCommand {
         Ok(exclusion)
     }
 
-    /// Fails if any port of the (validated) exclusion is reserved. The ports
-    /// are checked in ascending order by the verified
-    /// `trop::port::exclusions::first_reserved_port`; database errors are
-    /// reported, not treated as "not reserved".
+    /// Fails if any port of the (validated) exclusion is reserved, naming the
+    /// lowest one. The decision is made by the verified
+    /// `trop::port::exclusions::first_reserved_port`, which consults the
+    /// database only at the exclusion's ports; database errors are reported,
+    /// not treated as "not reserved".
     fn check_reserved(&self, db: &Database, exclusion: &PortExclusion) -> Result<(), CliError> {
         match first_reserved_port(exclusion, |port| {
             Database::is_port_reserved(db.connection(), port)
@@ -117,6 +118,16 @@ pub(crate) fn read_config_document(path: &Path) -> Result<String, CliError> {
     }
 }
 
+/// The description of a library error, without the library's
+/// `validation error for '<field>':` prefix, for CLI messages that name
+/// their own context.
+pub(crate) fn error_detail(error: trop::Error) -> String {
+    match error {
+        trop::Error::Validation { message, .. } => message,
+        other => other.to_string(),
+    }
+}
+
 /// The `excluded_ports` list of a configuration document (empty when the
 /// document has none).
 pub(crate) fn current_exclusions(
@@ -127,8 +138,9 @@ pub(crate) fn current_exclusions(
         .map(Option::unwrap_or_default)
         .map_err(|error| {
             CliError::Config(format!(
-                "Failed to parse config {}: {error}",
-                path.display()
+                "Failed to parse config {}: {}",
+                path.display(),
+                error_detail(error)
             ))
         })
 }
@@ -144,8 +156,9 @@ pub(crate) fn write_exclusions(
 ) -> Result<(), CliError> {
     let yaml = rewrite_excluded_ports(document, exclusions).map_err(|error| {
         CliError::Config(format!(
-            "Failed to rewrite config {}: {error}",
-            path.display()
+            "Failed to rewrite config {}: {}",
+            path.display(),
+            error_detail(error)
         ))
     })?;
     std::fs::write(path, yaml)?;

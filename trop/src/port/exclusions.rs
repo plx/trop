@@ -15,7 +15,7 @@
 //! [`Port`] / YAML values and the kernels' primitive values.
 
 use super::{Port, PortRange};
-use crate::config::PortExclusion;
+use crate::config::{Config, PortExclusion};
 use crate::error::Error;
 use crate::verified::config_rewrite::{plan_key_rewrite, RewriteStep};
 use crate::verified::exclusions::{
@@ -24,6 +24,8 @@ use crate::verified::exclusions::{
     is_compact as entries_are_compact, validate_entries, ExclusionEntry, ExclusionError,
     ExclusionSet,
 };
+use serde::Deserialize;
+use serde_yaml::value::TaggedValue;
 use serde_yaml::{Mapping, Value};
 
 pub use crate::verified::config_rewrite::{select_write_target, WriteScope, WriteTarget};
@@ -247,9 +249,10 @@ pub fn add_exclusion_to_list(
 /// of ports newly excluded.
 ///
 /// Ports the list already excludes (and repeated ports) are skipped; every
-/// other port is appended as a `Single`, in order. The count is the number
-/// of entries appended, which is the number of distinct ports newly
-/// excluded. Verified by the `verified::exclusions` kernel.
+/// other port is appended as a `Single`, in the order of its first
+/// occurrence in `ports`. The count is the number of entries appended, which
+/// is the number of distinct ports newly excluded. Verified by the
+/// `verified::exclusions` kernel.
 ///
 /// # Examples
 ///
@@ -276,10 +279,13 @@ pub fn add_ports_to_list(
 
 /// The lowest port of `exclusion` for which `is_reserved` answers `true`.
 ///
-/// The valid ports the exclusion names are checked one at a time in
-/// ascending order, stopping at the first reserved port or the first error.
-/// An error is returned, never treated as "not reserved". Port 0 is never
-/// checked. Verified by the `verified::exclusions` kernel.
+/// The `verified::exclusions` kernel proves that `is_reserved` is consulted
+/// only at valid ports the exclusion names (never port 0), that a returned
+/// port answered `true` while every lower port of the exclusion answered
+/// `false`, and that an error is returned, never treated as "not reserved".
+/// The ports are checked one at a time in ascending order, stopping at the
+/// first reserved port or the first error; that order is how the kernel is
+/// written (and is tested), not part of its proved specification.
 ///
 /// # Errors
 ///
@@ -312,16 +318,101 @@ where
 /// The top-level key of the exclusion list.
 const EXCLUDED_PORTS_KEY: &str = "excluded_ports";
 
+/// `value` without its YAML tags.
+fn untagged(mut value: &Value) -> &Value {
+    while let Value::Tagged(tagged) = value {
+        value = &tagged.value;
+    }
+    value
+}
+
+/// Whether the configuration reader reads `key` as the `excluded_ports`
+/// field. It identifies a field by the text of its key and ignores YAML tags
+/// on the key, so `!tag excluded_ports` names the field as well.
+fn is_excluded_ports_key(key: &Value) -> bool {
+    untagged(key).as_str() == Some(EXCLUDED_PORTS_KEY)
+}
+
+/// A configuration document as the configuration loader reads it.
+#[derive(Debug, PartialEq)]
+struct LoadedDocument {
+    /// The document parsed as a [`Config`].
+    config: Config,
+    /// The state of the `reservations` key: absent (`None`), `null`
+    /// (`Some(false)`), or set (`Some(true)`). The loader reads an absent
+    /// key as "inherit" and `null` as "clear".
+    reservations: Option<bool>,
+}
+
+/// The `reservations` key as the loader's reservations-presence probe reads
+/// it (`ReservationPresence` in `config/loader.rs`).
+#[derive(Deserialize)]
+struct ReservationsKey {
+    #[serde(default, deserialize_with = "reservations_state")]
+    reservations: Option<bool>,
+}
+
+fn reservations_state<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde::de::IgnoredAny>::deserialize(deserializer).map(|value| Some(value.is_some()))
+}
+
+/// Reads a configuration document the way `ConfigLoader` reads a file
+/// (`serde_yaml::from_str` into [`Config`] and into the reservations
+/// probe). An empty document (or one holding only comments or `null`) reads
+/// as the default configuration.
+///
+/// The error message is `serde_yaml`'s description of the problem, under the
+/// field `configuration`.
+fn read_configuration(document: &str) -> crate::Result<LoadedDocument> {
+    let unreadable = |error: serde_yaml::Error| Error::Validation {
+        field: "configuration".into(),
+        message: error.to_string(),
+    };
+    if serde_yaml::from_str::<Value>(document)
+        .map_err(unreadable)?
+        .is_null()
+    {
+        return Ok(LoadedDocument {
+            config: Config::default(),
+            reservations: None,
+        });
+    }
+    Ok(LoadedDocument {
+        config: serde_yaml::from_str(document).map_err(unreadable)?,
+        reservations: serde_yaml::from_str::<ReservationsKey>(document)
+            .map_err(unreadable)?
+            .reservations,
+    })
+}
+
+/// Whether two documents are equal with their top-level mapping keys in the
+/// same order. (`Mapping` equality ignores the order of keys.)
+fn same_in_order(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Tagged(left), Value::Tagged(right)) => {
+            left.tag == right.tag && same_in_order(&left.value, &right.value)
+        }
+        (Value::Mapping(left), Value::Mapping(right)) => {
+            left.len() == right.len() && left.iter().eq(right.iter())
+        }
+        _ => left == right,
+    }
+}
+
 /// The `excluded_ports` list of a YAML configuration document, or `None`
 /// when the document has no list (an empty document has none).
 ///
-/// The document is read as a configuration, so unknown keys and malformed
-/// values are rejected; the entries themselves are not validated (see
-/// [`validate_exclusions`]).
+/// The document is read the way the configuration loader reads a file, so
+/// unknown keys and malformed values are rejected; the entries themselves
+/// are not validated (see [`validate_exclusions`]).
 ///
 /// # Errors
 ///
-/// Returns [`Error::Validation`] if the document is not valid YAML or not a
+/// Returns [`Error::Validation`] (field `configuration`, with `serde_yaml`'s
+/// description of the problem) if the document is not valid YAML or not a
 /// valid configuration.
 ///
 /// # Examples
@@ -337,38 +428,45 @@ const EXCLUDED_PORTS_KEY: &str = "excluded_ports";
 /// );
 /// ```
 pub fn excluded_ports_in(document: &str) -> crate::Result<Option<Vec<PortExclusion>>> {
-    let invalid = |error: serde_yaml::Error| Error::Validation {
-        field: "configuration".into(),
-        message: format!("Invalid YAML: {error}"),
-    };
-    let value: Value = serde_yaml::from_str(document).map_err(invalid)?;
-    if value.is_null() {
-        return Ok(None);
-    }
-    let config: crate::config::Config = serde_yaml::from_value(value).map_err(invalid)?;
-    Ok(config.excluded_ports)
+    Ok(read_configuration(document)?.config.excluded_ports)
 }
 
 /// Rewrites the `excluded_ports` list of a YAML configuration document,
 /// leaving every other top-level key exactly as it was.
 ///
 /// The document is read as a YAML mapping (an empty document is an empty
-/// mapping). The verified `verified::config_rewrite` kernel plans the
-/// result: every other entry is copied unchanged and in order, and
-/// `excluded_ports` is replaced in place, or appended when absent. A key
-/// that was absent stays absent and an explicit `null` stays `null`, so the
-/// rewrite does not change how the file overlays the files below it (for
-/// example, an omitted `reservations` key keeps inheriting the group of
-/// `trop.yaml`). The emitted text is parsed back and compared with the
-/// planned mapping, and with the original document (every other key keeps
-/// its exact value, and no key is added), before it is returned.
+/// mapping; a tag on the document is kept). The verified
+/// `verified::config_rewrite` kernel plans the result over the entries'
+/// "is `excluded_ports`" marks: every other entry is copied unchanged and in
+/// order, and `excluded_ports` is replaced in place, or appended when
+/// absent. An entry is marked when the configuration reader reads its key as
+/// `excluded_ports` (it ignores YAML tags on keys). A key that was absent
+/// stays absent and an explicit `null` stays `null`, so the rewrite does not
+/// change how the file overlays the files below it (for example, an omitted
+/// `reservations` key keeps inheriting the group of `trop.yaml`).
 ///
-/// YAML comments and the original formatting are not preserved.
+/// Before the text is returned it is checked three ways:
+///
+/// - it parses back to exactly the planned document, with the top-level
+///   keys in the planned order;
+/// - against the original mapping: every unmarked entry reads back with its
+///   exact value, exactly one key reads as `excluded_ports` and it holds the
+///   new list, and no other key was added;
+/// - through the configuration loader's own reading: the text reads as the
+///   original configuration with only `excluded_ports` replaced, and the
+///   `reservations` key keeps its absent, `null`, or set state.
+///
+/// YAML comments and the original formatting are not preserved. Scalars are
+/// re-emitted in canonical form, so a document whose string-typed value is
+/// written as an unquoted scalar that YAML reads as a non-string in a
+/// non-canonical spelling (a project named `0x10`, say) fails the last check
+/// and is refused rather than changed.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Validation`] if the document is not valid YAML or not a
-/// mapping, or if the rewritten document cannot be emitted.
+/// Returns [`Error::Validation`] if the document is not valid YAML, not a
+/// mapping, or not a valid configuration, or if the rewritten document cannot
+/// be emitted or fails one of the checks above.
 ///
 /// # Examples
 ///
@@ -387,9 +485,20 @@ pub fn rewrite_excluded_ports(
         field: EXCLUDED_PORTS_KEY.into(),
         message,
     };
-    let original = match serde_yaml::from_str::<Value>(document)
-        .map_err(|error| invalid(format!("Invalid YAML: {error}")))?
-    {
+    // How the loader reads the document now (this also rejects documents
+    // that are not configurations, and documents with a repeated key).
+    let before = read_configuration(document)?;
+    let parsed: Value = serde_yaml::from_str(document)
+        .map_err(|error| invalid(format!("Invalid YAML: {error}")))?;
+    // A tagged document reads like an untagged one; its tag is kept.
+    let (tag, root) = match parsed {
+        Value::Tagged(tagged) => {
+            let TaggedValue { tag, value } = *tagged;
+            (Some(tag), value)
+        }
+        root => (None, root),
+    };
+    let original = match root {
         Value::Null => Mapping::new(),
         Value::Mapping(mapping) => mapping,
         _ => return Err(invalid("the configuration is not a YAML mapping".into())),
@@ -400,12 +509,12 @@ pub fn rewrite_excluded_ports(
     let entries: Vec<(&Value, &Value)> = original.iter().collect();
     let is_target: Vec<bool> = entries
         .iter()
-        .map(|(entry_key, _)| **entry_key == key)
+        .map(|(entry_key, _)| is_excluded_ports_key(entry_key))
         .collect();
 
     // Execute the kernel's plan. The kept keys are distinct (they come from
-    // one mapping) and differ from `excluded_ports`, so every `insert`
-    // appends.
+    // one mapping) and differ from `excluded_ports` (they are unmarked), so
+    // every `insert` appends.
     let mut planned = Mapping::new();
     for step in plan_key_rewrite(&is_target) {
         let (entry_key, entry_value) = match step {
@@ -414,35 +523,67 @@ pub fn rewrite_excluded_ports(
         };
         planned.insert(entry_key, entry_value);
     }
-    let planned = Value::Mapping(planned);
+    let planned = match tag {
+        Some(tag) => Value::Tagged(Box::new(TaggedValue {
+            tag,
+            value: Value::Mapping(planned),
+        })),
+        None => Value::Mapping(planned),
+    };
 
     let text = serde_yaml::to_string(&planned)
         .map_err(|error| invalid(format!("Failed to serialize configuration: {error}")))?;
     // Check the trusted YAML emitter against the plan: the text must read
-    // back as exactly the planned mapping.
+    // back as exactly the planned document, keys in the planned order.
     let reread: Value = serde_yaml::from_str(&text).map_err(|error| {
         invalid(format!(
             "Rewritten configuration is not valid YAML: {error}"
         ))
     })?;
-    if reread != planned {
+    if !same_in_order(&reread, &planned) {
         return Err(invalid(
             "the rewritten configuration does not read back unchanged".into(),
         ));
     }
     // Check the result against the original as well (independently of how
-    // the plan was executed): every other key reads back with its exact
-    // value, `excluded_ports` holds the new list, and no key was added.
-    let preserved = reread.as_mapping().is_some_and(|rewritten| {
-        rewritten.len() == original.len() + usize::from(!original.contains_key(&key))
+    // the plan was executed): every unmarked entry reads back with its exact
+    // value, exactly one key reads as `excluded_ports` and holds the new
+    // list, and no other key was added.
+    let preserved = untagged(&reread).as_mapping().is_some_and(|rewritten| {
+        let kept = entries
+            .iter()
+            .filter(|(entry_key, _)| !is_excluded_ports_key(entry_key));
+        rewritten.len() == kept.clone().count() + 1
+            && rewritten
+                .keys()
+                .filter(|entry_key| is_excluded_ports_key(entry_key))
+                .count()
+                == 1
             && rewritten.get(&key) == Some(&value)
-            && original.iter().all(|(entry_key, entry_value)| {
-                *entry_key == key || rewritten.get(entry_key) == Some(entry_value)
-            })
+            && kept
+                .into_iter()
+                .all(|(entry_key, entry_value)| rewritten.get(*entry_key) == Some(*entry_value))
     });
     if !preserved {
         return Err(invalid(
             "the rewrite would change keys other than excluded_ports".into(),
+        ));
+    }
+    // Check the result through the loader's own reading of the file: the
+    // effective configuration changes only in `excluded_ports`, and the
+    // overlay state of `reservations` is unchanged.
+    let expected = LoadedDocument {
+        config: Config {
+            excluded_ports: Some(exclusions.to_vec()),
+            ..before.config
+        },
+        reservations: before.reservations,
+    };
+    if read_configuration(&text).ok() != Some(expected) {
+        return Err(invalid(
+            "the rewritten configuration would not read as the original with only \
+             excluded_ports replaced"
+                .into(),
         ));
     }
     Ok(text)

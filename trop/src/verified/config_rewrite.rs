@@ -14,11 +14,19 @@
 //! `reservations` key keeps inheriting the group of `trop.yaml` instead of
 //! becoming an explicit `null` that clears it.
 //!
+//! The key type `K` is abstract: the glue instantiates it with keys as the
+//! configuration reader identifies them (by their text, ignoring YAML tags),
+//! and marks an entry as the edited key under that identity. The reader
+//! rejects a document that repeats a field, so the lemmas' "distinct keys"
+//! precondition holds for every document the glue rewrites.
+//!
 //! Production glue: `crate::port::exclusions` (`rewrite_excluded_ports`, and
 //! the write-target selection used by `trop-cli`'s `config_file_for_write`).
 //! Parsing and emitting YAML (`serde_yaml`) stay outside the kernel; the
-//! glue checks that the emitted text parses back to the planned mapping, and
-//! that every other key of the original reads back with its exact value.
+//! glue checks that the emitted text parses back to the planned mapping (keys
+//! in order), that every other key of the original reads back with its exact
+//! value, and that the loader's own reading of the text is the original
+//! configuration with only `excluded_ports` replaced.
 
 use vstd::prelude::*;
 
