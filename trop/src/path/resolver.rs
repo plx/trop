@@ -3,11 +3,20 @@
 //! This module provides the `PathResolver` type, which is the main interface
 //! for resolving paths according to their provenance.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::path::types::{PathProvenance, ResolvedPath};
 use crate::path::{canonicalize, normalize};
+use crate::verified::path::{resolve_by_provenance, Resolution};
+
+/// Canonicalizes `path`, pairing a failure with whether it means "not found".
+fn canonicalize_reporting_not_found(path: &Path) -> std::result::Result<PathBuf, (Error, bool)> {
+    canonicalize::canonicalize(path).map_err(|error| {
+        let not_found = error.is_not_found();
+        (error, not_found)
+    })
+}
 
 /// Resolves paths according to provenance rules.
 ///
@@ -135,27 +144,28 @@ impl PathResolver {
         // Always normalize first
         let normalized = normalize::normalize(path)?;
 
-        // Decide whether to canonicalize based on provenance
-        let (resolved, canonicalized) = match provenance {
-            PathProvenance::Explicit => {
-                // Explicit paths: normalize only
-                (normalized.clone(), false)
-            }
-            PathProvenance::Implicit => {
-                // Implicit paths: normalize and canonicalize
-                match canonicalize::canonicalize(&normalized) {
-                    Ok(canonical) => (canonical, true),
-                    Err(e) if e.is_not_found() => {
-                        if self.warn_on_nonexistent {
-                            eprintln!(
-                                "Warning: Cannot canonicalize inferred path because it does not exist: {}",
-                                normalized.display()
-                            );
-                        }
-                        return Err(e);
-                    }
-                    Err(e) => return Err(e),
+        // The verified provenance policy: explicit paths are only normalized
+        // (the filesystem is not consulted); implicit paths are canonicalized
+        // and never silently fall back to the normalized path.
+        let resolution = resolve_by_provenance(
+            provenance == PathProvenance::Implicit,
+            self.warn_on_nonexistent,
+            &|| canonicalize_reporting_not_found(&normalized),
+        );
+        let (resolved, canonicalized) = match resolution {
+            Resolution::Normalized => (normalized, false),
+            Resolution::Canonical(canonical) => (canonical, true),
+            Resolution::Failed {
+                failure: (error, _),
+                warn,
+            } => {
+                if warn {
+                    eprintln!(
+                        "Warning: Cannot canonicalize inferred path because it does not exist: {}",
+                        normalized.display()
+                    );
                 }
+                return Err(error);
             }
         };
 

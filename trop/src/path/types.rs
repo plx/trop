@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::path::is_canonical_absolute;
 
 /// Indicates how a path was provided to the system.
 ///
@@ -69,9 +70,15 @@ pub struct NormalizedPath {
 impl NormalizedPath {
     /// Create a new normalized path.
     ///
+    /// The path must already be in the form [`normalize`](crate::path::normalize::normalize)
+    /// produces. On Unix that is `/` or `/a/b/c`: absolute, with no `.` or
+    /// `..` component, no empty component (`//`), and no trailing separator.
+    /// Elsewhere it must be absolute and contain no `.` or `..` component.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the path is not absolute.
+    /// Returns an error if the path is not absolute, or is not in normalized
+    /// form.
     ///
     /// # Examples
     ///
@@ -91,6 +98,14 @@ impl NormalizedPath {
             return Err(Error::InvalidPath {
                 path,
                 reason: "Path must be absolute after normalization".to_string(),
+            });
+        }
+        if !is_canonical_absolute(&path) {
+            return Err(Error::InvalidPath {
+                path,
+                reason: "Path must be in normalized form (no '.' or '..' components, empty \
+                         components, or trailing separators)"
+                    .to_string(),
             });
         }
         Ok(Self { path, provenance })
@@ -352,6 +367,26 @@ mod tests {
         let result = NormalizedPath::new(absolute.clone(), PathProvenance::Explicit);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().as_path(), absolute.as_path());
+    }
+
+    // Regression: only absoluteness used to be checked, so non-normalized
+    // absolute spellings were accepted as `NormalizedPath`s.
+    #[test]
+    #[cfg(unix)]
+    fn test_normalized_path_rejects_non_normalized_absolute_paths() {
+        for spelling in [
+            "/a/../b", "/a/./b", "/a//b", "/a/", "//", "/.", "/..", "/a/.", "/a/..",
+        ] {
+            let result = NormalizedPath::new(PathBuf::from(spelling), PathProvenance::Explicit);
+            assert!(
+                matches!(result, Err(Error::InvalidPath { .. })),
+                "{spelling} must be rejected"
+            );
+        }
+        for spelling in ["/", "/a", "/a/b", "/a/.b", "/a/..b", "/a/b c", "/a\\b"] {
+            let result = NormalizedPath::new(PathBuf::from(spelling), PathProvenance::Implicit);
+            assert!(result.is_ok(), "{spelling} must be accepted");
+        }
     }
 
     #[test]

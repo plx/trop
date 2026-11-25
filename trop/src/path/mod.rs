@@ -75,7 +75,50 @@ mod types;
 #[cfg(all(test, feature = "property-tests"))]
 mod proptests;
 
+#[cfg(test)]
+mod verified_glue_tests;
+
+use std::path::{Component, Path};
+
+use crate::verified::path::CompKind;
+
 // Re-export key types
 pub use relationship::PathRelationship;
 pub use resolver::PathResolver;
 pub use types::{NormalizedPath, PathProvenance, ResolvedPath};
+
+/// The kind of a path component, as the verified path kernels see it.
+pub(crate) fn component_kind(component: Component<'_>) -> CompKind {
+    match component {
+        Component::Prefix(_) => CompKind::Prefix,
+        Component::RootDir => CompKind::Root,
+        Component::CurDir => CompKind::Cur,
+        Component::ParentDir => CompKind::Parent,
+        Component::Normal(_) => CompKind::Normal,
+    }
+}
+
+/// Whether `path` is spelled in canonical absolute form: what
+/// [`normalize::normalize`] produces.
+///
+/// On Unix this is the byte-level test `verified::path::is_canonical_abs_path`:
+/// `/`, or `/` followed by non-empty segments other than `.` and `..` (so no
+/// `//` and no trailing `/`); it accepts exactly the fixed points of
+/// normalization. Elsewhere it checks that the path is absolute and that
+/// resolving `.` and `..` leaves its components unchanged.
+#[cfg(unix)]
+pub(crate) fn is_canonical_absolute(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    crate::verified::path::is_canonical_abs_path(path.as_os_str().as_bytes(), false)
+}
+
+/// Whether `path` is spelled in canonical absolute form: what
+/// [`normalize::normalize`] produces.
+///
+/// Outside Unix this checks that the path is absolute and that resolving `.`
+/// and `..` leaves its components unchanged.
+#[cfg(not(unix))]
+pub(crate) fn is_canonical_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && normalize::resolve_components(path).is_ok_and(|resolved| resolved.as_path() == path)
+}
