@@ -173,6 +173,31 @@ pub proof fn lemma_entry_valid_meaning(e: ExclusionEntry)
     }
 }
 
+/// A one-port range `p..p` (for example `5000..5000`) is valid, and its
+/// canonical form is the single port `p`: by `compact_exclusions`'
+/// uniqueness guarantee, that is what compaction returns for it.
+pub proof fn lemma_one_port_range(p: u16)
+    requires
+        p >= 1,
+    ensures
+        entry_valid(ExclusionEntry::Range { start: p, end: p }),
+        is_compaction(
+            seq![ExclusionEntry::Single(p)],
+            seq![ExclusionEntry::Range { start: p, end: p }],
+        ),
+{
+    let single = seq![ExclusionEntry::Single(p)];
+    let range = seq![ExclusionEntry::Range { start: p, end: p }];
+    assert forall|q: int| covers(single, q) == covers(range, q) by {
+        if covers(single, q) {
+            assert(entry_covers(range[0], q));
+        }
+        if covers(range, q) {
+            assert(entry_covers(single[0], q));
+        }
+    }
+}
+
 /// Validates one entry.
 ///
 /// Errors follow the configuration validator's precedence: for ranges a zero
