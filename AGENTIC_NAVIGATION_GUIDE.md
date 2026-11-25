@@ -57,19 +57,30 @@
     - verified/ # Verus-verified kernels (specs + proofs); production code delegates to these
       - mod.rs # Kernel list and the rules for code in this tree
       - allocation.rs # Port availability classification, forward scan, single-port allocation, preferred-then-scan fallback, exhaustion blockers (oracle-generic)
+      - config.rs # Configuration kernel: TROP_* text (decimal/bool/format), reservations group rules (order-independent), lock-wait bounds, defaults, leaf overlay, placement, discovery
+      - config_rewrite.rs # Key-preserving YAML rewrite plan (only excluded_ports changes) and exclusion write-target selection
       - env_name.rs # Portable env-var grammar + shell-inertness, tag derivation, explicit-mapping resolution, collision keys
-      - exclusions.rs # Exclusion validation, ExclusionSet (canonical run list), minimal/unique compaction, exclusion-text parsing
-      - group.rs # Group request validation, offset-pattern search, fresh plans, stored-group matching/compatibility, reconciliation, scan bounds
+      - escape.rs # char::escape_default for diagnostics: printable ASCII, quote-safe, injective
+      - exclusions.rs # Exclusion validation, ExclusionSet (canonical run list), compaction, exclusion text, list edits (exclude merge, scan add), is_compact, reserved-port guard
+      - expiry.rs # Expiry rule, exact SQL cutoff (no wrap), Duration comparison agreement
+      - group.rs # Group requests via the shared identifier rule (kernel trims tags/project/task), offset-pattern search, fresh plans, stored-group matching/compatibility, reconciliation, reserve-group/autoreserve output selection
       - identifier.rs # Unicode trim spec + verified &str trim, identifier rule (blank > NUL > 255 bytes), canonical form, stored-tag sentinel lemmas
       - inference.rs # Git inference name steps: repository name (.git parent rule, one .git suffix) and refs/heads/ branch names
+      - migrate.rs # Migration conflict classification, all-deletes-then-creates schedule, guard over every source/destination key, canonical path rebasing
       - occupancy.rs # Occupancy policy: effective skip flags, probe matrix (set/order/count), fail-closed probe fold, ascending range scan, owner status
       - path.rs # Path normalization: `.`/`..` stack, Unix byte normalizer + canonical-form recognizer, tilde classifier/join, deepest-existing-prefix search, provenance policy
       - path_relation.rs # Path relationships (Same/Ancestor/Descendant/Unrelated over lexically resolved paths), component prefix and rebasing on canonical paths
       - port.rs # Port validity/arithmetic, PortSpan (range invariant), PortCursor (iteration)
       - port_bounds.rs # Configured port bounds: validation, resolution, layer overlay (max_offset anchoring), env/CLI checks, defaults, reservations.base rules
-      - reserve.rs # Single-reservation decisions: metadata intents, sticky decision table, reserve policy, cleanup-then-retry call discipline, deferred step, reported port
+      - release.rs # Release tag table, row selection fused with the unrelated-path guard (lexical relation in-kernel, physical fallback as oracle)
+      - render.rs # Decimal ports, stable byte-order sort, fail-closed export/dotenv group blocks (order-independent), display-field escaping, tab rows
+      - reserve.rs # Single-reservation decisions: metadata intents, sticky decision table, reserve policy, cleanup-then-retry control (shared with groups), deferred step, reported port
+      - schema_version.rs # Schema-version classification (corrupt metadata never restamped), i32 parsing, v1 preflight completeness, column layouts
+      - shell.rs # --shell alias table, SHELL basename classification and detection precedence, export lines with injection-freedom proofs
       - sticky.rs # Sticky project/task rules for group refresh and forced replacement (shared can_change_field)
-      - text.rs # ASCII case folding, ASCII/UTF-8 bridging lemmas, char-offset &str slicing
+      - storage.rs # Stored ports/timestamps/paths/tags/rows: write predicate == read predicate, injective keys, exact lookups, row round trip, prefix-query key
+      - text.rs # ASCII case folding and byte comparisons, ASCII/UTF-8 bridging lemmas, char-offset &str slicing
+      - verbosity.rs # Log-level names, --verbose/--quiet/TROP_LOG_MODE precedence, logger severity filter
   - tests/ # Integration tests
     - common/ # Shared test utilities
       - mod.rs # Common test helpers
