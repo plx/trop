@@ -99,11 +99,13 @@ trusted base too, and names the specific facts.
   `scripts/install-verus.sh`; `vstd` pinned in the workspace `Cargo.toml`);
 - `vstd`'s specifications of the `core`/`std` operations a kernel calls
   (for example `u16::checked_add`);
-- the toolchain skew: those specifications are checked against the Rust
+- the toolchain skew: those specifications are written for the Rust
   toolchain the verifier is built with (`VERUS_RUST_TOOLCHAIN` in
-  `scripts/install-verus.sh`, 1.100.0), but `trop` is built and tested with
+  `scripts/install-verus.sh`, 1.100.0), and Verus resolves them against that
+  toolchain's names and signatures only; their content is trusted
+  (`assume_specification` inside `vstd`). `trop` is built and tested with
   the toolchain in `rust-toolchain.toml` (1.99.1). The specified operations
-  are assumed to behave the same in both. A few are re-checked under the
+  are assumed to behave as specified in both. A few are checked under the
   build toolchain by exhaustive tests (`char::is_whitespace`,
   `char::len_utf8`, `char::escape_default`); most (`str::split_at`,
   `str::chars`, `Vec::insert`, `String::push`, ...) are not;
@@ -120,8 +122,9 @@ trusted base too, and names the specific facts.
     `test_replacement_ignores_only_the_current_keys_port`. The README's "No
     flag can take a port owned by another reservation key" rests on it;
   - the unrelated-path guard's physical fallback
-    (`Database::validate_path_relationship`, used by `migrate` and
-    `release`) decides a lexically unrelated path by canonical comparison;
+    (`Database::validate_path_relationship`, called by `reserve`,
+    `reserve-group`, `migrate` and `release`) decides a lexically unrelated
+    path by canonical comparison;
 - the `std`/`core` behavior that glue relies on and kernels do not model,
   pinned by tests where noted per kernel (for example `str::trim` in the
   exclusion-text glue, `std::path` component splitting, and the agreement
@@ -183,7 +186,9 @@ Glue: `trop/src/port/exclusions.rs` (`ExclusionManager`, `validate_exclusions`,
 (`validate_excluded_ports`), `trop/src/config/schema.rs` (`PortExclusion`'s
 `FromStr`, used by the YAML string form), and `trop/src/config/environment.rs`
 (`TROP_EXCLUDED_PORTS`, through the same `FromStr`). The CLI reaches the
-kernel only through `trop::port::exclusions`:
+kernel through `trop::port::exclusions` and through that `FromStr`:
+`trop exclude` parses its argument with `PortExclusion`'s `FromStr`
+(`trop-cli/src/commands/exclude.rs`, `parse_exclusion`);
 `trop-cli/src/commands/compact_exclusions.rs` and `scan --autocompact`
 (`trop-cli/src/commands/scan.rs`) call `compact_exclusions` and `is_compact`;
 the exclusion-list edits below list the rest.
@@ -572,9 +577,10 @@ owner lookups stay outside the kernel.
   errors.
 - `scan_ports` (the default `find_occupied_ports`, the mock's override, and
   `find_occupied_reports`): inspects `lo..=hi` in ascending order. On success
-  it returns exactly the kept values in ascending port order. On error, some
-  inspection of the reported port returned that error, and every earlier port
-  has an inspection observed without error. An empty range inspects nothing.
+  it returns exactly the kept values in ascending port order. On error it
+  returns only the error: the inspection of some port in the range returned
+  it, and every port before that one has an inspection observed without
+  error. An empty range inspects nothing.
 - `owner_status`: `Available` iff PID, process name, and user are all known;
   `Unavailable` iff none is; `Partial` otherwise.
 
@@ -587,11 +593,13 @@ number of calls):
   and "collected evidence never hides a failure" hold by construction, not
   by proof.
 - That nothing runs after the first failure.
-- Both are pinned by call-counting tests in `trop/src/port/occupancy.rs`
-  (`test_failure_on_last_probe_runs_every_earlier_probe_and_fails_closed`,
-  `test_default_find_occupied_ports_stops_at_first_failure`).
 - The glue mappings above (covered by exhaustive tests over all 729 settings
   and all 32 flag combinations).
+
+The first two are pinned by call-counting tests in
+`trop/src/port/occupancy.rs`
+(`test_failure_on_last_probe_runs_every_earlier_probe_and_fails_closed`,
+`test_default_find_occupied_ports_stops_at_first_failure`).
 
 ### `verified::group` — group requests, offset-pattern search, fresh plans, stored groups, output selection
 
@@ -823,8 +831,11 @@ Properties:
   `decode_stored_tag`), specified with these definitions. Every reservation
   write path enforces `is_valid_tag` even though `ReservationKey` has public
   fields and derives `Deserialize`: it binds only keys that
-  `ReservationKey::storage_key` encoded with `encode_storage_key`. (The
-  schema v1-to-v2 migration copies rows in SQL instead; its preflight,
+  `encode_storage_key` produced (`StoredKey` and `StoredRow` have private
+  fields). Inserts and `delete_reservation_if_unchanged` get theirs from
+  `encode_record`, which calls `encode_storage_key`; the other writes get
+  theirs from `ReservationKey::storage_key`. (The schema v1-to-v2 migration
+  copies rows in SQL instead; its preflight,
   `schema_version::classify_legacy_row`, blocks every row whose copy the v2
   decoder would reject.)
 
@@ -874,11 +885,18 @@ char-offset slicing behind `trim`), `env_name` (`string_from_ascii`,
 - Every char prefix ends on a UTF-8 char boundary, and prefix byte offsets are
   injective. `char_slice` (kernel-internal) slices a `&str` at proved char
   offsets.
-- Exec helpers, each total and exactly its specification: `ascii_uppercase`
-  (`str::to_ascii_uppercase`), `upper_byte` (`u8::to_ascii_uppercase`),
-  `bytes_equal` (`<[u8]>::eq`), `bytes_eq_ignore_ascii_case`
-  (`<[u8]>::eq_ignore_ascii_case`), and `string_from_ascii` (the string of
-  the given code points; the inverse of UTF-8 encoding on ASCII).
+- Exec helpers, each total and exactly its kernel specification:
+  `ascii_uppercase` (`ascii_upper_chars`: each char `a`-`z` mapped to
+  `A`-`Z`, every other char kept), `upper_byte` (`ascii_upper`, the same on
+  bytes), `bytes_equal` (equal byte sequences), `bytes_eq_ignore_ascii_case`
+  (`eq_ignore_ascii_case`: equal lengths, and equal bytes after
+  `ascii_upper`), and `string_from_ascii` (the string of the given code
+  points; the inverse of UTF-8 encoding on ASCII). The first four are
+  written to compute what `str::to_ascii_uppercase`,
+  `u8::to_ascii_uppercase`, `<[u8]>::eq` and `<[u8]>::eq_ignore_ascii_case`
+  compute, but no lemma relates them to those functions (`vstd` specifies
+  none of the three ASCII ones), so that correspondence holds by
+  construction and is not proved.
 
 Trusted-base additions (no new escape hatches): `vstd`'s specs of
 `char::is_whitespace`, `char::len_utf8`, `str::chars` / `Iterator::next`,
@@ -1217,9 +1235,14 @@ Numbers:
 - Not every number goes through it. YAML integer scalars (`ports`,
   `maximum_lock_wait_seconds`, `cleanup.expire_after_days`, `reservations`
   base/offset/preferred) are parsed by `serde_yaml`, which also accepts
-  `0x`/`0o`/`0b` and rejects leading zeros (`min: 05000` is a string). CLI
-  numbers are parsed by `clap` (as an `i64`, then range-checked), not by
-  the kernel.
+  `0x`/`0o`/`0b` and rejects leading zeros (`min: 05000` is a string). On
+  the command line only `trop exclude`'s argument reaches `parse_u16`
+  (through `PortExclusion`'s `FromStr`). `reserve`'s `--port`, `--min` and
+  `--max` are strings parsed by `str::parse::<u32>` and then range-checked
+  (`parse_port_string` in `trop-cli/src/commands/reserve.rs`). The typed
+  arguments (`scan --min`/`--max`, the `port` of `assert-port` and
+  `port-info`, `expire`/`autoclean --days`, `--busy-timeout`) are parsed by
+  `clap` (as an `i64`, then range-checked).
 - `lemma_decimal_text_accepted` (completeness): every value up to `max`, with
   any leading zeros and an optional `+`, parses back to itself.
 
@@ -1444,7 +1467,9 @@ classes and `Path::to_str` stay in the glue.
   (`check_stored_identifier`, which calls
   `identifier::is_canonical_identifier`, the predicate `encode_record`
   applies). Every reservation write path returns `Error::Validation` before
-  any SQL for a value the reader would reject.
+  it writes a value the reader would reject. Keys and supplied values are
+  checked before any SQL runs; `update_last_used` converts the current time
+  after its `BEGIN IMMEDIATE`, before the `UPDATE`.
 - Lookups: `lookup_key` is the key's exact text. Among rows whose tag decodes,
   it matches exactly the rows holding the requested key, so a lookup never
   returns another key's row (a `Some("")` tag never aliases the untagged one)
@@ -1563,10 +1588,13 @@ stored tag text. The same id lists feed `guard_moves`, `classify_conflicts` and
   The postconditions pin `LengthMismatch` in both directions and tie every
   other variant to its cause: some id is out of range, two sources are
   equal, or two destinations are equal while the sources are in range and
-  distinct. They do not fix which of `KeyOutOfRange` and a duplicate is
-  reported when both occur (with three keys, sources `[0, 0]` and
-  destinations `[9, 1]`, the code reports `DuplicateSource`); that order
-  holds by construction.
+  distinct. So `DuplicateDest` is never reported while a source is out of
+  range or repeated. They do not fix the choice in two cases, where the
+  order above holds by construction: a repeated source together with an
+  out-of-range id, source or destination (with three keys, sources
+  `[0, 0]` and destinations `[9, 1]`, the code reports `DuplicateSource`,
+  and `KeyOutOfRange` would also satisfy them); and, with valid sources,
+  destinations that hold both an out-of-range id and a repeat.
 
   Lemmas:
   - `lemma_conflicts_are_overwrites`: under a consistent snapshot, the
@@ -1876,9 +1904,11 @@ explaining that Verus cannot see inside `b"..."` literals.
   `vstd` in `Cargo.toml` to the crates.io version published from the same
   commit (`0.0.0-YYYY-MM-DD-HHMM`). Re-run `just verify`.
 - Keep the build toolchain and the verifier's toolchain in step. `vstd`'s
-  `std` specifications are checked against `VERUS_RUST_TOOLCHAIN` (now
-  1.100.0), while `rust-toolchain.toml` and the CI jobs build `trop` with
-  1.99.1 (see "Trusted computing base"). When bumping either, move the
-  other with it where possible (`rust-toolchain.toml` and every
-  `dtolnay/rust-toolchain@` pin in `.github/workflows/ci.yml` together), or
-  update the skew recorded in the trusted base.
+  `std` specifications are written for, and resolved against,
+  `VERUS_RUST_TOOLCHAIN` (now 1.100.0), while `rust-toolchain.toml` and the
+  CI jobs build `trop` with 1.99.1 (see "Trusted computing base"). When
+  bumping either, move the other with it where possible, or update the skew
+  recorded in the trusted base. The build toolchain is `rust-toolchain.toml`
+  plus every `dtolnay/rust-toolchain@1.99.1` pin in
+  `.github/workflows/ci.yml` and `.github/workflows/property-tests.yml`;
+  move them together. The licenses job's `@stable` is not a pin and stays.

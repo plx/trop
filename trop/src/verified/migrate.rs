@@ -1325,8 +1325,11 @@ fn check_keys(key_count: usize, sources: &[usize], dests: &[usize]) -> (r: Resul
 /// The code checks the lengths, then scans the sources left to right and
 /// reports the first out-of-range id or repeat it meets, then the
 /// destinations the same way. The postconditions pin `LengthMismatch` and
-/// tie each other error to its cause, but do not fix which of an
-/// out-of-range id and a repeat is reported when both occur.
+/// tie each other error to its cause; `DuplicateDest` requires in-range,
+/// distinct sources. They do not fix the choice between `KeyOutOfRange`
+/// and `DuplicateSource` when a source repeats and some id is out of range,
+/// or between `KeyOutOfRange` and `DuplicateDest` when, with valid sources,
+/// the destinations hold both an out-of-range id and a repeat.
 pub fn classify_conflicts(
     key_count: usize,
     sources: &[usize],

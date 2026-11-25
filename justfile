@@ -56,8 +56,26 @@ verify *args:
     verus_bin="$(./scripts/install-verus.sh --print-path)"
     cd trop-verification
     # A replay has no results line, so drop the harness crate's cached build
-    # to make the verifier run; dependencies stay cached.
-    cargo clean --quiet --package trop-verification
+    # to make the verifier run; dependencies stay cached. (`cargo verus`
+    # checks freshness by content checksum, so touching a file is not
+    # enough.) The arguments that choose the build directory are passed on,
+    # so the build this run would replay is the one dropped.
+    clean_args=()
+    take=0
+    for arg in "$@"; do
+        if [ "$take" -eq 1 ]; then
+            clean_args+=("$arg")
+            take=0
+            continue
+        fi
+        case "$arg" in
+            --) break ;;
+            -r|--release) clean_args+=("$arg") ;;
+            --profile|--target|--target-dir|--config) clean_args+=("$arg"); take=1 ;;
+            --profile=*|--target=*|--target-dir=*|--config=*) clean_args+=("$arg") ;;
+        esac
+    done
+    cargo clean --quiet --package trop-verification ${clean_args[@]+"${clean_args[@]}"}
     log="$(mktemp)"
     trap 'rm -f "$log"' EXIT
     status=0
@@ -81,8 +99,15 @@ verify-module module *args:
     cd trop-verification
     # As in `verify`, drop the harness crate's cached build (`cargo verus
     # focus` builds under `<target>/verus-partial`): a replay would also
-    # ignore which module was asked for.
-    target_dir="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+    # ignore which module was asked for. The target directory is read from
+    # `cargo metadata`, undoing JSON escapes (Windows backslashes, quotes).
+    target_dir="$(cargo metadata --no-deps --format-version 1 \
+        | sed -nE 's/.*"target_directory":"((\\.|[^"\\])*)".*/\1/p' \
+        | sed -E 's/\\(.)/\1/g')"
+    if [ -z "$target_dir" ]; then
+        echo "error: could not read cargo's target directory" >&2
+        exit 1
+    fi
     cargo clean --quiet --package trop-verification --target-dir "$target_dir/verus-partial"
     log="$(mktemp)"
     trap 'rm -f "$log"' EXIT

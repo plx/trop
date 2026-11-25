@@ -393,7 +393,8 @@ a 0.2.x patch:
 
 - `operations::MigrateOptions` has a new public field,
   `allow_unrelated_path`. Code that builds `MigrateOptions` with a struct
-  literal must set it; `MigrateOptions::new` sets it to `false`.
+  literal must set it; `MigrateOptions::new` sets it to `false`, and the new
+  builder `MigrateOptions::with_allow_unrelated_path` sets it.
 - `operations::migrate::to_operation_plan` now returns
   `Result<OperationPlan>` instead of `OperationPlan`.
 - Migration now applies the unrelated-path guard. With neither `force` nor
