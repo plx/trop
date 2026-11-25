@@ -9,17 +9,15 @@ use std::path::{Path, PathBuf};
 use crate::config::merger::ConfigMerger;
 use crate::config::schema::{
     CleanupConfig, Config, OccupancyConfig, OutputFormat, PortConfig, PortExclusion,
-    ReservationGroup, DEFAULT_MAX_PORT, DEFAULT_MIN_PORT,
+    ReservationGroup,
 };
 use crate::config::validator::ConfigValidator;
 use crate::error::Result;
-use crate::verified::port_bounds::{overlay_port_bounds, PortLayer};
+use crate::verified::port_bounds::{default_port_bounds, overlay_port_bounds, PortLayer};
 
-static BUILT_IN_PORTS: PortConfig = PortConfig {
-    min: DEFAULT_MIN_PORT,
-    max: Some(DEFAULT_MAX_PORT),
-    max_offset: None,
-};
+/// The built-in `ports` section, as the verified kernel defines it (and
+/// proves canonical and valid).
+static BUILT_IN_PORTS: PortConfig = PortConfig::from_bounds(default_port_bounds());
 static BUILT_IN_CLEANUP: CleanupConfig = CleanupConfig {
     expire_after_days: Some(30),
 };
@@ -486,20 +484,58 @@ impl EffectiveConfig {
     /// # Errors
     ///
     /// Returns a validation error if the resulting configuration is invalid.
+    /// This configuration is then left unchanged.
     pub fn apply_cli_config<I>(&mut self, config: &Config, explicit_fields: I) -> Result<()>
     where
         I: IntoIterator<Item = ConfigField>,
     {
-        self.apply_precise(
+        // Apply to a copy and commit only a valid result, so an
+        // `EffectiveConfig` never holds a rejected layer (which a later
+        // `min`-only layer could otherwise re-anchor).
+        let mut next = self.clone();
+        next.apply_precise(
             config,
             explicit_fields.into_iter().collect(),
             &ConfigValueSource::CommandLine,
         );
-        self.validate(true)
+        next.validate(true)?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Check that `reservations.base` lies within the range the current
+    /// `ports` section names.
+    ///
+    /// [`crate::config::ConfigBuilder`] calls this once the built-in defaults
+    /// and every configuration file are laid, before environment,
+    /// programmatic, and command-line overrides, which apply to one
+    /// invocation. The decision is the verified port-bounds kernel's
+    /// (`group_base_outside_range`). A violation is attributed to the source
+    /// that last set the group or a port bound.
+    pub(crate) fn validate_configured_group_base(&self) -> Result<()> {
+        let Some(group) = &self.config.reservations else {
+            return Ok(());
+        };
+        ConfigValidator::validate_group_base_in_range(group, Some(self.ports())).map_err(|error| {
+            let source = [
+                ConfigField::Reservations,
+                ConfigField::PortsMin,
+                ConfigField::PortsMax,
+                ConfigField::PortsMaxOffset,
+            ]
+            .iter()
+            .filter_map(|field| self.provenance.get(field))
+            .max_by_key(|provenance| provenance.winner_order)
+            .map(FieldProvenance::winner);
+            match source {
+                Some(source) => ConfigValidator::annotate(error, source),
+                None => error,
+            }
+        })
     }
 
     pub(crate) fn validate(&self, is_tropfile: bool) -> Result<()> {
-        ConfigValidator::validate(&self.config, is_tropfile)
+        ConfigValidator::validate_effective(&self.config, is_tropfile)
             .and_then(|()| {
                 self.task.as_deref().map_or(Ok(()), |task| {
                     ConfigValidator::validate_runtime_identifier("task", task)

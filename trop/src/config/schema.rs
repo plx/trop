@@ -99,11 +99,17 @@ pub struct Config {
 /// `max_offset` can be specified, but not both.
 ///
 /// When configuration sources are layered (see
-/// [`crate::config::ConfigBuilder`]), a `max_offset` is resolved against the
-/// `min` in effect at the layer that sets it and stored as the absolute
-/// `max` it names, so a higher layer that changes only `min` never moves it.
-/// An effective configuration therefore always holds `max` and no
-/// `max_offset`.
+/// [`crate::config::ConfigBuilder`]), a `max_offset` that resolves at the
+/// `min` in effect at the layer that sets it is stored as the absolute `max`
+/// it names, so a higher layer that changes only `min` never moves it.
+/// `ConfigBuilder` checks every layer below the command line on its own
+/// (configuration files and the programmatic layer are validated, the
+/// environment's upper bound must resolve), and validates the result, so
+/// every configuration it builds, and every [`crate::config::EffectiveConfig`]
+/// after a successful `apply_cli_config`, holds `max` and no `max_offset`.
+/// (A bare [`crate::config::ConfigMerger`] merge validates nothing: there, an
+/// unresolvable `max_offset` is kept as written, and a later `min`-only
+/// section re-evaluates it at its new `min`.)
 ///
 /// # Examples
 ///

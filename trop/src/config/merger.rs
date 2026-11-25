@@ -172,8 +172,10 @@ impl ConfigMerger {
     /// always wins, and an upper bound in the source replaces the target's.
     /// The source's `max_offset` is resolved against the source's own `min`
     /// into an absolute `max`, and a target upper bound the source keeps
-    /// stays where it is, so a later `min` never moves an earlier offset. The
-    /// decision is made by the verified port-bounds kernel
+    /// stays where it is, so a later `min` never moves an earlier offset that
+    /// resolved. (An offset that does not resolve -- 0, or past 65535 -- is
+    /// kept as written for validation to report; this merge validates
+    /// nothing.) The decision is made by the verified port-bounds kernel
     /// (`overlay_port_bounds`); this returns the merged section and the
     /// leaves the source set.
     fn merge_port_config(

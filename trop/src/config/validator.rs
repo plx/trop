@@ -83,6 +83,22 @@ impl ConfigValidator {
     ///
     /// Returns validation errors for invalid configurations.
     pub fn validate(config: &Config, is_tropfile: bool) -> Result<()> {
+        Self::validate_with(config, is_tropfile, true)
+    }
+
+    /// Validate an effective (layered) configuration: every rule of
+    /// [`Self::validate`] except the `reservations.base` range rule.
+    ///
+    /// Environment, programmatic, and command-line port overrides apply to
+    /// one invocation and do not make a group's base invalid. The base is
+    /// checked against the range the configuration files name
+    /// (`EffectiveConfig::validate_configured_group_base`), and
+    /// `reserve-group` checks it against the range it scans.
+    pub(crate) fn validate_effective(config: &Config, is_tropfile: bool) -> Result<()> {
+        Self::validate_with(config, is_tropfile, false)
+    }
+
+    fn validate_with(config: &Config, is_tropfile: bool, check_group_base: bool) -> Result<()> {
         // Validate project field
         // Note: We allow project from any source (env vars, CLI flags, trop.yaml)
         // The tropfile restriction was overly strict and prevented valid CLI usage
@@ -99,7 +115,9 @@ impl ConfigValidator {
                 });
             }
             Self::validate_reservation_group(reservations)?;
-            Self::validate_group_base_in_range(reservations, config.ports.as_ref())?;
+            if check_group_base {
+                Self::validate_group_base_in_range(reservations, config.ports.as_ref())?;
+            }
         }
 
         // Validate port configuration
@@ -259,31 +277,38 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate that a reservation group's base lies within the range the
-    /// same configuration's `ports` section names.
+    /// Validate that a reservation group's base lies within the ports that a
+    /// `ports` section admits.
     ///
-    /// Decided by the verified port-bounds kernel. A `ports` section that is
-    /// invalid, or that names no upper bound, is left to its own checks (and,
-    /// for a single document, to validation of the effective configuration,
-    /// whose `ports` section always names one).
-    fn validate_group_base_in_range(
+    /// Decided by the verified port-bounds kernel. A section that names a
+    /// complete range admits that range; a section that names only `min`
+    /// admits no base below `min`. An invalid section is left to its own
+    /// checks, and a configuration without a `ports` section is checked once
+    /// layered over the other configuration files
+    /// (`EffectiveConfig::validate_configured_group_base`).
+    pub(crate) fn validate_group_base_in_range(
         group: &ReservationGroup,
         ports: Option<&PortConfig>,
     ) -> Result<()> {
-        match ports.and_then(|ports| {
+        let Some(outside) = ports.and_then(|ports| {
             group_base_outside_range(group.base, ports.min, ports.max, ports.max_offset)
-        }) {
-            Some(outside) => Err(Error::Validation {
-                field: "reservations.base".into(),
-                message: format!(
-                    "Base port {} must be within port range {}..{}",
-                    outside.base,
-                    outside.range.min(),
-                    outside.range.max()
-                ),
-            }),
-            None => Ok(()),
-        }
+        }) else {
+            return Ok(());
+        };
+        let message = match outside.max {
+            Some(max) => format!(
+                "Base port {} must be within port range {}..{max}",
+                outside.base, outside.min
+            ),
+            None => format!(
+                "Base port {} must not be below the minimum port {}",
+                outside.base, outside.min
+            ),
+        };
+        Err(Error::Validation {
+            field: "reservations.base".into(),
+            message,
+        })
     }
 
     /// Validate reservation group.

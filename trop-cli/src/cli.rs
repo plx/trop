@@ -19,7 +19,6 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use trop::config::{
     CleanupConfig, ConfigField, OccupancyConfig, OutputFormat as ConfigOutputFormat, PortConfig,
-    DEFAULT_MAX_PORT, DEFAULT_MIN_PORT,
 };
 
 /// Command-line tool for managing ephemeral port reservations.
@@ -413,9 +412,11 @@ fn set_port_overrides(
         return Ok(());
     }
 
+    // Only the recorded leaves are applied; the others are placeholders.
+    let placeholder = PortConfig::default();
     command_line.config.ports = Some(PortConfig {
-        min: min.unwrap_or(DEFAULT_MIN_PORT),
-        max: max.or(Some(DEFAULT_MAX_PORT)),
+        min: min.unwrap_or(placeholder.min),
+        max: max.or(placeholder.max),
         max_offset: None,
     });
     if min.is_some() {

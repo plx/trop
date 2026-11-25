@@ -601,9 +601,23 @@ fn validation_rejects_group_base_outside_the_range() {
         (range(5000, None, Some(10)), 5000, None),
         (range(5000, None, Some(10)), 5010, None),
         (range(1, Some(65535), None), 65535, None),
-        // A section that names no upper bound is left to the effective
-        // configuration.
+        (range(1, Some(65535), None), 1, None),
+        (range(65535, None, None), 65535, None),
+        // A section that names only `min` admits no base below it; its upper
+        // bound comes from another layer.
         (range(6000, None, None), 9000, None),
+        (range(6000, None, None), 6000, None),
+        (
+            range(6000, None, None),
+            5999,
+            Some("Base port 5999 must not be below the minimum port 6000"),
+        ),
+        (
+            range(65535, None, None),
+            1,
+            Some("Base port 1 must not be below the minimum port 65535"),
+        ),
+        // Without a `ports` section the range comes from other layers.
         (None, 9000, None),
     ] {
         let result = ConfigValidator::validate(&document(ports.clone(), base), true);
@@ -623,15 +637,21 @@ fn validation_rejects_group_base_outside_the_range() {
     }
 
     // An invalid section is reported by its own rule, not as a base error.
-    let error = ConfigValidator::validate(&document(range(6000, Some(5000), None), 9000), true)
-        .unwrap_err();
-    assert!(
-        matches!(&error, Error::Validation { message, .. } if message == "max must be >= min"),
-        "{error:?}"
-    );
+    for invalid in [
+        range(6000, Some(5000), None),
+        range(6000, None, Some(0)),
+        range(0, None, None),
+    ] {
+        let error = ConfigValidator::validate(&document(invalid.clone(), 1), true).unwrap_err();
+        assert!(
+            matches!(&error, Error::Validation { field, .. } if !field.starts_with("reservations")),
+            "{invalid:?}: {error:?}"
+        );
+    }
 
-    // The effective configuration always has a complete range (here the
-    // built-in one), so a project file without `ports` is checked too.
+    // Layered over the configuration files, every section names a complete
+    // range (here the built-in one), so a project file without `ports` is
+    // checked too.
     let temp = TempDir::new().unwrap();
     let _env = PortEnv::set(None, None, None);
     fs::write(
@@ -788,4 +808,260 @@ fn command_line_bounds_check() {
         check(Some(6000), Some(5999)),
         Err("Invalid port range: min (6000) must be less than or equal to max (5999)".into())
     );
+}
+
+/// Writes `contents` to `name` in `dir`.
+fn write(dir: &Path, name: &str, contents: &str) {
+    fs::write(dir.join(name), contents).unwrap();
+}
+
+const GROUP_AT_6000: &str = "reservations:\n  base: 6000\n  services:\n    web:\n      offset: 0\n";
+
+/// `reservations.base` is checked against the range the configuration files
+/// name, and a violation names the file that last set the group or a port
+/// bound. Environment and command-line port overrides apply to one
+/// invocation and do not invalidate the group; `reserve-group` still checks
+/// the base against the range it scans.
+///
+/// Regression (against this package's first version, which checked the base
+/// after every override): a single `--min 6100 --max 6200`, or
+/// `TROP_PORT_MIN=6500`, failed in any project whose group base was 6000,
+/// and the error blamed `trop.yaml`.
+#[test]
+#[serial]
+fn group_base_is_checked_against_the_configured_range() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path();
+    let data_dir = dir.join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let builder = || {
+        ConfigBuilder::new()
+            .with_working_dir(dir)
+            .with_data_dir(&data_dir)
+    };
+    let base_error = |result: trop::Result<EffectiveConfig>| match result {
+        Err(Error::Validation { field, message }) => (field, message),
+        other => panic!("expected a validation error, got {:?}", other.map(|_| ())),
+    };
+
+    write(
+        dir,
+        "trop.yaml",
+        &format!("ports:\n  min: 5000\n  max: 7000\n{GROUP_AT_6000}"),
+    );
+    let _env = PortEnv::set(Some(6500), None, None);
+    let effective = builder().build_effective().unwrap();
+    assert_eq!(resolved(&effective), (6500, 7000));
+    drop(_env);
+
+    let _env = PortEnv::set(None, None, None);
+    let (cli, fields) = cli_layer(Some(6100), Some(6200));
+    let effective = builder()
+        .with_cli_config_fields(cli, fields)
+        .build_effective()
+        .unwrap();
+    assert_eq!(resolved(&effective), (6100, 6200));
+
+    // `reserve-group` scans the overridden range, which excludes the base.
+    let options = trop::operations::ReserveGroupOptions::new(dir.join("trop.yaml"));
+    let error = trop::operations::ReserveGroupPlan::from_effective(options, &effective)
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "validation error for 'reservations.base': \
+         Base port 6000 must be within port range 6100..6200"
+    );
+
+    // A higher file that moves the range is named, although the base is
+    // declared by trop.yaml (which is valid on its own).
+    write(dir, "trop.yaml", GROUP_AT_6000);
+    write(dir, "trop.local.yaml", "ports:\n  min: 6500\n  max: 7000\n");
+    let local = dir.join("trop.local.yaml");
+    assert_eq!(
+        base_error(builder().build_effective()),
+        (
+            format!("reservations.base ({})", local.display()),
+            "Base port 6000 must be within port range 6500..7000".to_string()
+        )
+    );
+
+    // The base inside the range the files name is accepted.
+    write(dir, "trop.local.yaml", "ports:\n  min: 6000\n  max: 7000\n");
+    builder().build_effective().unwrap();
+
+    // A lower file that sets the range: the newer trop.yaml is named.
+    fs::remove_file(&local).unwrap();
+    write(
+        &data_dir,
+        "config.yaml",
+        "ports:\n  min: 6500\n  max: 7000\n",
+    );
+    assert_eq!(
+        base_error(builder().build_effective()),
+        (
+            format!("reservations.base ({})", dir.join("trop.yaml").display()),
+            "Base port 6000 must be within port range 6500..7000".to_string()
+        )
+    );
+}
+
+/// A zero or overflowing `TROP_PORT_MAX_OFFSET` is rejected at the
+/// environment layer, even when a command-line `--max` replaces the upper
+/// bound. (Before, the command line silently rescued it.)
+#[test]
+#[serial]
+fn environment_offset_is_not_rescued_by_the_command_line() {
+    let temp = TempDir::new().unwrap();
+    for (env, cli, expected) in [
+        (
+            Layer {
+                max_offset: Some(0),
+                ..Layer::default()
+            },
+            (None, Some(6500)),
+            "validation error for 'ports.max_offset (TROP_PORT_MAX_OFFSET)': \
+             max_offset must be > 0",
+        ),
+        (
+            Layer {
+                min: Some(65000),
+                max_offset: Some(1000),
+                ..Layer::default()
+            },
+            (Some(6000), Some(6000)),
+            "validation error for 'ports.max_offset (TROP_PORT_MAX_OFFSET)': \
+             Offset 1000 would overflow when added to min port 65000",
+        ),
+    ] {
+        let error = Stack {
+            project: None,
+            local: None,
+            env,
+            cli,
+        }
+        .build(temp.path())
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+/// The programmatic layer (`ConfigBuilder::with_config`) is validated on its
+/// own, like a configuration file: a later layer can neither rescue an
+/// invalid upper bound in it nor re-anchor an offset that never resolved.
+#[test]
+#[serial]
+fn programmatic_layer_is_validated_on_its_own() {
+    let _env = PortEnv::set(None, None, None);
+    let build = |ports: PortConfig, cli: (Option<u16>, Option<u16>)| {
+        let (cli, fields) = cli_layer(cli.0, cli.1);
+        ConfigBuilder::new()
+            .skip_files()
+            .skip_env()
+            .with_config(Config {
+                ports: Some(ports),
+                ..Default::default()
+            })
+            .with_cli_config_fields(cli, fields)
+            .build_effective()
+    };
+    for (ports, cli, expected) in [
+        (
+            PortConfig {
+                min: 5000,
+                max: Some(5005),
+                max_offset: Some(5),
+            },
+            (None, Some(6500)),
+            "validation error for 'ports (<programmatic override>)': \
+             Cannot specify both max and max_offset",
+        ),
+        (
+            PortConfig {
+                min: 65000,
+                max: None,
+                max_offset: Some(1000),
+            },
+            (Some(100), None),
+            "validation error for 'ports.max_offset (<programmatic override>)': \
+             Offset 1000 would overflow when added to min port 65000",
+        ),
+    ] {
+        let error = build(ports, cli).err().unwrap();
+        assert_eq!(error.to_string(), expected);
+    }
+
+    // A valid programmatic offset is fixed where it is declared.
+    let effective = build(
+        PortConfig {
+            min: 5000,
+            max: None,
+            max_offset: Some(10),
+        },
+        (Some(5004), None),
+    )
+    .unwrap();
+    assert_eq!(resolved(&effective), (5004, 5010));
+}
+
+/// `EffectiveConfig::apply_cli_config` commits only a valid result: after a
+/// rejected layer the configuration (bounds and provenance) is unchanged.
+#[test]
+#[serial]
+fn rejected_command_line_layer_leaves_the_configuration_unchanged() {
+    let _env = PortEnv::set(None, None, None);
+    let mut effective = ConfigBuilder::new()
+        .skip_files()
+        .skip_env()
+        .with_config(Config {
+            ports: Some(PortConfig {
+                min: 5000,
+                max: None,
+                max_offset: Some(50),
+            }),
+            ..Default::default()
+        })
+        .build_effective()
+        .unwrap();
+    let before = effective.clone();
+    assert_eq!(
+        effective.ports(),
+        &PortConfig {
+            min: 5000,
+            max: Some(5050),
+            max_offset: None,
+        }
+    );
+
+    let bad = Config {
+        ports: Some(PortConfig {
+            min: 6000,
+            max: None,
+            max_offset: Some(0),
+        }),
+        ..Default::default()
+    };
+    let error = effective
+        .apply_cli_config(&bad, [ConfigField::PortsMaxOffset])
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "validation error for 'ports.max_offset (<command line>)': max_offset must be > 0"
+    );
+    assert_eq!(effective, before);
+
+    // A later valid layer applies over the unchanged configuration.
+    let min_only = Config {
+        ports: Some(PortConfig {
+            min: 5040,
+            max: None,
+            max_offset: None,
+        }),
+        ..Default::default()
+    };
+    effective
+        .apply_cli_config(&min_only, [ConfigField::PortsMin])
+        .unwrap();
+    assert_eq!(resolved(&effective), (5040, 5050));
 }

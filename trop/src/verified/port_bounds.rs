@@ -14,14 +14,19 @@
 //!   `max_offset` are mutually exclusive and the offset is strictly positive.
 //! - [`overlay_port_bounds`] -- how one configuration layer (a YAML document,
 //!   the environment, a programmatic override, or the command line) is laid
-//!   over the bounds below it. A layer's `max_offset` is resolved against the
-//!   `min` in effect *at that layer* into an absolute `max`, so a higher
-//!   layer that changes only `min` never moves a lower layer's upper bound.
+//!   over the bounds below it. A layer's `max_offset` that resolves at the
+//!   `min` in effect *at that layer* is stored as the absolute `max` it
+//!   names, so a higher layer that changes only `min` never moves it. (A
+//!   `max_offset` that does not resolve there -- 0, or past 65535 -- is kept
+//!   as written so that validation of that state reports it; a later
+//!   `min`-only layer re-evaluates it at the new `min`. Every layer
+//!   `ConfigBuilder` lays below the top one is checked first, so this case
+//!   arises only for unvalidated library-level layers.)
 //! - [`check_upper_declaration`] and [`check_override_bounds`] -- the checks
 //!   the environment and command-line layers apply to themselves.
 //! - [`group_scan_span`] and [`group_base_outside_range`] -- the
-//!   `reservations.base` rules: the base must lie in the range, and rebasing
-//!   only narrows it.
+//!   `reservations.base` rules: the base must lie in the ports a section
+//!   admits, and rebasing only narrows the range.
 //! - [`DEFAULT_MIN_PORT`], [`DEFAULT_MAX_PORT`], and [`default_port_bounds`]
 //!   -- the built-in bounds, proved valid.
 //!
@@ -30,7 +35,9 @@
 //! that passes validation holds exactly one, absolute upper bound (and so does
 //! every section built from layers whose declarations resolve);
 //! `{min: m, max_offset: o}` and `{min: m, max: m + o}` are interchangeable in
-//! every layer stack; and layering is associative.
+//! every layer stack; and layering is associative for layers that anchor
+//! their `max_offset` at their own `min`, over a section that holds no
+//! unresolvable offset (`lemma_overlay_compose`).
 //!
 //! Production glue: `crate::port::allocator::port_range_from_config` (and
 //! `port_span_from_config`),
@@ -426,7 +433,8 @@ pub open spec fn upper_declaration_error(
 /// - The result is normalized: a resolvable lone `max_offset` is stored as the
 ///   absolute `max`. Shapes validation rejects (both forms, a zero or
 ///   overflowing offset) are kept as they are, so validation still reports
-///   them.
+///   them. Such an unresolvable lone `max_offset` is the one value a later
+///   layer that sets only `min` re-evaluates, at its new `min`.
 pub open spec fn overlay(lower: PortBounds, layer: PortLayer) -> PortBounds {
     let anchor = layer_anchor(lower, layer);
     if declares_upper(layer) {
@@ -542,9 +550,12 @@ pub fn overlay_port_bounds(lower: PortBounds, layer: PortLayer) -> (r: (PortBoun
 /// itself, as validation does to every YAML document.
 ///
 /// Succeeds exactly when `upper_declaration_ok`; otherwise reports
-/// `upper_declaration_error`, which is the error `ConfigValidator` reports
-/// for the same declaration in a document with that `min`
-/// (`lemma_upper_declaration_agrees_with_validation`).
+/// `upper_declaration_error`. Validation rejects every document with that
+/// `min` whose declaration this check rejects, and whenever the first rule
+/// such a document breaks is an upper-bound rule, validation reports the same
+/// error (`lemma_upper_declaration_agrees_with_validation`). (When the
+/// document breaks a `min`/`max` rule first, validation reports that rule
+/// instead; this check does not look at `min` or `max <= min`.)
 pub fn check_upper_declaration(anchor: u16, max: Option<u16>, max_offset: Option<u16>) -> (r: Result<
     (),
     PortBoundsViolation,
@@ -660,23 +671,41 @@ pub fn group_scan_span(base: Option<u16>, span: PortSpan) -> (r: Option<PortSpan
     r
 }
 
-/// A `reservations.base` outside the range its own document names.
+/// The ports a `ports` section admits for `reservations.base`: from `min` up
+/// to the upper bound the section names, with no upper limit when it names
+/// none (that bound then comes from another layer).
+pub open spec fn base_within_section(
+    base: u16,
+    min: u16,
+    max: Option<u16>,
+    max_offset: Option<u16>,
+) -> bool {
+    &&& min <= base
+    &&& (requested_max(min, max, max_offset) matches Some(hi) ==> base <= hi)
+}
+
+/// A `reservations.base` outside the range a `ports` section names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BaseOutsideRange {
     /// The base.
     pub base: u16,
-    /// The range the document's `ports` section names.
-    pub range: PortSpan,
+    /// The section's `min`.
+    pub min: u16,
+    /// The upper bound the section names, if it names one. `None` means the
+    /// section names no upper bound and the base lies below `min`.
+    pub max: Option<u16>,
 }
 
-/// The document-level `reservations.base` rule: when the same document's
-/// `ports` section is strictly valid and names a range, the base must lie in
-/// that range. (A section that is invalid, or that names no upper bound, is
-/// left to its own checks and to validation of the effective configuration,
-/// where every section is canonical.)
+/// The `reservations.base` range rule for one `ports` section: when the
+/// section is strictly valid, the base must lie in the ports it admits
+/// (`base_within_section`). A section that names a complete range admits
+/// exactly that range; one that names only `min` admits no base below `min`,
+/// whatever upper bound a lower layer supplies. An invalid section is left to
+/// its own checks.
 ///
-/// Reports a violation exactly when the base lies outside that range, and
-/// then the range is exactly the one `check_port_bounds` validates.
+/// Reports a violation exactly when the base lies outside the admitted
+/// ports, and then names exactly the section's `min` and the upper bound it
+/// requests (the range `check_port_bounds` validates).
 pub fn group_base_outside_range(
     base: Option<u16>,
     min: u16,
@@ -684,24 +713,38 @@ pub fn group_base_outside_range(
     max_offset: Option<u16>,
 ) -> (r: Option<BaseOutsideRange>)
     ensures
-        r is Some <==> base is Some && strictly_valid(min, max, max_offset) && (requested_max(
+        r is Some <==> base is Some && strictly_valid(min, max, max_offset) && !base_within_section(
+            base->0,
             min,
             max,
             max_offset,
-        ) matches Some(hi) && !(min <= base->0 <= hi)),
-        r matches Some(v) ==> base == Some(v.base) && v.range.spec_min() == min && requested_max(
+        ),
+        r matches Some(v) ==> base == Some(v.base) && v.min == min && requested_max(
             min,
             max,
             max_offset,
-        ) == Some(v.range.spec_max() as int),
+        ) == (match v.max {
+            Some(hi) => Some(hi as int),
+            None => None::<int>,
+        }),
+        r matches Some(v) ==> (v.max matches Some(hi) ==> super::port::is_valid_range(
+            v.min as int,
+            hi as int,
+        ) && !(v.min <= v.base <= hi)),
+        r matches Some(v) ==> (v.max is None ==> v.base < v.min),
 {
     let b = base?;
     match check_port_bounds(min, max, max_offset) {
         Ok(Some(range)) => match group_scan_span(Some(b), range) {
             Some(_) => None,
-            None => Some(BaseOutsideRange { base: b, range }),
+            None => Some(BaseOutsideRange { base: b, min, max: Some(range.max()) }),
         },
-        _ => None,
+        Ok(None) => if b < min {
+            Some(BaseOutsideRange { base: b, min, max: None })
+        } else {
+            None
+        },
+        Err(_) => None,
     }
 }
 
@@ -904,6 +947,34 @@ pub proof fn lemma_valid_document_layer(
     lemma_overlay_properties(lower, PortLayer { min: Some(min), max, max_offset });
 }
 
+/// The per-document `reservations.base` rule never rejects a base that the
+/// document itself could still admit: a base outside the ports a strictly
+/// valid section admits lies outside the range of the section obtained by
+/// laying that document over any section at all. (Only a higher layer that
+/// sets `ports` could bring it back in.) For a complete section this is its
+/// own range; for a `min`-only section the result's `min` is the document's.
+pub proof fn lemma_base_rule_predicts_document_layer(
+    lower: PortBounds,
+    base: u16,
+    min: u16,
+    max: Option<u16>,
+    max_offset: Option<u16>,
+)
+    requires
+        strictly_valid(min, max, max_offset),
+        !base_within_section(base, min, max, max_offset),
+    ensures
+        ({
+            let r = overlay(lower, PortLayer { min: Some(min), max, max_offset });
+            !base_within_section(base, r.min, r.max, r.max_offset)
+        }),
+{
+    lemma_overlay_properties(lower, PortLayer { min: Some(min), max, max_offset });
+    if requested_max(min, max, max_offset) is Some {
+        lemma_valid_document_layer(lower, min, max, max_offset);
+    }
+}
+
 /// Two layers combined into one: `b`'s `min` if it sets one, otherwise
 /// `a`'s; `b`'s upper bound if it sets one, otherwise `a`'s, with a
 /// resolvable `max_offset` fixed at `a`'s own `min`.
@@ -1078,8 +1149,11 @@ pub open spec fn self_anchored_ok(layer: PortLayer) -> bool {
     }
 }
 
-/// Every validated document is a self-anchored layer (it always sets `min`),
-/// and so is every command-line layer (it never sets `max_offset`).
+/// Every validated document is a self-anchored layer (it always sets `min`).
+/// Any layer that sets no `max_offset` is self-anchored too; that second
+/// clause holds by definition. It covers `trop`'s command-line layer only
+/// because the (unverified, test-pinned) glue builds that layer without a
+/// `max_offset`.
 pub proof fn lemma_self_anchored_layers(
     min: u16,
     max: Option<u16>,
