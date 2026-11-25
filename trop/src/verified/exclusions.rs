@@ -1685,4 +1685,1063 @@ pub proof fn lemma_range_text_roundtrip(start: u16, end: u16)
     assert(t.subrange(a.len() as int + 2, t.len() as int) =~= b);
 }
 
+// ---------------------------------------------------------------------------
+// Canonical lists: `trop compact-exclusions` and `trop scan --autocompact`
+// ---------------------------------------------------------------------------
+/// Whether `es` is already in canonical (compacted) form.
+///
+/// A list is canonical exactly when it is its own compaction: then
+/// `compact_exclusions(es)` returns `es` unchanged (by its uniqueness
+/// guarantee), and otherwise compaction changes the list — even when it does
+/// not change the number of entries (`[9000, 8000]`, or `[5000..5000]`).
+/// Callers rewrite a list exactly when this returns `false`.
+pub fn is_compact(es: &[ExclusionEntry]) -> (b: bool)
+    ensures
+        b == canonical(es@),
+        b == is_compaction(es@, es@),
+        // A compact list is the only compaction of itself ...
+        b ==> forall|c: Seq<ExclusionEntry>| #[trigger] is_compaction(c, es@) ==> c == es@,
+        // ... and every compaction of a list that is not compact differs from it.
+        !b ==> forall|c: Seq<ExclusionEntry>| #[trigger] is_compaction(c, es@) ==> c != es@,
+{
+    let n = es.len();
+    let mut i: usize = 0;
+    while i < n
+        invariant
+            i <= n == es@.len(),
+            canonical(es@.take(i as int)),
+        decreases n - i,
+    {
+        let (lo, hi) = entry_bounds(es[i]);
+        let single = match es[i] {
+            ExclusionEntry::Single(_) => true,
+            ExclusionEntry::Range { .. } => false,
+        };
+        // The entry is valid and a `Single` exactly when it names one port.
+        let entry_ok = lo >= 1 && lo <= hi && single == (lo == hi);
+        // It starts more than one port after the previous entry ends.
+        let gap_ok = i == 0 || u32::from(entry_bounds(es[i - 1]).1) + 1 < u32::from(lo);
+        proof {
+            assert(entry_ok == entry_canonical(es@[i as int]));
+        }
+        if !(entry_ok && gap_ok) {
+            proof {
+                if !entry_ok {
+                    assert(!entry_canonical(es@[i as int]));
+                } else {
+                    assert(entry_hi(es@[i - 1]) + 1 >= entry_lo(es@[i as int]));
+                }
+                assert(!canonical(es@));
+            }
+            return false;
+        }
+        proof {
+            let prefix = es@.take(i as int);
+            if i > 0 {
+                assert(prefix.last() == es@[i - 1]);
+            }
+            lemma_canonical_join(prefix, es@[i as int], Seq::<ExclusionEntry>::empty());
+            assert(prefix.push(es@[i as int]) + Seq::<ExclusionEntry>::empty() =~= es@.take(
+                i as int + 1,
+            ));
+        }
+        i += 1;
+    }
+    proof {
+        assert(es@.take(i as int) =~= es@);
+        assert(same_coverage(es@, es@));
+        assert forall|c: Seq<ExclusionEntry>| #[trigger] is_compaction(c, es@) implies c == es@ by {
+            lemma_canonical_unique(c, es@);
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Adding to an exclusion list: `trop exclude` and `trop scan --autoexclude`
+// ---------------------------------------------------------------------------
+/// `e` and the block of ports `lo..=hi` share at least one port
+/// (`lemma_overlaps_block_meaning`). Adjacent entries do not overlap.
+pub open spec fn overlaps_block(e: ExclusionEntry, lo: int, hi: int) -> bool {
+    &&& entry_lo(e) <= entry_hi(e)
+    &&& lo <= hi
+    &&& entry_lo(e) <= hi
+    &&& lo <= entry_hi(e)
+}
+
+/// The bounds of `e` lie within `lo..=hi`.
+pub open spec fn entry_within(e: ExclusionEntry, lo: int, hi: int) -> bool {
+    lo <= entry_lo(e) && entry_hi(e) <= hi
+}
+
+/// Every entry of `es` that overlaps the block `lo..=hi` lies within it.
+pub open spec fn closed_block(es: Seq<ExclusionEntry>, lo: int, hi: int) -> bool {
+    forall|i: int|
+        0 <= i < es.len() && #[trigger] overlaps_block(es[i], lo, hi) ==> entry_within(
+            es[i],
+            lo,
+            hi,
+        )
+}
+
+/// `lo..=hi` is the merge block of `new` in `es`: the smallest block that
+/// contains `new` and within which lies every entry of `es` it overlaps.
+/// (Overlap is transitive through the block: an entry that overlaps an entry
+/// merged into the block is merged too.)
+pub open spec fn merge_block(es: Seq<ExclusionEntry>, new: ExclusionEntry, lo: int, hi: int) -> bool {
+    &&& entry_within(new, lo, hi)
+    &&& closed_block(es, lo, hi)
+    &&& forall|a: int, b: int|
+        entry_within(new, a, b) && #[trigger] closed_block(es, a, b) ==> a <= lo && hi <= b
+}
+
+/// A single entry of `es` already excludes every port of `new` (in
+/// particular, an entry identical to `new`).
+pub open spec fn already_excluded(es: Seq<ExclusionEntry>, new: ExclusionEntry) -> bool {
+    exists|i: int|
+        0 <= i < es.len() && entry_within(new, entry_lo(#[trigger] es[i]), entry_hi(es[i]))
+}
+
+/// The entries that do not overlap the block `lo..=hi`.
+pub open spec fn outside_block(lo: int, hi: int) -> spec_fn(ExclusionEntry) -> bool {
+    |e: ExclusionEntry| !overlaps_block(e, lo, hi)
+}
+
+/// `out` is `es` with `new` added through its merge block `lo..=hi`:
+/// - if no entry of `es` overlaps the block (`f == es.len()`), `new` is
+///   appended unchanged;
+/// - otherwise every entry that overlaps the block is replaced by one range
+///   naming exactly the block, placed at the position `f` of the first such
+///   entry, and every other entry keeps its content and relative order.
+///
+/// Afterwards no entry other than the one at `f` overlaps the block.
+pub open spec fn added_through(
+    es: Seq<ExclusionEntry>,
+    new: ExclusionEntry,
+    out: Seq<ExclusionEntry>,
+    lo: int,
+    hi: int,
+    f: int,
+) -> bool {
+    &&& merge_block(es, new, lo, hi)
+    &&& 0 <= f <= es.len()
+    &&& forall|j: int| 0 <= j < f ==> !overlaps_block(#[trigger] es[j], lo, hi)
+    &&& if f == es.len() {
+        out == es.push(new)
+    } else {
+        &&& overlaps_block(es[f], lo, hi)
+        &&& f < out.len()
+        &&& out[f] is Range
+        &&& entry_lo(out[f]) == lo
+        &&& entry_hi(out[f]) == hi
+        &&& out == es.take(f).push(out[f]) + es.skip(f + 1).filter(outside_block(lo, hi))
+    }
+    &&& forall|j: int| 0 <= j < out.len() && j != f ==> !overlaps_block(#[trigger] out[j], lo, hi)
+}
+
+/// `out` is `es` with `new` added through its merge block (`added_through`,
+/// for some block and position).
+pub open spec fn merged_in(es: Seq<ExclusionEntry>, new: ExclusionEntry, out: Seq<ExclusionEntry>) -> bool {
+    exists|lo: int, hi: int, f: int| #[trigger] added_through(es, new, out, lo, hi, f)
+}
+
+/// Overlap means sharing a port.
+pub proof fn lemma_overlaps_block_meaning(e: ExclusionEntry, lo: int, hi: int)
+    ensures
+        overlaps_block(e, lo, hi) <==> exists|p: int| lo <= p <= hi && #[trigger] entry_covers(e, p),
+{
+    if overlaps_block(e, lo, hi) {
+        let p = if entry_lo(e) > lo {
+            entry_lo(e)
+        } else {
+            lo
+        };
+        assert(lo <= p <= hi && entry_covers(e, p));
+    }
+}
+
+/// An identical entry already excludes every port of `new`.
+pub proof fn lemma_identical_is_already_excluded(es: Seq<ExclusionEntry>, new: ExclusionEntry)
+    ensures
+        (exists|i: int| 0 <= i < es.len() && es[i] == new) ==> already_excluded(es, new),
+{
+    if exists|i: int| 0 <= i < es.len() && es[i] == new {
+        let i = choose|i: int| 0 <= i < es.len() && es[i] == new;
+        assert(entry_within(new, entry_lo(es[i]), entry_hi(es[i])));
+    }
+}
+
+/// `p` is excluded by an entry of `es` that lies within `lo..=hi`.
+pub open spec fn covered_within(es: Seq<ExclusionEntry>, lo: int, hi: int, p: int) -> bool {
+    exists|i: int|
+        0 <= i < es.len() && entry_within(es[i], lo, hi) && #[trigger] entry_covers(es[i], p)
+}
+
+/// When no entry overlaps the merge block, appending `new` adds it through
+/// that block.
+proof fn lemma_appended_through(es: Seq<ExclusionEntry>, new: ExclusionEntry, lo: int, hi: int)
+    requires
+        merge_block(es, new, lo, hi),
+        forall|j: int| 0 <= j < es.len() ==> !overlaps_block(#[trigger] es[j], lo, hi),
+    ensures
+        merged_in(es, new, es.push(new)),
+{
+    let out = es.push(new);
+    assert forall|j: int| 0 <= j < out.len() && j != es.len() implies !overlaps_block(
+        #[trigger] out[j],
+        lo,
+        hi,
+    ) by {
+        assert(out[j] == es[j]);
+    }
+    assert(added_through(es, new, out, lo, hi, es.len() as int));
+}
+
+/// Whether `e` overlaps the block `lo..=hi`.
+const fn overlaps_bounds(e: ExclusionEntry, lo: u16, hi: u16) -> (r: bool)
+    ensures
+        r == overlaps_block(e, lo as int, hi as int),
+{
+    let (a, b) = entry_bounds(e);
+    a <= b && lo <= hi && a <= hi && lo <= b
+}
+
+/// One growth step of a merge block: `cur_lo..=cur_hi` (which contains
+/// `lo..=hi`) grows to its hull with an entry `e` of `es` that overlaps it.
+/// The grown block still lies within every closed block around `lo..=hi`,
+/// and each of its ports outside `lo..=hi` is excluded by an entry lying
+/// within it.
+proof fn lemma_grow_block(
+    es: Seq<ExclusionEntry>,
+    lo: int,
+    hi: int,
+    cur_lo: int,
+    cur_hi: int,
+    i: int,
+    new_lo: int,
+    new_hi: int,
+)
+    requires
+        all_valid(es),
+        0 <= i < es.len(),
+        lo <= hi,
+        cur_lo <= lo,
+        hi <= cur_hi,
+        entry_lo(es[i]) <= cur_hi,
+        cur_lo <= entry_hi(es[i]),
+        new_lo == if entry_lo(es[i]) < cur_lo {
+            entry_lo(es[i])
+        } else {
+            cur_lo
+        },
+        new_hi == if entry_hi(es[i]) > cur_hi {
+            entry_hi(es[i])
+        } else {
+            cur_hi
+        },
+        forall|a: int, b: int|
+            a <= lo && hi <= b && #[trigger] closed_block(es, a, b) ==> a <= cur_lo && cur_hi <= b,
+        forall|p: int|
+            cur_lo <= p <= cur_hi && !(lo <= p <= hi) ==> #[trigger] covered_within(
+                es,
+                cur_lo,
+                cur_hi,
+                p,
+            ),
+    ensures
+        entry_within(es[i], new_lo, new_hi),
+        forall|a: int, b: int|
+            a <= lo && hi <= b && #[trigger] closed_block(es, a, b) ==> a <= new_lo && new_hi <= b,
+        forall|p: int|
+            new_lo <= p <= new_hi && !(lo <= p <= hi) ==> #[trigger] covered_within(
+                es,
+                new_lo,
+                new_hi,
+                p,
+            ),
+{
+    assert(entry_valid(es[i]));
+    // Every closed block around `lo..=hi` contains the current block, so it
+    // overlaps this entry and contains it too.
+    assert forall|a: int, b: int|
+        a <= lo && hi <= b && #[trigger] closed_block(es, a, b) implies a <= new_lo && new_hi
+        <= b by {
+        assert(overlaps_block(es[i], a, b));
+    }
+    // The grown block is the union of the current block and this entry.
+    assert forall|p: int|
+        new_lo <= p <= new_hi && !(lo <= p <= hi) implies #[trigger] covered_within(
+        es,
+        new_lo,
+        new_hi,
+        p,
+    ) by {
+        if cur_lo <= p <= cur_hi {
+            assert(covered_within(es, cur_lo, cur_hi, p));
+            let w = choose|w: int|
+                0 <= w < es.len() && entry_within(es[w], cur_lo, cur_hi) && #[trigger] entry_covers(
+                    es[w],
+                    p,
+                );
+            assert(entry_within(es[w], new_lo, new_hi));
+        } else {
+            assert(entry_covers(es[i], p));
+        }
+    }
+}
+
+/// The merge block of the ports `lo..=hi` in the valid list `es`: grows the
+/// block by every overlapping entry until no entry overlapping it sticks
+/// out. Every port of the block is in `lo..=hi` or excluded by an entry
+/// lying within the block.
+fn merge_block_of(es: &[ExclusionEntry], lo: u16, hi: u16) -> (r: (u16, u16))
+    requires
+        1 <= lo <= hi,
+        all_valid(es@),
+    ensures
+        1 <= r.0 <= lo,
+        hi <= r.1,
+        closed_block(es@, r.0 as int, r.1 as int),
+        forall|a: int, b: int|
+            a <= lo && hi <= b && #[trigger] closed_block(es@, a, b) ==> a <= r.0 && r.1 <= b,
+        forall|p: int|
+            r.0 <= p <= r.1 && !(lo <= p <= hi) ==> #[trigger] covered_within(
+                es@,
+                r.0 as int,
+                r.1 as int,
+                p,
+            ),
+{
+    let n = es.len();
+    let mut cur_lo = lo;
+    let mut cur_hi = hi;
+    loop
+        invariant
+            n == es@.len(),
+            all_valid(es@),
+            1 <= cur_lo <= lo <= hi <= cur_hi,
+            forall|a: int, b: int|
+                a <= lo && hi <= b && #[trigger] closed_block(es@, a, b) ==> a <= cur_lo && cur_hi
+                    <= b,
+            forall|p: int|
+                cur_lo <= p <= cur_hi && !(lo <= p <= hi) ==> #[trigger] covered_within(
+                    es@,
+                    cur_lo as int,
+                    cur_hi as int,
+                    p,
+                ),
+        decreases cur_lo as int + (65535 - cur_hi as int),
+    {
+        let ghost start_lo = cur_lo;
+        let ghost start_hi = cur_hi;
+        let mut grew = false;
+        let mut i: usize = 0;
+        while i < n
+            invariant
+                i <= n == es@.len(),
+                all_valid(es@),
+                1 <= cur_lo <= start_lo <= lo <= hi <= start_hi <= cur_hi,
+                forall|a: int, b: int|
+                    a <= lo && hi <= b && #[trigger] closed_block(es@, a, b) ==> a <= cur_lo
+                        && cur_hi <= b,
+                forall|p: int|
+                    cur_lo <= p <= cur_hi && !(lo <= p <= hi) ==> #[trigger] covered_within(
+                        es@,
+                        cur_lo as int,
+                        cur_hi as int,
+                        p,
+                    ),
+                grew == (cur_lo < start_lo || start_hi < cur_hi),
+                !grew ==> forall|j: int|
+                    0 <= j < i && #[trigger] overlaps_block(es@[j], cur_lo as int, cur_hi as int)
+                        ==> entry_within(es@[j], cur_lo as int, cur_hi as int),
+            decreases n - i,
+        {
+            let (a, b) = entry_bounds(es[i]);
+            if a <= cur_hi && cur_lo <= b {
+                let new_lo = if a < cur_lo {
+                    a
+                } else {
+                    cur_lo
+                };
+                let new_hi = if b > cur_hi {
+                    b
+                } else {
+                    cur_hi
+                };
+                proof {
+                    lemma_grow_block(
+                        es@,
+                        lo as int,
+                        hi as int,
+                        cur_lo as int,
+                        cur_hi as int,
+                        i as int,
+                        new_lo as int,
+                        new_hi as int,
+                    );
+                }
+                if new_lo < cur_lo || new_hi > cur_hi {
+                    grew = true;
+                }
+                cur_lo = new_lo;
+                cur_hi = new_hi;
+            }
+            i += 1;
+        }
+        if !grew {
+            return (cur_lo, cur_hi);
+        }
+    }
+}
+
+/// Copies `es` into a new vector.
+fn copy_entries(es: &[ExclusionEntry]) -> (out: Vec<ExclusionEntry>)
+    ensures
+        out@ == es@,
+{
+    let mut out: Vec<ExclusionEntry> = Vec::new();
+    extend_from(&mut out, es, 0, es.len());
+    assert(out@ =~= es@);
+    out
+}
+
+/// `es` with its entries overlapping the block `lo..=hi` replaced by one
+/// range for the block at position `f` (the first of them).
+fn replace_block(es: &[ExclusionEntry], f: usize, lo: u16, hi: u16) -> (out: Vec<
+    ExclusionEntry,
+>)
+    requires
+        f < es@.len(),
+        all_valid(es@),
+        1 <= lo <= hi,
+        closed_block(es@, lo as int, hi as int),
+    ensures
+        out@ == es@.take(f as int).push(ExclusionEntry::Range { start: lo, end: hi }) + es@.skip(
+            f + 1,
+        ).filter(outside_block(lo as int, hi as int)),
+        all_valid(out@),
+        forall|j: int| f < j < out@.len() ==> !overlaps_block(#[trigger] out@[j], lo as int, hi as int),
+        forall|p: int|
+            #[trigger] covers(out@, p) <==> (covers(es@.take(f as int), p) || (lo <= p <= hi)
+                || covers(es@.skip(f + 1), p)),
+{
+    let n = es.len();
+    let merged = ExclusionEntry::Range { start: lo, end: hi };
+    let ghost keep = outside_block(lo as int, hi as int);
+    let mut out: Vec<ExclusionEntry> = Vec::new();
+    extend_from(&mut out, es, 0, f);
+    out.push(merged);
+    proof {
+        reveal(Seq::filter);
+        assert(es@.subrange(0, f as int) =~= es@.take(f as int));
+        assert(es@.subrange(f + 1, f + 1).filter(keep) =~= Seq::<ExclusionEntry>::empty());
+        assert(out@ =~= es@.take(f as int).push(merged) + es@.subrange(f + 1, f + 1).filter(keep));
+        assert forall|p: int|
+            #[trigger] covers(out@, p) <==> (covers(es@.take(f as int), p) || (lo <= p <= hi)
+                || covers(es@.subrange(f + 1, f + 1), p)) by {
+            lemma_covers_push(es@.take(f as int), merged, p);
+        }
+        assert forall|i: int| 0 <= i < out@.len() implies entry_valid(#[trigger] out@[i]) by {
+            if i < f {
+                assert(out@[i] == es@[i]);
+            }
+        }
+    }
+    let mut k: usize = f + 1;
+    while k < n
+        invariant
+            f < k <= n == es@.len(),
+            all_valid(es@),
+            1 <= lo <= hi,
+            merged == (ExclusionEntry::Range { start: lo, end: hi }),
+            keep == outside_block(lo as int, hi as int),
+            closed_block(es@, lo as int, hi as int),
+            out@ == es@.take(f as int).push(merged) + es@.subrange(f + 1, k as int).filter(keep),
+            all_valid(out@),
+            forall|j: int|
+                f < j < out@.len() ==> !overlaps_block(#[trigger] out@[j], lo as int, hi as int),
+            forall|p: int|
+                #[trigger] covers(out@, p) <==> (covers(es@.take(f as int), p) || (lo <= p <= hi)
+                    || covers(es@.subrange(f + 1, k as int), p)),
+        decreases n - k,
+    {
+        let e = es[k];
+        let kept = !overlaps_bounds(e, lo, hi);
+        let ghost before = out@;
+        if kept {
+            out.push(e);
+        }
+        proof {
+            reveal(Seq::filter);
+            let s = es@.subrange(f + 1, k + 1);
+            assert(s.drop_last() =~= es@.subrange(f + 1, k as int));
+            assert(s.last() == e);
+            assert(kept == keep(e));
+            assert(entry_valid(es@[k as int]));
+            assert(out@ =~= es@.take(f as int).push(merged) + s.filter(keep));
+            if !kept {
+                // A dropped entry overlaps the block, so it lies within it.
+                assert(entry_within(es@[k as int], lo as int, hi as int));
+            }
+            assert forall|p: int|
+                #[trigger] covers(out@, p) <==> (covers(es@.take(f as int), p) || (lo <= p <= hi)
+                    || covers(s, p)) by {
+                lemma_covers_push(es@.subrange(f + 1, k as int), e, p);
+                assert(s =~= es@.subrange(f + 1, k as int).push(e));
+                if kept {
+                    lemma_covers_push(before, e, p);
+                }
+            }
+        }
+        k += 1;
+    }
+    proof {
+        assert(es@.subrange(f + 1, n as int) =~= es@.skip(f + 1));
+    }
+    out
+}
+
+/// Coverage after `replace_block` through the merge block of `new`: the
+/// block is `new` plus entries lying within it, and the replaced entries lie
+/// within the block.
+proof fn lemma_replace_block_coverage(
+    es: Seq<ExclusionEntry>,
+    new: ExclusionEntry,
+    out: Seq<ExclusionEntry>,
+    f: int,
+    lo: int,
+    hi: int,
+)
+    requires
+        0 <= f < es.len(),
+        entry_within(new, lo, hi),
+        entry_within(es[f], lo, hi),
+        forall|p: int|
+            lo <= p <= hi && !entry_covers(new, p) ==> #[trigger] covered_within(es, lo, hi, p),
+        forall|p: int|
+            #[trigger] covers(out, p) <==> (covers(es.take(f), p) || (lo <= p <= hi) || covers(
+                es.skip(f + 1),
+                p,
+            )),
+    ensures
+        forall|p: int| #[trigger] covers(out, p) <==> covers(es, p) || entry_covers(new, p),
+{
+    let a = es.take(f);
+    let tail = es.skip(f + 1);
+    assert(es =~= a.push(es[f]) + tail);
+    assert forall|p: int| #[trigger] covers(out, p) <==> covers(es, p) || entry_covers(new, p) by {
+        lemma_covers_add(a.push(es[f]), tail, p);
+        lemma_covers_push(a, es[f], p);
+        if lo <= p <= hi && !entry_covers(new, p) {
+            assert(covered_within(es, lo, hi, p));
+            let w = choose|w: int|
+                0 <= w < es.len() && entry_within(es[w], lo, hi) && #[trigger] entry_covers(
+                    es[w],
+                    p,
+                );
+            assert(covers(es, p));
+        }
+    }
+}
+
+/// Adds `new` to the valid list `es` when no single entry already excludes
+/// all of it: through its merge block (`added_through`). The list changes.
+fn add_uncovered(es: &[ExclusionEntry], new: ExclusionEntry) -> (out: Vec<ExclusionEntry>)
+    requires
+        all_valid(es@),
+        entry_valid(new),
+        !already_excluded(es@, new),
+    ensures
+        all_valid(out@),
+        forall|p: int| #[trigger] covers(out@, p) <==> covers(es@, p) || entry_covers(new, p),
+        out@ != es@,
+        merged_in(es@, new, out@),
+{
+    let n = es.len();
+    let (nlo, nhi) = entry_bounds(new);
+    let (lo, hi) = merge_block_of(es, nlo, nhi);
+    proof {
+        assert(merge_block(es@, new, lo as int, hi as int));
+    }
+    let mut f: usize = 0;
+    while f < n && !overlaps_bounds(es[f], lo, hi)
+        invariant
+            f <= n == es@.len(),
+            all_valid(es@),
+            entry_valid(new),
+            1 <= lo <= hi,
+            !already_excluded(es@, new),
+            merge_block(es@, new, lo as int, hi as int),
+            forall|p: int|
+                lo <= p <= hi && !entry_covers(new, p) ==> #[trigger] covered_within(
+                    es@,
+                    lo as int,
+                    hi as int,
+                    p,
+                ),
+            forall|j: int| 0 <= j < f ==> !overlaps_block(#[trigger] es@[j], lo as int, hi as int),
+        decreases n - f,
+    {
+        f += 1;
+    }
+    if f == n {
+        // Nothing overlaps the block: append `new`.
+        let mut out = copy_entries(es);
+        out.push(new);
+        proof {
+            assert forall|p: int| #[trigger]
+                covers(out@, p) <==> covers(es@, p) || entry_covers(new, p) by {
+                lemma_covers_push(es@, new, p);
+            }
+            lemma_appended_through(es@, new, lo as int, hi as int);
+            assert(out@.len() != es@.len());
+        }
+        return out;
+    }
+    // Replace the overlapping entries by one range for the block, at the
+    // position of the first of them.
+    let out = replace_block(es, f, lo, hi);
+    let ghost merged = ExclusionEntry::Range { start: lo, end: hi };
+    proof {
+        let a = es@.take(f as int);
+        let tail = es@.skip(f + 1).filter(outside_block(lo as int, hi as int));
+        assert(entry_within(es@[f as int], lo as int, hi as int));
+        assert(out@[f as int] == merged) by {
+            assert(out@[f as int] == (a.push(merged) + tail)[f as int]);
+        }
+        assert forall|j: int| 0 <= j < out@.len() && j != f implies !overlaps_block(
+            #[trigger] out@[j],
+            lo as int,
+            hi as int,
+        ) by {
+            if j < f {
+                assert(out@[j] == es@[j]);
+            }
+        }
+        assert(added_through(es@, new, out@, lo as int, hi as int, f as int));
+        lemma_replace_block_coverage(es@, new, out@, f as int, lo as int, hi as int);
+        // The list changed: otherwise the entry at `f` would be the block,
+        // which contains `new`.
+        if out@ == es@ {
+            assert(es@[f as int] == merged);
+            assert(entry_within(new, entry_lo(es@[f as int]), entry_hi(es@[f as int])));
+        }
+    }
+    out
+}
+
+/// Adds the exclusion `new` to the list `es` (`trop exclude`), reporting
+/// whether the list changed.
+///
+/// - The result excludes exactly the ports `es` excluded plus the ports of
+///   `new`: nothing is lost and nothing extra is added.
+/// - If one entry already excludes every port of `new` (in particular, an
+///   identical entry), the list is returned unchanged.
+/// - Otherwise `new` is merged through its merge block (`added_through`):
+///   entries that overlap it (directly, or through other merged entries)
+///   become one range at the position of the first of them, and every other
+///   entry keeps its content and order. Adjacency is not overlap: `5010`
+///   next to `5000..5009` is appended.
+/// - The flag is `true` exactly when the returned list differs from `es`.
+///
+/// An invalid entry (in `es`, or `new` at index `es.len()`) is reported as
+/// the first invalid entry of `es` followed by `new`; nothing is added.
+pub fn add_exclusion(es: &[ExclusionEntry], new: ExclusionEntry) -> (r: Result<
+    (Vec<ExclusionEntry>, bool),
+    (usize, ExclusionError),
+>)
+    ensures
+        r is Ok <==> all_valid(es@.push(new)),
+        r matches Err((i, err)) ==> first_invalid(es@.push(new), i as int, err),
+        r matches Ok((out, changed)) ==> all_valid(out@),
+        r matches Ok((out, changed)) ==> forall|p: int| #[trigger]
+            covers(out@, p) <==> covers(es@, p) || entry_covers(new, p),
+        r matches Ok((out, changed)) ==> changed == (out@ != es@),
+        // The list changes exactly when no single entry already excludes
+        // every port of `new`.
+        r matches Ok((out, changed)) ==> changed == !already_excluded(es@, new),
+        r matches Ok((out, changed)) ==> (already_excluded(es@, new) ==> out@ == es@),
+        r matches Ok((out, changed)) ==> ((exists|i: int| 0 <= i < es@.len() && es@[i] == new)
+            ==> out@ == es@ && !changed),
+        r matches Ok((out, changed)) ==> (!already_excluded(es@, new) ==> merged_in(
+            es@,
+            new,
+            out@,
+        )),
+{
+    let n = es.len();
+    if let Err((i, err)) = validate_entries(es) {
+        proof {
+            assert(es@.push(new).take(i as int) =~= es@.take(i as int));
+            assert(es@.push(new)[i as int] == es@[i as int]);
+        }
+        return Err((i, err));
+    }
+    if let Err(err) = validate_entry(new) {
+        proof {
+            assert(es@.push(new).take(n as int) =~= es@);
+            assert(es@.push(new)[n as int] == new);
+        }
+        return Err((n, err));
+    }
+    proof {
+        assert forall|i: int| 0 <= i < es@.push(new).len() implies entry_valid(
+            #[trigger] es@.push(new)[i],
+        ) by {
+            if i < n {
+                assert(es@.push(new)[i] == es@[i]);
+            }
+        }
+        lemma_identical_is_already_excluded(es@, new);
+    }
+    let (nlo, nhi) = entry_bounds(new);
+    // One entry already excludes every port of `new`: unchanged.
+    let mut k: usize = 0;
+    while k < n
+        invariant
+            k <= n == es@.len(),
+            all_valid(es@),
+            all_valid(es@.push(new)),
+            entry_valid(new),
+            nlo == entry_lo(new),
+            nhi == entry_hi(new),
+            forall|j: int|
+                0 <= j < k ==> !entry_within(new, entry_lo(#[trigger] es@[j]), entry_hi(es@[j])),
+        decreases n - k,
+    {
+        let (a, b) = entry_bounds(es[k]);
+        if a <= nlo && nhi <= b {
+            let out = copy_entries(es);
+            proof {
+                assert(already_excluded(es@, new));
+                assert forall|p: int| #[trigger]
+                    covers(out@, p) <==> covers(es@, p) || entry_covers(new, p) by {
+                    if entry_covers(new, p) {
+                        assert(entry_covers(es@[k as int], p));
+                    }
+                }
+            }
+            return Ok((out, false));
+        }
+        k += 1;
+    }
+    proof {
+        if already_excluded(es@, new) {
+            let i = choose|i: int|
+                0 <= i < es@.len() && entry_within(
+                    new,
+                    entry_lo(#[trigger] es@[i]),
+                    entry_hi(es@[i]),
+                );
+            assert(!entry_within(new, entry_lo(es@[i]), entry_hi(es@[i])));
+        }
+    }
+    let out = add_uncovered(es, new);
+    Ok((out, true))
+}
+
+/// The single-port entries for `ports`, in order.
+pub open spec fn singles(ports: Seq<u16>) -> Seq<ExclusionEntry> {
+    ports.map_values(|q: u16| ExclusionEntry::Single(q))
+}
+
+/// The valid ports of `ports` that `es` does not exclude.
+pub open spec fn newly_excluded(es: Seq<ExclusionEntry>, ports: Seq<u16>) -> Set<u16> {
+    ports.to_set().filter(|q: u16| q != 0 && !covers(es, q as int))
+}
+
+/// `fresh` lists the ports newly excluded by adding `ports` to `es`, each
+/// once.
+pub open spec fn fresh_ports(es: Seq<ExclusionEntry>, ports: Seq<u16>, fresh: Seq<u16>) -> bool {
+    &&& fresh.no_duplicates()
+    &&& forall|q: u16| #[trigger] fresh.contains(q) <==> newly_excluded(es, ports).contains(q)
+}
+
+/// The ports that adding `ports` to `es` newly excludes, in the order of
+/// their first occurrence in `ports`: walking `ports` from the front, a port
+/// is taken when it is valid (not 0), `es` does not exclude it, and it was
+/// not taken before.
+pub open spec fn fresh_in_order(es: Seq<ExclusionEntry>, ports: Seq<u16>) -> Seq<u16>
+    decreases ports.len(),
+{
+    if ports.len() == 0 {
+        Seq::empty()
+    } else {
+        let earlier = fresh_in_order(es, ports.drop_last());
+        let q = ports.last();
+        if q != 0 && !covers(es, q as int) && !earlier.contains(q) {
+            earlier.push(q)
+        } else {
+            earlier
+        }
+    }
+}
+
+/// Whether some entry of `es` (any list, not necessarily canonical) excludes
+/// `p`.
+fn list_covers(es: &[ExclusionEntry], p: u16) -> (b: bool)
+    ensures
+        b == covers(es@, p as int),
+{
+    let mut i: usize = 0;
+    while i < es.len()
+        invariant
+            i <= es@.len(),
+            forall|j: int| 0 <= j < i ==> !entry_covers(#[trigger] es@[j], p as int),
+        decreases es@.len() - i,
+    {
+        let (lo, hi) = entry_bounds(es[i]);
+        if lo <= p && p <= hi {
+            assert(entry_covers(es@[i as int], p as int));
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Membership after a push.
+proof fn lemma_push_contains<A>(s: Seq<A>, x: A)
+    ensures
+        forall|q: A| #[trigger] s.push(x).contains(q) <==> (s.contains(q) || q == x),
+{
+    assert forall|q: A| #[trigger] s.push(x).contains(q) <==> (s.contains(q) || q == x) by {
+        if s.push(x).contains(q) {
+            let j = choose|j: int| 0 <= j < s.push(x).len() && s.push(x)[j] == q;
+            if j < s.len() {
+                assert(s[j] == q);
+            }
+        }
+        if s.contains(q) {
+            let j = choose|j: int| 0 <= j < s.len() && s[j] == q;
+            assert(s.push(x)[j] == q);
+        }
+        if q == x {
+            assert(s.push(x)[s.len() as int] == q);
+        }
+    }
+}
+
+/// Appending a port not yet in `fresh` keeps it free of duplicates.
+proof fn lemma_push_fresh(fresh: Seq<u16>, p: u16)
+    requires
+        fresh.no_duplicates(),
+        !fresh.contains(p),
+    ensures
+        fresh.push(p).no_duplicates(),
+        singles(fresh.push(p)) == singles(fresh).push(ExclusionEntry::Single(p)),
+{
+    let s = fresh.push(p);
+    assert forall|x: int, y: int| 0 <= x < s.len() && 0 <= y < s.len() && x != y implies s[x]
+        != s[y] by {
+        if x == fresh.len() {
+            assert(fresh.contains(s[y]));
+        } else if y == fresh.len() {
+            assert(fresh.contains(s[x]));
+        }
+    }
+    assert(singles(fresh.push(p)) =~= singles(fresh).push(ExclusionEntry::Single(p)));
+}
+
+/// Adds single-port exclusions for `ports` (`trop scan --autoexclude`),
+/// returning the new list and the number of ports newly excluded.
+///
+/// The result is `es` followed by one `Single` for each valid port of
+/// `ports` that `es` does not already exclude, each once, in the order of
+/// their first occurrence in `ports` (`fresh_in_order`): it excludes exactly
+/// the ports `es` excluded plus every valid port of `ports`. The count is the
+/// number of entries appended, which is the number of distinct ports newly
+/// excluded. Port 0 (never a valid port) is ignored.
+pub fn add_ports(es: &[ExclusionEntry], ports: &[u16]) -> (r: (Vec<ExclusionEntry>, usize))
+    ensures
+        r.0@ == es@ + singles(fresh_in_order(es@, ports@)),
+        fresh_ports(es@, ports@, fresh_in_order(es@, ports@)),
+        r.1 == r.0@.len() - es@.len(),
+        r.1 == newly_excluded(es@, ports@).len(),
+        forall|p: int| #[trigger]
+            covers(r.0@, p) <==> covers(es@, p) || (1 <= p <= 65535 && ports@.contains(p as u16)),
+        all_valid(es@) ==> all_valid(r.0@),
+{
+    let mut out = copy_entries(es);
+    let mut added: usize = 0;
+    let ghost mut fresh: Seq<u16> = Seq::empty();
+    let mut i: usize = 0;
+    while i < ports.len()
+        invariant
+            i <= ports@.len(),
+            added == fresh.len(),
+            added <= i,
+            out@ == es@ + singles(fresh),
+            fresh == fresh_in_order(es@, ports@.take(i as int)),
+            fresh.no_duplicates(),
+            forall|q: u16|
+                #[trigger] fresh.contains(q) <==> (q != 0 && ports@.take(i as int).contains(q)
+                    && !covers(es@, q as int)),
+            forall|p: int|
+                #[trigger] covers(out@, p) <==> covers(es@, p) || (1 <= p <= 65535 && ports@.take(
+                    i as int,
+                ).contains(p as u16)),
+            all_valid(es@) ==> all_valid(out@),
+        decreases ports@.len() - i,
+    {
+        let p = ports[i];
+        let ghost before = out@;
+        let is_new = p != 0 && !list_covers(out.as_slice(), p);
+        if is_new {
+            out.push(ExclusionEntry::Single(p));
+            added += 1;
+        }
+        proof {
+            let seen = ports@.take(i as int);
+            assert(ports@.take(i as int + 1) =~= seen.push(p));
+            lemma_push_contains(seen, p);
+            // One step of `fresh_in_order`: `p` is taken exactly when it is
+            // new.
+            assert(ports@.take(i as int + 1).drop_last() =~= seen);
+            assert(ports@.take(i as int + 1).last() == p);
+            assert(is_new == (p != 0 && !covers(es@, p as int) && !fresh.contains(p))) by {
+                if p != 0 {
+                    lemma_covers_add(es@, singles(fresh), p as int);
+                    if covers(before, p as int) && !covers(es@, p as int) {
+                        assert(seen.contains(p));
+                        assert(fresh.contains(p));
+                    }
+                    if fresh.contains(p) {
+                        assert(covers(before, p as int));
+                    }
+                }
+            }
+            if is_new {
+                assert(!fresh.contains(p)) by {
+                    if fresh.contains(p) {
+                        assert(covers(before, p as int));
+                    }
+                }
+                assert(!covers(es@, p as int)) by {
+                    lemma_covers_add(es@, singles(fresh), p as int);
+                }
+                lemma_push_fresh(fresh, p);
+                lemma_push_contains(fresh, p);
+                assert(out@ =~= es@ + singles(fresh.push(p)));
+                assert forall|x: int| #[trigger] covers(out@, x) <==> covers(before, x) || x == p by {
+                    lemma_covers_push(before, ExclusionEntry::Single(p), x);
+                }
+                fresh = fresh.push(p);
+            } else if p != 0 {
+                // `p` was already excluded, by `es` or by an earlier port.
+                assert(covers(before, p as int));
+            }
+        }
+        i += 1;
+    }
+    proof {
+        assert(ports@.take(i as int) =~= ports@);
+        fresh.to_set_ensures();
+        ports@.to_set_ensures();
+        // The appended ports are exactly the newly excluded ports.
+        assert(fresh.to_set() =~= newly_excluded(es@, ports@));
+        fresh.unique_seq_to_set();
+        assert(fresh_ports(es@, ports@, fresh));
+    }
+    (out, added)
+}
+
+// ---------------------------------------------------------------------------
+// The reserved-port guard of `trop exclude`
+// ---------------------------------------------------------------------------
+/// The oracle of `first_reserved_port` may be consulted at the valid ports
+/// `e` names, and the requirement grants nothing more.
+pub open spec fn callable_on_entry<E, F: Fn(u16) -> Result<bool, E>>(
+    is_reserved: F,
+    e: ExclusionEntry,
+) -> bool {
+    forall|q: u16| 1 <= q && entry_covers(e, q as int) ==> #[trigger] is_reserved.requires((q,))
+}
+
+/// Checks whether a valid port of `e` is reserved, and returns the lowest
+/// one.
+///
+/// The precondition grants the oracle's own precondition only at the valid
+/// ports (`1..=65535`) that `e` names, and a generic oracle can be called
+/// only where its precondition is known to hold, so the oracle is consulted
+/// at no other port (a call at any other port fails verification). Errors
+/// are returned, never treated as "not reserved". The cursor never
+/// overflows, including for entries that end at 65535.
+///
+/// The body scans from the lowest such port upward, consulting each port
+/// once and stopping at the first port reported reserved or at the first
+/// failure. That order is not part of the specification (closure calls
+/// leave no trace in it); it is pinned by the glue's unit tests.
+pub fn first_reserved_port<E, F: Fn(u16) -> Result<bool, E>>(
+    e: ExclusionEntry,
+    is_reserved: &F,
+) -> (r: Result<Option<u16>, super::allocation::ScanFailure<E>>)
+    requires
+        callable_on_entry(*is_reserved, e),
+    ensures
+        r matches Ok(None) ==> forall|q: u16|
+            1 <= q && entry_covers(e, q as int) ==> #[trigger] super::allocation::answered(
+                *is_reserved,
+                q,
+                false,
+            ),
+        r matches Ok(Some(p)) ==> {
+            &&& 1 <= p && entry_covers(e, p as int)
+            &&& super::allocation::answered(*is_reserved, p, true)
+            &&& forall|q: u16|
+                1 <= q < p && entry_covers(e, q as int) ==> #[trigger] super::allocation::answered(
+                    *is_reserved,
+                    q,
+                    false,
+                )
+        },
+        r matches Err(failure) ==> {
+            &&& 1 <= failure.port && entry_covers(e, failure.port as int)
+            &&& super::allocation::failed(*is_reserved, failure.port, failure.error)
+            &&& forall|q: u16|
+                1 <= q < failure.port && entry_covers(e, q as int)
+                    ==> #[trigger] super::allocation::answered(*is_reserved, q, false)
+        },
+{
+    let (lo, hi) = entry_bounds(e);
+    let start = if lo == 0 {
+        1
+    } else {
+        lo
+    };
+    if start > hi {
+        return Ok(None);
+    }
+    let mut p = start;
+    loop
+        invariant
+            1 <= start <= p <= hi,
+            start as int == if entry_lo(e) == 0 {
+                1
+            } else {
+                entry_lo(e)
+            },
+            hi == entry_hi(e),
+            callable_on_entry(*is_reserved, e),
+            forall|q: u16|
+                start <= q < p ==> #[trigger] super::allocation::answered(*is_reserved, q, false),
+        decreases hi - p,
+    {
+        match is_reserved(p) {
+            Err(error) => {
+                return Err(super::allocation::ScanFailure { port: p, error });
+            },
+            Ok(true) => {
+                return Ok(Some(p));
+            },
+            Ok(false) => {},
+        }
+        if p == hi {
+            return Ok(None);
+        }
+        p += 1;
+    }
+}
+
 } // verus!

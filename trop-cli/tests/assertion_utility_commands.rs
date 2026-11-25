@@ -2096,10 +2096,8 @@ fn test_scan_uses_configured_max_offset_range() {
     drop(listener);
 }
 
-// Note: --autoexclude and --autocompact flags are difficult to test in
-// integration tests because they require actually occupied ports.
-// These are better tested manually or with mock occupancy checkers.
-// We've included unit tests for the compact_exclusion_list function below.
+// Note: --autoexclude and --autocompact need actually occupied ports; they
+// are tested with a bound listener in exclusion_edits.rs.
 
 // ============================================================================
 // Edge Cases and Error Handling

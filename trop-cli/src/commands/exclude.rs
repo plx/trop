@@ -2,12 +2,14 @@
 
 use crate::error::CliError;
 use crate::invocation::InvocationContext;
-use crate::utils::GlobalOptions;
 use clap::Args;
 use std::path::Path;
-use trop::config::{Config, PortExclusion};
-use trop::port::exclusions::validate_exclusions;
-use trop::{Database, Port};
+use trop::config::PortExclusion;
+use trop::port::exclusions::{
+    add_exclusion_to_list, excluded_ports_in, first_reserved_port, rewrite_excluded_ports,
+    validate_exclusions, WriteScope,
+};
+use trop::Database;
 
 /// Add port or range to exclusion list.
 #[derive(Args)]
@@ -27,32 +29,39 @@ pub struct ExcludeCommand {
 
 impl ExcludeCommand {
     pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
-        let global = context.global();
-        // 1. Parse port or range
+        let quiet = context.global().quiet;
+        // 1. Parse and validate the port or range
         let exclusion = self.parse_exclusion()?;
 
-        // 2. Load configuration and database
-        let db = context.open_database()?;
+        // 2. Determine the target config file: without --global, a project
+        //    trop.yaml (or trop.local.yaml) is required.
+        let scope = if self.global {
+            WriteScope::Global
+        } else {
+            WriteScope::Project
+        };
+        let config_path = context.config_file_for_write(scope)?;
 
         // 3. Check if any ports are reserved (unless --force)
+        let db = context.open_database()?;
         if !self.force {
             self.check_reserved(&db, &exclusion)?;
         }
 
-        // 4. Determine target config file
-        let config_path = context.config_file_for_write(self.global)?;
+        // 4. Add the exclusion (merging overlapping entries) and rewrite only
+        //    the `excluded_ports` key of the file.
+        let document = read_config_document(&config_path)?;
+        let current = current_exclusions(&config_path, &document)?;
+        let (updated, changed) = add_exclusion_to_list(&current, &exclusion)
+            .map_err(|error| CliError::Config(format!("{}: {error}", config_path.display())))?;
 
-        // 5. Load, modify, and save configuration
-        let mut file_config = self.load_config_file(&config_path)?;
-        let was_added = self.add_exclusion(&mut file_config, exclusion, global)?;
-
-        if was_added {
-            self.save_config_file(&config_path, &file_config)?;
-            if !global.quiet {
+        if changed {
+            write_exclusions(&config_path, &document, &updated)?;
+            if !quiet {
                 println!("Added exclusion to {}", config_path.display());
             }
-        } else if !global.quiet {
-            println!("Exclusion already exists in {}", config_path.display());
+        } else if !quiet {
+            println!("Ports already excluded in {}", config_path.display());
         }
 
         Ok(())
@@ -63,84 +72,97 @@ impl ExcludeCommand {
     /// inclusive range (`"8080..8090"`). Port 0 and reversed ranges are
     /// rejected here, before anything is written.
     fn parse_exclusion(&self) -> Result<PortExclusion, CliError> {
-        let exclusion: PortExclusion = self
-            .port_or_range
-            .parse()
-            .map_err(|e| CliError::InvalidArguments(format!("Invalid port number: {e}")))?;
+        let invalid = |reason: &str| {
+            CliError::InvalidArguments(format!(
+                "Invalid exclusion '{}': {reason}",
+                self.port_or_range
+            ))
+        };
+        let exclusion: PortExclusion = self.port_or_range.parse().map_err(|_| {
+            invalid("expected a port (1-65535) or an inclusive range such as 8080..8090")
+        })?;
 
         validate_exclusions(std::slice::from_ref(&exclusion)).map_err(|error| match error {
-            trop::Error::Validation { message, .. } => CliError::InvalidArguments(format!(
-                "Invalid exclusion '{}': {message}",
-                self.port_or_range
-            )),
+            trop::Error::Validation { message, .. } => invalid(&message),
             other => CliError::Library(other),
         })?;
 
         Ok(exclusion)
     }
 
-    /// Fails if any port of the (validated) exclusion is reserved. Database
-    /// errors are reported, not treated as "not reserved".
+    /// Fails if any port of the (validated) exclusion is reserved, naming the
+    /// lowest one. The decision is made by the verified
+    /// `trop::port::exclusions::first_reserved_port`, which consults the
+    /// database only at the exclusion's ports; database errors are reported,
+    /// not treated as "not reserved".
     fn check_reserved(&self, db: &Database, exclusion: &PortExclusion) -> Result<(), CliError> {
-        let (start, end) = match *exclusion {
-            PortExclusion::Single(port) => (port, port),
-            PortExclusion::Range { start, end } => (start, end),
-        };
-
-        for port_value in start..=end {
-            let port = Port::try_from(port_value)
-                .map_err(|e| CliError::InvalidArguments(e.to_string()))?;
-            if Database::is_port_reserved(db.connection(), port)? {
-                return Err(CliError::InvalidArguments(format!(
-                    "Port {port_value} is reserved. Use --force to override."
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn load_config_file(&self, path: &Path) -> Result<Config, CliError> {
-        if path.exists() {
-            let contents = std::fs::read_to_string(path)?;
-            serde_yaml::from_str(&contents)
-                .map_err(|e| CliError::Config(format!("Failed to parse config: {e}")))
-        } else {
-            Ok(Config::default())
+        match first_reserved_port(exclusion, |port| {
+            Database::is_port_reserved(db.connection(), port)
+        })? {
+            Some(port) => Err(CliError::InvalidArguments(format!(
+                "Port {} is reserved. Use --force to override.",
+                port.value()
+            ))),
+            None => Ok(()),
         }
     }
+}
 
-    fn add_exclusion(
-        &self,
-        config: &mut Config,
-        exclusion: PortExclusion,
-        _global: &GlobalOptions,
-    ) -> Result<bool, CliError> {
-        if config.excluded_ports.is_none() {
-            config.excluded_ports = Some(Vec::new());
-        }
-
-        if let Some(ref mut exclusions) = config.excluded_ports {
-            // Check for duplicates
-            if !exclusions.contains(&exclusion) {
-                exclusions.push(exclusion);
-                Ok(true) // Was added
-            } else {
-                Ok(false) // Already existed
-            }
-        } else {
-            Ok(false)
-        }
+/// Reads a configuration file for rewriting; a missing file reads as an
+/// empty document.
+pub(crate) fn read_config_document(path: &Path) -> Result<String, CliError> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.into()),
     }
+}
 
-    fn save_config_file(&self, path: &Path, config: &Config) -> Result<(), CliError> {
-        // Note: YAML comments will be lost during this process
-        // This is a known limitation documented in the plan
-        let yaml = serde_yaml::to_string(config)
-            .map_err(|e| CliError::Config(format!("Failed to serialize config: {e}")))?;
-        std::fs::write(path, yaml)?;
-        Ok(())
+/// The description of a library error, without the library's
+/// `validation error for '<field>':` prefix, for CLI messages that name
+/// their own context.
+pub(crate) fn error_detail(error: trop::Error) -> String {
+    match error {
+        trop::Error::Validation { message, .. } => message,
+        other => other.to_string(),
     }
+}
+
+/// The `excluded_ports` list of a configuration document (empty when the
+/// document has none).
+pub(crate) fn current_exclusions(
+    path: &Path,
+    document: &str,
+) -> Result<Vec<PortExclusion>, CliError> {
+    excluded_ports_in(document)
+        .map(Option::unwrap_or_default)
+        .map_err(|error| {
+            CliError::Config(format!(
+                "Failed to parse config {}: {}",
+                path.display(),
+                error_detail(error)
+            ))
+        })
+}
+
+/// Writes `exclusions` as the `excluded_ports` list of the configuration
+/// document read from `path`, leaving every other top-level key as it was.
+///
+/// YAML comments and formatting are not preserved.
+pub(crate) fn write_exclusions(
+    path: &Path,
+    document: &str,
+    exclusions: &[PortExclusion],
+) -> Result<(), CliError> {
+    let yaml = rewrite_excluded_ports(document, exclusions).map_err(|error| {
+        CliError::Config(format!(
+            "Failed to rewrite config {}: {}",
+            path.display(),
+            error_detail(error)
+        ))
+    })?;
+    std::fs::write(path, yaml)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -222,6 +244,24 @@ mod tests {
         }
     }
 
+    /// Regression: a parse failure used to be reported twice over
+    /// (`Invalid arguments: Invalid port number: Invalid port: abc`).
+    #[test]
+    fn parse_exclusion_failure_message_is_not_doubled() {
+        for text in ["abc", "8080..", "65536"] {
+            let error = command(text).parse_exclusion().unwrap_err();
+            let message = error.to_string();
+            assert_eq!(
+                message,
+                format!(
+                    "Invalid arguments: Invalid exclusion '{text}': expected a port (1-65535) \
+                     or an inclusive range such as 8080..8090"
+                )
+            );
+            assert_eq!(message.matches("Invalid").count(), 2, "{message}");
+        }
+    }
+
     /// Regression: a database error while checking for reservations used to
     /// be treated as "not reserved" (fail open).
     #[test]
@@ -258,5 +298,17 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn read_config_document_treats_a_missing_file_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_config_document(&dir.path().join("missing.yaml")).unwrap(),
+            ""
+        );
+        assert!(current_exclusions(&dir.path().join("missing.yaml"), "")
+            .unwrap()
+            .is_empty());
     }
 }

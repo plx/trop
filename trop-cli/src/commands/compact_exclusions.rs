@@ -1,11 +1,11 @@
 //! Command to compact exclusion list to minimal representation.
 
+use crate::commands::exclude::{error_detail, write_exclusions};
 use crate::error::CliError;
 use crate::utils::GlobalOptions;
 use clap::Args;
 use std::path::PathBuf;
-use trop::config::{Config, PortExclusion};
-use trop::port::exclusions::compact_exclusions;
+use trop::port::exclusions::{compact_exclusions, excluded_ports_in, is_compact};
 
 /// Compact exclusion list to minimal representation.
 #[derive(Args)]
@@ -29,64 +29,57 @@ impl CompactExclusionsCommand {
             )));
         }
 
-        let contents = std::fs::read_to_string(&self.path)?;
-        let mut config: Config = serde_yaml::from_str(&contents)
-            .map_err(|e| CliError::Config(format!("Parse error: {e}")))?;
+        let document = std::fs::read_to_string(&self.path)?;
+        let Some(exclusions) = excluded_ports_in(&document)
+            .map_err(|e| CliError::Config(format!("Parse error: {}", error_detail(e))))?
+        else {
+            println!("No exclusions to compact");
+            return Ok(());
+        };
 
         // 2. Compact exclusions. Invalid entries (port 0, reversed ranges)
         //    are reported, never dropped: compaction must not change the set
         //    of excluded ports.
-        if let Some(ref mut exclusions) = config.excluded_ports {
-            let original_count = exclusions.len();
-            let compacted =
-                compact_exclusions(exclusions).map_err(|e| CliError::Config(e.to_string()))?;
-            let new_count = compacted.len();
+        let compacted =
+            compact_exclusions(&exclusions).map_err(|e| CliError::Config(e.to_string()))?;
 
-            // The compacted list is verified to be count-minimal, so an
-            // unchanged count means the list already has the minimal size.
-            if original_count != new_count {
-                println!("Compacted {original_count} exclusions to {new_count}");
+        // The list is rewritten exactly when it is not already in canonical
+        // form (`is_compact` holds exactly when compaction returns the list
+        // unchanged), even when compaction keeps the number of entries.
+        if is_compact(&exclusions) {
+            println!("Exclusions already optimal");
+            return Ok(());
+        }
+        println!(
+            "Compacted {} exclusions to {}",
+            exclusions.len(),
+            compacted.len()
+        );
 
-                if !self.dry_run {
-                    *exclusions = compacted;
-
-                    // 3. Save configuration (YAML comments will be lost)
-                    let yaml = serde_yaml::to_string(&config)
-                        .map_err(|e| CliError::Config(format!("Serialize error: {e}")))?;
-                    std::fs::write(&self.path, yaml)?;
-                    println!("Updated {}", self.path.display());
-                } else {
-                    println!("Dry run - no changes made");
-                    println!("Would save: {compacted:?}");
-                }
-            } else {
-                println!("Exclusions already optimal");
-            }
+        if self.dry_run {
+            println!("Dry run - no changes made");
+            println!("Would save: {compacted:?}");
         } else {
-            println!("No exclusions to compact");
+            // 3. Rewrite only `excluded_ports` (YAML comments will be lost)
+            write_exclusions(&self.path, &document, &compacted)?;
+            println!("Updated {}", self.path.display());
         }
 
         Ok(())
     }
 }
 
-/// Compact a list of port exclusions to minimal representation.
-///
-/// Delegates to the verified compaction (`trop::port::exclusions::compact_exclusions`):
-/// the result excludes exactly the same ports, is sorted with overlapping and
-/// adjacent entries merged, and no shorter list excludes the same ports.
-///
-/// A list with an invalid entry (port 0 or a reversed range) has no
-/// compaction; it is returned unchanged rather than altered, so the excluded
-/// set never changes. Callers that must report invalid entries use
-/// `compact_exclusions` directly.
-pub fn compact_exclusion_list(exclusions: &[PortExclusion]) -> Vec<PortExclusion> {
-    compact_exclusions(exclusions).unwrap_or_else(|_| exclusions.to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trop::config::PortExclusion;
+
+    /// The compaction `compact-exclusions` uses
+    /// (`trop::port::exclusions::compact_exclusions`), on a list the test
+    /// knows to be valid.
+    fn compact_valid(exclusions: &[PortExclusion]) -> Vec<PortExclusion> {
+        compact_exclusions(exclusions).expect("the test list is valid")
+    }
 
     /// Test compaction of empty list.
     ///
@@ -95,7 +88,7 @@ mod tests {
     #[test]
     fn test_compact_empty_list() {
         let exclusions: Vec<PortExclusion> = vec![];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
         assert_eq!(compacted.len(), 0, "Empty list should remain empty");
     }
 
@@ -106,7 +99,7 @@ mod tests {
     #[test]
     fn test_compact_single_port() {
         let exclusions = vec![PortExclusion::Single(8080)];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert_eq!(compacted.len(), 1);
         assert_eq!(compacted[0], PortExclusion::Single(8080));
@@ -120,7 +113,7 @@ mod tests {
     #[test]
     fn test_compact_two_adjacent_ports() {
         let exclusions = vec![PortExclusion::Single(8080), PortExclusion::Single(8081)];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert_eq!(compacted.len(), 1);
         match compacted[0] {
@@ -140,7 +133,7 @@ mod tests {
     #[test]
     fn test_compact_non_adjacent_ports_stay_separate() {
         let exclusions = vec![PortExclusion::Single(8080), PortExclusion::Single(9000)];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert_eq!(compacted.len(), 2);
         assert_eq!(compacted[0], PortExclusion::Single(8080));
@@ -161,7 +154,7 @@ mod tests {
             PortExclusion::Single(8083),
             PortExclusion::Single(8084),
         ];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert_eq!(compacted.len(), 1);
         match compacted[0] {
@@ -186,7 +179,7 @@ mod tests {
             PortExclusion::Single(8085),
             PortExclusion::Single(8086),
         ];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert_eq!(compacted.len(), 2);
 
@@ -219,7 +212,7 @@ mod tests {
             start: 8080,
             end: 8090,
         }];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert_eq!(compacted.len(), 1);
         match compacted[0] {
@@ -249,7 +242,7 @@ mod tests {
                 end: 8090,
             },
         ];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert_eq!(compacted.len(), 1);
         match compacted[0] {
@@ -278,7 +271,7 @@ mod tests {
                 end: 8090,
             },
         ];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert_eq!(compacted.len(), 1);
         match compacted[0] {
@@ -308,7 +301,7 @@ mod tests {
                 end: 8086,
             },
         ];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert_eq!(compacted.len(), 1);
         match compacted[0] {
@@ -338,7 +331,7 @@ mod tests {
                 end: 8090,
             },
         ];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert_eq!(compacted.len(), 3);
     }
@@ -356,7 +349,7 @@ mod tests {
             PortExclusion::Single(8080),
             PortExclusion::Single(8081),
         ];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         // Should be sorted and compacted
         assert_eq!(compacted.len(), 2);
@@ -386,7 +379,7 @@ mod tests {
             PortExclusion::Single(8080),
             PortExclusion::Single(8081),
         ];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert_eq!(compacted.len(), 1);
         match compacted[0] {
@@ -410,7 +403,7 @@ mod tests {
             PortExclusion::Single(2),
             PortExclusion::Single(3),
         ];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert_eq!(
             compacted.len(),
@@ -437,7 +430,7 @@ mod tests {
             PortExclusion::Single(65534),
             PortExclusion::Single(65535),
         ];
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert_eq!(compacted.len(), 1);
         match compacted[0] {
@@ -487,7 +480,7 @@ mod tests {
         }
 
         // Compact and collect all ports from result
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
         let mut compacted_ports = HashSet::new();
         for excl in &compacted {
             match excl {
@@ -520,8 +513,8 @@ mod tests {
             PortExclusion::Single(8085),
         ];
 
-        let compacted_once = compact_exclusion_list(&exclusions);
-        let compacted_twice = compact_exclusion_list(&compacted_once);
+        let compacted_once = compact_valid(&exclusions);
+        let compacted_twice = compact_valid(&compacted_once);
 
         assert_eq!(
             compacted_once, compacted_twice,
@@ -544,7 +537,7 @@ mod tests {
             PortExclusion::Single(8084),
         ];
 
-        let compacted = compact_exclusion_list(&exclusions);
+        let compacted = compact_valid(&exclusions);
 
         assert!(
             compacted.len() <= exclusions.len(),
@@ -558,9 +551,9 @@ mod tests {
     }
 
     /// Regression: a reversed range used to vanish (changing the excluded
-    /// set) and port 0 used to survive or merge with port 1. A list with an
-    /// invalid entry is now returned unchanged, and the fallible compaction
-    /// that `compact-exclusions` uses rejects it.
+    /// set) and port 0 used to survive or merge with port 1. The compaction
+    /// that `compact-exclusions` uses rejects a list with an invalid entry,
+    /// and such a list is never reported as compact.
     #[test]
     fn test_compact_never_changes_invalid_lists() {
         for exclusions in [
@@ -577,8 +570,8 @@ mod tests {
             }],
             vec![PortExclusion::Single(0), PortExclusion::Single(1)],
         ] {
-            assert_eq!(compact_exclusion_list(&exclusions), exclusions);
             assert!(compact_exclusions(&exclusions).is_err());
+            assert!(!is_compact(&exclusions));
         }
     }
 
@@ -592,7 +585,7 @@ mod tests {
             PortExclusion::Single(1),
         ];
         assert_eq!(
-            compact_exclusion_list(&exclusions),
+            compact_valid(&exclusions),
             vec![PortExclusion::Range {
                 start: 1,
                 end: 65535
