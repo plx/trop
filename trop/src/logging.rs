@@ -250,7 +250,7 @@ impl Default for Logger {
 /// ```
 #[must_use]
 pub fn resolve_log_level(verbose: bool, quiet: bool, log_mode: Option<&str>) -> LogLevel {
-    LogLevel::from_verbosity(verbosity::resolve_cli_verbosity(
+    LogLevel::from_verbosity(verbosity::resolve_verbosity(
         verbose,
         quiet,
         log_mode.map(str::as_bytes),

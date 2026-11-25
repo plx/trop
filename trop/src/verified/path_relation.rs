@@ -220,10 +220,12 @@ pub open spec fn kinds_of(ts: Seq<(CompKind, Seq<u8>)>) -> Seq<CompKind> {
 /// Lexical resolution, as the indices of the surviving components: `.` is
 /// dropped; `..` cancels a preceding named component and is kept when there
 /// is none (at the root, at the start of a relative path, after a drive
-/// prefix, or after another kept `..`). The first kept `..` is exactly where
-/// the strict resolution `super::path::spec_resolve` (which backs
-/// `resolve_components`) fails, so the two agree whenever the strict
-/// resolution succeeds (`lemma_lex_resolve_agrees_with_strict`). A kept `..` is part of the
+/// prefix, or after another kept `..`). Compared with the strict resolution
+/// `super::path::spec_resolve` (which backs `resolve_components`): some `..`
+/// is kept exactly when the strict resolution fails
+/// (`lemma_lex_resolve_keeps_parent_iff_strict_fails`), and the two agree
+/// whenever the strict resolution succeeds
+/// (`lemma_lex_resolve_agrees_with_strict`). A kept `..` is part of the
 /// path's head, never treated as a name (see `spec_between`).
 pub open spec fn spec_lex_resolve(ks: Seq<CompKind>) -> Seq<int>
     decreases ks.len(),

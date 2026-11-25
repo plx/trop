@@ -11,8 +11,13 @@
 //!   order: rows at the target path (or, recursively, at a component
 //!   descendant of it) whose tag the selector accepts (`release_selects`).
 //!   Paths are component-token sequences, so `/work/ab` is never under
-//!   `/work/a` (`lemma_component_aware`). The non-recursive selection is
-//!   contained in the recursive one and every selector's in `AllTags`'.
+//!   `/work/a` (`lemma_component_aware`). The target is given by its stored
+//!   identity (`target_view`): its tokens when it is spelled as a stored
+//!   key's path (canonical form), and `None` otherwise, which
+//!   selects nothing in every mode (`lemma_unstored_target_selects_nothing`),
+//!   as the exact-text lookups find nothing for it. The non-recursive
+//!   selection is contained in the recursive one and every selector's in
+//!   `AllTags`'.
 //!   The unrelated-path guard is applied in the same step to exactly the
 //!   selected rows.
 //! - The unrelated-path guard (`guard_paths`, `select_and_guard`, and
@@ -240,15 +245,38 @@ pub open spec fn tag_view(t: Option<Vec<u8>>) -> Option<Seq<u8>> {
     }
 }
 
-/// Row `i` is selected.
+/// The release target's stored identity: the components of the target path
+/// when it is spelled as a stored key's path (the form the storage kernel's
+/// write-side check accepts; on Unix exactly the canonical absolute
+/// spellings), and `None` otherwise. Stored keys are compared by their
+/// exact text, and in that form equal text is equal components, so a target
+/// spelled any other way (`/w/a/`, `/w/./a`, `/w//a`) names no stored
+/// reservation.
+pub open spec fn target_view(
+    target: Option<&[super::path_relation::PathToken]>,
+) -> Option<Seq<(super::path::CompKind, Seq<u8>)>> {
+    match target {
+        Some(t) => Some(super::path_relation::tok_views(t@)),
+        None => None,
+    }
+}
+
+/// Row `i` is selected: the target has a stored identity, and the row is
+/// at it (or, recursively, below it) with a tag the selector accepts.
 pub open spec fn row_selected(
     sel: TagSelector<Seq<u8>>,
     recursive: bool,
-    target: Seq<(super::path::CompKind, Seq<u8>)>,
+    target: Option<Seq<(super::path::CompKind, Seq<u8>)>>,
     rows: Seq<ReleaseRow>,
     i: int,
 ) -> bool {
-    release_selects(sel, recursive, target, row_path(rows[i]), tag_view(rows[i].tag))
+    target matches Some(t) && release_selects(
+        sel,
+        recursive,
+        t,
+        row_path(rows[i]),
+        tag_view(rows[i].tag),
+    )
 }
 
 /// `v` lists exactly the selected rows, strictly increasing (so no row is
@@ -257,7 +285,7 @@ pub open spec fn is_selection(
     v: Seq<usize>,
     sel: TagSelector<Seq<u8>>,
     recursive: bool,
-    target: Seq<(super::path::CompKind, Seq<u8>)>,
+    target: Option<Seq<(super::path::CompKind, Seq<u8>)>>,
     rows: Seq<ReleaseRow>,
 ) -> bool {
     &&& forall|j: int, l: int| 0 <= j < l < v.len() ==> v[j] < v[l]
@@ -270,6 +298,31 @@ pub open spec fn is_selection(
             rows,
             i,
         ))
+}
+
+/// A target that is not spelled in stored (canonical) form selects nothing,
+/// whatever the mode (exact key, all tags, recursive) and the selector:
+/// the only selection of any candidate rows is empty. (With canonical
+/// spellings, the exact-text candidate queries and the token comparison
+/// agree, so the three modes identify the target the same way.)
+pub proof fn lemma_unstored_target_selects_nothing(
+    v: Seq<usize>,
+    sel: TagSelector<Seq<u8>>,
+    recursive: bool,
+    rows: Seq<ReleaseRow>,
+)
+    requires
+        is_selection(v, sel, recursive, None, rows),
+    ensures
+        v.len() == 0,
+        forall|i: int| 0 <= i < rows.len() ==> !row_selected(sel, recursive, None, rows, i),
+{
+    if v.len() > 0 {
+        let i = v[0] as int;
+        assert(0 <= i < rows.len());
+        assert(v.contains(i as usize));
+        assert(!row_selected(sel, recursive, None, rows, i));
+    }
 }
 
 /// The tag table selects as the specification describes it.
@@ -463,19 +516,19 @@ pub fn tag_matches(sel: &TagSelector<Vec<u8>>, tag: Option<&[u8]>) -> (r: bool)
 fn select_rows(
     sel: &TagSelector<Vec<u8>>,
     recursive: bool,
-    target: &[super::path_relation::PathToken],
+    target: Option<&[super::path_relation::PathToken]>,
     rows: &[ReleaseRow],
 ) -> (r: Vec<usize>)
     ensures
-        is_selection(
-            r@,
-            sel_view(*sel),
-            recursive,
-            super::path_relation::tok_views(target@),
-            rows@,
-        ),
+        is_selection(r@, sel_view(*sel), recursive, target_view(target), rows@),
 {
+    let ghost tv = target_view(target);
+    let Some(target) = target else {
+        // No stored identity: no row is selected, in any mode.
+        return Vec::new();
+    };
     let ghost t = super::path_relation::tok_views(target@);
+    assert(tv == Some(t));
     let mut out: Vec<usize> = Vec::new();
     let mut i: usize = 0;
     while i < rows.len()
@@ -484,11 +537,12 @@ fn select_rows(
             t == super::path_relation::tok_views(target@),
             forall|j: int, l: int| 0 <= j < l < out@.len() ==> out@[j] < out@[l],
             forall|j: int| 0 <= j < out@.len() ==> #[trigger] out@[j] < i,
+            tv == Some(t),
             forall|l: int|
                 0 <= l < i ==> (out@.contains(l as usize) <==> row_selected(
                     sel_view(*sel),
                     recursive,
-                    t,
+                    tv,
                     rows@,
                     l,
                 )),
@@ -516,12 +570,12 @@ fn select_rows(
             assert(path_ok && tag_ok <==> row_selected(
                 sel_view(*sel),
                 recursive,
-                t,
+                tv,
                 rows@,
                 i as int,
             ));
             assert forall|l: int| 0 <= l < i + 1 implies (out@.contains(l as usize)
-                <==> row_selected(sel_view(*sel), recursive, t, rows@, l)) by {
+                <==> row_selected(sel_view(*sel), recursive, tv, rows@, l)) by {
                 if l < i {
                     if out@.contains(l as usize) {
                         let j = choose|j: int| 0 <= j < out@.len() && out@[j] == l as usize;
@@ -748,7 +802,10 @@ pub open spec fn row_permitted<E, F: Fn(usize) -> Option<E>>(
 /// guard covers exactly the rows the release deletes.
 ///
 /// - Selection: on success, exactly the selected rows (`is_selection`:
-///   strictly increasing, each candidate listed iff `row_selected`).
+///   strictly increasing, each candidate listed iff `row_selected`). A
+///   target without a stored identity (`target` is `None`: the path is not
+///   in canonical form) selects nothing in every mode
+///   (`lemma_unstored_target_selects_nothing`).
 /// - Soundness: when the guard applies, every selected row is lexically
 ///   related to the working directory or permitted by the physical fallback
 ///   (`row_permitted`), so a release never deletes a reservation sideways
@@ -760,7 +817,7 @@ pub open spec fn row_permitted<E, F: Fn(usize) -> Option<E>>(
 pub fn select_and_guard<E, F: Fn(usize) -> Option<E>>(
     sel: &TagSelector<Vec<u8>>,
     recursive: bool,
-    target: &[super::path_relation::PathToken],
+    target: Option<&[super::path_relation::PathToken]>,
     rows: &[ReleaseRow],
     guard: &PathGuard,
     fallback: &F,
@@ -774,14 +831,14 @@ pub fn select_and_guard<E, F: Fn(usize) -> Option<E>>(
             v@,
             sel_view(*sel),
             recursive,
-            super::path_relation::tok_views(target@),
+            target_view(target),
             rows@,
         ),
         r is Ok && guard_applies(*guard) ==> forall|i: int|
             0 <= i < rows.len() && #[trigger] row_selected(
                 sel_view(*sel),
                 recursive,
-                super::path_relation::tok_views(target@),
+                target_view(target),
                 rows@,
                 i,
             ) ==> row_permitted(guard_cwd(*guard), rows@, *fallback, i as usize),
@@ -789,7 +846,7 @@ pub fn select_and_guard<E, F: Fn(usize) -> Option<E>>(
             && row_selected(
             sel_view(*sel),
             recursive,
-            super::path_relation::tok_views(target@),
+            target_view(target),
             rows@,
             f.index as int,
         ) && refused(
@@ -802,12 +859,12 @@ pub fn select_and_guard<E, F: Fn(usize) -> Option<E>>(
             0 <= i < f.index && #[trigger] row_selected(
                 sel_view(*sel),
                 recursive,
-                super::path_relation::tok_views(target@),
+                target_view(target),
                 rows@,
                 i,
             ) ==> row_permitted(guard_cwd(*guard), rows@, *fallback, i as usize),
 {
-    let ghost t = super::path_relation::tok_views(target@);
+    let ghost t = target_view(target);
     let ghost c = guard_cwd(*guard);
     let selected = select_rows(sel, recursive, target, rows);
     if !requires_path_check(guard.force, guard.allow_unrelated) {
@@ -820,7 +877,7 @@ pub fn select_and_guard<E, F: Fn(usize) -> Option<E>>(
             guard_applies(*guard),
             forall|i: usize| i < rows.len() ==> fallback.requires((i,)),
             is_selection(selected@, sel_view(*sel), recursive, t, rows@),
-            t == super::path_relation::tok_views(target@),
+            t == target_view(target),
             c == guard_cwd(*guard),
             forall|p: int|
                 0 <= p < j ==> row_permitted(c, rows@, *fallback, #[trigger] selected@[p]),

@@ -1176,6 +1176,227 @@ pub enum MigrationKeyError {
     },
 }
 
+/// A left-to-right scan of `ids` meets no problem before position `n`: the
+/// first `n` ids are below `key_count` and pairwise distinct.
+pub open spec fn clean_prefix(ids: Seq<usize>, key_count: usize, n: int) -> bool {
+    0 <= n <= ids.len() && in_range(ids.take(n), key_count) && distinct(ids.take(n))
+}
+
+/// The first problem a left-to-right scan of `ids` meets is the id at `at`,
+/// which is out of range.
+pub open spec fn first_problem_out_of_range_at(ids: Seq<usize>, key_count: usize, at: int) -> bool {
+    0 <= at < ids.len() && clean_prefix(ids, key_count, at) && ids[at] >= key_count
+}
+
+/// The first problem a left-to-right scan of `ids` meets is an id that is
+/// out of range.
+pub open spec fn first_problem_out_of_range(ids: Seq<usize>, key_count: usize) -> bool {
+    exists|at: int| first_problem_out_of_range_at(ids, key_count, at)
+}
+
+/// The first problem a left-to-right scan of `ids` meets is the id at
+/// `second`, which repeats the (in-range) id at `first`.
+pub open spec fn first_problem_repeat(
+    ids: Seq<usize>,
+    key_count: usize,
+    first: int,
+    second: int,
+) -> bool {
+    0 <= first < second < ids.len() && clean_prefix(ids, key_count, second) && ids[first]
+        == ids[second]
+}
+
+/// The error a check of the key lists reports, exactly: a length mismatch
+/// first; then the first problem a left-to-right scan of the sources meets
+/// (an out-of-range id, or a repeat named by both items); then, for valid
+/// sources, the first problem in the destinations.
+pub open spec fn key_error_found(
+    key_count: usize,
+    sources: Seq<usize>,
+    dests: Seq<usize>,
+    e: MigrationKeyError,
+) -> bool {
+    match e {
+        MigrationKeyError::LengthMismatch => sources.len() != dests.len(),
+        MigrationKeyError::KeyOutOfRange => sources.len() == dests.len() && (
+        first_problem_out_of_range(sources, key_count) || (in_range(sources, key_count)
+            && distinct(sources) && first_problem_out_of_range(dests, key_count))),
+        MigrationKeyError::DuplicateSource { first, second } => sources.len() == dests.len()
+            && first_problem_repeat(sources, key_count, first as int, second as int),
+        MigrationKeyError::DuplicateDest { first, second } => sources.len() == dests.len()
+            && in_range(sources, key_count) && distinct(sources) && first_problem_repeat(
+            dests,
+            key_count,
+            first as int,
+            second as int,
+        ),
+    }
+}
+
+/// A clean prefix stays clean when it is shortened, and the whole list is
+/// clean exactly when it is in range and distinct.
+proof fn lemma_clean_prefix_facts(ids: Seq<usize>, key_count: usize, m: int, n: int)
+    requires
+        0 <= m <= n,
+        clean_prefix(ids, key_count, n),
+    ensures
+        clean_prefix(ids, key_count, m),
+        forall|i: int| 0 <= i < n ==> #[trigger] ids[i] < key_count,
+        forall|i: int, j: int| 0 <= i < j < n ==> ids[i] != ids[j],
+{
+    assert forall|i: int| 0 <= i < n implies #[trigger] ids[i] < key_count by {
+        assert(ids.take(n)[i] == ids[i]);
+    }
+    assert forall|i: int, j: int| 0 <= i < j < n implies ids[i] != ids[j] by {
+        assert(ids.take(n)[i] == ids[i]);
+        assert(ids.take(n)[j] == ids[j]);
+    }
+    assert forall|i: int| 0 <= i < m implies #[trigger] ids.take(m)[i] < key_count by {
+        assert(ids.take(m)[i] == ids[i]);
+    }
+    assert forall|i: int, j: int| 0 <= i < j < m implies ids.take(m)[i] != ids.take(m)[j] by {
+        assert(ids.take(m)[i] == ids[i]);
+        assert(ids.take(m)[j] == ids[j]);
+    }
+}
+
+/// The whole list is clean exactly when it is in range and distinct.
+pub proof fn lemma_clean_prefix_whole(ids: Seq<usize>, key_count: usize)
+    ensures
+        clean_prefix(ids, key_count, ids.len() as int) <==> (in_range(ids, key_count) && distinct(
+            ids,
+        )),
+{
+    assert(ids.take(ids.len() as int) =~= ids);
+}
+
+/// The scan's first problem is unique, so the error is determined by the
+/// key lists: two out-of-range positions coincide, two repeats coincide
+/// (both items), and an out-of-range first problem excludes a repeat. And
+/// a list that is not clean has a first problem of one of the two kinds.
+pub proof fn lemma_first_problem_unique(ids: Seq<usize>, key_count: usize)
+    ensures
+        forall|a: int, b: int|
+            #![trigger first_problem_out_of_range_at(ids, key_count, a), first_problem_out_of_range_at(ids, key_count, b)]
+            first_problem_out_of_range_at(ids, key_count, a) && first_problem_out_of_range_at(
+                ids,
+                key_count,
+                b,
+            ) ==> a == b,
+        forall|a: int, f: int, s: int|
+            #![trigger first_problem_out_of_range_at(ids, key_count, a), first_problem_repeat(ids, key_count, f, s)]
+            first_problem_out_of_range_at(ids, key_count, a) ==> !first_problem_repeat(
+                ids,
+                key_count,
+                f,
+                s,
+            ),
+        forall|f: int, s: int, f2: int, s2: int|
+            #![trigger first_problem_repeat(ids, key_count, f, s), first_problem_repeat(ids, key_count, f2, s2)]
+            first_problem_repeat(ids, key_count, f, s) && first_problem_repeat(
+                ids,
+                key_count,
+                f2,
+                s2,
+            ) ==> f == f2 && s == s2,
+        !(in_range(ids, key_count) && distinct(ids)) ==> first_problem_out_of_range(ids, key_count)
+            || exists|f: int, s: int| first_problem_repeat(ids, key_count, f, s),
+{
+    assert forall|a: int, b: int|
+        #![trigger first_problem_out_of_range_at(ids, key_count, a), first_problem_out_of_range_at(ids, key_count, b)]
+        first_problem_out_of_range_at(ids, key_count, a) && first_problem_out_of_range_at(
+            ids,
+            key_count,
+            b,
+        ) implies a == b by {
+        if a < b {
+            lemma_clean_prefix_facts(ids, key_count, b, b);
+        } else if b < a {
+            lemma_clean_prefix_facts(ids, key_count, a, a);
+        }
+    }
+    assert forall|a: int, f: int, s: int|
+        #![trigger first_problem_out_of_range_at(ids, key_count, a), first_problem_repeat(ids, key_count, f, s)]
+        first_problem_out_of_range_at(ids, key_count, a) implies !first_problem_repeat(
+            ids,
+            key_count,
+            f,
+            s,
+        ) by {
+        if first_problem_repeat(ids, key_count, f, s) {
+            lemma_clean_prefix_facts(ids, key_count, s, s);
+            lemma_clean_prefix_facts(ids, key_count, a, a);
+            if a < s {
+                assert(ids[a] < key_count);
+            } else if a == s {
+                assert(ids[f] < key_count);
+            } else {
+                assert(ids[f] != ids[s]);
+            }
+        }
+    }
+    assert forall|f: int, s: int, f2: int, s2: int|
+        #![trigger first_problem_repeat(ids, key_count, f, s), first_problem_repeat(ids, key_count, f2, s2)]
+        first_problem_repeat(ids, key_count, f, s) && first_problem_repeat(ids, key_count, f2, s2)
+            implies f == f2 && s == s2 by {
+        lemma_clean_prefix_facts(ids, key_count, s, s);
+        lemma_clean_prefix_facts(ids, key_count, s2, s2);
+        if s < s2 {
+            assert(ids[f] != ids[s]);
+        } else if s2 < s {
+            assert(ids[f2] != ids[s2]);
+        } else if f < f2 {
+            assert(ids[f] != ids[f2]);
+        } else if f2 < f {
+            assert(ids[f2] != ids[f]);
+        }
+    }
+    lemma_clean_prefix_whole(ids, key_count);
+    if !(in_range(ids, key_count) && distinct(ids)) {
+        lemma_first_problem_exists(ids, key_count, ids.len() as int);
+    }
+}
+
+/// Some position below `n` is a first problem when the prefix of length `n`
+/// is not clean.
+proof fn lemma_first_problem_exists(ids: Seq<usize>, key_count: usize, n: int)
+    requires
+        0 <= n <= ids.len(),
+        !clean_prefix(ids, key_count, n),
+    ensures
+        first_problem_out_of_range(ids, key_count) || exists|f: int, s: int|
+            first_problem_repeat(ids, key_count, f, s),
+    decreases n,
+{
+    if n == 0 {
+        assert(ids.take(0) =~= Seq::<usize>::empty());
+        assert(false);
+    } else if !clean_prefix(ids, key_count, n - 1) {
+        lemma_first_problem_exists(ids, key_count, n - 1);
+    } else {
+        let at = n - 1;
+        lemma_clean_prefix_facts(ids, key_count, at, at);
+        if ids[at] >= key_count {
+            assert(first_problem_out_of_range_at(ids, key_count, at));
+        } else if exists|j: int| 0 <= j < at && ids[j] == ids[at] {
+            let j = choose|j: int| 0 <= j < at && ids[j] == ids[at];
+            assert(first_problem_repeat(ids, key_count, j, at));
+        } else {
+            // The prefix of length `n` would be clean.
+            assert forall|i: int| 0 <= i < n implies #[trigger] ids.take(n)[i] < key_count by {
+                assert(ids.take(n)[i] == ids[i]);
+            }
+            assert forall|i: int, j: int| 0 <= i < j < n implies ids.take(n)[i] != ids.take(
+                n,
+            )[j] by {
+                assert(ids.take(n)[i] == ids[i]);
+                assert(ids.take(n)[j] == ids[j]);
+            }
+            assert(false);
+        }
+    }
+}
+
 /// Why `index_keys` failed.
 enum IndexIssue {
     OutOfRange,
@@ -1201,9 +1422,13 @@ fn index_keys(key_count: usize, ids: &[usize]) -> (r: Result<Vec<Option<usize>>,
             ids@,
             key_count,
         ),
-        r matches Err(IndexIssue::OutOfRange) ==> !in_range(ids@, key_count),
-        r matches Err(IndexIssue::Duplicate(first, second)) ==> first < second < ids.len()
-            && ids@[first as int] == ids@[second as int],
+        r matches Err(IndexIssue::OutOfRange) ==> first_problem_out_of_range(ids@, key_count),
+        r matches Err(IndexIssue::Duplicate(first, second)) ==> first_problem_repeat(
+            ids@,
+            key_count,
+            first as int,
+            second as int,
+        ),
 {
     let mut pos: Vec<Option<usize>> = Vec::new();
     while pos.len() < key_count
@@ -1230,12 +1455,11 @@ fn index_keys(key_count: usize, ids: &[usize]) -> (r: Result<Vec<Option<usize>>,
     {
         let k = ids[i];
         if k >= key_count {
-            assert(!in_range(ids@, key_count)) by {
-                assert(ids@[i as int] >= key_count);
-            }
+            assert(first_problem_out_of_range_at(ids@, key_count, i as int));
             return Err(IndexIssue::OutOfRange);
         }
         if let Some(first) = pos[k] {
+            assert(first_problem_repeat(ids@, key_count, first as int, i as int));
             return Err(IndexIssue::Duplicate(first, i));
         }
         proof {
@@ -1288,15 +1512,7 @@ fn check_keys(key_count: usize, sources: &[usize], dests: &[usize]) -> (r: Resul
         sources.len() != dests.len() ==> r == Err::<Vec<Option<usize>>, MigrationKeyError>(
             MigrationKeyError::LengthMismatch,
         ),
-        r matches Err(MigrationKeyError::LengthMismatch) ==> sources.len() != dests.len(),
-        r matches Err(MigrationKeyError::KeyOutOfRange) ==> sources.len() == dests.len() && !(
-        in_range(sources@, key_count) && in_range(dests@, key_count)),
-        r matches Err(MigrationKeyError::DuplicateSource { first, second }) ==> sources.len()
-            == dests.len() && first < second < sources.len() && sources@[first as int]
-            == sources@[second as int],
-        r matches Err(MigrationKeyError::DuplicateDest { first, second }) ==> sources.len()
-            == dests.len() && in_range(sources@, key_count) && distinct(sources@) && first
-            < second < dests.len() && dests@[first as int] == dests@[second as int],
+        r matches Err(e) ==> key_error_found(key_count, sources@, dests@, e),
 {
     if sources.len() != dests.len() {
         return Err(MigrationKeyError::LengthMismatch);
@@ -1308,6 +1524,9 @@ fn check_keys(key_count: usize, sources: &[usize], dests: &[usize]) -> (r: Resul
             return Err(MigrationKeyError::DuplicateSource { first, second });
         },
     };
+    proof {
+        lemma_clean_prefix_whole(sources@, key_count);
+    }
     match index_keys(key_count, dests) {
         Ok(_) => Ok(src_pos),
         Err(IndexIssue::OutOfRange) => Err(MigrationKeyError::KeyOutOfRange),
@@ -1322,14 +1541,13 @@ fn check_keys(key_count: usize, sources: &[usize], dests: &[usize]) -> (r: Resul
 /// being moved (`is_conflict`). Fails exactly when the key lists do not
 /// describe a migration or `dest_exists` has the wrong length.
 ///
-/// The code checks the lengths, then scans the sources left to right and
-/// reports the first out-of-range id or repeat it meets, then the
-/// destinations the same way. The postconditions pin `LengthMismatch` and
-/// tie each other error to its cause; `DuplicateDest` requires in-range,
-/// distinct sources. They do not fix the choice between `KeyOutOfRange`
-/// and `DuplicateSource` when a source repeats and some id is out of range,
-/// or between `KeyOutOfRange` and `DuplicateDest` when, with valid sources,
-/// the destinations hold both an out-of-range id and a repeat.
+/// The error is specified exactly (`key_error_found`): the lengths are
+/// checked first, then the sources are scanned left to right and the first
+/// out-of-range id or repeat met is reported, then the destinations the
+/// same way. That first problem is unique (`lemma_first_problem_unique`),
+/// so the key lists determine the error variant and the items it names:
+/// with three keys, sources `[0, 0]` and destinations `[9, 1]` give
+/// `DuplicateSource { first: 0, second: 1 }`, never `KeyOutOfRange`.
 pub fn classify_conflicts(
     key_count: usize,
     sources: &[usize],
@@ -1339,22 +1557,23 @@ pub fn classify_conflicts(
     ensures
         r is Ok <==> (well_formed(key_count, sources@, dests@) && dest_exists.len() == dests.len()),
         r matches Ok(c) ==> conflict_list(c@, sources@, dests@, dest_exists@),
-        // Every error names its cause, checked in this order: lengths, then
-        // the sources (range, repeats), then the destinations.
+        // The error is exactly the first problem found, in this order: a
+        // length mismatch (of any of the three lists); then the sources,
+        // scanned left to right, where the first out-of-range id or repeat
+        // met is reported; then the destinations the same way
+        // (`key_error_found`; it is unique, `lemma_first_problem_unique`).
         (sources.len() != dests.len() || dest_exists.len() != dests.len()) ==> r == Err::<
             Vec<usize>,
             MigrationKeyError,
         >(MigrationKeyError::LengthMismatch),
         r matches Err(MigrationKeyError::LengthMismatch) ==> sources.len() != dests.len()
             || dest_exists.len() != dests.len(),
-        r matches Err(MigrationKeyError::KeyOutOfRange) ==> sources.len() == dests.len() && !(
-        in_range(sources@, key_count) && in_range(dests@, key_count)),
-        r matches Err(MigrationKeyError::DuplicateSource { first, second }) ==> sources.len()
-            == dests.len() && first < second < sources.len() && sources@[first as int]
-            == sources@[second as int],
-        r matches Err(MigrationKeyError::DuplicateDest { first, second }) ==> sources.len()
-            == dests.len() && in_range(sources@, key_count) && distinct(sources@) && first
-            < second < dests.len() && dests@[first as int] == dests@[second as int],
+        r matches Err(e) ==> e == MigrationKeyError::LengthMismatch || key_error_found(
+            key_count,
+            sources@,
+            dests@,
+            e,
+        ),
 {
     if dest_exists.len() != dests.len() {
         return Err(MigrationKeyError::LengthMismatch);
@@ -1460,20 +1679,15 @@ pub fn schedule_migration(key_count: usize, sources: &[usize], dests: &[usize]) 
                 payload,
                 port,
             ),
-        // Every error names its cause, checked in this order: lengths, then
-        // the sources (range, repeats), then the destinations.
+        // The error is exactly the first problem found, in this order: a
+        // length mismatch; then the sources, scanned left to right, where
+        // the first out-of-range id or repeat met is reported; then the
+        // destinations the same way (`key_error_found`; it is unique,
+        // `lemma_first_problem_unique`).
         sources.len() != dests.len() ==> r == Err::<Vec<MigAction>, MigrationKeyError>(
             MigrationKeyError::LengthMismatch,
         ),
-        r matches Err(MigrationKeyError::LengthMismatch) ==> sources.len() != dests.len(),
-        r matches Err(MigrationKeyError::KeyOutOfRange) ==> sources.len() == dests.len() && !(
-        in_range(sources@, key_count) && in_range(dests@, key_count)),
-        r matches Err(MigrationKeyError::DuplicateSource { first, second }) ==> sources.len()
-            == dests.len() && first < second < sources.len() && sources@[first as int]
-            == sources@[second as int],
-        r matches Err(MigrationKeyError::DuplicateDest { first, second }) ==> sources.len()
-            == dests.len() && in_range(sources@, key_count) && distinct(sources@) && first
-            < second < dests.len() && dests@[first as int] == dests@[second as int],
+        r matches Err(e) ==> key_error_found(key_count, sources@, dests@, e),
 {
     let src_pos = check_keys(key_count, sources, dests)?;
     let mut acts: Vec<MigAction> = Vec::new();
@@ -1759,32 +1973,6 @@ pub fn guard_moves<E, F: Fn(usize) -> Option<E>>(
 // Rebasing canonical paths
 // ===========================================================================
 
-/// `p` is a byte prefix of `s`.
-fn starts_with(s: &[u8], p: &[u8]) -> (r: bool)
-    ensures
-        r == super::path_relation::is_prefix_of(p@, s@),
-{
-    if p.len() > s.len() {
-        return false;
-    }
-    let mut i: usize = 0;
-    while i < p.len()
-        invariant
-            p.len() <= s.len(),
-            i <= p.len(),
-            forall|j: int| 0 <= j < i ==> s@[j] == p@[j],
-        decreases p.len() - i,
-    {
-        if s[i] != p[i] {
-            assert(s@.subrange(0, p.len() as int)[i as int] != p@[i as int]);
-            return false;
-        }
-        i += 1;
-    }
-    assert(s@.subrange(0, p.len() as int) =~= p@);
-    true
-}
-
 /// `s[start..]` followed by nothing, appended to `out`.
 fn push_from(out: &mut Vec<u8>, s: &[u8], start: usize)
     requires
@@ -1845,18 +2033,11 @@ pub fn rebase_canonical(orig: &[u8], from: &[u8], to: &[u8]) -> (r: Option<Vec<u
         super::path::lemma_canonical_render(to@, false);
         super::path_relation::lemma_component_prefix_iff_segs(from@, orig@);
     }
-    if !starts_with(orig, from) {
+    if !super::path_relation::canonical_is_component_prefix(from, orig) {
         return None;
     }
+    // `from` is canonical, so its only one-byte spelling is the root `/`.
     let root = from.len() == 1;
-    if !(from.len() == orig.len() || root || orig[from.len()] == b'/') {
-        proof {
-            if from@ == seq![b'/'] {
-                assert(from.len() == 1);
-            }
-        }
-        return None;
-    }
     proof {
         if root {
             assert(from@ =~= seq![b'/']) by {

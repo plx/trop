@@ -1117,6 +1117,68 @@ mod tests {
         }
     }
 
+    /// The kernels report the first problem a left-to-right scan meets:
+    /// lengths, then the sources, then the destinations (the error is
+    /// determined exactly, `key_error_found`).
+    #[test]
+    fn test_key_errors_follow_scan_order() {
+        use crate::verified::migrate::MigrationKeyError as E;
+        let cases: [(&[usize], &[usize], E); 7] = [
+            (&[0], &[], E::LengthMismatch),
+            (
+                &[0, 0],
+                &[9, 1],
+                E::DuplicateSource {
+                    first: 0,
+                    second: 1,
+                },
+            ),
+            (
+                &[0, 0, 7],
+                &[1, 2, 0],
+                E::DuplicateSource {
+                    first: 0,
+                    second: 1,
+                },
+            ),
+            (&[7, 0, 0], &[1, 2, 0], E::KeyOutOfRange),
+            (&[0, 1], &[9, 2], E::KeyOutOfRange),
+            (
+                &[0, 1],
+                &[2, 2],
+                E::DuplicateDest {
+                    first: 0,
+                    second: 1,
+                },
+            ),
+            (
+                &[0, 1, 2],
+                &[1, 1, 9],
+                E::DuplicateDest {
+                    first: 0,
+                    second: 1,
+                },
+            ),
+        ];
+        for (sources, dests, expected) in cases {
+            assert_eq!(
+                schedule_migration(3, sources, dests).err(),
+                Some(expected),
+                "{sources:?} -> {dests:?}"
+            );
+            let exists = vec![false; dests.len()];
+            assert_eq!(
+                classify_conflicts(3, sources, dests, &exists).err(),
+                Some(expected),
+                "{sources:?} -> {dests:?}"
+            );
+        }
+        assert_eq!(
+            classify_conflicts(3, &[0], &[1], &[]).err(),
+            Some(E::LengthMismatch)
+        );
+    }
+
     /// Stored paths must already be canonical: a legacy row spelled `/w/a/`
     /// is reported as database corruption before any migration item is
     /// built, so two spellings of one path never reach the planner.

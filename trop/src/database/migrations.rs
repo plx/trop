@@ -413,21 +413,24 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 
 /// The corruption error for schema metadata the kernel classified as
 /// corrupt.
-fn version_corruption(corruption: Corruption) -> Error {
+///
+/// This is the one message table for a `Corruption` verdict: opening, the
+/// post-lock recheck, and validation all report the same text for the same
+/// metadata. The wording matches the other stored-value diagnostics
+/// (`expected TEXT, found ...`, `stored TEXT is not valid UTF-8`).
+pub(crate) fn version_corruption(corruption: Corruption) -> Error {
     let reason = match corruption {
-        Corruption::MissingMetadataTable => {
-            "the metadata table is missing although a reservations table exists"
-        }
+        Corruption::MissingMetadataTable => "the metadata table is missing",
         Corruption::MissingVersionRow | Corruption::MultipleVersionRows => {
             "exactly one schema_version row is required"
         }
-        Corruption::NotText(SqlType::Null) => "schema_version must be TEXT, found NULL",
-        Corruption::NotText(SqlType::Integer) => "schema_version must be TEXT, found INTEGER",
-        Corruption::NotText(SqlType::Real) => "schema_version must be TEXT, found REAL",
-        Corruption::NotText(SqlType::Blob) => "schema_version must be TEXT, found BLOB",
+        Corruption::NotText(SqlType::Null) => "expected TEXT, found NULL",
+        Corruption::NotText(SqlType::Integer) => "expected TEXT, found INTEGER",
+        Corruption::NotText(SqlType::Real) => "expected TEXT, found REAL",
+        Corruption::NotText(SqlType::Blob) => "expected TEXT, found BLOB",
         // Text cells are never reported as `NotText`.
-        Corruption::NotText(SqlType::Text) => "schema_version must be TEXT",
-        Corruption::NotUtf8 => "schema_version TEXT is not valid UTF-8",
+        Corruption::NotText(SqlType::Text) => "expected TEXT, found TEXT",
+        Corruption::NotUtf8 => "stored TEXT is not valid UTF-8",
         Corruption::NotAnInteger => "schema_version must be a base-10 signed integer",
     };
     Error::corrupt_stored_value("metadata", "value", "key=\"schema_version\"", reason)
@@ -442,8 +445,9 @@ fn no_migration_path(version: i32) -> Error {
     }
 }
 
-/// The error for a schema newer than this client.
-fn unsupported_version(version: i32) -> Error {
+/// The error for a schema newer than this client (opening, the post-lock
+/// recheck, and validation).
+pub(crate) fn unsupported_version(version: i32) -> Error {
     Error::UnsupportedSchemaVersion {
         expected: u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or_default(),
         found: u32::try_from(version).unwrap_or(u32::MAX),
