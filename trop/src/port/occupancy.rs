@@ -10,7 +10,16 @@
 //! added when `check_all_interfaces` is enabled. IPv6 probe sockets set
 //! `IPV6_V6ONLY` before binding so operating-system dual-stack defaults cannot
 //! make an IPv6 probe accidentally test IPv4 too.
+//!
+//! The policy decisions are made by the verified kernel in
+//! `crate::verified::occupancy`: combining configuration into effective flags,
+//! selecting and ordering the probe matrix, deciding when checking is
+//! disabled, folding probe outcomes into a report (fail closed on the first
+//! probe failure), and classifying owner metadata completeness. This module
+//! supplies the effects: socket binds, error classification, and owner
+//! lookups.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::io;
@@ -23,6 +32,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
 
 use crate::config::OccupancyConfig;
+use crate::verified::occupancy as kernel;
 use crate::{Error, Port, PortRange, Result};
 
 /// Configuration for a single occupancy check.
@@ -44,20 +54,48 @@ pub struct OccupancyCheckConfig {
     pub check_all_interfaces: bool,
 }
 
+impl OccupancyCheckConfig {
+    /// The verified kernel's view of this policy (a field-for-field copy).
+    const fn flags(&self) -> kernel::OccFlags {
+        kernel::OccFlags {
+            skip_tcp: self.skip_tcp,
+            skip_udp: self.skip_udp,
+            skip_ipv4: self.skip_ipv4,
+            skip_ipv6: self.skip_ipv6,
+            check_all_interfaces: self.check_all_interfaces,
+        }
+    }
+
+    /// The policy described by the kernel's flags (a field-for-field copy).
+    const fn from_flags(flags: kernel::OccFlags) -> Self {
+        Self {
+            skip_tcp: flags.skip_tcp,
+            skip_udp: flags.skip_udp,
+            skip_ipv4: flags.skip_ipv4,
+            skip_ipv6: flags.skip_ipv6,
+            check_all_interfaces: flags.check_all_interfaces,
+        }
+    }
+}
+
 impl From<&OccupancyConfig> for OccupancyCheckConfig {
+    /// Each skip flag is set when `skip` or its own setting is `Some(true)`;
+    /// unset (`None`) settings mean `false`, and `Some(false)` never re-enables
+    /// a check that `skip` disabled. `check_all_interfaces` is independent of
+    /// `skip` (with every family or protocol skipped, no probe runs anyway).
     fn from(config: &OccupancyConfig) -> Self {
-        let skip_all = config.skip.unwrap_or(false);
         // Note: Field name divergence between `skip_ip4`/`skip_ip6` (in OccupancyConfig)
         // and `skip_ipv4`/`skip_ipv6` (in OccupancyCheckConfig) is intentional.
         // The config uses abbreviated names for brevity, while the runtime struct uses
         // full names for clarity.
-        Self {
-            skip_tcp: skip_all || config.skip_tcp.unwrap_or(false),
-            skip_udp: skip_all || config.skip_udp.unwrap_or(false),
-            skip_ipv4: skip_all || config.skip_ip4.unwrap_or(false),
-            skip_ipv6: skip_all || config.skip_ip6.unwrap_or(false),
-            check_all_interfaces: config.check_all_interfaces.unwrap_or(false),
-        }
+        Self::from_flags(kernel::effective_occupancy_flags(kernel::OccSettings {
+            skip: config.skip,
+            skip_tcp: config.skip_tcp,
+            skip_udp: config.skip_udp,
+            skip_ipv4: config.skip_ip4,
+            skip_ipv6: config.skip_ip6,
+            check_all_interfaces: config.check_all_interfaces,
+        }))
     }
 }
 
@@ -97,7 +135,9 @@ pub trait PortOccupancyChecker: Send + Sync {
     /// Find all occupied ports in a given range.
     ///
     /// This is an optimization opportunity - implementations may batch checks
-    /// for efficiency. The default implementation calls `is_occupied` for each port.
+    /// for efficiency. The default implementation calls `is_occupied` for each
+    /// port in ascending order and returns the occupied ones in that order,
+    /// stopping at the first failed check.
     ///
     /// # Errors
     ///
@@ -107,14 +147,22 @@ pub trait PortOccupancyChecker: Send + Sync {
         range: &PortRange,
         config: &OccupancyCheckConfig,
     ) -> Result<Vec<Port>> {
-        let mut occupied = Vec::new();
-        for port in *range {
-            if self.is_occupied(port, config)? {
-                occupied.push(port);
-            }
-        }
-        Ok(occupied)
+        scan_range(range, |port| {
+            Ok(self.is_occupied(port, config)?.then_some(port))
+        })
     }
+}
+
+/// Inspects every port of `range` in ascending order and collects the values
+/// `inspect` keeps, stopping at the first error.
+///
+/// The scan itself is the verified kernel's `scan_ports`; this glue only
+/// converts between `Port` and `u16`.
+fn scan_range<T>(range: &PortRange, inspect: impl Fn(Port) -> Result<Option<T>>) -> Result<Vec<T>> {
+    kernel::scan_ports(range.min().value(), range.max().value(), &|port| {
+        // Never fails: the kernel only inspects ports of the range.
+        inspect(Port::try_from(port)?)
+    })
 }
 
 /// Production implementation using explicit socket bind probes.
@@ -294,18 +342,14 @@ impl Default for OccupancyOwner {
 
 impl OccupancyOwner {
     fn refresh_status(&mut self) {
-        let available = [
+        self.status = match kernel::owner_status(
             self.process_id.is_some(),
             self.process_name.is_some(),
             self.user.is_some(),
-        ]
-        .into_iter()
-        .filter(|value| *value)
-        .count();
-        self.status = match available {
-            0 => OccupancyOwnerStatus::Unavailable,
-            3 => OccupancyOwnerStatus::Available,
-            _ => OccupancyOwnerStatus::Partial,
+        ) {
+            kernel::OwnerStatus::Available => OccupancyOwnerStatus::Available,
+            kernel::OwnerStatus::Partial => OccupancyOwnerStatus::Partial,
+            kernel::OwnerStatus::Unavailable => OccupancyOwnerStatus::Unavailable,
         };
     }
 }
@@ -357,6 +401,26 @@ struct OccupancyProbe {
 }
 
 impl OccupancyProbe {
+    /// The bind probe that realizes the kernel's `probe` for `port`.
+    fn new(port: Port, probe: kernel::Probe) -> Self {
+        use kernel::{Family, Scope};
+
+        let protocol = match probe.protocol {
+            kernel::Protocol::Tcp => OccupancyProtocol::Tcp,
+            kernel::Protocol::Udp => OccupancyProtocol::Udp,
+        };
+        let ip: IpAddr = match (probe.family, probe.scope) {
+            (Family::Ipv4, Scope::Localhost) => Ipv4Addr::LOCALHOST.into(),
+            (Family::Ipv4, Scope::Wildcard) => Ipv4Addr::UNSPECIFIED.into(),
+            (Family::Ipv6, Scope::Localhost) => Ipv6Addr::LOCALHOST.into(),
+            (Family::Ipv6, Scope::Wildcard) => Ipv6Addr::UNSPECIFIED.into(),
+        };
+        Self {
+            protocol,
+            address: SocketAddr::new(ip, port.value()),
+        }
+    }
+
     fn domain(self) -> Domain {
         if self.address.is_ipv4() {
             Domain::IPV4
@@ -424,52 +488,13 @@ impl std::error::Error for ProbeFailure {
 }
 
 impl SystemOccupancyChecker {
+    /// The bind probes the policy selects for `port`, in matrix order.
+    #[cfg(test)]
     fn probes(port: Port, config: &OccupancyCheckConfig) -> Vec<OccupancyProbe> {
-        let mut probes = Vec::with_capacity(if config.check_all_interfaces { 8 } else { 4 });
-
-        if !config.skip_ipv4 {
-            Self::add_family_probes(
-                &mut probes,
-                config,
-                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port.value()),
-                SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port.value()),
-            );
-        }
-        if !config.skip_ipv6 {
-            Self::add_family_probes(
-                &mut probes,
-                config,
-                SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port.value()),
-                SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port.value()),
-            );
-        }
-
-        probes
-    }
-
-    fn add_family_probes(
-        probes: &mut Vec<OccupancyProbe>,
-        config: &OccupancyCheckConfig,
-        localhost: SocketAddr,
-        wildcard: SocketAddr,
-    ) {
-        for address in [localhost]
+        kernel::probe_matrix(config.flags())
             .into_iter()
-            .chain(config.check_all_interfaces.then_some(wildcard))
-        {
-            if !config.skip_tcp {
-                probes.push(OccupancyProbe {
-                    protocol: OccupancyProtocol::Tcp,
-                    address,
-                });
-            }
-            if !config.skip_udp {
-                probes.push(OccupancyProbe {
-                    protocol: OccupancyProtocol::Udp,
-                    address,
-                });
-            }
-        }
+            .map(|probe| OccupancyProbe::new(port, probe))
+            .collect()
     }
 
     fn probe_socket(probe: &OccupancyProbe) -> io::Result<()> {
@@ -533,38 +558,52 @@ impl SystemOccupancyChecker {
         }
     }
 
+    /// Runs the policy's probe matrix for `port` through `run_probe`.
+    ///
+    /// The verified kernel selects the probes, runs them in matrix order, and
+    /// stops at the first failure; this glue only maps kernel probes to
+    /// socket addresses and classifies each bind result: success is free,
+    /// `AddrInUse` is occupied, and any other error is a probe failure.
     fn report_with<F>(
         port: Port,
         config: &OccupancyCheckConfig,
-        mut run_probe: F,
+        run_probe: F,
     ) -> Result<OccupancyReport>
     where
         F: FnMut(&OccupancyProbe) -> io::Result<()>,
     {
-        let probes = Self::probes(port, config);
-        let enabled_probe_count = probes.len();
-        let mut occupied_probes = Vec::new();
-
-        for probe in probes {
-            match run_probe(&probe) {
-                Ok(()) => {}
+        // The kernel's oracle is a `Fn`; the probe runner may be stateful.
+        // The kernel never re-enters the oracle, so the borrow cannot clash.
+        let run_probe = RefCell::new(run_probe);
+        let outcome = |probe: kernel::Probe| {
+            let mut run_probe = run_probe.borrow_mut();
+            match (*run_probe)(&OccupancyProbe::new(port, probe)) {
+                Ok(()) => kernel::ProbeOutcome::Free,
                 Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                    occupied_probes.push(probe.occupied_evidence());
+                    kernel::ProbeOutcome::InUse
                 }
-                Err(source) => {
-                    return Err(Error::OccupancyCheckFailed {
-                        port,
-                        source: Box::new(ProbeFailure { probe, source }),
-                    });
-                }
+                Err(error) => kernel::ProbeOutcome::Failed(error),
             }
-        }
+        };
 
-        Ok(OccupancyReport {
-            port,
-            enabled_probe_count,
-            occupied_probes,
-        })
+        match kernel::run_probe_matrix(config.flags(), &outcome) {
+            Ok(evidence) => Ok(OccupancyReport {
+                port,
+                enabled_probe_count: evidence.enabled,
+                occupied_probes: evidence
+                    .occupied
+                    .into_iter()
+                    .map(|probe| OccupancyProbe::new(port, probe).occupied_evidence())
+                    .collect(),
+            }),
+            Err((probe, source)) => Err(Error::OccupancyCheckFailed {
+                port,
+                source: Box::new(ProbeFailure {
+                    probe: OccupancyProbe::new(port, probe),
+                    source,
+                }),
+            }),
+        }
     }
 
     fn is_occupied_with<F>(port: Port, config: &OccupancyCheckConfig, run_probe: F) -> Result<bool>
@@ -610,13 +649,10 @@ impl SystemOccupancyChecker {
         range: &PortRange,
         config: &OccupancyCheckConfig,
     ) -> Result<Vec<OccupancyReport>> {
-        let mut reports = Vec::new();
-        for port in *range {
+        let mut reports = scan_range(range, |port| {
             let report = Self::report_with(port, config, Self::probe_socket)?;
-            if report.is_occupied() {
-                reports.push(report);
-            }
-        }
+            Ok(report.is_occupied().then_some(report))
+        })?;
         Self::enrich_owner_metadata(&mut reports);
         Ok(reports)
     }
@@ -809,7 +845,8 @@ impl MockOccupancyChecker {
 
 impl PortOccupancyChecker for MockOccupancyChecker {
     fn is_occupied(&self, port: Port, config: &OccupancyCheckConfig) -> Result<bool> {
-        if (config.skip_tcp && config.skip_udp) || (config.skip_ipv4 && config.skip_ipv6) {
+        // Disabled exactly when the system checker's probe matrix is empty.
+        if kernel::occupancy_disabled(config.flags()) {
             return Ok(false);
         }
         Ok(self.occupied_ports.contains(&port))
@@ -820,17 +857,13 @@ impl PortOccupancyChecker for MockOccupancyChecker {
         range: &PortRange,
         config: &OccupancyCheckConfig,
     ) -> Result<Vec<Port>> {
-        if (config.skip_tcp && config.skip_udp) || (config.skip_ipv4 && config.skip_ipv6) {
+        if kernel::occupancy_disabled(config.flags()) {
             return Ok(Vec::new());
         }
 
-        let mut occupied = Vec::new();
-        for port in *range {
-            if self.occupied_ports.contains(&port) {
-                occupied.push(port);
-            }
-        }
-        Ok(occupied)
+        scan_range(range, |port| {
+            Ok(self.occupied_ports.contains(&port).then_some(port))
+        })
     }
 }
 
@@ -1551,5 +1584,381 @@ mod tests {
 
         assert!(!checker.is_occupied(port, &localhost_only).unwrap());
         assert!(checker.is_occupied(port, &all_interfaces).unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // Glue tests for the verified occupancy kernel
+    // -----------------------------------------------------------------------
+
+    /// Every combination of the five effective flags.
+    fn every_check_config() -> Vec<OccupancyCheckConfig> {
+        (0..32_u8)
+            .map(|bits| OccupancyCheckConfig {
+                skip_tcp: bits & 1 != 0,
+                skip_udp: bits & 2 != 0,
+                skip_ipv4: bits & 4 != 0,
+                skip_ipv6: bits & 8 != 0,
+                check_all_interfaces: bits & 16 != 0,
+            })
+            .collect()
+    }
+
+    /// Independent statement of the documented matrix: families (IPv4, IPv6),
+    /// then scopes (localhost, wildcard when enabled), then protocols (TCP,
+    /// UDP), skipping disabled dimensions.
+    fn documented_matrix(port: Port, config: &OccupancyCheckConfig) -> Vec<OccupancyProbe> {
+        let mut families: Vec<(IpAddr, IpAddr)> = Vec::new();
+        if !config.skip_ipv4 {
+            families.push((Ipv4Addr::LOCALHOST.into(), Ipv4Addr::UNSPECIFIED.into()));
+        }
+        if !config.skip_ipv6 {
+            families.push((Ipv6Addr::LOCALHOST.into(), Ipv6Addr::UNSPECIFIED.into()));
+        }
+        let mut protocols = Vec::new();
+        if !config.skip_tcp {
+            protocols.push(OccupancyProtocol::Tcp);
+        }
+        if !config.skip_udp {
+            protocols.push(OccupancyProtocol::Udp);
+        }
+
+        let mut probes = Vec::new();
+        for (localhost, wildcard) in families {
+            let mut addresses = vec![localhost];
+            if config.check_all_interfaces {
+                addresses.push(wildcard);
+            }
+            for ip in addresses {
+                for &protocol in &protocols {
+                    probes.push(OccupancyProbe {
+                        protocol,
+                        address: SocketAddr::new(ip, port.value()),
+                    });
+                }
+            }
+        }
+        probes
+    }
+
+    #[test]
+    fn test_occupancy_check_config_from_every_setting_combination() {
+        let values = [None, Some(false), Some(true)];
+        let on = |setting: Option<bool>| setting == Some(true);
+        for code in 0..3_usize.pow(6) {
+            let digit = |position: u32| values[code / 3_usize.pow(position) % 3];
+            let settings = OccupancyConfig {
+                skip: digit(0),
+                skip_tcp: digit(1),
+                skip_udp: digit(2),
+                skip_ip4: digit(3),
+                skip_ip6: digit(4),
+                check_all_interfaces: digit(5),
+            };
+
+            let effective = OccupancyCheckConfig::from(&settings);
+
+            assert_eq!(
+                effective,
+                OccupancyCheckConfig {
+                    skip_tcp: on(settings.skip) || on(settings.skip_tcp),
+                    skip_udp: on(settings.skip) || on(settings.skip_udp),
+                    skip_ipv4: on(settings.skip) || on(settings.skip_ip4),
+                    skip_ipv6: on(settings.skip) || on(settings.skip_ip6),
+                    check_all_interfaces: on(settings.check_all_interfaces),
+                },
+                "{settings:?}"
+            );
+            if on(settings.skip) {
+                assert!(
+                    SystemOccupancyChecker::probes(Port::try_from(5050).unwrap(), &effective)
+                        .is_empty(),
+                    "skip = true must disable every probe: {settings:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_skip_false_does_not_override_global_skip() {
+        let config = OccupancyCheckConfig::from(&OccupancyConfig {
+            skip: Some(true),
+            skip_tcp: Some(false),
+            skip_udp: Some(false),
+            skip_ip4: Some(false),
+            skip_ip6: Some(false),
+            check_all_interfaces: Some(true),
+        });
+
+        assert!(config.skip_tcp && config.skip_udp && config.skip_ipv4 && config.skip_ipv6);
+        assert!(config.check_all_interfaces);
+        assert_eq!(
+            SystemOccupancyChecker::probes(Port::try_from(5050).unwrap(), &config),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn test_report_runs_exactly_the_documented_matrix_for_every_policy() {
+        for config in every_check_config() {
+            for port_value in [1, 5050, 65535] {
+                let port = Port::try_from(port_value).unwrap();
+                let expected = documented_matrix(port, &config);
+                let mut run = Vec::new();
+
+                let report = SystemOccupancyChecker::report_with(port, &config, |probe| {
+                    run.push(*probe);
+                    Ok(())
+                })
+                .unwrap();
+
+                assert_eq!(run, expected, "{config:?} port {port_value}");
+                assert_eq!(SystemOccupancyChecker::probes(port, &config), expected);
+                assert_eq!(report.port, port);
+                assert_eq!(report.enabled_probe_count, expected.len());
+                assert!(!report.is_occupied());
+                assert_eq!(report.was_skipped(), expected.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_interfaces_matrix_is_in_documented_order() {
+        let port = Port::try_from(65535).unwrap();
+        let config = OccupancyCheckConfig {
+            check_all_interfaces: true,
+            ..Default::default()
+        };
+        let probe = |protocol, ip: IpAddr| OccupancyProbe {
+            protocol,
+            address: SocketAddr::new(ip, 65535),
+        };
+        let (tcp, udp) = (OccupancyProtocol::Tcp, OccupancyProtocol::Udp);
+
+        assert_eq!(
+            SystemOccupancyChecker::probes(port, &config),
+            vec![
+                probe(tcp, Ipv4Addr::LOCALHOST.into()),
+                probe(udp, Ipv4Addr::LOCALHOST.into()),
+                probe(tcp, Ipv4Addr::UNSPECIFIED.into()),
+                probe(udp, Ipv4Addr::UNSPECIFIED.into()),
+                probe(tcp, Ipv6Addr::LOCALHOST.into()),
+                probe(udp, Ipv6Addr::LOCALHOST.into()),
+                probe(tcp, Ipv6Addr::UNSPECIFIED.into()),
+                probe(udp, Ipv6Addr::UNSPECIFIED.into()),
+            ]
+        );
+        assert_eq!(
+            SystemOccupancyChecker::probes(port, &OccupancyCheckConfig::default()),
+            vec![
+                probe(tcp, Ipv4Addr::LOCALHOST.into()),
+                probe(udp, Ipv4Addr::LOCALHOST.into()),
+                probe(tcp, Ipv6Addr::LOCALHOST.into()),
+                probe(udp, Ipv6Addr::LOCALHOST.into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_mock_checker_disabled_exactly_when_system_matrix_is_empty() {
+        let port = Port::try_from(5050).unwrap();
+        let checker = MockOccupancyChecker::new(HashSet::from([port]));
+        let range = PortRange::new(port, port).unwrap();
+
+        for config in every_check_config() {
+            let matrix_empty = SystemOccupancyChecker::probes(port, &config).is_empty();
+            let report = SystemOccupancyChecker::report_with(port, &config, |_| Ok(())).unwrap();
+
+            assert_eq!(report.was_skipped(), matrix_empty, "{config:?}");
+            assert_eq!(
+                checker.is_occupied(port, &config).unwrap(),
+                !matrix_empty,
+                "{config:?}"
+            );
+            assert_eq!(
+                checker.find_occupied_ports(&range, &config).unwrap(),
+                if matrix_empty { vec![] } else { vec![port] },
+                "{config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_detailed_report_evidence_is_the_in_use_probes_for_every_policy() {
+        let port = Port::try_from(5050).unwrap();
+        for config in every_check_config() {
+            let expected = documented_matrix(port, &config);
+            // Alternate in-use and free answers in run order.
+            let mut calls = 0;
+            let report = SystemOccupancyChecker::report_with(port, &config, |_| {
+                calls += 1;
+                if calls % 2 == 1 {
+                    Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "synthetic bind conflict",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+
+            assert_eq!(calls, expected.len(), "{config:?}");
+            assert_eq!(
+                report.occupied_probes,
+                expected
+                    .iter()
+                    .step_by(2)
+                    .map(|probe| probe.occupied_evidence())
+                    .collect::<Vec<_>>(),
+                "{config:?}"
+            );
+            assert_eq!(report.is_occupied(), !expected.is_empty(), "{config:?}");
+        }
+    }
+
+    #[test]
+    fn test_failure_on_last_probe_runs_every_earlier_probe_and_fails_closed() {
+        let port = Port::try_from(5050).unwrap();
+        let config = OccupancyCheckConfig {
+            check_all_interfaces: true,
+            ..Default::default()
+        };
+        let mut calls = 0;
+        let error = SystemOccupancyChecker::report_with(port, &config, |_| {
+            calls += 1;
+            if calls == 8 {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "synthetic last-probe failure",
+                ))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "synthetic bind conflict",
+                ))
+            }
+        })
+        .unwrap_err();
+        let diagnostic = error.to_string();
+
+        assert_eq!(calls, 8);
+        assert!(matches!(error, Error::OccupancyCheckFailed { port: p, .. } if p == port));
+        assert!(diagnostic.contains("UDP IPv6 wildcard bind at [::]:5050"));
+        assert!(diagnostic.contains("synthetic last-probe failure"));
+    }
+
+    #[test]
+    fn test_owner_status_reflects_field_completeness() {
+        for bits in 0..8_u8 {
+            let mut owner = OccupancyOwner {
+                process_id: (bits & 1 != 0).then_some(42),
+                process_name: (bits & 2 != 0).then(|| "service".to_string()),
+                user: (bits & 4 != 0).then(|| "operator".to_string()),
+                status: OccupancyOwnerStatus::Available,
+            };
+            owner.refresh_status();
+
+            let expected = match bits {
+                0 => OccupancyOwnerStatus::Unavailable,
+                7 => OccupancyOwnerStatus::Available,
+                _ => OccupancyOwnerStatus::Partial,
+            };
+            assert_eq!(owner.status, expected, "fields present: {bits:03b}");
+        }
+    }
+
+    /// A checker that only implements `is_occupied`, so the trait's default
+    /// `find_occupied_ports` is exercised. Odd ports are occupied; checking
+    /// `failing` fails. Every checked port is logged.
+    struct ScriptedChecker {
+        failing: Option<u16>,
+        checked: std::sync::Mutex<Vec<u16>>,
+    }
+
+    impl ScriptedChecker {
+        fn new(failing: Option<u16>) -> Self {
+            Self {
+                failing,
+                checked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn checked(&self) -> Vec<u16> {
+            self.checked.lock().unwrap().clone()
+        }
+    }
+
+    impl PortOccupancyChecker for ScriptedChecker {
+        fn is_occupied(&self, port: Port, _config: &OccupancyCheckConfig) -> Result<bool> {
+            self.checked.lock().unwrap().push(port.value());
+            if Some(port.value()) == self.failing {
+                return Err(Error::OccupancyCheckFailed {
+                    port,
+                    source: Box::new(io::Error::other("synthetic scan failure")),
+                });
+            }
+            Ok(port.value() % 2 == 1)
+        }
+    }
+
+    fn port_range(min: u16, max: u16) -> PortRange {
+        PortRange::new(Port::try_from(min).unwrap(), Port::try_from(max).unwrap()).unwrap()
+    }
+
+    fn ports(values: &[u16]) -> Vec<Port> {
+        values
+            .iter()
+            .map(|&value| Port::try_from(value).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_default_find_occupied_ports_scans_range_in_ascending_order() {
+        let config = OccupancyCheckConfig::default();
+
+        let checker = ScriptedChecker::new(None);
+        let occupied = checker
+            .find_occupied_ports(&port_range(65530, 65535), &config)
+            .unwrap();
+        assert_eq!(occupied, ports(&[65531, 65533, 65535]));
+        assert_eq!(checker.checked(), (65530..=65535).collect::<Vec<_>>());
+
+        let checker = ScriptedChecker::new(None);
+        let occupied = checker
+            .find_occupied_ports(&port_range(1, 1), &config)
+            .unwrap();
+        assert_eq!(occupied, ports(&[1]));
+        assert_eq!(checker.checked(), vec![1]);
+    }
+
+    #[test]
+    fn test_default_find_occupied_ports_stops_at_first_failure() {
+        let checker = ScriptedChecker::new(Some(5003));
+        let error = checker
+            .find_occupied_ports(&port_range(5000, 5010), &OccupancyCheckConfig::default())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("synthetic scan failure"));
+        assert_eq!(checker.checked(), vec![5000, 5001, 5002, 5003]);
+    }
+
+    #[test]
+    fn test_mock_find_occupied_ports_returns_ascending_ports() {
+        let checker =
+            MockOccupancyChecker::new(ports(&[65535, 1, 3, 2, 40000]).into_iter().collect());
+        let config = OccupancyCheckConfig::default();
+
+        assert_eq!(
+            checker
+                .find_occupied_ports(&port_range(1, 65535), &config)
+                .unwrap(),
+            ports(&[1, 2, 3, 40000, 65535])
+        );
+        assert_eq!(
+            checker
+                .find_occupied_ports(&port_range(2, 39999), &config)
+                .unwrap(),
+            ports(&[2, 3])
+        );
     }
 }
