@@ -1,9 +1,19 @@
 //! Shell detection and export formatting.
+//!
+//! Every decision here (the `--shell` alias table, `SHELL` classification,
+//! detection precedence, and export-line rendering and value checking) is
+//! made by the formally verified kernel `verified::shell` (see
+//! `docs/verification.md`); this module only reads the environment and maps
+//! kernel results onto trop's types and errors.
 
 use std::env;
+use std::ffi::OsString;
 
 use crate::identifier::EnvironmentVariableName;
-use crate::Result;
+use crate::verified::shell::{self as shell_kernel, ShellKind, ShellSignals};
+use crate::{Error, Result};
+
+use super::display_field;
 
 /// Supported shell types for export formatting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,78 +29,103 @@ pub enum ShellType {
 }
 
 impl ShellType {
+    /// The kernel's shell kind.
+    pub(super) const fn kind(self) -> ShellKind {
+        match self {
+            Self::Bash => ShellKind::Bash,
+            Self::Zsh => ShellKind::Zsh,
+            Self::Fish => ShellKind::Fish,
+            Self::PowerShell => ShellKind::PowerShell,
+        }
+    }
+
+    /// The shell type of a kernel shell kind.
+    const fn from_kind(kind: ShellKind) -> Self {
+        match kind {
+            ShellKind::Bash => Self::Bash,
+            ShellKind::Zsh => Self::Zsh,
+            ShellKind::Fish => Self::Fish,
+            ShellKind::PowerShell => Self::PowerShell,
+        }
+    }
+
     /// Detect the current shell from environment variables.
     ///
     /// Detection precedence:
     /// 1. `ZSH_VERSION` - indicates zsh
     /// 2. `FISH_VERSION` - indicates fish
     /// 3. `PSModulePath` - indicates `PowerShell`
-    /// 4. `SHELL` environment variable (path like `/bin/bash`)
-    /// 5. Default to bash if unable to determine
+    /// 4. The final path component of `SHELL` (a trailing `.exe` is
+    ///    ignored, and so is ASCII case): `zsh`; `fish`; `pwsh` or
+    ///    `powershell`; or a POSIX shell (`bash`, `sh`, `dash`, `ksh`,
+    ///    `mksh`, `ash`, `yash`), which uses bash syntax. Directory names
+    ///    never matter, so `/home/selfish/bin/bash` is bash.
     ///
     /// # Errors
     ///
-    /// This function never returns an error; it defaults to bash if detection fails.
+    /// Returns a validation error asking for an explicit `--shell` when none
+    /// of these identifies a supported shell (for example when `SHELL` is
+    /// unset or names `tcsh`).
     pub fn detect() -> Result<Self> {
-        // Check for shell-specific version variables first
-        if env::var("ZSH_VERSION").is_ok() {
-            return Ok(Self::Zsh);
-        }
-        if env::var("FISH_VERSION").is_ok() {
-            return Ok(Self::Fish);
-        }
-        if env::var("PSModulePath").is_ok() {
-            return Ok(Self::PowerShell);
-        }
+        Self::detect_with(|name| env::var_os(name))
+    }
 
-        // Check SHELL environment variable
-        if let Ok(shell_path) = env::var("SHELL") {
-            if shell_path.contains("zsh") {
-                return Ok(Self::Zsh);
-            } else if shell_path.contains("fish") {
-                return Ok(Self::Fish);
-            } else if shell_path.contains("pwsh") || shell_path.contains("powershell") {
-                return Ok(Self::PowerShell);
-            }
-            // Default to bash for other shells (sh, bash, etc.)
-            return Ok(Self::Bash);
-        }
-
-        // Default to bash if no shell detected
-        Ok(Self::Bash)
+    /// Detection over an environment lookup (the process environment in
+    /// production, a fixed map in tests).
+    fn detect_with(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Self> {
+        // A version variable counts when it is set to valid Unicode, as with
+        // `env::var(..).is_ok()`.
+        let is_set = |name: &str| lookup(name).is_some_and(|value| value.to_str().is_some());
+        let signals = ShellSignals {
+            zsh_version: is_set("ZSH_VERSION"),
+            fish_version: is_set("FISH_VERSION"),
+            ps_module_path: is_set("PSModulePath"),
+        };
+        // A lossy conversion only replaces bytes that are not UTF-8, which
+        // are neither path separators nor part of any shell name.
+        let shell = lookup("SHELL").map(|value| value.to_string_lossy().into_owned());
+        shell_kernel::detect_shell(signals, shell.as_deref().map(str::as_bytes))
+            .map(Self::from_kind)
+            .ok_or_else(|| Error::Validation {
+                field: "shell".to_owned(),
+                message: "could not detect the shell from ZSH_VERSION, FISH_VERSION, PSModulePath or SHELL; pass --shell bash, zsh, fish or powershell".to_owned(),
+            })
     }
 
     /// Parse a shell type from a string.
     ///
     /// # Arguments
     ///
-    /// * `s` - Shell name (case-insensitive): "bash", "zsh", "fish", "powershell", "pwsh"
+    /// * `s` - Shell name (ASCII case-insensitive, no surrounding
+    ///   whitespace): "bash" or "sh", "zsh", "fish", "powershell", "pwsh" or
+    ///   "ps"
     ///
     /// # Errors
     ///
-    /// Returns an error if the shell name is not recognized.
+    /// Returns an error if the shell name is not recognized. The error shows
+    /// the name with control characters escaped.
     pub fn from_string(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "bash" | "sh" => Ok(Self::Bash),
-            "zsh" => Ok(Self::Zsh),
-            "fish" => Ok(Self::Fish),
-            "powershell" | "pwsh" | "ps" => Ok(Self::PowerShell),
-            _ => Err(crate::Error::Validation {
+        shell_kernel::parse_shell_name(s.as_bytes())
+            .map(Self::from_kind)
+            .ok_or_else(|| Error::Validation {
                 field: "shell".to_string(),
                 message: format!(
-                    "unknown shell type '{s}': supported shells are bash, zsh, fish, powershell"
+                    "unknown shell type '{}': supported shells are bash, zsh, fish, powershell",
+                    display_field(s)
                 ),
-            }),
-        }
+            })
     }
 
     /// Format an export statement for this shell type.
     ///
     /// # Arguments
     ///
-    /// * `var` - Environment variable name
-    /// * `value` - Caller-supplied shell-safe value. Group formatters pass only
-    ///   decimal port numbers.
+    /// * `var` - Environment variable name (`[A-Za-z_][A-Za-z0-9_]*`, at
+    ///   most 255 bytes)
+    /// * `value` - The value: a non-empty word of ASCII letters, digits and
+    ///   `_ . / : @ + , -` that does not start with `-` (port numbers always
+    ///   qualify). Every supported shell reads such a value literally, so the
+    ///   statement can be passed to `eval` safely.
     ///
     /// # Examples
     ///
@@ -109,20 +144,21 @@ impl ShellType {
     ///     ShellType::PowerShell.format_export("PORT", "5000").unwrap(),
     ///     "$env:PORT=\"5000\""
     /// );
+    /// assert!(ShellType::Bash.format_export("PORT", "1; rm -rf ~").is_err());
     /// ```
     ///
     /// # Errors
     ///
     /// Returns a typed validation error when `var` is not a portable
-    /// environment-variable identifier.
+    /// environment-variable identifier, or when `value` is not such a word.
+    /// Neither diagnostic echoes the rejected input.
     pub fn format_export(&self, var: &str, value: &str) -> Result<String> {
         let variable_name = EnvironmentVariableName::parse(var)?;
-        let variable_name = variable_name.as_str();
-
-        Ok(match self {
-            Self::Bash | Self::Zsh => format!("export {variable_name}={value}"),
-            Self::Fish => format!("set -x {variable_name} {value}"),
-            Self::PowerShell => format!("$env:{variable_name}=\"{value}\""),
+        shell_kernel::export_line(self.kind(), variable_name.as_str(), value).ok_or_else(|| {
+            Error::Validation {
+                field: "value".to_owned(),
+                message: "export values must be non-empty words of ASCII letters, digits, and _ . / : @ + , - that do not start with -".to_owned(),
+            }
         })
     }
 }
@@ -234,17 +270,144 @@ mod tests {
         }
     }
 
+    /// Detects over a fixed environment.
+    fn detect_in(vars: &[(&str, &str)]) -> Result<ShellType> {
+        let map: std::collections::HashMap<String, OsString> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), OsString::from(*value)))
+            .collect();
+        ShellType::detect_with(|name| map.get(name).cloned())
+    }
+
     #[test]
-    fn test_detect_defaults_to_bash() {
-        // When no shell-specific variables are set, should default to bash
-        // Note: This test may be affected by the actual test environment
-        let detected = ShellType::detect().unwrap();
-        // We can't assert a specific shell since it depends on test environment
-        // Just verify it returns successfully
-        assert!(matches!(
-            detected,
-            ShellType::Bash | ShellType::Zsh | ShellType::Fish | ShellType::PowerShell
-        ));
+    fn test_detect_classifies_shell_by_final_path_component() {
+        let cases = [
+            ("/bin/bash", ShellType::Bash),
+            ("/usr/local/bin/bash", ShellType::Bash),
+            ("/bin/sh", ShellType::Bash),
+            ("/bin/dash", ShellType::Bash),
+            ("/bin/ksh", ShellType::Bash),
+            ("/bin/mksh", ShellType::Bash),
+            ("/bin/ash", ShellType::Bash),
+            ("/usr/bin/yash", ShellType::Bash),
+            ("bash", ShellType::Bash),
+            ("/bin/zsh", ShellType::Zsh),
+            ("/opt/homebrew/bin/zsh", ShellType::Zsh),
+            ("/usr/bin/fish", ShellType::Fish),
+            ("/usr/bin/pwsh", ShellType::PowerShell),
+            (
+                "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                ShellType::PowerShell,
+            ),
+            (
+                "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+                ShellType::PowerShell,
+            ),
+            (
+                "C:\\Program Files\\Git\\usr\\bin\\BASH.EXE",
+                ShellType::Bash,
+            ),
+            // Directory names never matter (these used to detect fish and
+            // PowerShell from a substring of the directory).
+            ("/home/selfish/bin/bash", ShellType::Bash),
+            ("/opt/powershell-addons/bin/bash", ShellType::Bash),
+            ("/home/zshfan/bin/fish", ShellType::Fish),
+            ("/bash/zsh", ShellType::Zsh),
+        ];
+        for (shell, expected) in cases {
+            assert_eq!(
+                detect_in(&[("SHELL", shell)]).unwrap(),
+                expected,
+                "SHELL={shell}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_fails_when_the_shell_is_unknown() {
+        for shell in [
+            "",
+            "/",
+            "/bin/",
+            "/bin/tcsh",
+            "/bin/csh",
+            "/usr/bin/nu",
+            "/usr/bin/xonsh",
+            "/bin/bash5",
+            "/bin/fish-shell",
+            "/usr/bin/zsh.sh",
+            ".exe",
+            "/bin/ bash",
+            "/bin/bash\n",
+        ] {
+            let error = detect_in(&[("SHELL", shell)]).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("--shell"), "{message}");
+            if !shell.is_empty() {
+                assert!(!message.contains(shell), "{message}");
+            }
+        }
+        let error = detect_in(&[]).unwrap_err();
+        assert!(error.to_string().contains("--shell"));
+    }
+
+    #[test]
+    fn test_detect_version_variables_take_precedence() {
+        assert_eq!(
+            detect_in(&[
+                ("ZSH_VERSION", "5.9"),
+                ("FISH_VERSION", "3.7"),
+                ("SHELL", "/bin/bash")
+            ])
+            .unwrap(),
+            ShellType::Zsh
+        );
+        assert_eq!(
+            detect_in(&[
+                ("FISH_VERSION", "3.7"),
+                ("PSModulePath", "x"),
+                ("SHELL", "/bin/zsh")
+            ])
+            .unwrap(),
+            ShellType::Fish
+        );
+        assert_eq!(
+            detect_in(&[("PSModulePath", "C:\\Modules"), ("SHELL", "/bin/zsh")]).unwrap(),
+            ShellType::PowerShell
+        );
+        // A set-but-empty variable counts, as with `env::var(..).is_ok()`.
+        assert_eq!(
+            detect_in(&[("ZSH_VERSION", ""), ("SHELL", "/usr/bin/fish")]).unwrap(),
+            ShellType::Zsh
+        );
+        assert_eq!(
+            detect_in(&[("PSModulePath", "")]).unwrap(),
+            ShellType::PowerShell
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_ignores_non_unicode_version_variables_and_classifies_non_unicode_shells() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let not_unicode = OsString::from_vec(vec![0xff, 0xfe]);
+        let map = std::collections::HashMap::from([
+            ("ZSH_VERSION".to_owned(), not_unicode.clone()),
+            (
+                "SHELL".to_owned(),
+                OsString::from_vec(b"/home/\xff/bin/fish".to_vec()),
+            ),
+        ]);
+        assert_eq!(
+            ShellType::detect_with(|name| map.get(name).cloned()).unwrap(),
+            ShellType::Fish
+        );
+        let map = std::collections::HashMap::from([(
+            "SHELL".to_owned(),
+            OsString::from_vec(b"/bin/ba\xffsh".to_vec()),
+        )]);
+        assert!(ShellType::detect_with(|name| map.get(name).cloned()).is_err());
     }
 
     // ========================================================================
@@ -482,53 +645,253 @@ mod tests {
 
     /// Test `format_export` with empty values.
     ///
-    /// While port values are never empty in practice, the `format_export`
-    /// method should handle empty strings gracefully.
+    /// An empty value means different things to different shells (bash sets
+    /// an empty string, fish an empty list, and `PowerShell` deletes the
+    /// variable), so it is rejected.
     #[test]
     fn test_format_export_empty_value() {
-        assert_eq!(
-            ShellType::Bash.format_export("PORT", "").unwrap(),
-            "export PORT="
-        );
-        assert_eq!(
-            ShellType::Fish.format_export("PORT", "").unwrap(),
-            "set -x PORT "
-        );
-        assert_eq!(
-            ShellType::PowerShell.format_export("PORT", "").unwrap(),
-            "$env:PORT=\"\""
-        );
+        for shell in [
+            ShellType::Bash,
+            ShellType::Zsh,
+            ShellType::Fish,
+            ShellType::PowerShell,
+        ] {
+            let error = shell.format_export("PORT", "").unwrap_err();
+            assert!(
+                matches!(error, crate::Error::Validation { ref field, .. } if field == "value")
+            );
+        }
     }
 
     /// Test `format_export` with whitespace in values.
     ///
-    /// Port values won't have whitespace, but this tests the formatter's
-    /// robustness for potential future use cases.
+    /// Whitespace would split the value into several shell words, so values
+    /// containing it are rejected rather than emitted unquoted.
     #[test]
     fn test_format_export_whitespace_in_value() {
-        // Note: These scenarios shouldn't occur with port numbers, but we test
-        // the formatter's behavior for completeness
-
         // Single word (no spaces) - typical case
         assert_eq!(
             ShellType::Bash.format_export("PORT", "8080").unwrap(),
             "export PORT=8080"
         );
 
-        // Value with leading/trailing spaces (shouldn't happen with ports)
-        // The formatter doesn't trim, so spaces are preserved
-        assert_eq!(
-            ShellType::Bash.format_export("PORT", " 8080 ").unwrap(),
-            "export PORT= 8080 "
-        );
+        for shell in [
+            ShellType::Bash,
+            ShellType::Zsh,
+            ShellType::Fish,
+            ShellType::PowerShell,
+        ] {
+            for value in [" 8080 ", "80 80", "8080\t", "8080\n", "\r8080"] {
+                assert!(shell.format_export("PORT", value).is_err(), "{value:?}");
+            }
+        }
+    }
 
-        // PowerShell always quotes, so spaces are properly handled
-        assert_eq!(
-            ShellType::PowerShell
-                .format_export("PORT", " 8080 ")
-                .unwrap(),
-            "$env:PORT=\" 8080 \""
+    /// Values that every supported shell reads literally are rendered
+    /// exactly as before; everything else is rejected without echoing it.
+    #[test]
+    fn test_format_export_accepts_exactly_inert_values() {
+        for value in [
+            "0",
+            "8080",
+            "65535",
+            "localhost:8080",
+            "/tmp/trop.sock",
+            "user@host",
+            "a,b",
+            "v1.2+3",
+            "WEB_PORT",
+            "x-y",
+        ] {
+            assert_eq!(
+                ShellType::Bash.format_export("PORT", value).unwrap(),
+                format!("export PORT={value}")
+            );
+            assert_eq!(
+                ShellType::Zsh.format_export("PORT", value).unwrap(),
+                format!("export PORT={value}")
+            );
+            assert_eq!(
+                ShellType::Fish.format_export("PORT", value).unwrap(),
+                format!("set -x PORT {value}")
+            );
+            assert_eq!(
+                ShellType::PowerShell.format_export("PORT", value).unwrap(),
+                format!("$env:PORT=\"{value}\"")
+            );
+        }
+        let hostile = [
+            "1\"; Remove-Item -Recurse ~; \"",
+            "1; rm -rf ~",
+            "$(touch /tmp/pwned)",
+            "`id`",
+            "1|id",
+            "1&id",
+            "1>out",
+            "*",
+            "?",
+            "[a]",
+            "{a,b}",
+            "~",
+            "~/x",
+            "#comment",
+            "%self",
+            "a=b",
+            "'quoted'",
+            "\\",
+            "!1",
+            "a^b",
+            "-x",
+            "-1",
+            "\u{1b}[31m",
+            "caf\u{e9}",
+            "\u{201c}smart\u{201d}",
+            "\u{2019}",
+        ];
+        for shell in [
+            ShellType::Bash,
+            ShellType::Zsh,
+            ShellType::Fish,
+            ShellType::PowerShell,
+        ] {
+            for value in hostile {
+                let error = shell.format_export("PORT", value).unwrap_err();
+                let message = error.to_string();
+                assert!(!message.contains(value), "{message}");
+                assert!(!message.contains('\n'));
+            }
+        }
+    }
+
+    /// The name is checked before the value (the name error is reported
+    /// when both are invalid).
+    #[test]
+    fn test_format_export_reports_name_errors_first() {
+        let error = ShellType::Bash.format_export("1PORT", "a b").unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Validation { ref field, .. } if field == "environment_variable")
         );
+    }
+
+    /// Port exports are byte-identical to the previous `format!` rendering
+    /// for every port and shell.
+    #[test]
+    fn test_format_export_matches_previous_rendering_for_every_port() {
+        for port in 0..=u16::MAX {
+            let value = port.to_string();
+            assert_eq!(
+                ShellType::Bash.format_export("P", &value).unwrap(),
+                format!("export P={value}")
+            );
+            assert_eq!(
+                ShellType::Fish.format_export("P", &value).unwrap(),
+                format!("set -x P {value}")
+            );
+            assert_eq!(
+                ShellType::PowerShell.format_export("P", &value).unwrap(),
+                format!("$env:P=\"{value}\"")
+            );
+        }
+    }
+
+    /// The kernel's alias table agrees with the previous Unicode
+    /// `to_lowercase` matching.
+    #[test]
+    fn test_from_string_matches_previous_unicode_lowercase_matching() {
+        fn previous(s: &str) -> Option<ShellType> {
+            match s.to_lowercase().as_str() {
+                "bash" | "sh" => Some(ShellType::Bash),
+                "zsh" => Some(ShellType::Zsh),
+                "fish" => Some(ShellType::Fish),
+                "powershell" | "pwsh" | "ps" => Some(ShellType::PowerShell),
+                _ => None,
+            }
+        }
+        let mut inputs: Vec<String> = [
+            "bash",
+            "BASH",
+            "Bash",
+            "bAsH",
+            "sh",
+            "SH",
+            "zsh",
+            "ZSH",
+            "fish",
+            "FISH",
+            "powershell",
+            "PowerShell",
+            "POWERSHELL",
+            "pwsh",
+            "PWSH",
+            "ps",
+            "PS",
+            "",
+            " ",
+            " bash",
+            "bash ",
+            "ba",
+            "bashh",
+            "csh",
+            "ksh",
+            "\u{212a}sh",
+            "\u{130}",
+            "p\u{17f}",
+            "fi\u{17f}h",
+            "ba\u{17f}h",
+            "\u{17f}h",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        // Every one- and two-char string over a mixed alphabet.
+        let alphabet = [
+            's', 'S', 'h', 'H', 'p', 'P', '\u{212a}', '\u{130}', '\u{17f}', ' ', '\n',
+        ];
+        for a in alphabet {
+            inputs.push(a.to_string());
+            for b in alphabet {
+                inputs.push(format!("{a}{b}"));
+            }
+        }
+        for input in inputs {
+            assert_eq!(
+                ShellType::from_string(&input).ok(),
+                previous(&input),
+                "{input:?}"
+            );
+        }
+    }
+
+    /// The equivalence argument for ASCII folding: the only non-ASCII chars
+    /// whose lowercase is entirely ASCII letters are U+212A KELVIN SIGN
+    /// (`k`), and no shell name or log level contains `k`.
+    #[test]
+    fn test_only_kelvin_sign_lowercases_to_ascii() {
+        let mut found = Vec::new();
+        for code in 0x80..=0x10_FFFF_u32 {
+            let Some(c) = char::from_u32(code) else {
+                continue;
+            };
+            let lower: String = c.to_lowercase().collect();
+            if lower.chars().all(|l| l.is_ascii_alphabetic()) {
+                found.push(c);
+            }
+        }
+        assert_eq!(found, vec!['\u{212a}']);
+        for name in ["bash", "sh", "zsh", "fish", "powershell", "pwsh", "ps"] {
+            assert!(!name.contains('k'));
+        }
+    }
+
+    /// The unknown-shell diagnostic escapes control characters in the input.
+    #[test]
+    fn test_from_string_error_escapes_control_characters() {
+        let message = ShellType::from_string("bad\nshell\u{1b}[2J")
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains('\n'));
+        assert!(!message.contains('\u{1b}'));
+        assert!(message.contains("\"bad\\nshell\\x1b[2J\""), "{message}");
     }
 
     /// Test `format_export` output is valid for respective shells.
@@ -652,8 +1015,10 @@ mod tests {
     /// This test documents the fallback behavior when shell detection is used.
     #[test]
     fn test_auto_detection_scenario() {
-        // Auto-detect should always succeed (defaults to bash)
-        let detected = ShellType::detect();
+        // Auto-detection succeeds when the environment identifies a shell,
+        // and asks for --shell otherwise.
+        assert!(detect_in(&[]).is_err());
+        let detected = detect_in(&[("SHELL", "/bin/bash")]);
         assert!(detected.is_ok());
 
         // Should produce valid export format

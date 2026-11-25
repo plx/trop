@@ -99,6 +99,21 @@ pub proof fn lemma_ascii_upper_seq_eq_iff(a: Seq<u8>, b: Seq<u8>)
     }
 }
 
+/// `eq_ignore_ascii_case` is an equivalence relation (reflexive, symmetric,
+/// transitive): it is equality of the folded keys.
+pub proof fn lemma_eq_ignore_ascii_case_equivalence(a: Seq<u8>, b: Seq<u8>, c: Seq<u8>)
+    ensures
+        eq_ignore_ascii_case(a, a),
+        eq_ignore_ascii_case(a, b) ==> eq_ignore_ascii_case(b, a),
+        eq_ignore_ascii_case(b, a) && eq_ignore_ascii_case(b, c) ==> eq_ignore_ascii_case(a, c),
+{
+    lemma_ascii_upper_seq_eq_iff(a, a);
+    lemma_ascii_upper_seq_eq_iff(a, b);
+    lemma_ascii_upper_seq_eq_iff(b, a);
+    lemma_ascii_upper_seq_eq_iff(b, c);
+    lemma_ascii_upper_seq_eq_iff(a, c);
+}
+
 // ---------------------------------------------------------------------------
 // ASCII case folding over chars
 // ---------------------------------------------------------------------------
@@ -465,13 +480,14 @@ pub fn ascii_uppercase(s: &str) -> (upper: String)
 }
 
 /// `u8::to_ascii_uppercase`. Total.
-fn upper_byte(b: u8) -> (u: u8)
+pub const fn upper_byte(b: u8) -> (u: u8)
     ensures
         u == ascii_upper(b),
 {
-    match b {
-        b'a'..=b'z' => b - 0x20,
-        _ => b,
+    if b'a' <= b && b <= b'z' {
+        b - 0x20
+    } else {
+        b
     }
 }
 
