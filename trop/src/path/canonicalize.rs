@@ -9,9 +9,11 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::path::component_kind;
+use crate::verified::path::{deepest_existing_prefix, CompKind};
 
 /// Attempt to canonicalize a path by following symlinks.
 ///
@@ -167,40 +169,31 @@ pub fn canonicalize_existing(path: &Path) -> Result<(PathBuf, Option<PathBuf>)> 
         return Ok((canonical, None));
     }
 
-    // Walk up the path to find the existing portion
-    let mut current = path.to_path_buf();
-    let mut non_existent = Vec::new();
-
-    loop {
-        if current.exists() {
-            // Found an existing ancestor - canonicalize it
-            let canonical = canonicalize(&current)?;
-
-            // Rebuild the non-existent portion
-            let remainder = if non_existent.is_empty() {
-                None
-            } else {
-                non_existent.reverse();
-                Some(non_existent.into_iter().collect())
-            };
-
-            return Ok((canonical, remainder));
+    let components: Vec<Component<'_>> = path.components().collect();
+    let kinds: Vec<CompKind> = components.iter().map(|c| component_kind(*c)).collect();
+    // The prefix of the first `k` components. The whole path is used as
+    // written (a trailing separator matters to the filesystem).
+    let prefix = |k: usize| -> PathBuf {
+        if k == components.len() {
+            path.to_path_buf()
+        } else {
+            components[..k].iter().collect()
         }
+    };
 
-        // Save this component and move to parent
-        match current.file_name() {
-            Some(name) => {
-                non_existent.push(name.to_os_string());
-                current.pop();
-            }
-            None => {
-                // Reached root without finding existing path
-                return Err(Error::InvalidPath {
-                    path: path.to_path_buf(),
-                    reason: "Cannot find any existing portion of path".to_string(),
-                });
-            }
+    // The verified search walks up from the whole path, one named component
+    // at a time, and stops at the deepest prefix observed to exist. Every
+    // component after that prefix is a named component.
+    match deepest_existing_prefix(&kinds, &|k| prefix(k).exists()) {
+        Ok(k) => {
+            let canonical = canonicalize(&prefix(k))?;
+            let remainder = (k < components.len()).then(|| components[k..].iter().collect());
+            Ok((canonical, remainder))
         }
+        Err(_) => Err(Error::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "Cannot find any existing portion of path".to_string(),
+        }),
     }
 }
 
