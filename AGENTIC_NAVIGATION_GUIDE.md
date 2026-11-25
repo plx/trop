@@ -56,7 +56,13 @@
     - reservation.rs # Reservation and ReservationKey types
     - verified/ # Verus-verified kernels (specs + proofs); production code delegates to these
       - mod.rs # Kernel list and the rules for code in this tree
+      - allocation.rs # Port availability classification, forward scan, single-port allocation, exhaustion blockers (oracle-generic)
+      - exclusions.rs # Exclusion validation, ExclusionSet (canonical run list), minimal/unique compaction, exclusion-text parsing
+      - group.rs # Group request validation, offset-pattern search, fresh plans, stored-group matching/compatibility, reconciliation, scan bounds
+      - occupancy.rs # Occupancy policy: effective skip flags, probe matrix (set/order/count), fail-closed probe fold, ascending range scan, owner status
       - port.rs # Port validity/arithmetic, PortSpan (range invariant), PortCursor (iteration)
+      - port_bounds.rs # PortConfig bounds: allocator resolution (min + max | max_offset) and strict validator rules
+      - sticky.rs # Sticky project/task rules for group refresh and forced replacement (shared can_change_field)
   - tests/ # Integration tests
     - common/ # Shared test utilities
       - mod.rs # Common test helpers

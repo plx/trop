@@ -53,6 +53,14 @@ verify *args:
     cd trop-verification
     PATH="$verus_bin:$PATH" cargo verus verify "$@"
 
+# Verify one kernel module while iterating, e.g. `just verify-module exclusions`
+verify-module module *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    verus_bin="$(./scripts/install-verus.sh --print-path)"
+    cd trop-verification
+    PATH="$verus_bin:$PATH" cargo verus focus -- --verify-module "verified::{{module}}" "$@"
+
 # Build the project in debug mode
 build:
     cargo build
