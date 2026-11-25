@@ -874,6 +874,10 @@ proof fn lemma_word_end_shift(s: Seq<u8>, i: int, w: u8, k: int)
     }
 }
 
+// Isolated with extra headroom: this lemma needs more than half the default
+// resource limit even in a fresh solver, so it would be flaky at the margin.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(20)]
 proof fn lemma_quote_shift(s: Seq<u8>, i: int, w: u8, k: int, d: u8)
     requires
         0 <= i <= k <= s.len(),
@@ -923,6 +927,7 @@ proof fn lemma_block_comment_end_shift(s: Seq<u8>, i: int, w: u8, k: int)
     }
 }
 
+#[verifier::spinoff_prover]
 proof fn lemma_scan_token_shift(s: Seq<u8>, i: int, w: u8, k: int, allowed: Option<Seq<u8>>)
     requires
         0 <= i <= k < s.len(),

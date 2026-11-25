@@ -1069,6 +1069,7 @@ proof fn lemma_value_facts(port: u16, rest: Seq<char>, trail: nat)
 /// The facts `read_member` checks at position `i` of a text, given what
 /// follows the opening quote there: the escaped key, its closing quote, `: `,
 /// the digits, `trail` whitespace, and a structural character.
+#[verifier::spinoff_prover]
 proof fn lemma_member_facts_at(
     t: Seq<char>,
     i: int,
@@ -1108,12 +1109,16 @@ proof fn lemma_member_facts_at(
     let colon: int = i + 2 + esc.len();
     lemma_json_string_round_trip(key, tail);
     let u = t.subrange(colon, t.len() as int);
+    assert(u == tail);
     lemma_value_facts(port, rest, trail);
     assert(t[colon] == u[0]);
     lemma_ws_run_shift(t, colon, 0);
     lemma_ws_run_shift(t, colon, 1);
     lemma_read_uint_shift(t, colon, 2);
-    lemma_ws_run_shift(t, colon, 2int + digits.len());
+    let k: int = 2int + digits.len();
+    lemma_ws_run_shift(t, colon, k);
+    assert(ws_run(t, colon + k) == ws_run(tail, k));
+    assert(colon + 2 + digits.len() == colon + k);
 }
 
 /// The facts `read_member` checks, for a member line after any prefix,

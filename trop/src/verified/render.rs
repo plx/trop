@@ -1611,6 +1611,7 @@ proof fn lemma_hex_char(d: u8)
 }
 
 /// Every escape sequence decodes to its char, whatever follows it.
+#[verifier::spinoff_prover]
 proof fn lemma_unescape_unit(c: char, rest: Seq<char>)
     ensures
         unescape_body(escape_char(c) + rest) == seq![c] + unescape_body(rest),
@@ -1997,6 +1998,7 @@ pub open spec fn strictly_sorted_views(s: Seq<(Seq<u8>, Option<Seq<u8>>, u16)>) 
 
 /// Two sequences with strictly increasing tags and the same elements are
 /// equal.
+#[verifier::spinoff_prover]
 pub proof fn lemma_strictly_sorted_views_unique(
     s1: Seq<(Seq<u8>, Option<Seq<u8>>, u16)>,
     s2: Seq<(Seq<u8>, Option<Seq<u8>>, u16)>,

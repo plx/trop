@@ -1026,6 +1026,7 @@ proof fn lemma_two_digits_lt(u: int, v: int)
 }
 
 /// Four digits are the two digits of the hundreds, then of the rest.
+#[verifier::spinoff_prover]
 proof fn lemma_four_digits_split(v: int)
     requires
         0 <= v <= 9999,
