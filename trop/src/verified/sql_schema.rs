@@ -623,6 +623,172 @@ pub proof fn lemma_encode_tokens_push(ts: Seq<Token>, t: Token)
 }
 
 // ---------------------------------------------------------------------------
+// Coverage: the tokens are the input, less the whitespace between them
+// ---------------------------------------------------------------------------
+
+/// The spans `(start, end)` of the tokens of `s` from position `i` on, in
+/// the order `lex` produces the tokens.
+pub open spec fn lex_spans(s: Seq<u8>, i: int, allowed: Option<Seq<u8>>) -> Seq<(int, int)>
+    decreases s.len() - i,
+    via lex_spans_decreases
+{
+    if i < 0 || i >= s.len() {
+        Seq::empty()
+    } else if is_sql_space(s[i]) {
+        lex_spans(s, i + 1, allowed)
+    } else {
+        seq![(i, scan_token(s, i, allowed).1)] + lex_spans(s, scan_token(s, i, allowed).1, allowed)
+    }
+}
+
+#[via_fn]
+proof fn lex_spans_decreases(s: Seq<u8>, i: int, allowed: Option<Seq<u8>>) {
+    if 0 <= i < s.len() && !is_sql_space(s[i]) {
+        lemma_scan_token_bounds(s, i, allowed);
+    }
+}
+
+/// A token's value is determined by its raw text: a bare word is its raw
+/// text (word bytes only) in ASCII lowercase; the allowed quoted identifier
+/// is the allowed name, quoted with doubled `"`, in ASCII lowercase; every
+/// other token is exactly its raw text, which does not start with a word
+/// byte.
+pub open spec fn token_text(t: Token, raw: Seq<u8>, allowed: Option<Seq<u8>>) -> bool {
+    if t.0 == KIND_WORD {
+        ||| (raw.len() >= 1 && (forall|k: int| 0 <= k < raw.len() ==> is_word_byte(#[trigger] raw[k]))
+            && t.1 == lower_seq(raw))
+        ||| (allowed matches Some(a) && raw == seq![b'"'] + double_delims(a, b'"') + seq![b'"']
+            && t.1 == lower_seq(a))
+    } else {
+        raw.len() >= 1 && !is_word_byte(raw[0]) && t.1 == raw
+    }
+}
+
+/// Position `p` lies in none of the spans.
+pub open spec fn uncovered(spans: Seq<(int, int)>, p: int) -> bool {
+    forall|k: int| 0 <= k < spans.len() ==> !((#[trigger] spans[k]).0 <= p < spans[k].1)
+}
+
+/// The spans tile `s[i..]`: in order, non-empty, within the input, and
+/// every byte outside them is ASCII whitespace.
+pub open spec fn tiles(s: Seq<u8>, i: int, spans: Seq<(int, int)>) -> bool {
+    &&& forall|k: int| 0 <= k < spans.len() ==> i <= (#[trigger] spans[k]).0 < spans[k].1 <= s.len()
+    &&& forall|k: int| 0 <= k < spans.len() - 1 ==> (#[trigger] spans[k]).1 <= spans[k + 1].0
+    &&& forall|p: int|
+        i <= p < s.len() && uncovered(spans, p)
+            ==> is_sql_space(#[trigger] s[p])
+}
+
+/// One token's value is determined by its raw text (see `token_text`).
+pub proof fn lemma_scan_token_text(s: Seq<u8>, i: int, allowed: Option<Seq<u8>>)
+    requires
+        0 <= i < s.len(),
+    ensures
+        token_text(scan_token(s, i, allowed).0, s.subrange(i, scan_token(s, i, allowed).1), allowed),
+{
+    lemma_scan_token_bounds(s, i, allowed);
+    let (t, e) = scan_token(s, i, allowed);
+    let raw = s.subrange(i, e);
+    let c = s[i];
+    if is_word_byte(c) {
+        lemma_word_end_bounds(s, i);
+        assert forall|k: int| 0 <= k < raw.len() implies is_word_byte(#[trigger] raw[k]) by {
+            assert(raw[k] == s[i + k]);
+        }
+    } else if c == b'"' {
+        lemma_quote_scan_bounds(s, i + 1, c);
+        if quote_scan(s, i + 1, c).1 && allowed == Some(quote_body(s, i + 1, c)) {
+            lemma_closed_quote_round_trip(s, i + 1, c);
+            let body = quote_body(s, i + 1, c);
+            let tail = s.subrange(i + 1, e);
+            assert(tail == double_delims(body, c) + seq![c]);
+            assert(raw =~= seq![c] + tail);
+            assert(seq![c] + tail =~= seq![c] + double_delims(body, c) + seq![c]);
+        }
+    }
+}
+
+/// The tokens of `s[i..]` are the input less the whitespace between them:
+/// their spans tile it, and each token's value is determined by its raw
+/// text (`token_text`). So two texts with equal token streams differ only in
+/// whitespace between tokens, the ASCII case of bare words, and the quoting
+/// of the allowed identifier.
+pub proof fn lemma_tokens_cover_input(s: Seq<u8>, i: int, allowed: Option<Seq<u8>>)
+    requires
+        0 <= i <= s.len(),
+    ensures
+        lex_spans(s, i, allowed).len() == lex(s, i, allowed).len(),
+        tiles(s, i, lex_spans(s, i, allowed)),
+        forall|k: int|
+            0 <= k < lex(s, i, allowed).len() ==> token_text(
+                #[trigger] lex(s, i, allowed)[k],
+                s.subrange(lex_spans(s, i, allowed)[k].0, lex_spans(s, i, allowed)[k].1),
+                allowed,
+            ),
+    decreases s.len() - i,
+{
+    let spans = lex_spans(s, i, allowed);
+    let ts = lex(s, i, allowed);
+    if i == s.len() {
+        assert(spans =~= Seq::<(int, int)>::empty());
+    } else if is_sql_space(s[i]) {
+        lemma_tokens_cover_input(s, i + 1, allowed);
+        let rest = lex_spans(s, i + 1, allowed);
+        assert(spans == rest);
+        assert forall|p: int|
+            i <= p < s.len() && uncovered(spans, p)
+                implies is_sql_space(#[trigger] s[p]) by {
+            if p > i {
+                assert(i + 1 <= p);
+            }
+        }
+    } else {
+        lemma_scan_token_bounds(s, i, allowed);
+        let (t, e) = scan_token(s, i, allowed);
+        lemma_tokens_cover_input(s, e, allowed);
+        lemma_scan_token_text(s, i, allowed);
+        let rest = lex_spans(s, e, allowed);
+        let rest_ts = lex(s, e, allowed);
+        assert(spans == seq![(i, e)] + rest);
+        assert(ts == seq![t] + rest_ts);
+        assert forall|k: int| 0 <= k < spans.len() implies i <= (#[trigger] spans[k]).0 < spans[k].1
+            <= s.len() by {
+            if k > 0 {
+                assert(spans[k] == rest[k - 1]);
+            }
+        }
+        assert forall|k: int| 0 <= k < spans.len() - 1 implies (#[trigger] spans[k]).1 <= spans[k
+            + 1].0 by {
+            if k > 0 {
+                assert(spans[k] == rest[k - 1]);
+                assert(spans[k + 1] == rest[k]);
+            } else {
+                assert(spans[1] == rest[0]);
+            }
+        }
+        assert forall|p: int|
+            i <= p < s.len() && uncovered(spans, p)
+                implies is_sql_space(#[trigger] s[p]) by {
+            assert(!(spans[0].0 <= p < spans[0].1));
+            assert forall|k: int| 0 <= k < rest.len() implies !((#[trigger] rest[k]).0 <= p < rest[k].1) by {
+                assert(spans[k + 1] == rest[k]);
+            }
+            assert(uncovered(rest, p));
+        }
+        assert forall|k: int| 0 <= k < ts.len() implies token_text(
+            #[trigger] ts[k],
+            s.subrange(spans[k].0, spans[k].1),
+            allowed,
+        ) by {
+            if k > 0 {
+                assert(ts[k] == rest_ts[k - 1]);
+                assert(spans[k] == rest[k - 1]);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Token runs
 // ---------------------------------------------------------------------------
 

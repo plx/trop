@@ -20,8 +20,9 @@
 //!   (`pauses_justified`, `only_contention_retried`).
 //! - **Bounded total wait.** The pauses add up to at most `timeout`
 //!   (`total_pause`), and the loop terminates for every clock oracle: the
-//!   elapsed time the kernel works with is the clock reading, never less than
-//!   the time already paused (`clock_monotone`).
+//!   elapsed time the kernel works with is the clock reading, raised only if
+//!   needed to the previous elapsed time plus the pauses since
+//!   (`clock_consistent`), so every retry advances it by at least 1 ns.
 //! - **The outcome is exact** (`outcome_matches`): `Enabled` only when the
 //!   final attempt reported an accepted journal mode and the restore
 //!   succeeded; `NotWal(m)` when it reported any other mode `m`;
@@ -33,6 +34,11 @@
 //! - `mode_accepted`: the reported mode is `wal` (ASCII case-insensitive), or
 //!   `memory` for an in-memory database, which SQLite can never put in WAL
 //!   mode and no other connection can share.
+//!
+//! Every oracle call is recorded in the trace right where it is made (one
+//! call site per effect, checked by reading `attempt_until_settled` and
+//! `enable_wal`); each recorded answer is one the oracle gave
+//! (`answers_from`).
 //!
 //! Trusted: SQLite's busy/locked classification, `Instant::elapsed` and
 //! `thread::sleep` in the glue. With a monotonic clock and a sleep that
