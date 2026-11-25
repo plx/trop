@@ -9,9 +9,10 @@
 //! This module only resolves names through `crate::identifier` and maps
 //! kernel errors onto trop's errors.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use crate::identifier::EnvironmentVariableName;
+use crate::verified::json;
 use crate::verified::render::{self, AssignmentStyle, GroupEntry, GroupError};
 use crate::{Error, Port, Result};
 
@@ -126,21 +127,21 @@ impl OutputFormatter for ExportFormatter {
 }
 
 /// Formatter for JSON output.
+///
+/// The object is rendered by the verified kernel `verified::json`: tags in
+/// byte order (so identical mappings are byte-stable across processes with
+/// independently randomized `HashMap` iteration order), each tag a JSON
+/// string token that decodes back to exactly the tag, each port its decimal
+/// text, in `serde_json`'s pretty layout. Formatting never fails.
 pub struct JsonFormatter;
 
 impl OutputFormatter for JsonFormatter {
     fn format(&self, allocations: &HashMap<String, Port>) -> Result<String> {
-        // Sort service tags so identical mappings are byte-stable across
-        // processes with independently randomized HashMap iteration order.
-        let json_map: BTreeMap<String, u16> = allocations
+        let entries: Vec<(&str, u16)> = allocations
             .iter()
-            .map(|(k, v)| (k.clone(), v.value()))
+            .map(|(tag, port)| (tag.as_str(), port.value()))
             .collect();
-
-        serde_json::to_string_pretty(&json_map).map_err(|e| Error::Validation {
-            field: "json_output".to_string(),
-            message: format!("failed to serialize to JSON: {e}"),
-        })
+        Ok(json::render_port_map_pretty(&entries))
     }
 }
 

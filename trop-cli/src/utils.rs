@@ -30,11 +30,10 @@ pub struct GlobalOptions {
     pub disable_autoinit: bool,
 }
 
-/// Format a timestamp for display.
+/// Format a timestamp for display: UTC `YYYY-MM-DD HH:MM:SS` (see
+/// [`trop::output::format_utc_timestamp`]).
 pub fn format_timestamp(ts: std::time::SystemTime) -> String {
-    use chrono::{DateTime, Utc};
-    let dt: DateTime<Utc> = ts.into();
-    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    trop::output::format_utc_timestamp(ts)
 }
 
 /// Shorten a path for display.

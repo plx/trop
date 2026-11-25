@@ -12,8 +12,9 @@ mod formatters;
 mod shell;
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::verified::render;
+use crate::verified::{civil_time, render};
 use crate::{Port, Result};
 
 pub use formatters::{DotenvFormatter, ExportFormatter, HumanFormatter, JsonFormatter};
@@ -78,6 +79,37 @@ pub fn display_field(text: &str) -> String {
 #[must_use]
 pub fn tab_row(fields: &[&str]) -> String {
     render::tab_row(fields)
+}
+
+/// Formats a point in time as UTC `YYYY-MM-DD HH:MM:SS` (chrono's
+/// `%Y-%m-%d %H:%M:%S`), truncated to the second.
+///
+/// Dates are proleptic Gregorian with astronomical years. A year outside
+/// `0..=9999` is written with a sign, as chrono writes it (`+10000-01-01
+/// 00:00:00`, `-0001-12-31 23:59:59`). Every `SystemTime` is accepted, including
+/// times before the epoch and beyond chrono's range. The conversion and the
+/// text are decided by the formally verified kernel `verified::civil_time`
+/// (see `docs/verification.md`).
+///
+/// # Examples
+///
+/// ```
+/// use std::time::{Duration, UNIX_EPOCH};
+/// use trop::output::format_utc_timestamp;
+///
+/// assert_eq!(format_utc_timestamp(UNIX_EPOCH), "1970-01-01 00:00:00");
+/// let leap_day = UNIX_EPOCH + Duration::from_secs(951_782_400);
+/// assert_eq!(format_utc_timestamp(leap_day), "2000-02-29 00:00:00");
+/// let before = UNIX_EPOCH - Duration::from_millis(1);
+/// assert_eq!(format_utc_timestamp(before), "1969-12-31 23:59:59");
+/// ```
+#[must_use]
+pub fn format_utc_timestamp(time: SystemTime) -> String {
+    let (before_epoch, offset) = match time.duration_since(UNIX_EPOCH) {
+        Ok(after) => (false, after),
+        Err(before) => (true, before.duration()),
+    };
+    civil_time::format_unix_instant(before_epoch, offset.as_secs(), offset.subsec_nanos())
 }
 
 /// Trait for formatting port allocations into different output formats.
