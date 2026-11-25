@@ -105,10 +105,13 @@ impl PathResolver {
     /// This limits how many symlinks will be followed during canonicalization
     /// to prevent infinite loops: at most `depth` symbolic links are
     /// followed at the canonicalized path itself (a chain of exactly `depth`
-    /// links resolves; with `0` only a path that is not a link does), and a
-    /// path that links back to itself is reported as a symlink loop. Links in
-    /// parent directories are resolved by the operating system, which applies
-    /// its own limit. The default is 40.
+    /// links resolves; with `0` only a path that is not a link does). A chain
+    /// that reaches a path equal (component by component) to one it already
+    /// visited is reported as a symlink loop naming that path; a loop that
+    /// never repeats a path exactly (for example one spelled through `..`)
+    /// is reported as too many symlinks. Links in parent directories are
+    /// resolved by the operating system, which applies its own limit. The
+    /// default is 40.
     ///
     /// # Examples
     ///

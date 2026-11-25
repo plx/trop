@@ -60,13 +60,20 @@ pub fn canonicalize(path: &Path) -> Result<PathBuf> {
 /// not a link. Symbolic links in parent directories are resolved by the
 /// operating system, which applies its own limit.
 ///
-/// If the chain ends at a path that does not exist, that path is returned
-/// as-is.
+/// If the chain ends at a path that does not exist, the deepest existing
+/// ancestor of that path is canonicalized by the operating system (so `..`
+/// and links in it are resolved physically, as the filesystem would) and the
+/// missing components are appended (see [`canonicalize_existing`]). If no
+/// ancestor can be canonicalized, the path is returned as reached.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - A symlink loop is detected (`SymlinkLoop`)
+/// - A symlink loop is detected (`SymlinkLoop`): a link chain at `path`
+///   reaches a path equal (component by component) to one it already
+///   visited, within the first `max_depth` links. The error names the
+///   repeated path. A loop that never repeats a path exactly (for example
+///   one spelled differently through `..`) exceeds the depth instead.
 /// - The maximum symlink depth is exceeded
 /// - An I/O error occurs
 ///
@@ -87,18 +94,34 @@ pub fn canonicalize_safe(path: &Path, max_depth: usize) -> Result<PathBuf> {
             ErrorKind::PermissionDenied => Error::PermissionDenied { path: current },
             _ => Error::Io(e),
         }),
-        Followed::Missing(current) => Ok(current),
+        Followed::Missing(current) => Ok(resolve_missing(current)),
         Followed::Loop(state) => Err(Error::SymlinkLoop { path: state }),
         Followed::TooDeep => Err(too_many_symlinks(path, max_depth)),
         Followed::Failed(_, error) => Err(error),
     }
 }
 
+/// Where a link chain ends when its last path `current` does not exist: its
+/// deepest existing ancestor, canonicalized, with the missing components
+/// appended (they are all named components). `current` was joined
+/// lexically, so a `..` in it must be resolved by the filesystem, not
+/// dropped with the component before it: that component may be a link. If
+/// no ancestor can be canonicalized, `current` is returned unchanged.
+fn resolve_missing(current: PathBuf) -> PathBuf {
+    match canonicalize_existing(&current) {
+        Ok((canonical, Some(missing))) => canonical.join(missing),
+        Ok((canonical, None)) => canonical,
+        Err(_) => current,
+    }
+}
+
 /// Canonicalizes an existing path like [`canonicalize`], but follows at most
 /// `max_depth` symbolic links at the path itself, and reports a symlink loop
-/// there as `SymlinkLoop` (see [`canonicalize_safe`]). Errors name `path`,
-/// exactly as [`canonicalize`]'s do; a chain ending at a path that does not
-/// exist is `PathNotFound`.
+/// there as `SymlinkLoop` (see [`canonicalize_safe`]). `PathNotFound`,
+/// `PermissionDenied` and `InvalidPath` name `path`, as [`canonicalize`]'s
+/// errors do (a chain ending at a path that does not exist is
+/// `PathNotFound`); `SymlinkLoop` names the repeated path, which may be a
+/// link the chain reached rather than `path` itself.
 pub(crate) fn canonicalize_bounded(path: &Path, max_depth: usize) -> Result<PathBuf> {
     let io_error = |error: std::io::Error| match error.kind() {
         ErrorKind::NotFound => Error::PathNotFound {
@@ -128,9 +151,14 @@ fn too_many_symlinks(path: &Path, max_depth: usize) -> Error {
 }
 
 /// Follows symbolic links from `path`, at most `max_depth` of them (verified
-/// kernel `follow_links`: `TooDeep` only when exactly `max_depth` links were
-/// followed and the path reached is a link again; `Loop` exactly when a path
-/// repeats). I/O errors other than "not found" are mapped by `io_error`.
+/// kernel `follow_links`). `TooDeep` only when exactly `max_depth` links were
+/// followed and the path reached is a link again. `Loop` when a path reached
+/// within the first `max_depth` links equals (as a `PathBuf`, component by
+/// component) one visited before; a repeat that would only be reached by the
+/// link that is not followed is reported as `TooDeep`, and a loop spelled
+/// differently (for example through `..`) is never an exact repeat, so it
+/// also ends as `TooDeep`. I/O errors other than "not found" are mapped by
+/// `io_error`.
 fn follow_symlinks(
     path: &Path,
     max_depth: usize,
@@ -486,13 +514,87 @@ mod tests {
             canonicalize_safe(&dir.path().join("links").join("rel"), 1).unwrap(),
             fs::canonicalize(dir.path().join("real")).unwrap()
         );
-        // A dangling relative link ends at its (missing) target, returned as
-        // joined to the link's directory.
+        // A dangling relative link ends at its (missing) target, in the
+        // link's (canonical) directory.
         symlink("missing", dir.path().join("links").join("dangling")).unwrap();
         assert_eq!(
             canonicalize_safe(&dir.path().join("links").join("dangling"), 1).unwrap(),
-            dir.path().join("links").join("missing")
+            fs::canonicalize(dir.path().join("links"))
+                .unwrap()
+                .join("missing")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_safe_resolves_a_dangling_target_physically() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        // `symdir -> x/realdir`, and inside it `rm -> ../missing`. The joined
+        // target `symdir/../missing` names `x/missing` physically, although
+        // it reads lexically as `missing` next to `symdir`.
+        fs::create_dir_all(base.join("x").join("realdir")).unwrap();
+        symlink(base.join("x").join("realdir"), base.join("symdir")).unwrap();
+        symlink("../missing", base.join("x").join("realdir").join("rm")).unwrap();
+        // Before, the joined path was returned unchanged.
+        assert_eq!(
+            canonicalize_safe(&base.join("symdir").join("rm"), 2).unwrap(),
+            base.join("x").join("missing")
+        );
+        // `up -> ../nope`: the parent directory is resolved, not kept as `..`.
+        symlink("../nope", base.join("up")).unwrap();
+        assert_eq!(
+            canonicalize_safe(&base.join("up"), 1).unwrap(),
+            base.parent().unwrap().join("nope")
+        );
+        // A path that is missing from the start is unchanged when it is
+        // already canonical.
+        assert_eq!(
+            canonicalize_safe(&base.join("absent").join("deeper"), 0).unwrap(),
+            base.join("absent").join("deeper")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_safe_reports_a_loop_by_exact_repeat_within_the_depth() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let (a, b, c) = (base.join("a"), base.join("b"), base.join("c"));
+        symlink(&b, &a).unwrap();
+        symlink(&a, &b).unwrap();
+        symlink(&a, &c).unwrap();
+        // `a -> b -> a`: the repeat of `a` is reached by the second link.
+        assert!(matches!(
+            canonicalize_safe(&a, 2),
+            Err(Error::SymlinkLoop { ref path }) if *path == a
+        ));
+        // With one link allowed, the repeat would need the link that is not
+        // followed: too deep.
+        assert!(matches!(
+            canonicalize_safe(&a, 1),
+            Err(Error::InvalidPath { .. })
+        ));
+        // `c -> a -> b -> a`: the error names the repeated path, not `c`.
+        assert!(matches!(
+            canonicalize_bounded(&c, 40),
+            Err(Error::SymlinkLoop { ref path }) if *path == a
+        ));
+        // A loop through `..` never repeats a path exactly.
+        let name = base.file_name().unwrap();
+        symlink(
+            Path::new("..").join(name).join("dotloop"),
+            base.join("dotloop"),
+        )
+        .unwrap();
+        assert!(matches!(
+            canonicalize_safe(&base.join("dotloop"), 5),
+            Err(Error::InvalidPath { ref reason, .. }) if reason == "Too many symlinks (max 5)"
+        ));
     }
 
     #[cfg(unix)]

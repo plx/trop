@@ -43,9 +43,17 @@
 //!   (`lemma_tokens_cover_input`). So two texts normalize equally only if
 //!   they differ just in whitespace between tokens, the ASCII case of bare
 //!   words, and the quoting of the allowed identifier;
-//! - conversely, inserting ASCII whitespace at any position the tokenizer
-//!   reaches (a token boundary, or whitespace between tokens) leaves the
-//!   tokens unchanged (`lemma_space_between_tokens`).
+//! - conversely, inserting ASCII whitespace at any position before the end
+//!   of the input that the tokenizer reaches (a token boundary, or
+//!   whitespace between tokens) leaves the tokens unchanged
+//!   (`lemma_space_between_tokens`). At the very end it need not: an
+//!   unterminated quote, bracket or comment runs to the end of the input and
+//!   would absorb the new byte;
+//! - and changing the ASCII case of a byte inside a bare word (replacing it
+//!   by a byte with the same ASCII lowercase) leaves the tokens, the
+//!   positions the tokenizer reaches and every word's extent unchanged
+//!   (`lemma_word_case_irrelevant`), so any number of such changes does too.
+//!   Inside quoted tokens and comments the case is part of the raw text.
 //!
 //! Byte-level tokenizing agrees with the historical `char`-level tokenizer on
 //! every `&str`: every delimiter and operator is ASCII, every byte of a
@@ -1137,10 +1145,13 @@ proof fn lemma_visits_bound(s: Seq<u8>, j: int, i: int, allowed: Option<Seq<u8>>
     }
 }
 
-/// Inserting an ASCII whitespace byte at a position the lexer reaches (a
-/// token boundary, or inside whitespace between tokens) does not change the
-/// tokens. With `lemma_tokens_cover_input`, this makes the exact-definition
-/// check precisely "the same tokens, however they are spaced".
+/// Inserting an ASCII whitespace byte at a position before the end of the
+/// input that the lexer reaches (a token boundary, or inside whitespace
+/// between tokens) does not change the tokens. With
+/// `lemma_tokens_cover_input`, this makes the exact-definition check
+/// precisely "the same tokens, however they are spaced". The end of the
+/// input is excluded: there an unterminated quote, bracket or comment would
+/// absorb the new byte (`"'a"` and `"'a "` are different literals).
 pub proof fn lemma_space_between_tokens(s: Seq<u8>, i: int, w: u8, allowed: Option<Seq<u8>>)
     requires
         0 <= i < s.len(),
@@ -1150,6 +1161,243 @@ pub proof fn lemma_space_between_tokens(s: Seq<u8>, i: int, w: u8, allowed: Opti
         tokenize(insert_byte(s, i, w), allowed) == tokenize(s, allowed),
 {
     lemma_lex_local(s, i, w, 0, allowed);
+}
+
+// ---------------------------------------------------------------------------
+// Robustness: the ASCII case of a bare word does not matter
+// ---------------------------------------------------------------------------
+
+/// Replacing the byte at `p` (a word byte) by `b` keeps every byte's class:
+/// `b` is a word byte with the same ASCII lowercase, such as the same
+/// letter in the other case.
+pub open spec fn recases(s: Seq<u8>, p: int, b: u8) -> bool {
+    &&& 0 <= p < s.len()
+    &&& is_word_byte(s[p])
+    &&& ascii_lower(b) == ascii_lower(s[p])
+}
+
+// Every scanner compares bytes only with delimiters and operator bytes,
+// which are never word bytes, so a recased byte changes no scanner's end;
+// only a token's raw text can contain it.
+
+proof fn lemma_recase_word_end(s: Seq<u8>, p: int, b: u8, k: int)
+    requires
+        recases(s, p, b),
+        0 <= k <= s.len(),
+    ensures
+        word_end(s.update(p, b), k) == word_end(s, k),
+    decreases s.len() - k,
+{
+    if k < s.len() && is_word_byte(s[k]) {
+        lemma_recase_word_end(s, p, b, k + 1);
+    }
+}
+
+proof fn lemma_recase_quote(s: Seq<u8>, p: int, b: u8, k: int, d: u8)
+    requires
+        recases(s, p, b),
+        0 <= k <= s.len(),
+        !is_word_byte(d),
+    ensures
+        quote_scan(s.update(p, b), k, d) == quote_scan(s, k, d),
+        p < k || quote_scan(s, k, d).0 <= p ==> quote_body(s.update(p, b), k, d) == quote_body(
+            s,
+            k,
+            d,
+        ),
+    decreases s.len() - k,
+{
+    lemma_quote_scan_bounds(s, k, d);
+    if k < s.len() {
+        if s[k] == d {
+            if k + 1 < s.len() && s[k + 1] == d {
+                lemma_recase_quote(s, p, b, k + 2, d);
+            }
+        } else {
+            lemma_recase_quote(s, p, b, k + 1, d);
+        }
+    }
+}
+
+proof fn lemma_recase_through_byte(s: Seq<u8>, p: int, b: u8, k: int, c: u8)
+    requires
+        recases(s, p, b),
+        0 <= k <= s.len(),
+        !is_word_byte(c),
+    ensures
+        through_byte(s.update(p, b), k, c) == through_byte(s, k, c),
+    decreases s.len() - k,
+{
+    if k < s.len() && s[k] != c {
+        lemma_recase_through_byte(s, p, b, k + 1, c);
+    }
+}
+
+proof fn lemma_recase_block_comment_end(s: Seq<u8>, p: int, b: u8, k: int)
+    requires
+        recases(s, p, b),
+        0 <= k <= s.len(),
+    ensures
+        block_comment_end(s.update(p, b), k) == block_comment_end(s, k),
+    decreases s.len() - k,
+{
+    if k < s.len() && !(s[k] == b'*' && k + 1 < s.len() && s[k + 1] == b'/') {
+        lemma_recase_block_comment_end(s, p, b, k + 1);
+    }
+}
+
+/// A recased byte never moves a token's end, and changes no token that
+/// does not contain it, nor a bare word that does.
+proof fn lemma_recase_scan_token(s: Seq<u8>, p: int, b: u8, i: int, allowed: Option<Seq<u8>>)
+    requires
+        recases(s, p, b),
+        0 <= i < s.len(),
+    ensures
+        scan_token(s.update(p, b), i, allowed).1 == scan_token(s, i, allowed).1,
+        p < i || scan_token(s, i, allowed).1 <= p || is_word_byte(s[i]) ==> scan_token(
+            s.update(p, b),
+            i,
+            allowed,
+        ).0 == scan_token(s, i, allowed).0,
+{
+    let t = s.update(p, b);
+    lemma_scan_token_bounds(s, i, allowed);
+    let e = scan_token(s, i, allowed).1;
+    let c = s[i];
+    assert(is_word_byte(t[i]) == is_word_byte(c));
+    if is_word_byte(c) {
+        lemma_recase_word_end(s, p, b, i);
+        assert(lower_seq(t.subrange(i, e)) =~= lower_seq(s.subrange(i, e)));
+    } else {
+        assert(t[i] == c);
+        if c == b'"' || c == b'\'' || c == b'`' {
+            lemma_recase_quote(s, p, b, i + 1, c);
+        } else if c == b'[' {
+            lemma_recase_through_byte(s, p, b, i + 1, b']');
+        } else if c == b'-' && i + 1 < s.len() && s[i + 1] == b'-' {
+            lemma_recase_through_byte(s, p, b, i + 2, b'\n');
+        } else if c == b'/' && i + 1 < s.len() && s[i + 1] == b'*' {
+            lemma_recase_block_comment_end(s, p, b, i + 2);
+        }
+        if p < i || e <= p {
+            assert(t.subrange(i, e) =~= s.subrange(i, e));
+        }
+    }
+}
+
+/// After a recased byte, the lexer reads the same tokens.
+proof fn lemma_recase_lex_after(s: Seq<u8>, p: int, b: u8, k: int, allowed: Option<Seq<u8>>)
+    requires
+        recases(s, p, b),
+        p < k,
+    ensures
+        lex(s.update(p, b), k, allowed) == lex(s, k, allowed),
+    decreases s.len() - k,
+{
+    if 0 <= k < s.len() {
+        if is_sql_space(s[k]) {
+            lemma_recase_lex_after(s, p, b, k + 1, allowed);
+        } else {
+            lemma_scan_token_bounds(s, k, allowed);
+            lemma_recase_scan_token(s, p, b, k, allowed);
+            lemma_recase_lex_after(s, p, b, scan_token(s, k, allowed).1, allowed);
+        }
+    }
+}
+
+/// A recased byte does not change which positions the lexer reaches.
+pub proof fn lemma_recase_visits(
+    s: Seq<u8>,
+    p: int,
+    b: u8,
+    k: int,
+    i: int,
+    allowed: Option<Seq<u8>>,
+)
+    requires
+        recases(s, p, b),
+    ensures
+        visits(s.update(p, b), k, i, allowed) == visits(s, k, i, allowed),
+    decreases s.len() - k,
+{
+    if k != i && k <= i && 0 <= k < s.len() {
+        if is_sql_space(s[k]) {
+            lemma_recase_visits(s, p, b, k + 1, i, allowed);
+        } else {
+            lemma_scan_token_bounds(s, k, allowed);
+            lemma_recase_scan_token(s, p, b, k, allowed);
+            lemma_recase_visits(s, p, b, scan_token(s, k, allowed).1, i, allowed);
+        }
+    }
+}
+
+/// From a position the lexer reaches before the bare word at `j` that
+/// contains the recased byte, the lexer reads the same tokens.
+proof fn lemma_recase_lex(s: Seq<u8>, p: int, b: u8, j: int, k: int, allowed: Option<Seq<u8>>)
+    requires
+        recases(s, p, b),
+        0 <= k <= j <= p < word_end(s, j),
+        visits(s, k, j, allowed),
+    ensures
+        lex(s.update(p, b), k, allowed) == lex(s, k, allowed),
+    decreases j - k,
+{
+    let t = s.update(p, b);
+    lemma_word_end_bounds(s, j);
+    if k == j {
+        lemma_word_end_bounds(s, j + 1);
+        assert(is_word_byte(s[j]));
+        lemma_recase_scan_token(s, p, b, j, allowed);
+        lemma_recase_lex_after(s, p, b, word_end(s, j), allowed);
+    } else if is_sql_space(s[k]) {
+        lemma_recase_lex(s, p, b, j, k + 1, allowed);
+    } else {
+        lemma_scan_token_bounds(s, k, allowed);
+        let e = scan_token(s, k, allowed).1;
+        lemma_visits_bound(s, e, j, allowed);
+        lemma_recase_scan_token(s, p, b, k, allowed);
+        lemma_recase_lex(s, p, b, j, e, allowed);
+    }
+}
+
+/// Changing the ASCII case of a byte inside a bare word does not change the
+/// tokens. Precisely: when the lexer reaches a bare word at `j` and `p` lies
+/// within it, replacing `s[p]` by any byte with the same ASCII lowercase
+/// leaves `tokenize` unchanged. The positions the lexer reaches and the
+/// extent of every bare word are unchanged too, so the lemma applies again
+/// to the result: recasing any number of letters of bare words, one at a
+/// time, leaves the tokens unchanged. (Inside a quoted token or a comment
+/// the case is kept, since there it is part of the raw text.)
+pub proof fn lemma_word_case_irrelevant(
+    s: Seq<u8>,
+    j: int,
+    p: int,
+    b: u8,
+    allowed: Option<Seq<u8>>,
+)
+    requires
+        visits(s, 0, j, allowed),
+        0 <= j <= p < word_end(s, j),
+        ascii_lower(b) == ascii_lower(s[p]),
+    ensures
+        tokenize(s.update(p, b), allowed) == tokenize(s, allowed),
+        forall|i: int| #[trigger]
+            visits(s.update(p, b), 0, i, allowed) == visits(s, 0, i, allowed),
+        forall|i: int|
+            0 <= i <= s.len() ==> #[trigger] word_end(s.update(p, b), i) == word_end(s, i),
+{
+    lemma_word_end_bounds(s, j);
+    assert(is_word_byte(s[p]));
+    assert(recases(s, p, b));
+    lemma_recase_lex(s, p, b, j, 0, allowed);
+    assert forall|i: int| #[trigger]
+        visits(s.update(p, b), 0, i, allowed) == visits(s, 0, i, allowed) by {
+        lemma_recase_visits(s, p, b, 0, i, allowed);
+    }
+    assert forall|i: int| 0 <= i <= s.len() implies #[trigger] word_end(s.update(p, b), i)
+        == word_end(s, i) by {
+        lemma_recase_word_end(s, p, b, i);
+    }
 }
 
 // ---------------------------------------------------------------------------

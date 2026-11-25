@@ -2,49 +2,61 @@
 //!
 //! `enable_wal` drives `PRAGMA journal_mode = WAL` through four oracles: the
 //! clock (nanoseconds since the start), `PRAGMA busy_timeout = <ms>`, the
-//! journal-mode attempt itself, and a pause. It returns how the attempt
-//! ended together with a ghost trace of every effect it performed, in order,
-//! with the answer each oracle gave. Proved over that trace:
+//! journal-mode attempt itself, and a pause. Every oracle call takes a
+//! *ticket* and returns the next one: the first call takes the ticket the
+//! caller passes in, and `enable_wal` hands back the ticket the last call
+//! returned. It also returns how the attempt ended and a ghost log
+//! (`WalLog`) of its calls. Proved (`wal_run`):
 //!
-//! - **The busy timeout is restored on every exit.** The last effect is always
-//!   `busy_timeout = timeout_ms`, whatever happened before
-//!   (`restored_last`).
-//! - **Every attempt runs under the remaining budget.** Each attempt is
-//!   immediately preceded by a successful `busy_timeout` of the remaining
-//!   time (`timeout - elapsed`, saturating, in whole milliseconds) at the
-//!   clock reading just before it (`attempts_guarded`).
-//! - **Retry only on contention, only while time remains.** Every pause
-//!   directly follows an attempt that reported lock contention and a clock
-//!   reading `u < timeout`, and lasts exactly `min(timeout - u, 10 ms)`,
-//!   which is at least 1 ns. Every attempt but the last reported contention
-//!   (`pauses_justified`, `only_contention_retried`).
-//! - **Bounded total wait.** The pauses add up to at most `timeout`
-//!   (`total_pause`), and the loop terminates for every clock oracle: the
-//!   elapsed time the kernel works with is the clock reading, raised only if
-//!   needed to the previous elapsed time plus the pauses since
-//!   (`clock_consistent`), so every retry advances it by at least 1 ns.
-//! - **The outcome is exact** (`outcome_matches`): `Enabled` only when the
-//!   final attempt reported an accepted journal mode and the restore
-//!   succeeded; `NotWal(m)` when it reported any other mode `m`;
-//!   `TimedOut(e)` when it reported contention `e` and the next clock reading
-//!   was at or past the timeout; `Failed(e)` for any other attempt error;
-//!   `BusyTimeoutFailed(e)` when setting the per-attempt busy timeout failed;
-//!   `RestoreFailed(e)` only when everything else succeeded. An earlier
-//!   error wins over a failed restore.
+//! - **The log is the calls, in order, with their own answers**
+//!   (`calls_chained`). Call `i` took ticket `tickets[i]`, returned
+//!   `tickets[i + 1]`, and gave the answer recorded in `events[i]`. A pause
+//!   is recorded with the length the kernel requested. The ticket type is
+//!   arbitrary, so the kernel can neither copy a ticket nor make one. Each
+//!   ticket therefore goes into exactly one call, and the calls form a single
+//!   chain from the caller's ticket to the returned one. So no answer is
+//!   replayed, no call is left out of the log, and no call happens out of
+//!   order. The glue numbers its calls (ticket `n` in, `n + 1` out), which
+//!   ties every recorded answer to one numbered call.
+//! - **The effects have exactly this shape** (`settled_run`, `wal_run`):
+//!   zero or more *retried rounds*, then one *last round*, then the restore.
+//!   - A retried round (`retried_round`): a clock reading `t`; a successful
+//!     busy timeout of the time remaining at `t` (whole milliseconds); an
+//!     attempt that reported lock contention; a clock reading `u` *before*
+//!     the timeout; a pause of `min(timeout - u, 10 ms)`, which is at least
+//!     1 ns.
+//!   - The last round (`last_round`) starts with the same clock reading and
+//!     busy timeout. Then:
+//!     - setting the busy timeout failed: `BusyTimeoutFailed(e)`;
+//!     - the attempt reported an accepted journal mode: `Enabled`, or
+//!       `RestoreFailed(e)` if the restore then failed;
+//!     - it reported any other mode `m`: `NotWal(m)`;
+//!     - it failed with an error other than contention: `Failed(e)`;
+//!     - it reported contention `e` and the next clock reading was at or
+//!       past the timeout: `TimedOut(e)`.
+//!   - The restore: the busy timeout is set back to the whole timeout, as the
+//!     last effect, on every exit.
+//!
+//!   So an attempt is retried only after contention, only while time
+//!   remains, and only after a pause; the restore is always last; and an
+//!   earlier error wins over a failed restore.
+//! - **Elapsed time** (`clock_at`, `round_floor`): the kernel works with the
+//!   clock reading, raised only if needed to the time already accounted for
+//!   (the previous elapsed time plus the pause since). Every retry therefore
+//!   advances it by at least 1 ns, and the loop terminates for every clock
+//!   oracle. The pauses add up to at most `timeout` (`total_pause`).
 //! - `mode_accepted`: the reported mode is `wal` (ASCII case-insensitive), or
 //!   `memory` for an in-memory database, which SQLite can never put in WAL
 //!   mode and no other connection can share.
-//!
-//! Every oracle call is recorded in the trace right where it is made (one
-//! call site per effect, checked by reading `attempt_until_settled` and
-//! `enable_wal`); each recorded answer is one the oracle gave
-//! (`answers_from`).
 //!
 //! Trusted: SQLite's busy/locked classification, `Instant::elapsed` and
 //! `thread::sleep` in the glue. With a monotonic clock and a sleep that
 //! lasts at least as long as requested (both `std` guarantees), the
 //! elapsed time the kernel works with equals the clock reading, so the
-//! decisions are exactly those of the historical loop.
+//! decisions are exactly those of the historical loop. The chain argument
+//! relies on the kernel being generic in the ticket type: it uses no
+//! operation that inspects a type (no `size_of`, `Any` or trait bound on the
+//! ticket), so it makes the same calls whatever ticket type the glue uses.
 //!
 //! Production glue: `enable_wal_with_retry` in
 //! `crate::database::connection`.
@@ -141,8 +153,28 @@ pub open spec fn pause_nanos(elapsed: int, timeout: int) -> int {
     }
 }
 
+/// A pause after contention before the timeout lasts at least 1 ns and at
+/// most 10 ms, and ends no later than the timeout.
+pub proof fn lemma_pause_bounds(elapsed: int, timeout: int)
+    requires
+        elapsed < timeout,
+    ensures
+        1 <= pause_nanos(elapsed, timeout) <= PAUSE_CAP_NANOS,
+        elapsed + pause_nanos(elapsed, timeout) <= timeout,
+{
+}
+
+/// The larger of two integers.
+pub open spec fn max_int(a: int, b: int) -> int {
+    if a < b {
+        b
+    } else {
+        a
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Oracle answers, outcomes, and the effect trace
+// Oracle answers, outcomes, and the log
 // ---------------------------------------------------------------------------
 
 /// What one `PRAGMA journal_mode = WAL` attempt answered.
@@ -172,14 +204,14 @@ pub enum WalOutcome<E> {
     RestoreFailed(E),
 }
 
-/// One effect `enable_wal` performed, with the answer it got.
+/// One call `enable_wal` made, with the answer it got.
 // A ghost type: only specifications use it. Ordinary builds erase the
 // specifications but keep the declaration, which would otherwise trip the
 // `dead_code` lint.
 #[allow(dead_code)]
 pub ghost enum WalEvent<E> {
     /// The clock answered `reading`; the kernel works with the elapsed time
-    /// `elapsed`: the reading, but never less than the time already paused.
+    /// `elapsed` (see `clock_at`).
     Clock { reading: u128, elapsed: int },
     /// `PRAGMA busy_timeout = millis` answered `result`.
     SetBusy { millis: int, result: Result<(), E> },
@@ -189,111 +221,201 @@ pub ghost enum WalEvent<E> {
     Pause { nanos: int },
 }
 
-/// The answer recorded in `ev` is one the oracle gave for that call (a
-/// clock event also records an elapsed time no less than the reading).
-pub open spec fn answered<E, C, B, A>(clock: C, set_busy: B, attempt: A, ev: WalEvent<E>) -> bool where
-    C: Fn() -> u128,
-    B: Fn(u128) -> Result<(), E>,
-    A: Fn() -> WalAnswer<E>,
+/// The ghost log of a run: call `i` made the effect `events[i]`, took the
+/// ticket `tickets[i]`, and returned the ticket `tickets[i + 1]`.
+// A ghost type, kept by ordinary builds like `WalEvent`.
+#[allow(dead_code)]
+pub ghost struct WalLog<E, K> {
+    /// The effects, in the order the calls were made.
+    pub events: Seq<WalEvent<E>>,
+    /// The tickets: one more than there are events.
+    pub tickets: Seq<K>,
+}
+
+/// The call that took ticket `tin` and returned ticket `tout` made the
+/// effect `ev` and gave the answer recorded there (a pause: of the length
+/// recorded).
+pub open spec fn answered<E, K, C, B, A, P>(
+    clock: C,
+    set_busy: B,
+    attempt: A,
+    pause: P,
+    tin: K,
+    ev: WalEvent<E>,
+    tout: K,
+) -> bool where
+    C: Fn(K) -> (u128, K),
+    B: Fn(K, u128) -> (Result<(), E>, K),
+    A: Fn(K) -> (WalAnswer<E>, K),
+    P: Fn(K, u64) -> K,
  {
     match ev {
-        WalEvent::Clock { reading, elapsed } => clock.ensures((), reading) && reading <= elapsed,
+        WalEvent::Clock { reading, .. } => clock.ensures((tin,), (reading, tout)),
         WalEvent::SetBusy { millis, result } => 0 <= millis <= u128::MAX && set_busy.ensures(
-            (millis as u128,),
-            result,
+            (tin, millis as u128),
+            (result, tout),
         ),
-        WalEvent::Attempt { answer } => attempt.ensures((), answer),
-        WalEvent::Pause { .. } => true,
+        WalEvent::Attempt { answer } => attempt.ensures((tin,), (answer, tout)),
+        WalEvent::Pause { nanos } => 0 <= nanos <= u64::MAX && pause.ensures(
+            (tin, nanos as u64),
+            tout,
+        ),
     }
 }
 
-/// Every recorded answer is one the oracle gave for that call.
-#[verifier::opaque]
-pub open spec fn answers_from<E, C, B, A>(clock: C, set_busy: B, attempt: A, trace: Seq<WalEvent<E>>) -> bool where
-    C: Fn() -> u128,
-    B: Fn(u128) -> Result<(), E>,
-    A: Fn() -> WalAnswer<E>,
+/// The log's calls form one chain from ticket `start` to ticket `end`, and
+/// every event is the effect and answer of its call.
+pub open spec fn calls_chained<E, K, C, B, A, P>(
+    clock: C,
+    set_busy: B,
+    attempt: A,
+    pause: P,
+    start: K,
+    log: WalLog<E, K>,
+    end: K,
+) -> bool where
+    C: Fn(K) -> (u128, K),
+    B: Fn(K, u128) -> (Result<(), E>, K),
+    A: Fn(K) -> (WalAnswer<E>, K),
+    P: Fn(K, u64) -> K,
  {
-    forall|i: int| 0 <= i < trace.len() ==> answered(clock, set_busy, attempt, #[trigger] trace[i])
-}
-
-/// The last effect restored the busy timeout to the whole timeout.
-pub open spec fn restored_last<E>(trace: Seq<WalEvent<E>>, timeout: int) -> bool {
-    &&& trace.len() >= 1
-    &&& trace.last() is SetBusy
-    &&& trace.last()->SetBusy_millis == busy_millis(0, timeout)
-}
-
-/// Every attempt directly follows a clock reading and a successful busy
-/// timeout of the time remaining at that reading.
-#[verifier::opaque]
-pub open spec fn attempts_guarded<E>(trace: Seq<WalEvent<E>>, timeout: int) -> bool {
-    forall|i: int| 0 <= i < trace.len() && #[trigger] trace[i] is Attempt ==> guarded_at(trace, i, timeout)
-}
-
-/// Position `i` directly follows a clock reading and a successful busy
-/// timeout of the time remaining at that reading.
-pub open spec fn guarded_at<E>(trace: Seq<WalEvent<E>>, i: int, timeout: int) -> bool {
-    &&& 2 <= i
-    &&& trace[i - 2] is Clock
-    &&& trace[i - 1] is SetBusy
-    &&& trace[i - 1]->SetBusy_millis == busy_millis(trace[i - 2]->Clock_elapsed, timeout)
-    &&& trace[i - 1]->SetBusy_result is Ok
-}
-
-/// Every pause directly follows an attempt that reported contention and a
-/// clock reading before the timeout, and lasts `min(timeout - elapsed,
-/// 10 ms)`.
-#[verifier::opaque]
-pub open spec fn pauses_justified<E>(trace: Seq<WalEvent<E>>, timeout: int) -> bool {
-    forall|i: int|
-        0 <= i < trace.len() && #[trigger] trace[i] is Pause ==> {
-            &&& 2 <= i
-            &&& trace[i - 2] matches WalEvent::Attempt { answer: WalAnswer::Contention(_) }
-            &&& trace[i - 1] is Clock
-            &&& trace[i - 1]->Clock_elapsed < timeout
-            &&& trace[i]->Pause_nanos == pause_nanos(trace[i - 1]->Clock_elapsed, timeout)
-        }
-}
-
-/// Only the last attempt may report anything but contention.
-#[verifier::opaque]
-pub open spec fn only_contention_retried<E>(trace: Seq<WalEvent<E>>) -> bool {
-    forall|i: int, j: int|
-        0 <= i < j < trace.len() && #[trigger] trace[i] is Attempt && #[trigger] trace[j] is Attempt
-            ==> trace[i] matches WalEvent::Attempt { answer: WalAnswer::Contention(_) }
-}
-
-/// No clock reading in `trace[i + 1..j]`.
-pub open spec fn no_clock_between<E>(trace: Seq<WalEvent<E>>, i: int, j: int) -> bool {
-    forall|k: int| i < k < j ==> !(#[trigger] trace[k] is Clock)
-}
-
-/// The elapsed time the kernel uses at each clock reading: the first is the
-/// reading itself; every later one is the reading, raised (only if needed)
-/// to the previous elapsed time plus the pauses since. A monotonic clock
-/// with sleeps that last at least as long as requested never reads less,
-/// so in practice the elapsed time is exactly the reading.
-#[verifier::opaque]
-pub open spec fn clock_consistent<E>(trace: Seq<WalEvent<E>>) -> bool {
-    &&& forall|j: int|
-        0 <= j < trace.len() && #[trigger] trace[j] is Clock && no_clock_between(trace, -1, j)
-            ==> trace[j]->Clock_elapsed == trace[j]->Clock_reading
-    &&& forall|i: int, j: int|
-        0 <= i < j < trace.len() && #[trigger] trace[i] is Clock && #[trigger] trace[j] is Clock
-            && no_clock_between(trace, i, j) ==> trace[j]->Clock_elapsed == max_int(
-            trace[j]->Clock_reading as int,
-            trace[i]->Clock_elapsed + pauses_between(trace, i, j),
+    &&& log.tickets.len() == log.events.len() + 1
+    &&& log.tickets[0] == start
+    &&& log.tickets.last() == end
+    &&& forall|i: int|
+        0 <= i < log.events.len() ==> answered(
+            clock,
+            set_busy,
+            attempt,
+            pause,
+            log.tickets[i],
+            #[trigger] log.events[i],
+            log.tickets[i + 1],
         )
 }
 
-/// The larger of two integers.
-pub open spec fn max_int(a: int, b: int) -> int {
-    if a < b {
-        b
+// ---------------------------------------------------------------------------
+// The shape of a run
+// ---------------------------------------------------------------------------
+
+/// `trace[s]` is a clock reading, and the elapsed time the kernel works with
+/// is the reading, raised (only if needed) to `floor`, the time already
+/// accounted for.
+pub open spec fn clock_at<E>(trace: Seq<WalEvent<E>>, s: int, floor: int) -> bool {
+    &&& 0 <= s < trace.len()
+    &&& trace[s] is Clock
+    &&& trace[s]->Clock_elapsed == max_int(trace[s]->Clock_reading as int, floor)
+}
+
+/// The time already accounted for when the round starting at `s` reads the
+/// clock: none for the first round; otherwise the previous round's last
+/// elapsed time plus its pause.
+pub open spec fn round_floor<E>(trace: Seq<WalEvent<E>>, s: int) -> int {
+    if s == 0 {
+        0
     } else {
-        a
+        trace[s - 2]->Clock_elapsed + trace[s - 1]->Pause_nanos
     }
+}
+
+/// The round starting at `s` reads the clock and then sets the busy timeout
+/// to the time remaining at that reading, in whole milliseconds.
+pub open spec fn round_opens<E>(trace: Seq<WalEvent<E>>, s: int, timeout: int) -> bool {
+    &&& clock_at(trace, s, round_floor(trace, s))
+    &&& s + 1 < trace.len()
+    &&& trace[s + 1] is SetBusy
+    &&& trace[s + 1]->SetBusy_millis == busy_millis(trace[s]->Clock_elapsed, timeout)
+}
+
+/// Round `j` (the effects `5j .. 5j + 5`) was retried: after it opened (see
+/// `round_opens`), the busy timeout was set, the attempt reported lock
+/// contention, the next clock reading was before the timeout, and the kernel
+/// paused for `min(timeout - elapsed, 10 ms)`.
+pub open spec fn retried_round<E>(trace: Seq<WalEvent<E>>, j: int, timeout: int) -> bool {
+    let s = 5 * j;
+    &&& 0 <= j
+    &&& s + 4 < trace.len()
+    &&& round_opens(trace, s, timeout)
+    &&& trace[s + 1]->SetBusy_result is Ok
+    &&& trace[s + 2] matches WalEvent::Attempt { answer: WalAnswer::Contention(_) }
+    &&& clock_at(trace, s + 3, trace[s]->Clock_elapsed)
+    &&& trace[s + 3]->Clock_elapsed < timeout
+    &&& trace[s + 4] == WalEvent::<E>::Pause {
+        nanos: pause_nanos(trace[s + 3]->Clock_elapsed, timeout),
+    }
+}
+
+/// The last round, the effects `s .. end`, ended the attempts with `outcome`
+/// (before the restore): it opened (see `round_opens`), and then exactly one
+/// of these happened.
+pub open spec fn last_round<E>(
+    trace: Seq<WalEvent<E>>,
+    s: int,
+    end: int,
+    timeout: int,
+    in_memory: bool,
+    outcome: WalOutcome<E>,
+) -> bool {
+    let set_ok = trace[s + 1]->SetBusy_result is Ok;
+    &&& 0 <= s
+    &&& end <= trace.len()
+    &&& s + 2 <= end
+    &&& round_opens(trace, s, timeout)
+    &&& match outcome {
+        // Setting the busy timeout failed.
+        WalOutcome::BusyTimeoutFailed(e) => {
+            &&& end == s + 2
+            &&& trace[s + 1]->SetBusy_result == Err::<(), E>(e)
+        },
+        // The attempt reported an accepted journal mode.
+        WalOutcome::Enabled => {
+            &&& end == s + 3
+            &&& set_ok
+            &&& (trace[s + 2] matches WalEvent::Attempt { answer: WalAnswer::Mode(m) }
+                && mode_accepted(m@, in_memory))
+        },
+        // The attempt reported another journal mode.
+        WalOutcome::NotWal(m) => {
+            &&& end == s + 3
+            &&& set_ok
+            &&& trace[s + 2] == WalEvent::<E>::Attempt { answer: WalAnswer::Mode(m) }
+            &&& !mode_accepted(m@, in_memory)
+        },
+        // The attempt failed with an error other than contention.
+        WalOutcome::Failed(e) => {
+            &&& end == s + 3
+            &&& set_ok
+            &&& trace[s + 2] == WalEvent::<E>::Attempt { answer: WalAnswer::Failed(e) }
+        },
+        // The attempt reported contention, and the next clock reading was at
+        // or past the timeout.
+        WalOutcome::TimedOut(e) => {
+            &&& end == s + 4
+            &&& set_ok
+            &&& trace[s + 2] == WalEvent::<E>::Attempt { answer: WalAnswer::Contention(e) }
+            &&& clock_at(trace, s + 3, trace[s]->Clock_elapsed)
+            &&& trace[s + 3]->Clock_elapsed >= timeout
+        },
+        // Decided only by the restore.
+        WalOutcome::RestoreFailed(_) => false,
+    }
+}
+
+/// The effects `0 .. end` are some retried rounds followed by a last round
+/// that ended the attempts with `outcome`. Each retried round has 5 effects
+/// and the last round 2, 3 or 4, so the number of retried rounds is
+/// `(end - 2) / 5`.
+pub open spec fn settled_run<E>(
+    trace: Seq<WalEvent<E>>,
+    end: int,
+    timeout: int,
+    in_memory: bool,
+    outcome: WalOutcome<E>,
+) -> bool {
+    let k = (end - 2) / 5;
+    &&& 2 <= end <= trace.len()
+    &&& forall|j: int| 0 <= j < k ==> #[trigger] retried_round(trace, j, timeout)
+    &&& last_round(trace, 5 * k, end, timeout, in_memory, outcome)
 }
 
 /// The total length of the pauses in `trace[i..j]`.
@@ -315,85 +437,59 @@ pub open spec fn total_pause<E>(trace: Seq<WalEvent<E>>) -> int {
     pauses_between(trace, 0, trace.len() as int)
 }
 
-/// The outcome is the one the final effects determine.
-pub open spec fn outcome_matches<E>(
-    trace: Seq<WalEvent<E>>,
-    timeout: int,
-    in_memory: bool,
-    outcome: WalOutcome<E>,
-) -> bool {
-    let n = trace.len() as int;
-    match outcome {
-        WalOutcome::Enabled => {
-            &&& n >= 2
-            &&& trace[n - 2] matches WalEvent::Attempt { answer: WalAnswer::Mode(m) }
-                && mode_accepted(m@, in_memory)
-            &&& trace[n - 1] is SetBusy
-            &&& trace[n - 1]->SetBusy_result is Ok
-        },
-        WalOutcome::NotWal(m) => {
-            &&& n >= 2
-            &&& trace[n - 2] == WalEvent::<E>::Attempt { answer: WalAnswer::Mode(m) }
-            &&& !mode_accepted(m@, in_memory)
-        },
-        WalOutcome::TimedOut(e) => {
-            &&& n >= 3
-            &&& trace[n - 3] == WalEvent::<E>::Attempt { answer: WalAnswer::Contention(e) }
-            &&& trace[n - 2] is Clock
-            &&& trace[n - 2]->Clock_elapsed >= timeout
-        },
-        WalOutcome::Failed(e) => {
-            &&& n >= 2
-            &&& trace[n - 2] == WalEvent::<E>::Attempt { answer: WalAnswer::Failed(e) }
-        },
-        WalOutcome::BusyTimeoutFailed(e) => {
-            &&& n >= 2
-            &&& trace[n - 2] is SetBusy
-            &&& trace[n - 2]->SetBusy_result == Err::<(), E>(e)
-        },
-        WalOutcome::RestoreFailed(e) => {
-            &&& n >= 2
-            &&& trace[n - 2] matches WalEvent::Attempt { answer: WalAnswer::Mode(m) }
-                && mode_accepted(m@, in_memory)
-            &&& trace[n - 1] is SetBusy
-            &&& trace[n - 1]->SetBusy_result == Err::<(), E>(e)
-        },
-    }
-}
-
-/// The shape of the effects up to the restore: every attempt guarded, every
-/// pause justified, only contention retried, consistent clock readings, and
-/// at most `timeout` of pauses in total.
-pub open spec fn well_paced<E>(trace: Seq<WalEvent<E>>, timeout: int) -> bool {
-    &&& attempts_guarded(trace, timeout)
-    &&& pauses_justified(trace, timeout)
-    &&& only_contention_retried(trace)
-    &&& clock_consistent(trace)
-    &&& total_pause(trace) <= timeout
-}
-
-/// `trace` and `outcome` describe a correct run of `enable_wal` with
-/// `timeout` (nanoseconds): every answer came from the oracles, the effects
-/// are well paced, the busy timeout was restored last, and the outcome is
-/// the one the final effects determine.
-pub open spec fn wal_run<E, C, B, A>(
+/// `log`, `end` and `outcome` describe a correct run of `enable_wal` from
+/// ticket `start` with `timeout` (nanoseconds): the log is the chain of
+/// calls with their answers; the effects are retried rounds and a last round
+/// (see `settled_run`), followed by the restore of the whole timeout as the
+/// last effect; and the pauses add up to at most `timeout`. The outcome is
+/// the last round's, except that a successful last round becomes
+/// `RestoreFailed(e)` when the restore failed with `e`.
+pub open spec fn wal_run<E, K, C, B, A, P>(
     timeout: int,
     in_memory: bool,
     clock: C,
     set_busy: B,
     attempt: A,
-    trace: Seq<WalEvent<E>>,
+    pause: P,
+    start: K,
+    end: K,
+    log: WalLog<E, K>,
     outcome: WalOutcome<E>,
-) -> bool where C: Fn() -> u128, B: Fn(u128) -> Result<(), E>, A: Fn() -> WalAnswer<E> {
-    &&& answers_from(clock, set_busy, attempt, trace)
-    &&& well_paced(trace, timeout)
-    &&& restored_last(trace, timeout)
-    &&& outcome_matches(trace, timeout, in_memory, outcome)
+) -> bool where
+    C: Fn(K) -> (u128, K),
+    B: Fn(K, u128) -> (Result<(), E>, K),
+    A: Fn(K) -> (WalAnswer<E>, K),
+    P: Fn(K, u64) -> K,
+ {
+    let trace = log.events;
+    let n = trace.len() as int;
+    &&& calls_chained(clock, set_busy, attempt, pause, start, log, end)
+    &&& n >= 3
+    &&& trace[n - 1] is SetBusy
+    &&& trace[n - 1]->SetBusy_millis == busy_millis(0, timeout)
+    &&& match outcome {
+        WalOutcome::Enabled => {
+            &&& settled_run(trace, n - 1, timeout, in_memory, WalOutcome::Enabled)
+            &&& trace[n - 1]->SetBusy_result is Ok
+        },
+        WalOutcome::RestoreFailed(e) => {
+            &&& settled_run(trace, n - 1, timeout, in_memory, WalOutcome::Enabled)
+            &&& trace[n - 1]->SetBusy_result == Err::<(), E>(e)
+        },
+        _ => settled_run(trace, n - 1, timeout, in_memory, outcome),
+    }
+    &&& total_pause(trace) <= timeout
 }
 
 // ---------------------------------------------------------------------------
-// Trace lemmas
+// Log lemmas
 // ---------------------------------------------------------------------------
+
+/// `log` with one more call: the effect `ev`, which returned the ticket
+/// `next`.
+pub open spec fn record<E, K>(log: WalLog<E, K>, ev: WalEvent<E>, next: K) -> WalLog<E, K> {
+    WalLog { events: log.events.push(ev), tickets: log.tickets.push(next) }
+}
 
 /// Extending a trace does not change the pauses within its old part.
 pub proof fn lemma_pauses_between_push<E>(trace: Seq<WalEvent<E>>, ev: WalEvent<E>, i: int, j: int)
@@ -419,295 +515,177 @@ pub proof fn lemma_total_pause_push<E>(trace: Seq<WalEvent<E>>, ev: WalEvent<E>)
     lemma_pauses_between_push(trace, ev, 0, trace.len() as int);
 }
 
-/// Pushing anything but an attempt keeps every attempt guarded.
-pub proof fn lemma_push_keeps_guarded<E>(trace: Seq<WalEvent<E>>, ev: WalEvent<E>, timeout: int)
-    requires
-        attempts_guarded(trace, timeout),
-        !(ev is Attempt),
-    ensures
-        attempts_guarded(trace.push(ev), timeout),
-{
-    reveal(attempts_guarded);
-    let t2 = trace.push(ev);
-    assert forall|i: int| 0 <= i < t2.len() && #[trigger] t2[i] is Attempt implies guarded_at(
-        t2,
-        i,
-        timeout,
-    ) by {
-        assert(trace[i] is Attempt);
-    }
-}
-
-/// Pushing anything but a pause keeps every pause justified.
-pub proof fn lemma_push_keeps_paused<E>(trace: Seq<WalEvent<E>>, ev: WalEvent<E>, timeout: int)
-    requires
-        pauses_justified(trace, timeout),
-        !(ev is Pause),
-    ensures
-        pauses_justified(trace.push(ev), timeout),
-{
-    reveal(pauses_justified);
-    let t2 = trace.push(ev);
-    assert forall|i: int| 0 <= i < t2.len() && #[trigger] t2[i] is Pause implies {
-        &&& 2 <= i
-        &&& t2[i - 2] matches WalEvent::Attempt { answer: WalAnswer::Contention(_) }
-        &&& t2[i - 1] is Clock
-        &&& t2[i - 1]->Clock_elapsed < timeout
-        &&& t2[i]->Pause_nanos == pause_nanos(t2[i - 1]->Clock_elapsed, timeout)
-    } by {
-        assert(trace[i] is Pause);
-    }
-}
-
-/// Pushing anything but an attempt keeps only contention retried.
-pub proof fn lemma_push_keeps_retries<E>(trace: Seq<WalEvent<E>>, ev: WalEvent<E>)
-    requires
-        only_contention_retried(trace),
-        !(ev is Attempt),
-    ensures
-        only_contention_retried(trace.push(ev)),
-{
-    reveal(only_contention_retried);
-    let t2 = trace.push(ev);
-    assert forall|i: int, j: int|
-        0 <= i < j < t2.len() && #[trigger] t2[i] is Attempt && #[trigger] t2[j] is Attempt implies t2[i] matches WalEvent::Attempt {
-        answer: WalAnswer::Contention(_),
-    } by {
-        assert(trace[i] is Attempt && trace[j] is Attempt);
-    }
-}
-
-/// Pushing anything but a clock reading keeps the clock readings
-/// consistent.
-pub proof fn lemma_push_keeps_clock<E>(trace: Seq<WalEvent<E>>, ev: WalEvent<E>)
-    requires
-        clock_consistent(trace),
-        !(ev is Clock),
-    ensures
-        clock_consistent(trace.push(ev)),
-{
-    reveal(clock_consistent);
-    let t2 = trace.push(ev);
-    assert forall|i: int, j: int|
-        0 <= i < j < t2.len() && #[trigger] t2[i] is Clock && #[trigger] t2[j] is Clock
-            && no_clock_between(t2, i, j) implies t2[j]->Clock_elapsed == max_int(
-        t2[j]->Clock_reading as int,
-        t2[i]->Clock_elapsed + pauses_between(t2, i, j),
-    ) by {
-        lemma_pauses_between_push(trace, ev, i, j);
-        assert(trace[i] is Clock && trace[j] is Clock);
-        assert forall|k: int| i < k < j implies !(#[trigger] trace[k] is Clock) by {
-            assert(t2[k] == trace[k]);
-        }
-    }
-    assert forall|j: int|
-        0 <= j < t2.len() && #[trigger] t2[j] is Clock && no_clock_between(t2, -1, j) implies t2[j]->Clock_elapsed
-        == t2[j]->Clock_reading by {
-        assert(trace[j] is Clock);
-        assert forall|k: int| -1 < k < j implies !(#[trigger] trace[k] is Clock) by {
-            assert(t2[k] == trace[k]);
-        }
-    }
-}
-
-/// Pushing an answered event keeps every answer accounted for.
-pub proof fn lemma_push_answered<E, C, B, A>(
+/// Recording the answered call that took the chain's last ticket keeps the
+/// chain, and adds the call's pause (if any) to the total.
+pub proof fn lemma_record<E, K, C, B, A, P>(
     clock: C,
     set_busy: B,
     attempt: A,
-    trace: Seq<WalEvent<E>>,
+    pause: P,
+    start: K,
+    log: WalLog<E, K>,
+    end: K,
     ev: WalEvent<E>,
-) where C: Fn() -> u128, B: Fn(u128) -> Result<(), E>, A: Fn() -> WalAnswer<E>
+    next: K,
+) where
+    C: Fn(K) -> (u128, K),
+    B: Fn(K, u128) -> (Result<(), E>, K),
+    A: Fn(K) -> (WalAnswer<E>, K),
+    P: Fn(K, u64) -> K,
+
     requires
-        answers_from(clock, set_busy, attempt, trace),
-        answered(clock, set_busy, attempt, ev),
+        calls_chained(clock, set_busy, attempt, pause, start, log, end),
+        answered(clock, set_busy, attempt, pause, end, ev, next),
     ensures
-        answers_from(clock, set_busy, attempt, trace.push(ev)),
+        calls_chained(clock, set_busy, attempt, pause, start, record(log, ev, next), next),
+        total_pause(record(log, ev, next).events) == total_pause(log.events) + match ev {
+            WalEvent::Pause { nanos } => nanos,
+            _ => 0,
+        },
 {
-    reveal(answers_from);
-    let t2 = trace.push(ev);
-    assert forall|i: int| 0 <= i < t2.len() implies answered(
+    let l2 = record(log, ev, next);
+    let n = log.events.len() as int;
+    assert forall|i: int| 0 <= i < l2.events.len() implies answered(
         clock,
         set_busy,
         attempt,
-        #[trigger] t2[i],
+        pause,
+        l2.tickets[i],
+        #[trigger] l2.events[i],
+        l2.tickets[i + 1],
     ) by {
-        if i < trace.len() {
-            assert(t2[i] == trace[i]);
+        if i < n {
+            assert(l2.events[i] == log.events[i]);
+            assert(l2.tickets[i] == log.tickets[i]);
+            assert(l2.tickets[i + 1] == log.tickets[i + 1]);
+        } else {
+            assert(l2.tickets[i] == log.tickets.last());
+        }
+    }
+    lemma_total_pause_push(log.events, ev);
+}
+
+/// Extending a trace keeps the shape of the retried rounds within its old
+/// part.
+pub proof fn lemma_rounds_kept<E>(
+    old: Seq<WalEvent<E>>,
+    new: Seq<WalEvent<E>>,
+    k: int,
+    timeout: int,
+)
+    requires
+        0 <= k,
+        5 * k <= old.len() <= new.len(),
+        forall|i: int| 0 <= i < old.len() ==> new[i] == old[i],
+        forall|j: int| 0 <= j < k ==> #[trigger] retried_round(old, j, timeout),
+    ensures
+        forall|j: int| 0 <= j < k ==> #[trigger] retried_round(new, j, timeout),
+{
+    assert forall|j: int| 0 <= j < k implies #[trigger] retried_round(new, j, timeout) by {
+        assert(retried_round(old, j, timeout));
+        let s = 5 * j;
+        assert(new[s] == old[s] && new[s + 1] == old[s + 1] && new[s + 2] == old[s + 2]);
+        assert(new[s + 3] == old[s + 3] && new[s + 4] == old[s + 4]);
+        if j > 0 {
+            assert(new[s - 2] == old[s - 2] && new[s - 1] == old[s - 1]);
         }
     }
 }
 
-/// Pushing a clock reading keeps the readings consistent when its elapsed
-/// time is the reading, raised to the previous elapsed time plus the pauses
-/// since (`last` is the previous reading's index, or -1 when there is none).
-pub proof fn lemma_push_clock<E>(trace: Seq<WalEvent<E>>, ev: WalEvent<E>, last: int)
+/// Extending a trace keeps a settled run within its old part.
+pub proof fn lemma_settled_kept<E>(
+    old: Seq<WalEvent<E>>,
+    new: Seq<WalEvent<E>>,
+    end: int,
+    timeout: int,
+    in_memory: bool,
+    outcome: WalOutcome<E>,
+)
     requires
-        clock_consistent(trace),
-        ev is Clock,
-        -1 <= last < trace.len(),
-        no_clock_between(trace, last, trace.len() as int),
-        last == -1 ==> ev->Clock_elapsed == ev->Clock_reading,
-        last >= 0 ==> trace[last] is Clock && ev->Clock_elapsed == max_int(
-            ev->Clock_reading as int,
-            trace[last]->Clock_elapsed + pauses_between(trace, last, trace.len() as int),
+        old.len() <= new.len(),
+        forall|i: int| 0 <= i < old.len() ==> new[i] == old[i],
+        settled_run(old, end, timeout, in_memory, outcome),
+    ensures
+        settled_run(new, end, timeout, in_memory, outcome),
+{
+    let k = (end - 2) / 5;
+    lemma_rounds_kept(old, new, k, timeout);
+    let s = 5 * k;
+    assert(new[s] == old[s] && new[s + 1] == old[s + 1]);
+    if s + 2 < end {
+        assert(new[s + 2] == old[s + 2]);
+    }
+    if s + 3 < end {
+        assert(new[s + 3] == old[s + 3]);
+    }
+    if k > 0 {
+        assert(new[s - 2] == old[s - 2] && new[s - 1] == old[s - 1]);
+    }
+}
+
+/// Recording one more call during round `k` keeps the chain, every earlier
+/// effect (so the retried rounds, and the current round's opening and
+/// floor), and adds the call's pause (if any) to the total.
+proof fn lemma_record_in_round<E, K, C, B, A, P>(
+    oracles: (C, B, A, P),
+    start: K,
+    log: WalLog<E, K>,
+    end: K,
+    ev: WalEvent<E>,
+    next: K,
+    k: int,
+    timeout: int,
+) where
+    C: Fn(K) -> (u128, K),
+    B: Fn(K, u128) -> (Result<(), E>, K),
+    A: Fn(K) -> (WalAnswer<E>, K),
+    P: Fn(K, u64) -> K,
+
+    requires
+        calls_chained(oracles.0, oracles.1, oracles.2, oracles.3, start, log, end),
+        answered(oracles.0, oracles.1, oracles.2, oracles.3, end, ev, next),
+        0 <= k,
+        5 * k <= log.events.len(),
+        forall|j: int| 0 <= j < k ==> #[trigger] retried_round(log.events, j, timeout),
+    ensures
+        calls_chained(
+            oracles.0,
+            oracles.1,
+            oracles.2,
+            oracles.3,
+            start,
+            record(log, ev, next),
+            next,
         ),
-    ensures
-        clock_consistent(trace.push(ev)),
+        total_pause(record(log, ev, next).events) == total_pause(log.events) + match ev {
+            WalEvent::Pause { nanos } => nanos,
+            _ => 0,
+        },
+        record(log, ev, next).events.len() == log.events.len() + 1,
+        record(log, ev, next).events[log.events.len() as int] == ev,
+        forall|i: int|
+            0 <= i < log.events.len() ==> #[trigger] record(log, ev, next).events[i]
+                == log.events[i],
+        forall|j: int|
+            0 <= j < k ==> #[trigger] retried_round(record(log, ev, next).events, j, timeout),
+        round_floor(record(log, ev, next).events, 5 * k) == round_floor(log.events, 5 * k),
+        round_opens(log.events, 5 * k, timeout) ==> round_opens(
+            record(log, ev, next).events,
+            5 * k,
+            timeout,
+        ),
 {
-    reveal(clock_consistent);
-    let t2 = trace.push(ev);
-    let n = trace.len() as int;
-    assert forall|i: int, j: int|
-        0 <= i < j < t2.len() && #[trigger] t2[i] is Clock && #[trigger] t2[j] is Clock
-            && no_clock_between(t2, i, j) implies t2[j]->Clock_elapsed == max_int(
-        t2[j]->Clock_reading as int,
-        t2[i]->Clock_elapsed + pauses_between(t2, i, j),
-    ) by {
-        lemma_pauses_between_push(trace, ev, i, j);
-        if j < n {
-            assert(trace[i] is Clock && trace[j] is Clock);
-            assert forall|k: int| i < k < j implies !(#[trigger] trace[k] is Clock) by {
-                assert(t2[k] == trace[k]);
-            }
-        } else {
-            // The previous reading is the last one before .
-            if last == -1 {
-                assert(!(trace[i] is Clock));
-            } else if i < last {
-                assert(t2[last] == trace[last]);
-                assert(!(t2[last] is Clock));
-            } else if last < i {
-                assert(!(trace[i] is Clock));
-            }
-        }
+    let (clock, set_busy, attempt, pause) = oracles;
+    let new = record(log, ev, next).events;
+    lemma_record(clock, set_busy, attempt, pause, start, log, end, ev, next);
+    lemma_rounds_kept(log.events, new, k, timeout);
+    if k > 0 {
+        assert(new[5 * k - 2] == log.events[5 * k - 2]);
+        assert(new[5 * k - 1] == log.events[5 * k - 1]);
     }
-    assert forall|j: int|
-        0 <= j < t2.len() && #[trigger] t2[j] is Clock && no_clock_between(t2, -1, j) implies t2[j]->Clock_elapsed
-        == t2[j]->Clock_reading by {
-        if j < n {
-            assert(trace[j] is Clock);
-            assert forall|k: int| -1 < k < j implies !(#[trigger] trace[k] is Clock) by {
-                assert(t2[k] == trace[k]);
-            }
-        } else if last >= 0 {
-            assert(t2[last] == trace[last]);
-            assert(!(t2[last] is Clock));
-        }
-    }
-}
-
-/// Pushing an attempt right after a clock reading and a successful busy
-/// timeout of the remaining time keeps every attempt guarded.
-pub proof fn lemma_push_attempt_guarded<E>(trace: Seq<WalEvent<E>>, ev: WalEvent<E>, timeout: int)
-    requires
-        attempts_guarded(trace, timeout),
-        ev is Attempt,
-        trace.len() >= 2,
-        guarded_at(trace.push(ev), trace.len() as int, timeout),
-    ensures
-        attempts_guarded(trace.push(ev), timeout),
-{
-    reveal(attempts_guarded);
-    let t2 = trace.push(ev);
-    let n = trace.len() as int;
-    assert forall|i: int| 0 <= i < t2.len() && #[trigger] t2[i] is Attempt implies guarded_at(
-        t2,
-        i,
-        timeout,
-    ) by {
-        if i < n {
-            assert(t2[i] == trace[i]);
-            assert(trace[i] is Attempt);
-            assert(t2[i - 2] == trace[i - 2]);
-            assert(t2[i - 1] == trace[i - 1]);
-        } else {
-            assert(t2[i - 2] == trace[n - 2]);
-            assert(t2[i - 1] == trace[n - 1]);
-        }
-    }
-}
-
-/// Every attempt in `trace` reported contention.
-#[verifier::opaque]
-pub open spec fn all_contended<E>(trace: Seq<WalEvent<E>>) -> bool {
-    forall|i: int|
-        0 <= i < trace.len() && #[trigger] trace[i] is Attempt ==> trace[i] matches WalEvent::Attempt {
-            answer: WalAnswer::Contention(_),
-        }
-}
-
-/// Pushing an attempt when every earlier attempt reported contention keeps
-/// only contention retried.
-pub proof fn lemma_push_attempt_retries<E>(trace: Seq<WalEvent<E>>, ev: WalEvent<E>)
-    requires
-        all_contended(trace),
-        ev is Attempt,
-    ensures
-        only_contention_retried(trace.push(ev)),
-{
-    reveal(only_contention_retried);
-    reveal(all_contended);
-    let t2 = trace.push(ev);
-    assert forall|i: int, j: int|
-        0 <= i < j < t2.len() && #[trigger] t2[i] is Attempt && #[trigger] t2[j] is Attempt implies t2[i] matches WalEvent::Attempt {
-        answer: WalAnswer::Contention(_),
-    } by {
-        assert(t2[i] == trace[i]);
-        assert(trace[i] is Attempt);
-    }
-}
-
-/// Pushing a contended attempt keeps every attempt contended.
-pub proof fn lemma_push_contended<E>(trace: Seq<WalEvent<E>>, ev: WalEvent<E>)
-    requires
-        all_contended(trace),
-        !(ev is Attempt) || ev matches WalEvent::Attempt { answer: WalAnswer::Contention(_) },
-    ensures
-        all_contended(trace.push(ev)),
-{
-    reveal(all_contended);
-    let t2 = trace.push(ev);
-    assert forall|i: int| 0 <= i < t2.len() && #[trigger] t2[i] is Attempt implies t2[i] matches WalEvent::Attempt {
-        answer: WalAnswer::Contention(_),
-    } by {
-        if i < trace.len() {
-            assert(t2[i] == trace[i]);
-            assert(trace[i] is Attempt);
-        }
-    }
-}
-
-/// Pushing a pause right after a contended attempt and a clock reading
-/// before the timeout, lasting `pause_nanos`, keeps pauses justified.
-pub proof fn lemma_push_pause<E>(trace: Seq<WalEvent<E>>, ev: WalEvent<E>, timeout: int)
-    requires
-        pauses_justified(trace, timeout),
-        ev is Pause,
-        trace.len() >= 2,
-        trace[trace.len() - 2] matches WalEvent::Attempt { answer: WalAnswer::Contention(_) },
-        trace[trace.len() - 1] is Clock,
-        trace[trace.len() - 1]->Clock_elapsed < timeout,
-        ev->Pause_nanos == pause_nanos(trace[trace.len() - 1]->Clock_elapsed, timeout),
-    ensures
-        pauses_justified(trace.push(ev), timeout),
-{
-    reveal(pauses_justified);
-    let t2 = trace.push(ev);
-    let n = trace.len() as int;
-    assert forall|i: int| 0 <= i < t2.len() && #[trigger] t2[i] is Pause implies {
-        &&& 2 <= i
-        &&& t2[i - 2] matches WalEvent::Attempt { answer: WalAnswer::Contention(_) }
-        &&& t2[i - 1] is Clock
-        &&& t2[i - 1]->Clock_elapsed < timeout
-        &&& t2[i]->Pause_nanos == pause_nanos(t2[i - 1]->Clock_elapsed, timeout)
-    } by {
-        if i < n {
-            assert(trace[i] is Pause);
-        } else {
-            assert(t2[i - 2] == trace[n - 2]);
-            assert(t2[i - 1] == trace[n - 1]);
-        }
+    if round_opens(log.events, 5 * k, timeout) {
+        assert(new[5 * k] == log.events[5 * k]);
+        assert(new[5 * k + 1] == log.events[5 * k + 1]);
     }
 }
 
@@ -715,381 +693,130 @@ pub proof fn lemma_push_pause<E>(trace: Seq<WalEvent<E>>, ev: WalEvent<E>, timeo
 // The driver
 // ---------------------------------------------------------------------------
 
-/// How the attempts ended, before the restore: the outcome the last effects
-/// determine (`RestoreFailed` is decided only by the restore).
-pub open spec fn settled<E>(
-    trace: Seq<WalEvent<E>>,
-    timeout: int,
-    in_memory: bool,
-    outcome: WalOutcome<E>,
-) -> bool {
-    let n = trace.len() as int;
-    match outcome {
-        WalOutcome::Enabled => {
-            &&& n >= 1
-            &&& trace[n - 1] matches WalEvent::Attempt { answer: WalAnswer::Mode(m) }
-                && mode_accepted(m@, in_memory)
-        },
-        WalOutcome::NotWal(m) => {
-            &&& n >= 1
-            &&& trace[n - 1] == WalEvent::<E>::Attempt { answer: WalAnswer::Mode(m) }
-            &&& !mode_accepted(m@, in_memory)
-        },
-        WalOutcome::TimedOut(e) => {
-            &&& n >= 2
-            &&& trace[n - 2] == WalEvent::<E>::Attempt { answer: WalAnswer::Contention(e) }
-            &&& trace[n - 1] is Clock
-            &&& trace[n - 1]->Clock_elapsed >= timeout
-        },
-        WalOutcome::Failed(e) => {
-            &&& n >= 1
-            &&& trace[n - 1] == WalEvent::<E>::Attempt { answer: WalAnswer::Failed(e) }
-        },
-        WalOutcome::BusyTimeoutFailed(e) => {
-            &&& n >= 1
-            &&& trace[n - 1] is SetBusy
-            &&& trace[n - 1]->SetBusy_result == Err::<(), E>(e)
-        },
-        WalOutcome::RestoreFailed(_) => false,
-    }
-}
-
-/// The empty trace has every property.
-proof fn lemma_empty_trace<E, C, B, A>(clock: C, set_busy: B, attempt: A, timeout: int) where
-    C: Fn() -> u128,
-    B: Fn(u128) -> Result<(), E>,
-    A: Fn() -> WalAnswer<E>,
-
-    ensures
-        answers_from(clock, set_busy, attempt, Seq::<WalEvent<E>>::empty()),
-        attempts_guarded(Seq::<WalEvent<E>>::empty(), timeout),
-        pauses_justified(Seq::<WalEvent<E>>::empty(), timeout),
-        only_contention_retried(Seq::<WalEvent<E>>::empty()),
-        clock_consistent(Seq::<WalEvent<E>>::empty()),
-        all_contended(Seq::<WalEvent<E>>::empty()),
-        total_pause(Seq::<WalEvent<E>>::empty()) == 0,
-{
-    reveal(answers_from);
-    reveal(attempts_guarded);
-    reveal(pauses_justified);
-    reveal(only_contention_retried);
-    reveal(clock_consistent);
-    reveal(all_contended);
-}
-
-/// The trace properties the retry loop maintains: every answer from the
-/// oracles, every attempt guarded, every pause justified, only contention
-/// retried, and consistent clock readings.
-pub open spec fn loop_props<E, C, B, A>(
-    clock: C,
-    set_busy: B,
-    attempt: A,
-    trace: Seq<WalEvent<E>>,
-    timeout: int,
-) -> bool where C: Fn() -> u128, B: Fn(u128) -> Result<(), E>, A: Fn() -> WalAnswer<E> {
-    &&& answers_from(clock, set_busy, attempt, trace)
-    &&& attempts_guarded(trace, timeout)
-    &&& pauses_justified(trace, timeout)
-    &&& only_contention_retried(trace)
-    &&& clock_consistent(trace)
-}
-
-/// Pushing an answered busy-timeout effect keeps the loop properties and the
-/// total pause.
-proof fn lemma_push_busy_event<E, C, B, A>(
-    clock: C,
-    set_busy: B,
-    attempt: A,
-    trace: Seq<WalEvent<E>>,
-    ev: WalEvent<E>,
-    timeout: int,
-) where C: Fn() -> u128, B: Fn(u128) -> Result<(), E>, A: Fn() -> WalAnswer<E>
-    requires
-        loop_props(clock, set_busy, attempt, trace, timeout),
-        answered(clock, set_busy, attempt, ev),
-        ev is SetBusy,
-    ensures
-        loop_props(clock, set_busy, attempt, trace.push(ev), timeout),
-        total_pause(trace.push(ev)) == total_pause(trace),
-        all_contended(trace) ==> all_contended(trace.push(ev)),
-{
-    lemma_push_answered(clock, set_busy, attempt, trace, ev);
-    lemma_push_keeps_guarded(trace, ev, timeout);
-    lemma_push_keeps_paused(trace, ev, timeout);
-    lemma_push_keeps_retries(trace, ev);
-    lemma_push_keeps_clock(trace, ev);
-    lemma_total_pause_push(trace, ev);
-    if all_contended(trace) {
-        lemma_push_contended(trace, ev);
-    }
-}
-
-/// Pushing an answered clock reading whose elapsed time is the reading,
-/// raised to the previous elapsed time plus the pauses since, keeps the
-/// loop properties.
-proof fn lemma_push_clock_event<E, C, B, A>(
-    clock: C,
-    set_busy: B,
-    attempt: A,
-    trace: Seq<WalEvent<E>>,
-    ev: WalEvent<E>,
-    last: int,
-    timeout: int,
-) where C: Fn() -> u128, B: Fn(u128) -> Result<(), E>, A: Fn() -> WalAnswer<E>
-    requires
-        loop_props(clock, set_busy, attempt, trace, timeout),
-        all_contended(trace),
-        answered(clock, set_busy, attempt, ev),
-        ev is Clock,
-        -1 <= last < trace.len(),
-        no_clock_between(trace, last, trace.len() as int),
-        last == -1 ==> ev->Clock_elapsed == ev->Clock_reading,
-        last >= 0 ==> trace[last] is Clock && ev->Clock_elapsed == max_int(
-            ev->Clock_reading as int,
-            trace[last]->Clock_elapsed + pauses_between(trace, last, trace.len() as int),
-        ),
-    ensures
-        loop_props(clock, set_busy, attempt, trace.push(ev), timeout),
-        all_contended(trace.push(ev)),
-        total_pause(trace.push(ev)) == total_pause(trace),
-{
-    lemma_push_clock(trace, ev, last);
-    lemma_push_answered(clock, set_busy, attempt, trace, ev);
-    lemma_push_keeps_guarded(trace, ev, timeout);
-    lemma_push_keeps_paused(trace, ev, timeout);
-    lemma_push_keeps_retries(trace, ev);
-    lemma_push_contended(trace, ev);
-    lemma_total_pause_push(trace, ev);
-}
-
-/// Pushing an answered attempt right after a clock reading and a successful
-/// busy timeout of the remaining time keeps the loop properties.
-proof fn lemma_push_attempt_event<E, C, B, A>(
-    clock: C,
-    set_busy: B,
-    attempt: A,
-    trace: Seq<WalEvent<E>>,
-    ev: WalEvent<E>,
-    timeout: int,
-) where C: Fn() -> u128, B: Fn(u128) -> Result<(), E>, A: Fn() -> WalAnswer<E>
-    requires
-        loop_props(clock, set_busy, attempt, trace, timeout),
-        all_contended(trace),
-        answered(clock, set_busy, attempt, ev),
-        ev is Attempt,
-        trace.len() >= 2,
-        guarded_at(trace.push(ev), trace.len() as int, timeout),
-    ensures
-        loop_props(clock, set_busy, attempt, trace.push(ev), timeout),
-        total_pause(trace.push(ev)) == total_pause(trace),
-        ev matches WalEvent::Attempt { answer: WalAnswer::Contention(_) } ==> all_contended(
-            trace.push(ev),
-        ),
-{
-    lemma_push_attempt_guarded(trace, ev, timeout);
-    lemma_push_attempt_retries(trace, ev);
-    lemma_push_keeps_paused(trace, ev, timeout);
-    lemma_push_keeps_clock(trace, ev);
-    lemma_push_answered(clock, set_busy, attempt, trace, ev);
-    lemma_total_pause_push(trace, ev);
-    if ev matches WalEvent::Attempt { answer: WalAnswer::Contention(_) } {
-        lemma_push_contended(trace, ev);
-    }
-}
-
-/// Pushing a pause right after a contended attempt and a clock reading
-/// before the timeout, lasting `pause_nanos`, keeps the loop properties.
-proof fn lemma_push_pause_event<E, C, B, A>(
-    clock: C,
-    set_busy: B,
-    attempt: A,
-    trace: Seq<WalEvent<E>>,
-    ev: WalEvent<E>,
-    timeout: int,
-) where C: Fn() -> u128, B: Fn(u128) -> Result<(), E>, A: Fn() -> WalAnswer<E>
-    requires
-        loop_props(clock, set_busy, attempt, trace, timeout),
-        all_contended(trace),
-        ev is Pause,
-        trace.len() >= 2,
-        trace[trace.len() - 2] matches WalEvent::Attempt { answer: WalAnswer::Contention(_) },
-        trace[trace.len() - 1] is Clock,
-        trace[trace.len() - 1]->Clock_elapsed < timeout,
-        ev->Pause_nanos == pause_nanos(trace[trace.len() - 1]->Clock_elapsed, timeout),
-    ensures
-        loop_props(clock, set_busy, attempt, trace.push(ev), timeout),
-        all_contended(trace.push(ev)),
-        total_pause(trace.push(ev)) == total_pause(trace) + ev->Pause_nanos,
-{
-    lemma_push_pause(trace, ev, timeout);
-    lemma_push_answered(clock, set_busy, attempt, trace, ev);
-    lemma_push_keeps_guarded(trace, ev, timeout);
-    lemma_push_keeps_retries(trace, ev);
-    lemma_push_keeps_clock(trace, ev);
-    lemma_push_contended(trace, ev);
-    lemma_total_pause_push(trace, ev);
-}
-
-/// The pauses over a clock reading, a busy timeout and an attempt: none.
-proof fn lemma_round_has_no_pause<E>(trace: Seq<WalEvent<E>>)
-    requires
-        trace.len() >= 3,
-        trace[trace.len() - 3] is Clock,
-        trace[trace.len() - 2] is SetBusy,
-        trace[trace.len() - 1] is Attempt,
-    ensures
-        pauses_between(trace, trace.len() - 3, trace.len() as int) == 0,
-        no_clock_between(trace, trace.len() - 3, trace.len() as int),
-{
-    let n = trace.len() as int;
-    assert(pauses_between(trace, n - 3, n - 3) == 0);
-    assert(pauses_between(trace, n - 3, n - 2) == 0);
-    assert(pauses_between(trace, n - 3, n - 1) == 0);
-}
-
-/// The pauses over a clock reading and a pause: the pause.
-proof fn lemma_round_pause<E>(trace: Seq<WalEvent<E>>)
-    requires
-        trace.len() >= 2,
-        trace[trace.len() - 2] is Clock,
-        trace[trace.len() - 1] is Pause,
-    ensures
-        pauses_between(trace, trace.len() - 2, trace.len() as int) == trace[trace.len()
-            - 1]->Pause_nanos,
-        no_clock_between(trace, trace.len() - 2, trace.len() as int),
-{
-    let n = trace.len() as int;
-    assert(pauses_between(trace, n - 2, n - 2) == 0);
-    assert(pauses_between(trace, n - 2, n - 1) == 0);
-}
-
-/// The index of the previous clock reading at the start of a round: none
-/// in an empty trace, otherwise the reading just before the last pause.
-pub open spec fn previous_reading<E>(trace: Seq<WalEvent<E>>) -> int {
-    if trace.len() == 0 {
-        -1
-    } else {
-        trace.len() - 2
-    }
-}
-
-/// Runs attempts until one settles (see `settled`).
-fn attempt_until_settled<E, C, B, A, P>(
+/// Runs rounds until one is the last (see `settled_run`), from ticket
+/// `start`; returns the outcome, the last ticket, and the log.
+fn attempt_until_settled<E, K, C, B, A, P>(
+    start: K,
     timeout: u128,
     in_memory: bool,
     clock: &C,
     set_busy: &B,
     attempt: &A,
     pause: &P,
-) -> (r: (WalOutcome<E>, Ghost<Seq<WalEvent<E>>>)) where
-    C: Fn() -> u128,
-    B: Fn(u128) -> Result<(), E>,
-    A: Fn() -> WalAnswer<E>,
-    P: Fn(u64),
+) -> (r: (WalOutcome<E>, K, Ghost<WalLog<E, K>>)) where
+    C: Fn(K) -> (u128, K),
+    B: Fn(K, u128) -> (Result<(), E>, K),
+    A: Fn(K) -> (WalAnswer<E>, K),
+    P: Fn(K, u64) -> K,
 
     requires
-        clock.requires(()),
-        forall|ms: u128| set_busy.requires((ms,)),
-        attempt.requires(()),
-        forall|ns: u64| pause.requires((ns,)),
+        forall|k: K| clock.requires((k,)),
+        forall|k: K, ms: u128| set_busy.requires((k, ms)),
+        forall|k: K| attempt.requires((k,)),
+        forall|k: K, ns: u64| pause.requires((k, ns)),
     ensures
-        answers_from(*clock, *set_busy, *attempt, r.1@),
-        well_paced(r.1@, timeout as int),
-        settled(r.1@, timeout as int, in_memory, r.0),
+        calls_chained(*clock, *set_busy, *attempt, *pause, start, r.2@, r.1),
+        settled_run(r.2@.events, r.2@.events.len() as int, timeout as int, in_memory, r.0),
+        total_pause(r.2@.events) <= timeout,
 {
     let ghost tt = timeout as int;
-    let ghost mut trace: Seq<WalEvent<E>> = Seq::empty();
+    let ghost oracles = (*clock, *set_busy, *attempt, *pause);
+    let ghost mut log = WalLog::<E, K> { events: Seq::empty(), tickets: seq![start] };
+    // The number of retried rounds so far.
+    let ghost mut k: int = 0;
+    let mut ticket = start;
+    // The time accounted for so far: the last elapsed time plus the pause.
     let mut floor: u128 = 0;
-    proof {
-        lemma_empty_trace(*clock, *set_busy, *attempt, tt);
-    }
     loop
         invariant
-            clock.requires(()),
-            forall|ms: u128| set_busy.requires((ms,)),
-            attempt.requires(()),
-            forall|ns: u64| pause.requires((ns,)),
+            forall|k: K| clock.requires((k,)),
+            forall|k: K, ms: u128| set_busy.requires((k, ms)),
+            forall|k: K| attempt.requires((k,)),
+            forall|k: K, ns: u64| pause.requires((k, ns)),
             tt == timeout as int,
+            oracles == (*clock, *set_busy, *attempt, *pause),
+            calls_chained(*clock, *set_busy, *attempt, *pause, start, log, ticket),
+            0 <= k,
+            log.events.len() == 5 * k,
+            forall|j: int| 0 <= j < k ==> #[trigger] retried_round(log.events, j, tt),
+            floor as int == round_floor(log.events, 5 * k),
             floor <= timeout,
-            loop_props(*clock, *set_busy, *attempt, trace, tt),
-            all_contended(trace),
-            total_pause(trace) <= floor,
-            trace.len() == 0 ==> floor == 0,
-            trace.len() > 0 ==> {
-                &&& trace.len() >= 2
-                &&& trace[trace.len() - 1] is Pause
-                &&& trace[trace.len() - 2] is Clock
-                &&& trace[trace.len() - 2]->Clock_elapsed + trace[trace.len() - 1]->Pause_nanos
-                    == floor
-            },
+            total_pause(log.events) <= floor,
         decreases timeout - floor,
     {
         // The elapsed time is the clock reading, never less than the time
         // already accounted for.
-        let reading = clock();
+        let (reading, next) = clock(ticket);
         let t: u128 = if reading > floor { reading } else { floor };
-        let ghost ev_clock = WalEvent::<E>::Clock { reading, elapsed: t as int };
         proof {
-            if trace.len() > 0 {
-                lemma_round_pause(trace);
-            }
-            let last = previous_reading(trace);
-            lemma_push_clock_event(*clock, *set_busy, *attempt, trace, ev_clock, last, tt);
-            trace = trace.push(ev_clock);
+            let ev = WalEvent::<E>::Clock { reading, elapsed: t as int };
+            lemma_record_in_round(oracles, start, log, ticket, ev, next, k, tt);
+            log = record(log, ev, next);
         }
+        ticket = next;
         // Limit SQLite's own busy handler to the remaining time.
         let millis = timeout.saturating_sub(t) / NANOS_PER_MILLI;
-        let set = set_busy(millis);
-        let ghost ev_set = WalEvent::<E>::SetBusy { millis: millis as int, result: set };
+        let (set, next) = set_busy(ticket, millis);
         proof {
-            lemma_push_busy_event(*clock, *set_busy, *attempt, trace, ev_set, tt);
-            trace = trace.push(ev_set);
+            let ev = WalEvent::<E>::SetBusy { millis: millis as int, result: set };
+            lemma_record_in_round(oracles, start, log, ticket, ev, next, k, tt);
+            log = record(log, ev, next);
+            assert(round_opens(log.events, 5 * k, tt));
+            assert((log.events.len() - 2) / 5 == k);
         }
+        ticket = next;
         if let Err(e) = set {
-            return (WalOutcome::BusyTimeoutFailed(e), Ghost(trace));
+            return (WalOutcome::BusyTimeoutFailed(e), ticket, Ghost(log));
         }
-        let answer = attempt();
-        let ghost ev_attempt = WalEvent::<E>::Attempt { answer };
+        let (answer, next) = attempt(ticket);
         proof {
-            lemma_push_attempt_event(*clock, *set_busy, *attempt, trace, ev_attempt, tt);
-            trace = trace.push(ev_attempt);
+            let ev = WalEvent::<E>::Attempt { answer };
+            lemma_record_in_round(oracles, start, log, ticket, ev, next, k, tt);
+            log = record(log, ev, next);
+            assert((log.events.len() - 2) / 5 == k);
         }
+        ticket = next;
         let error = match answer {
             WalAnswer::Mode(mode) => {
                 if journal_mode_accepted(mode.as_slice(), in_memory) {
-                    return (WalOutcome::Enabled, Ghost(trace));
+                    return (WalOutcome::Enabled, ticket, Ghost(log));
                 }
-                return (WalOutcome::NotWal(mode), Ghost(trace));
+                return (WalOutcome::NotWal(mode), ticket, Ghost(log));
             },
             WalAnswer::Failed(e) => {
-                return (WalOutcome::Failed(e), Ghost(trace));
+                return (WalOutcome::Failed(e), ticket, Ghost(log));
             },
             WalAnswer::Contention(e) => e,
         };
         // Contention: give up once the timeout has passed.
-        let reading_after = clock();
+        let (reading_after, next) = clock(ticket);
         let u: u128 = if reading_after > t { reading_after } else { t };
-        let ghost ev_after = WalEvent::<E>::Clock { reading: reading_after, elapsed: u as int };
         proof {
-            lemma_round_has_no_pause(trace);
-            let last = trace.len() - 3;
-            lemma_push_clock_event(*clock, *set_busy, *attempt, trace, ev_after, last, tt);
-            trace = trace.push(ev_after);
+            let ev = WalEvent::<E>::Clock { reading: reading_after, elapsed: u as int };
+            lemma_record_in_round(oracles, start, log, ticket, ev, next, k, tt);
+            log = record(log, ev, next);
+            assert(clock_at(log.events, 5 * k + 3, t as int));
+            assert((log.events.len() - 2) / 5 == k);
         }
+        ticket = next;
         if u >= timeout {
-            return (WalOutcome::TimedOut(error), Ghost(trace));
+            return (WalOutcome::TimedOut(error), ticket, Ghost(log));
         }
         // Otherwise pause for the remaining time, at most 10 ms, and retry.
         let nanos: u64 = match u64::try_from(timeout - u) {
             Ok(left) if left < PAUSE_CAP_NANOS => left,
             _ => PAUSE_CAP_NANOS,
         };
-        pause(nanos);
-        let ghost ev_pause = WalEvent::<E>::Pause { nanos: nanos as int };
+        let next = pause(ticket, nanos);
         proof {
-            lemma_push_pause_event(*clock, *set_busy, *attempt, trace, ev_pause, tt);
-            trace = trace.push(ev_pause);
+            lemma_pause_bounds(u as int, tt);
+            let ev = WalEvent::<E>::Pause { nanos: nanos as int };
+            lemma_record_in_round(oracles, start, log, ticket, ev, next, k, tt);
+            log = record(log, ev, next);
+            assert(retried_round(log.events, k, tt));
+            k = k + 1;
         }
+        ticket = next;
         floor = u + u128::from(nanos);
     }
 }
@@ -1101,28 +828,45 @@ fn attempt_until_settled<E, C, B, A, P>(
 /// The oracles: `clock` reads the nanoseconds elapsed since the start,
 /// `set_busy` runs `PRAGMA busy_timeout = <ms>`, `attempt` runs
 /// `PRAGMA journal_mode = WAL`, and `pause` sleeps the given nanoseconds.
-pub fn enable_wal<E, C, B, A, P>(
+/// Each takes a ticket and returns the next one; the first call takes
+/// `ticket`, and the ticket the last call returned is returned.
+pub fn enable_wal<E, K, C, B, A, P>(
+    ticket: K,
     timeout: u128,
     in_memory: bool,
     clock: &C,
     set_busy: &B,
     attempt: &A,
     pause: &P,
-) -> (r: (WalOutcome<E>, Ghost<Seq<WalEvent<E>>>)) where
-    C: Fn() -> u128,
-    B: Fn(u128) -> Result<(), E>,
-    A: Fn() -> WalAnswer<E>,
-    P: Fn(u64),
+) -> (r: (WalOutcome<E>, K, Ghost<WalLog<E, K>>)) where
+    C: Fn(K) -> (u128, K),
+    B: Fn(K, u128) -> (Result<(), E>, K),
+    A: Fn(K) -> (WalAnswer<E>, K),
+    P: Fn(K, u64) -> K,
 
     requires
-        clock.requires(()),
-        forall|ms: u128| set_busy.requires((ms,)),
-        attempt.requires(()),
-        forall|ns: u64| pause.requires((ns,)),
+        forall|k: K| clock.requires((k,)),
+        forall|k: K, ms: u128| set_busy.requires((k, ms)),
+        forall|k: K| attempt.requires((k,)),
+        forall|k: K, ns: u64| pause.requires((k, ns)),
     ensures
-        wal_run(timeout as int, in_memory, *clock, *set_busy, *attempt, r.1@, r.0),
+        wal_run(
+            timeout as int,
+            in_memory,
+            *clock,
+            *set_busy,
+            *attempt,
+            *pause,
+            ticket,
+            r.1,
+            r.2@,
+            r.0,
+        ),
 {
-    let (outcome, _attempts) = attempt_until_settled(
+    let ghost start = ticket;
+    // Ghost only: ordinary builds erase every use.
+    let (outcome, ticket, _settled) = attempt_until_settled(
+        ticket,
         timeout,
         in_memory,
         clock,
@@ -1131,12 +875,13 @@ pub fn enable_wal<E, C, B, A, P>(
         pause,
     );
     let millis = timeout / NANOS_PER_MILLI;
-    let restored = set_busy(millis);
+    let (restored, next) = set_busy(ticket, millis);
     let ghost ev = WalEvent::<E>::SetBusy { millis: millis as int, result: restored };
-    let ghost trace = _attempts@.push(ev);
+    let ghost log = record(_settled@, ev, next);
     proof {
-        lemma_push_busy_event(*clock, *set_busy, *attempt, _attempts@, ev, timeout as int);
-        assert(trace[trace.len() - 2] == _attempts@[_attempts@.len() - 1]);
+        lemma_record(*clock, *set_busy, *attempt, *pause, start, _settled@, ticket, ev, next);
+        let n = _settled@.events.len() as int;
+        lemma_settled_kept(_settled@.events, log.events, n, timeout as int, in_memory, outcome);
     }
     let outcome = match outcome {
         WalOutcome::Enabled => match restored {
@@ -1145,7 +890,7 @@ pub fn enable_wal<E, C, B, A, P>(
         },
         other => other,
     };
-    (outcome, Ghost(trace))
+    (outcome, next, Ghost(log))
 }
 
 } // verus!
