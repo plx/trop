@@ -300,6 +300,13 @@ Glue:
   - Pinned by `trop/tests/exclusion_edits.rs`, including differential proptests
     against set oracles, one of which checks the exact appended order.
 
+#### Additions to `verified::exclusions`
+
+- `unreserved_ports(occupied, reserved)`: exactly `occupied` filtered to the
+  ports not in `reserved`, in order (duplicates kept). No reserved port is
+  returned and every occupied unreserved port is, so `scan --autoexclude` never
+  excludes a reserved port (`trop::cli_support::unreserved_ports`).
+
 ### `verified::port_bounds` — configured port bounds: validation, resolution, layering, defaults, and `reservations.base`
 
 Glue (where production code calls the kernel):
@@ -1030,6 +1037,18 @@ Filesystem and environment answers (`exists`, `canonicalize`, `current_dir`,
 preconditions are conditional, so they also restrict which oracle calls the
 kernels may make.
 
+#### Additions to `verified::path_relation`
+
+- `home_display(path, home)` over `PathToken`s (`std::path` components): `Home`
+  exactly when the non-empty `home` equals `path`, `Below { rest_start =
+  home.len() }` exactly when it is a strict component prefix, and `Elsewhere`
+  otherwise, so `/home/al` never shortens `/home/alice`.
+  `lemma_home_display_round_trip`: home's components followed by the rest give
+  back the path, and two paths with the same rest are the same path. `trop
+  list` shows `~/` for the home directory itself and `~/rest` below it, as
+  before; a test checks agreement with the previous `Path::strip_prefix`
+  formatting.
+
 ### `verified::reserve` — single-reservation decisions
 
 Glue: `trop/src/operations/reserve.rs` (`MetadataIntent::{kernel_intent,
@@ -1715,6 +1734,28 @@ Trusted:
   canonical targets (every CLI target) only;
 - the working directory read for the tokens is the one the fallback reads.
 
+#### Reserve adopts the unrelated-path guard
+
+Glue: `ReservePlan::check_path_relationship` in
+`trop/src/operations/reserve.rs`:
+- `path_guard(false, !policy.check_path_relationship, true)`, where `policy` is
+  the verified `reserve_policy`;
+- `guard_paths` over `path_tokens(path)`;
+- `Database::validate_path_relationship(path, false)` as the physical fallback.
+
+- `lemma_reserve_guard_is_policy`: the guard's flag rule (`!force &&
+  !allow_unrelated_path`) is reserve's verified policy field
+  `check_path_relationship`. The guard is built from that field, so it applies
+  exactly when the policy says so. Either override bypasses it, and then the
+  fallback is never consulted.
+- The lexical relation is decided by `path_relation`: same, ancestor or
+  descendant is allowed.
+- `test_path_guard_matches_previous_check` is a differential test. It shows
+  identical accept/refuse decisions and errors to the previous check for each
+  tested path under all four flag combinations. The paths include `.`/`..`
+  components, a trailing separator, and a string prefix that is not a component
+  prefix.
+
 ### `verified::shell` — `--shell` names, shell detection, export lines
 
 Glue: `trop/src/output/shell.rs` (`ShellType::{from_string, detect,
@@ -1822,6 +1863,31 @@ Glue: `trop/src/output/formatters.rs` (`render_assignments` for
 - `tab_row`: for one or more fields, splitting a row on tabs gives exactly the
   escaped fields (one column per field), and the row has no line break.
 
+#### Additions to `verified::render`
+
+- `delimited_record(fields, d)`: one CSV (`,`) or TSV (`\t`) record. Each field
+  is written verbatim unless it contains the delimiter, `"`, `\r` or `\n`, in
+  which case it is quoted with inner quotes doubled. Fields are joined by the
+  delimiter, with one `\n` terminator. A record of no fields, or of a single
+  empty field, is written `""`. This is the `csv` crate's default writer byte
+  for byte: an exhaustive differential test covers the zero-field record and
+  all strings of up to 3 characters from `a , \t " \r \n é space`, alone and in
+  pairs, for both delimiters. `lemma_delimited_round_trip`: for a delimiter
+  other than `"`, `\r`, `\n`, a strict RFC 4180 reader model (`read_record`:
+  quotes only open a field, a doubled quote is one quote, a line break outside
+  quotes is malformed) reads every written non-empty record back as exactly its
+  fields. So the column count and every field survive any text, and the
+  terminator is the record's only line break outside quotes. Fields that need
+  no quoting are written verbatim (`lemma_delimited_field_shape`), so ordinary
+  output is unchanged. `trop list --format csv|tsv` and `trop scan --format
+  csv|tsv` write every record with it; the `csv` crate is now only a
+  dev-dependency used by the differential tests.
+- Table output: `trop list` rows and header go through `tab_row`.
+  `list-projects`, `port-info` (path, tag, project, task, owner process and
+  user) and `scan`'s table (owner process and user) show user and OS text with
+  `display_field`, so each reservation or probe stays on one line with a fixed
+  column count.
+
 ### `verified::verbosity` — log levels, precedence, severity filter
 
 Glue: `trop/src/logging.rs` (`LogLevel::parse`, `Logger::{error, warn, info,
@@ -1864,6 +1930,293 @@ Trusted for these kernels (no new escape hatches):
 `#[allow(clippy::byte_char_slices)]` on four literal-comparing functions is a
 lint exception, not a verification escape. Each one carries a comment
 explaining that Verus cannot see inside `b"..."` literals.
+
+#### Additions to `verified::verbosity`
+
+- `cli_level(verbose, quiet, env)` / `resolve_cli_verbosity`: the command
+  line's rule. It is `resolved_level` with `--verbose` ignored when `--quiet`
+  is given: `--quiet` gives `Quiet`, `--verbose` alone gives `Verbose`, either
+  flag overrides `TROP_LOG_MODE`, and without flags a valid level name is used
+  as is (`lemma_cli_level`). `trop::logging::resolve_log_level` (and so
+  `init_logger`) uses it. `trop-cli` derives both its `Logger` and
+  `GlobalOptions { quiet, verbose }` from this one level, so
+  `TROP_LOG_MODE=quiet` silences commands (before, it had no effect) and the
+  result is never both quiet and verbose. `invalid_log_mode` is exactly "set,
+  non-empty and not a level name". The CLI then warns through the logger,
+  showing the value escaped by `display_field` between backticks, and ignores
+  it. An empty value counts as unset: `lemma_empty_log_mode_is_unset` shows it
+  resolves like an unset variable for every flag combination and is not
+  diagnosed.
+
+### `verified::cli` — exit codes, lock contention, data directory, `init`, assertions, flags, occupancy layers, list filters, port arguments
+
+Glue: `trop/src/cli_support.rs` (`#[doc(hidden)] pub mod cli_support`: thin
+wrappers and re-exports for `trop-cli`), `trop/src/error.rs`
+(`sqlite_error_is_lock_contention`), `trop/src/database/config.rs`
+(`default_data_dir` via the private `data_dir_from`, `resolve_database_path`),
+`trop/src/operations/init.rs` (`plan_init` with the private `blocking_entry`,
+`init_database`). In `trop-cli`: `main.rs` (`Cli::try_parse`), `lib.rs`
+(`parse_failure_exit_code`, `run`, `log_mode_warning`), `error.rs`
+(`CliError::class`/`exit_code`), `cli.rs` (`cleanup_switches`,
+`set_occupancy_overrides`, `scan`'s `--min/--max`,
+`validate_task_like_reserve`), `invocation.rs` (`resolve_reservation_metadata`,
+data-dir errors),
+`commands/{assert_port,assert_reservation,assert_data_dir,autoreserve,init,list,reserve_group,scan,port_info,reserve,show_data_dir}.rs`,
+and `utils.rs` (`shorten_path`, `resolve_data_dir`). The glue reads the
+environment (`var_os`), computes `OsStr::is_empty` and `Path::is_absolute`,
+classifies clap's `ErrorKind` and `CliError`/`trop::Error` into kernel enums,
+gathers `symlink_metadata`/`is_dir`/`exists` facts for `init`, and joins
+`.trop`.
+
+- `exit_code_for(ErrorClass)`: the specification's table. The result lies in
+  `1..=7`. It is 1 exactly for the semantic classes (assertion failure, refused
+  sticky-field change, refused unrelated path), 2 exactly for `LockTimeout`, 3
+  exactly for `NoDataDir`, and at least 4 exactly for every other class. Codes
+  from 2 up identify the class (`lemma_exit_codes_identify_class`).
+  `process_exit_code(Termination)` covers the whole process: success and
+  `--help`/`--version` exit 0, every other clap parse failure is `Usage` and
+  exits 4 (invalid arguments), and a failed command exits with its class's
+  code. So 0 means success and 2 means a lock timeout and nothing else. Before,
+  clap's usage errors also exited 2: `trop scan --min 70000`.
+- `is_lock_contention_code(extended)`: true exactly when the low byte of the
+  SQLite (extended) result code is 5 (`SQLITE_BUSY`) or 6 (`SQLITE_LOCKED`).
+  For non-negative codes this is "the code is 5 or 6 modulo 256". So every
+  extended code of the two families classifies (`BUSY_RECOVERY` 261,
+  `BUSY_SNAPSHOT` 517, `BUSY_TIMEOUT` 773, `LOCKED_SHAREDCACHE` 262,
+  `LOCKED_VTAB` 518), and `OK`, `ERROR`, `CORRUPT`, `CANTOPEN`, `NOTADB` and
+  `IOERR_LOCK` never do (`lemma_lock_contention_families`,
+  `lemma_lock_contention_examples`, by `bit_vector`). The glue passes
+  `ffi::Error::extended_code`; a test checks the kernel against rusqlite's own
+  `DatabaseBusy`/`DatabaseLocked` classification for every code in `0..=0xFFFF`
+  and the `i32` extremes.
+- `select_data_dir(trop_data_dir, home, userprofile)`: returns
+  `selected_source`, the first usable source in the order `TROP_DATA_DIR`,
+  `HOME`, `USERPROFILE`, or `None` exactly when no source is usable.
+  `TROP_DATA_DIR` is explicit and used as given, so a relative value stays
+  relative, as before. A home variable is usable only when it is set, non-empty
+  and absolute. `lemma_data_dir_selection` is stated over the selection result:
+  `TROP_DATA_DIR` wins whatever the home variables are; `HOME` or `USERPROFILE`
+  is selected only when it is non-empty and absolute, so a home-derived default
+  never depends on the working directory; a usable `HOME` is preferred; an
+  unusable `HOME` falls through to `USERPROFILE`; and there is no default
+  exactly when no source is usable. `None` is the "no data directory" error:
+  `trop show-data-dir` and every command that needs a data directory exit 3.
+  Before, they panicked (exit 101) or used a cwd-relative
+  `.trop`/`relhome/.trop`. `--data-dir` (which clap also fills from
+  `TROP_DATA_DIR`) takes precedence in the CLI glue. The database path and the
+  user `config.yaml` both come from this one selection.
+- `plan_init(InitFacts)`: `RefuseNotADirectory` exactly when the data
+  directory's path is blocked (checked first: the deepest existing entry on the
+  path, the path itself or its nearest existing ancestor, is not a directory or
+  a link to one). Otherwise `RefuseExistingDatabase` exactly when the database
+  exists and `--overwrite` is not given. Otherwise the steps achieve the goal,
+  are safe and are minimal. The goal: the data directory exists, the database
+  is fresh, and a configuration file exists exactly when one existed or
+  `--with-config` asked for one, never replacing an existing one. Safe: the
+  database is removed only with `--overwrite`. Minimal: no step whose effect
+  already holds. `lemma_init_steps_unique` shows these determine the steps, and
+  without a database `--overwrite` changes nothing
+  (`lemma_overwrite_irrelevant_without_database`). The reference's
+  "`--overwrite`: Overwrite existing files" is read as the database only: an
+  existing `config.yaml` may hold the user's edits and is kept even with
+  `--overwrite`. This was also the behavior before the kernel, and the lead may
+  revisit it. The live run and `--dry-run` both use
+  `trop::operations::init::plan_init`, so a dry run fails exactly when the live
+  run would (exit 6, same message), for an existing database and for a path
+  that is a file alike. "Recreated database" is printed only when an existing
+  database was replaced (with its `-wal`, `-shm` and `-journal` files).
+- `assertion_outcome(observed, negate)`: `Holds` exactly when `observed !=
+  negate`. A failure is `FailsPresent` exactly when the thing exists (with
+  `--not`) and `FailsAbsent` exactly when it does not, so the failure message
+  always states the observed fact. `lemma_negation`: `--not` inverts the
+  verdict. `prints_reservation_port` is `exists && !negate && !quiet`, and
+  printing implies the assertion holds. Used by `assert-port`,
+  `assert-reservation` and `assert-data-dir`. A failed `--validate` stays an
+  internal error that `--not` cannot invert, and the unreachable "database
+  validation failed" branch is gone.
+- `cleanup_switches(prune, expire, clean)`: `(prune || clean, expire ||
+  clean)`; with `--disable-autoclean` the reserve kernel's `cleanup_of` runs
+  neither cleanup. `metadata_intent(clear, value)`: `Clear` exactly with
+  `--clear-*` and `Preserve` exactly without a value. Resolved against the
+  stored value, the three intents give `None`, the value, or the stored value
+  respectively.
+- `occupancy_layer(OccupancyFlags)`: no layer exactly when no switch is given,
+  otherwise `Some(true)` for exactly the given switches. Over any lower
+  settings the layer only disables probes, except for the wildcard probes
+  `--check-all-interfaces` adds, and every given skip switch disables its
+  probes whatever the lower layers say (`lemma_layer_only_disables`, stated
+  with `occupancy::settings_request_probe` and the configuration overlay).
+- `scan_probes(OccSettings)`: `trop scan` probes with the effective settings
+  minus the global `skip`. It has no `--skip-occupancy-check`, because scanning
+  is its purpose. The result does not depend on `skip`, equals what an
+  allocation would probe when `skip` is not set, and always includes the
+  localhost probes when no protocol or family is skipped
+  (`lemma_scan_ignores_global_skip`). `NotChecked` exactly when no probe
+  remains; `scan` then fails (exit 7, "ports were not checked") instead of
+  reporting that nothing is occupied.
+- `identifier_filter_matches(filter, stored)`: true exactly when the filter's
+  trimmed form (`identifier::trimmed`, `str::trim`) is non-empty and equals the
+  stored value. `lemma_filter_canonical`: whitespace padding of any amount,
+  independently on each side, does not matter; a blank filter selects nothing;
+  and a stored canonical identifier is selected by its own text and by any
+  padded form of it. `list --filter-project/--filter-tag` use it. Before,
+  `--filter-tag ' web'` found nothing.
+- `parse_port_arg(bytes)`: `Ok(p)` exactly for the text of a port from 1 to
+  65535 in `u16::from_str` syntax (`is_port_text`). Otherwise `NotANumber`
+  exactly when the text is not `u32` text, `Zero` exactly for zero, and
+  `TooLarge(v)` with the text's value. Every port argument (`reserve
+  --port/--min/--max`, `scan --min/--max`, `assert-port PORT`, `port-info
+  PORT`) goes through it, with the same messages and exit 4.
+
+Not proved (glue, pinned by tests): the clap `ErrorKind` and
+`CliError`/`trop::Error` classifications (exhaustive matches, unit-tested per
+class); that `Path::is_absolute` and `var_os` report the environment correctly
+(data-dir tests over empty, relative, `.` and absolute values, without touching
+the process environment); and the filesystem facts `init` observes
+(time-of-check to time-of-use; a permission-denied ancestor is not modeled).
+Also not proved: the configuration merger applying the occupancy layer leaf by
+leaf (`overlay_settings` models it), and `--filter-path` (still
+`Path::starts_with` plus canonicalization). `reserve-group`/`autoreserve` take
+their task from the effective configuration (`--task`, else `TROP_TASK`), as
+`reserve` does, so an invalid value is reported with its real source (`<command
+line>` or `TROP_TASK`) and exit 7 by all three commands.
+
+### `verified::cleanup` — cleanup selection, reasons, prune probe classification, probe-once, removal plan, revalidation, settlement
+
+Glue in `trop/src/operations/cleanup.rs`:
+- `CleanupOperations::{prune, expire, autoclean,
+  automatic_cleanup_in_connection}` (selections);
+- `execute_cleanup_in_connection` (reasons, plan, revalidation oracles,
+  settlement);
+- `probe_distinct_paths` (path ids, probe once);
+- `classify_path`, with `absence_evidence`, `error_facts` and `io_kind_class`
+  (probe facts);
+- `autoclean_result` (pruned/expired split);
+- `PrunePathStatus::is_prunable`.
+
+Reserve's automatic-cleanup call site is in `trop/src/operations/reserve.rs`.
+Reserve-group and autoreserve share `automatic_cleanup_in_connection`.
+
+What the glue does:
+- reads the clock (whole seconds) and computes `Elapsed` with
+  `SystemTime::duration_since`;
+- converts each stored `last_used_at` to whole seconds;
+- numbers distinct paths with a `BTreeMap<&Path, usize>`;
+- extracts independent facts from each probe's `io::Error`;
+- runs the database oracles;
+- pushes each candidate into the list `settle` decides.
+
+Selection:
+- `days_to_secs` is exact; no `u32` day count overflows.
+- `command_selection` is the selection of `trop prune`, `expire` and
+  `autoclean`: the threshold as given.
+- `automatic_selection` gives a maximum age exactly when automatic expiry is
+  enabled: the configured threshold, or the 30-day default when it is unset
+  (`lemma_automatic_expiry_always_has_threshold`).
+- So a `cleanup` section without `expire_after_days` expires exactly as a
+  missing section does. Before this, such a section reported automatic
+  expiration as enabled but expired nothing. That covered single reservations,
+  and groups loaded from a `trop.yaml` with `cleanup: {}`.
+
+Reasons:
+- `cleanup_reason` decides `Prune` exactly when the prune phase runs and the
+  path is prunable.
+- Otherwise it decides `Expire` exactly when a maximum age is set and the time
+  since the last use exceeds it, in `Duration` order (`expiry::duration_gt`). A
+  last use in the future never expires.
+- The two reasons are disjoint, and each names a phase that runs.
+- `lemma_whole_second_reason`: with whole-second times, `Expire` is
+  `expiry::expired(now, last_used, max)`. An age of exactly the maximum is
+  kept, and cleanup agrees with the SQL cutoff.
+- `lemma_larger_max_age_expires_subset`: a larger maximum age expires a subset.
+- `lemma_unchanged_candidate_still_eligible`: re-checking the same evidence
+  (`still_eligible`) never drops a candidate. Production re-checks with the
+  planning evidence, so its eligibility re-check is provably redundant and
+  `Fate::Ineligible` cannot occur. Revalidation is, in effect, the row-snapshot
+  equality check.
+
+Prune safety:
+- `classify_probe` makes a path prunable exactly on definitive evidence: a
+  non-directory target, or a failure with `NotFound`, a non-directory ancestor
+  or an invalid path.
+- A directory, and every other failure, is preserved (fail closed). Such a
+  failure is `Uninspectable`, with kind precedence symlink loop > transient OS
+  code > `io::ErrorKind` class.
+
+Probe once:
+- `representatives` maps each reservation to the first reservation with the
+  same path id.
+- So a path is probed exactly at its first reservation, and every reservation
+  on it shares that observation (`lemma_representatives`).
+
+Plan:
+- `plan_removals` returns the kept positions (ascending) and the removal
+  candidates in removal order (`verified::sort`).
+- Every scanned position is in exactly one list.
+
+Revalidation (`revalidate_all`, generic over `observe` and `delete` oracle
+closures). The call discipline is in `requires`, and ordinary closures meet it:
+- A dry run consults no oracle.
+- `delete(i)` is only requested in a live run, for an eligible candidate, after
+  some read of it answered `Unchanged` (`delete_permitted`).
+- On success, every candidate has exactly one `Fate`, justified by the oracles'
+  answers (`justified`).
+- A candidate counts as removed only in a dry run, when it was observed gone,
+  or when its permitted guarded delete removed it or found it gone
+  (`lemma_fate_meaning`).
+- A failure is an oracle error, with its candidate index.
+
+What the revalidation spec does not state:
+- the call order;
+- at most one call per index;
+- that no re-read happens between the `Unchanged` answer and the delete.
+
+`Fn` oracles are specified by their answers, not by call history. That the
+delete acts on current evidence rests on the loop's structure (one read, then
+the delete) and on the trusted guarded DELETE, which compares the whole row
+with the planned snapshot in one statement.
+
+Settlement:
+- `settle` places each fate in exactly one of the removed and preserved lists
+  (`Removed <==> removes(fate)`). A changed or replaced row is preserved with
+  its current value; an ineligible one as planned.
+- With one fate per candidate, the considered rows are the preserved ones plus
+  the removed ones.
+
+Autoclean:
+- `split_by_reason` splits the removals into pruned and expired positions, each
+  ascending, so each keeps the removal order.
+- The two lists partition the removals, so `total_removed == pruned_count +
+  expired_count`.
+
+Not proved:
+- revalidation freshness and call order (above);
+- the three-arm glue match that pushes into the decided list;
+- the `io::Error` fact tables;
+- the `Path`-ordered `path_decisions` sort.
+
+These are pinned by `trop/tests/cleanup_regressions.rs` and the `test_glue_*`
+tests in `operations/cleanup.rs`, which include differential tests against the
+previous expiry predicate and the previous stable `sort_by` order.
+
+### `verified::sort` — stable merge sort and the cleanup removal order
+
+Glue: none directly; `verified::cleanup::plan_removals` calls `order_removals`.
+
+- `stable_order(keys)` is a merge sort. It returns every position of `0..n`
+  exactly once, in strictly increasing `(key, position)` order
+  (`is_stable_order`). That order is unique (`lemma_stable_order_unique`).
+- It runs in `O(n log n)`; `verified::render::sort_order` is a quadratic
+  insertion sort over byte keys. Membership uses `verified::render::occurs`.
+- `order_removals(cands)` returns exactly the non-`Keep` positions, each once
+  (`is_removal_order`). By `lemma_removal_order_meaning`:
+  - every prune candidate comes before every expire candidate;
+  - prune candidates keep scan (path, tag) order;
+  - expire candidates come oldest first by `last_used_secs`, ties in scan
+    order.
+- The removal order is unique (`lemma_removal_order_unique`).
+- A differential test shows it equals the previous stable `sort_by` comparator,
+  and 65,535 candidates sort quickly.
 
 ## Working on verified code
 
