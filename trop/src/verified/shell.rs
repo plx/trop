@@ -1212,6 +1212,8 @@ fn ci_range(s: &[u8], lo: usize, hi: usize, lit: &[u8]) -> (r: bool)
 }
 
 /// Parses a `--shell` value (see `shell_alias`).
+// Verus cannot see the bytes of `b"..."` literals, so the literals here are
+// byte-char arrays, which the proof checks against the spec.
 #[allow(clippy::byte_char_slices)]
 pub fn parse_shell_name(s: &[u8]) -> (r: Option<ShellKind>)
     ensures
@@ -1277,6 +1279,8 @@ fn basename_start_index(p: &[u8]) -> (start: usize)
 
 /// Classifies a `SHELL` value by its basename (see
 /// `classify_shell_path_spec`).
+// Verus cannot see the bytes of `b"..."` literals, so the literals here are
+// byte-char arrays, which the proof checks against the spec.
 #[allow(clippy::byte_char_slices)]
 pub fn classify_shell_path(p: &[u8]) -> (r: Option<ShellKind>)
     ensures
@@ -1408,6 +1412,8 @@ pub fn is_inert_value_bytes(v: &[u8]) -> (r: bool)
 }
 
 /// Appends the export line for `name` and `value` (see `export_line_spec`).
+// Verus cannot see the bytes of `b"..."` literals, so the literals here are
+// byte-char arrays, which the proof checks against the spec.
 #[allow(clippy::byte_char_slices)]
 pub fn push_export_line(out: &mut Vec<u8>, sh: ShellKind, name: &[u8], value: &[u8])
     ensures

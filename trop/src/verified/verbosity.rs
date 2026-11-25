@@ -13,6 +13,13 @@
 //!   nothing, `Normal` errors and warnings, `Verbose` everything); it is
 //!   monotone in the level and in the severity.
 //!
+//! Policy note: `Quiet` suppresses the logger's error messages too, as the
+//! production logger always did. This treats logged errors as non-essential
+//! output (spec: "`--quiet`: Suppress non-essential output"); a command's
+//! fatal error is still reported, because the CLI prints it itself rather
+//! than through the logger. Making logged errors essential would set
+//! `threshold(Severity::Error)` to 0; that is a maintainer decision.
+//!
 //! Production glue: `crate::logging` (`LogLevel`, `Logger`, `init_logger`).
 
 use vstd::prelude::*;
@@ -24,7 +31,7 @@ verus! {
 /// Output verbosity, from least to most verbose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verbosity {
-    /// Suppress all non-essential output.
+    /// No log messages, errors included (see the policy note above).
     Quiet,
     /// Errors and warnings.
     Normal,
@@ -252,6 +259,8 @@ fn matches_name(s: &[u8], lit: &[u8]) -> (r: bool)
 }
 
 /// Parses a level name (see `parse_level`).
+// Verus cannot see the bytes of `b"..."` literals, so the literals here are
+// byte-char arrays, which the proof checks against the spec.
 #[allow(clippy::byte_char_slices)]
 pub fn parse_verbosity(s: &[u8]) -> (r: Option<Verbosity>)
     ensures

@@ -55,6 +55,41 @@ fn human_output_does_not_pass_terminal_escapes_through() {
     );
 }
 
+/// A tag carrying a line separator or a bidi override used to pass through:
+/// `U+2028` splits the line for readers such as Python's `str.splitlines`,
+/// and `U+202E` reorders the rest of the line in bidi-aware terminals.
+#[test]
+fn human_output_escapes_line_separators_and_bidi_controls() {
+    let allocations = HashMap::from([
+        (
+            "evil\u{2028}service: 1".to_string(),
+            Port::try_from(5001).unwrap(),
+        ),
+        ("web\u{202e}".to_string(), Port::try_from(5000).unwrap()),
+        ("\u{2066}x\u{2069}".to_string(), Port::try_from(1).unwrap()),
+        ("\u{61c}".to_string(), Port::try_from(65535).unwrap()),
+    ]);
+    let output = HumanFormatter.format(&allocations).unwrap();
+    let is_line_break = |c: char| {
+        matches!(
+            c,
+            '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{1c}'
+                ..='\u{1e}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+        )
+    };
+    let lines: Vec<&str> = output.split(is_line_break).collect();
+    assert_eq!(
+        lines,
+        [
+            "Reserved ports:",
+            "  \"evil\\u{2028}service: 1\": 5001",
+            "  \"web\\u{202e}\": 5000",
+            "  \"\\u{061c}\": 65535",
+            "  \"\\u{2066}x\\u{2069}\": 1",
+        ]
+    );
+}
+
 /// `format_export` used to interpolate the value unquoted, so a value could
 /// run arbitrary commands when the output was evaluated.
 #[test]

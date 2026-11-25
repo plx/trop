@@ -31,7 +31,9 @@ use crate::verified::verbosity::{self, Severity, Verbosity};
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
-    /// Suppress all non-essential output.
+    /// Suppress all non-essential output: the logger prints nothing, not
+    /// even error messages. (The CLI reports a command's fatal error itself,
+    /// not through the logger.)
     Quiet,
     /// Normal output level (errors and warnings).
     Normal,

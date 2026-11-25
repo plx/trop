@@ -4,8 +4,9 @@
 //! - Sequence vocabulary: `split_on` (exactly `str::split` with a single
 //!   separator), `join_with`, and `lemma_split_join` (splitting a join of
 //!   separator-free parts recovers the parts).
-//! - `u16_decimal`: the canonical decimal text of a port (digits only, no
-//!   leading zero, 1 to 5 bytes), which parses back to the same value.
+//! - `u16_decimal` / `u16_decimal_string`: the canonical decimal text of a
+//!   port (digits only, no leading zero, 1 to 5 bytes), which parses back
+//!   to the same value.
 //! - `sort_order`: a stable sort by byte-lexicographic key (`lex_lt`, the
 //!   order of Rust's `str`/`String` comparison), returning the unique
 //!   permutation that lists the keys in increasing order (ties by position).
@@ -14,12 +15,14 @@
 //!   that has no portable name or whose name collides, ignoring ASCII case,
 //!   with an earlier one, and otherwise renders one line per entry joined
 //!   by `\n`. Every line is a single shell/dotenv statement that parses back
-//!   to exactly its name and port (`lemma_block`), and the result does not
-//!   depend on the order of the input (`lemma_group_order_independent`).
-//! - `escape_display_field`: escapes control characters in user text shown
-//!   in human-readable output, injectively (`unescape_field` inverts it) and
-//!   as the identity on text without control characters; `tab_row` joins
-//!   escaped fields with tabs, one line with one column per field.
+//!   to exactly its name and port (`lemma_block`). Neither the text nor
+//!   which entry an error reports depends on the order of the input
+//!   (`lemma_group_order_independent`, `lemma_group_failure_order_independent`).
+//! - `escape_display_field`: escapes control characters, Unicode bidi
+//!   controls and the line/paragraph separators in user text shown in
+//!   human-readable output, injectively (`unescape_field` inverts it) and
+//!   as the identity on text without them; `tab_row` joins escaped fields
+//!   with tabs, one line with one column per field.
 //!
 //! Production glue: `crate::output` (`formatters`, `display_field`,
 //! `tab_row`).
@@ -315,6 +318,24 @@ pub fn u16_decimal(v: u16) -> (out: Vec<u8>)
     out
 }
 
+/// The canonical decimal text of `v` as a `String` (what `v.to_string()`
+/// produces): its UTF-8 bytes are `decimal_text(v)`.
+pub fn u16_decimal_string(v: u16) -> (text: String)
+    ensures
+        vstd::utf8::encode_utf8(text@) == super::exclusions::decimal_text(v as nat),
+        text@ == text::chars_of_bytes(super::exclusions::decimal_text(v as nat)),
+{
+    let digits = u16_decimal(v);
+    proof {
+        lemma_decimal_canonical(v as nat);
+        assert forall|i: int| 0 <= i < digits@.len() implies #[trigger] digits@[i] < 0x80 by {
+            assert(super::exclusions::is_digit(digits@[i]));
+        }
+        text::lemma_ascii_bytes_round_trip(digits@);
+    }
+    text::string_from_ascii(digits.as_slice())
+}
+
 // ---------------------------------------------------------------------------
 // Byte-lexicographic order and the stable sort
 // ---------------------------------------------------------------------------
@@ -503,6 +524,103 @@ pub proof fn lemma_canonical_order(keys: Seq<Seq<u8>>, o: Seq<usize>)
         is_sorted_order(keys, canonical_order(keys)),
 {
     lemma_sorted_order_unique(keys, o, canonical_order(keys));
+}
+
+/// Where position `i` is inserted into the sorted prefix `old`: the first
+/// index (from `p` on) whose key is strictly above `kv[i]`, or `old.len()`.
+spec fn insertion_point(kv: Seq<Seq<u8>>, old: Seq<usize>, i: int, p: int) -> int
+    decreases old.len() - p,
+{
+    if p >= old.len() || lex_lt(kv[i], kv[old[p] as int]) {
+        p
+    } else {
+        insertion_point(kv, old, i, p + 1)
+    }
+}
+
+/// The insertion point is past every key at most `kv[i]` and before the
+/// first key above it.
+proof fn lemma_insertion_point(kv: Seq<Seq<u8>>, old: Seq<usize>, i: int, p: int)
+    requires
+        0 <= p <= old.len(),
+        forall|x: int| 0 <= x < p ==> !lex_lt(kv[i], kv[#[trigger] old[x] as int]),
+    ensures
+        p <= insertion_point(kv, old, i, p) <= old.len(),
+        forall|x: int|
+            0 <= x < insertion_point(kv, old, i, p) ==> !lex_lt(kv[i], kv[#[trigger] old[x] as int]),
+        insertion_point(kv, old, i, p) < old.len() ==> lex_lt(
+            kv[i],
+            kv[old[insertion_point(kv, old, i, p)] as int],
+        ),
+    decreases old.len() - p,
+{
+    if p < old.len() && !lex_lt(kv[i], kv[old[p] as int]) {
+        lemma_insertion_point(kv, old, i, p + 1);
+    }
+}
+
+/// A sorted order of the first `i` positions, built by insertion (the
+/// ghost counterpart of `sort_order`).
+proof fn lemma_sorted_prefix(kv: Seq<Seq<u8>>, i: int) -> (o: Seq<usize>)
+    requires
+        0 <= i <= kv.len() <= usize::MAX,
+    ensures
+        o.len() == i,
+        forall|a: int| 0 <= a < i ==> (#[trigger] o[a] as int) < i,
+        forall|a: int, b: int|
+            0 <= a < b < i ==> key_before(kv, #[trigger] o[a] as int, #[trigger] o[b] as int),
+        forall|k: int| 0 <= k < i ==> #[trigger] occurs(o, k),
+    decreases i,
+{
+    if i == 0 {
+        Seq::empty()
+    } else {
+        let j = i - 1;
+        let old = lemma_sorted_prefix(kv, j);
+        lemma_insertion_point(kv, old, j, 0);
+        let p = insertion_point(kv, old, j, 0);
+        let o = old.insert(p, j as usize);
+        assert forall|a: int, b: int| 0 <= a < b < i implies key_before(
+            kv,
+            #[trigger] o[a] as int,
+            #[trigger] o[b] as int,
+        ) by {
+            lemma_insert_sorted(kv, old, p, j as usize, a, b);
+        }
+        assert forall|a: int| 0 <= a < i implies (#[trigger] o[a] as int) < i by {
+            if a < p {
+                assert(o[a] == old[a]);
+            } else if a > p {
+                assert(o[a] == old[a - 1]);
+            }
+        }
+        assert forall|k: int| 0 <= k < i implies #[trigger] occurs(o, k) by {
+            if k == j {
+                assert(o[p] as int == k);
+            } else {
+                assert(occurs(old, k));
+                let x = choose|x: int| 0 <= x < old.len() && old[x] as int == k;
+                if x < p {
+                    assert(o[x] == old[x]);
+                } else {
+                    assert(o[x + 1] == old[x]);
+                }
+            }
+        }
+        o
+    }
+}
+
+/// Every key sequence of a length a slice can have has a sorted order, so
+/// `canonical_order` is that (unique) sorted order.
+pub proof fn lemma_canonical_order_sorted(keys: Seq<Seq<u8>>)
+    requires
+        keys.len() <= usize::MAX,
+    ensures
+        is_sorted_order(keys, canonical_order(keys)),
+{
+    let o = lemma_sorted_prefix(keys, keys.len() as int);
+    lemma_canonical_order(keys, o);
 }
 
 /// With pairwise distinct keys (such as the keys of a map), the sorted keys
@@ -1200,7 +1318,9 @@ fn first_group_failure(entries: &[GroupEntry], order: &[usize]) -> (r: Option<Gr
 /// - Otherwise the error names the first entry in tag order that fails: no
 ///   portable name (`Unresolved`), or a name colliding with an earlier
 ///   entry's (`Collision`); an entry's own resolution failure is reported
-///   before any collision of it. Nothing is rendered on error.
+///   before any collision of it. Nothing is rendered on error. The entry an
+///   error names is the group's unique first failure (`first_failure_at`,
+///   `lemma_first_failure_unique`).
 pub fn render_group(style: AssignmentStyle, entries: &[GroupEntry]) -> (r: Result<
     String,
     GroupError,
@@ -1231,6 +1351,7 @@ pub fn render_group(style: AssignmentStyle, entries: &[GroupEntry]) -> (r: Resul
             name_of(entries@[earlier as int]),
             name_of(entries@[source as int]),
         ) && fine_before(entries@, source as int),
+        r matches Err(e) ==> first_failure_at(entries@, error_source(e)),
 {
     let n = entries.len();
     let ghost es = entries@;
@@ -1241,6 +1362,11 @@ pub fn render_group(style: AssignmentStyle, entries: &[GroupEntry]) -> (r: Resul
         lemma_canonical_order(keys, order@);
     }
     if let Some(error) = first_group_failure(entries, order.as_slice()) {
+        proof {
+            if let GroupError::Collision { source, earlier } = error {
+                assert(entry_name(es[earlier as int]) is Some);
+            }
+        }
         return Err(error);
     }
     let ghost assigns = sorted_assignments(es);
@@ -1316,15 +1442,36 @@ pub fn render_group(style: AssignmentStyle, entries: &[GroupEntry]) -> (r: Resul
 // ---------------------------------------------------------------------------
 
 /// A control character: C0 (`U+0000..=U+001F`, including `\t`, `\n`, `\r`
-/// and ESC), DEL (`U+007F`), or C1 (`U+0080..=U+009F`, including CSI).
+/// and ESC), DEL (`U+007F`), or C1 (`U+0080..=U+009F`, including CSI and
+/// NEL).
 pub open spec fn is_control_char(c: char) -> bool {
     (c as u32) < 0x20 || (0x7F <= (c as u32) && (c as u32) <= 0x9F)
 }
 
-/// A field that is printed as is: no control character, and not starting
-/// with `"` (so it can never be mistaken for an escaped field).
+/// A layout control: a Unicode `Bidi_Control` character (ALM `U+061C`,
+/// LRM and RLM `U+200E`/`U+200F`, the embeddings and overrides
+/// `U+202A..=U+202E`, the isolates `U+2066..=U+2069`), or the line or
+/// paragraph separator (`U+2028`, `U+2029`, the only characters of
+/// categories `Zl` and `Zp`). Bidi controls reorder the rest of a line in
+/// bidi-aware terminals; the separators end a line for readers such as
+/// Python's `str.splitlines` and JavaScript.
+pub open spec fn is_layout_control(c: char) -> bool {
+    let v = c as u32;
+    v == 0x061C || v == 0x200E || v == 0x200F || (0x2028 <= v && v <= 0x202E) || (0x2066 <= v
+        && v <= 0x2069)
+}
+
+/// A char that display fields escape: a control character or a layout
+/// control.
+pub open spec fn is_unsafe_char(c: char) -> bool {
+    is_control_char(c) || is_layout_control(c)
+}
+
+/// A field that is printed as is: no control character or layout control,
+/// and not starting with `"` (so it can never be mistaken for an escaped
+/// field).
 pub open spec fn is_clean_field(s: Seq<char>) -> bool {
-    &&& forall|i: int| 0 <= i < s.len() ==> !is_control_char(#[trigger] s[i])
+    &&& forall|i: int| 0 <= i < s.len() ==> !is_unsafe_char(#[trigger] s[i])
     &&& !(s.len() > 0 && s[0] == '"')
 }
 
@@ -1351,8 +1498,21 @@ pub open spec fn hex_value(c: char) -> int {
     }
 }
 
+/// The four hex digits of a layout control's code point (all are below
+/// `U+10000`), most significant first.
+pub open spec fn layout_digits(c: char) -> Seq<char> {
+    let v = c as u32;
+    seq![
+        hex_char(((v / 4096) % 16) as u8),
+        hex_char(((v / 256) % 16) as u8),
+        hex_char(((v / 16) % 16) as u8),
+        hex_char((v % 16) as u8),
+    ]
+}
+
 /// How one char is written inside an escaped field: `\"`, `\\`, `\n`,
-/// `\r`, `\t`, `\xHH` for any other control character, otherwise itself.
+/// `\r`, `\t`, `\xHH` for any other control character, `\u{HHHH}` for a
+/// layout control, otherwise itself.
 pub open spec fn escape_char(c: char) -> Seq<char> {
     if c == '"' {
         seq!['\\', '"']
@@ -1366,6 +1526,8 @@ pub open spec fn escape_char(c: char) -> Seq<char> {
         seq!['\\', 't']
     } else if is_control_char(c) {
         seq!['\\', 'x', hex_char(((c as u32) / 16) as u8), hex_char(((c as u32) % 16) as u8)]
+    } else if is_layout_control(c) {
+        seq!['\\', 'u', '{'] + layout_digits(c) + seq!['}']
     } else {
         seq![c]
     }
@@ -1409,6 +1571,12 @@ pub open spec fn unescape_body(t: Seq<char>) -> Seq<char>
             seq![(hex_value(t[2]) * 16 + hex_value(t[3])) as char] + unescape_body(
                 t.subrange(4, t.len() as int),
             )
+        } else if t[1] == 'u' && t.len() >= 8 {
+            seq![
+                (hex_value(t[3]) * 4096 + hex_value(t[4]) * 256 + hex_value(t[5]) * 16 + hex_value(
+                    t[6],
+                )) as char,
+            ] + unescape_body(t.subrange(8, t.len() as int))
         } else {
             seq![t[1]] + unescape_body(t.subrange(2, t.len() as int))
         }
@@ -1432,7 +1600,7 @@ proof fn lemma_hex_char(d: u8)
         d < 16,
     ensures
         hex_value(hex_char(d)) == d,
-        hex_char(d) != '\\' && !is_control_char(hex_char(d)),
+        hex_char(d) != '\\' && !is_unsafe_char(hex_char(d)),
         (hex_char(d) as u32) < 0x80,
 {
     assert((hex_byte(d) as char) as u32 == hex_byte(d) as u32);
@@ -1458,8 +1626,46 @@ proof fn lemma_unescape_unit(c: char, rest: Seq<char>)
         assert(t.subrange(4, t.len() as int) =~= rest);
         assert(hi as int * 16 + lo as int == v as int);
         assert((v as int) as char == c);
+    } else if is_layout_control(c) {
+        let v = c as u32;
+        let d3 = ((v / 4096) % 16) as u8;
+        let d2 = ((v / 256) % 16) as u8;
+        let d1 = ((v / 16) % 16) as u8;
+        let d0 = (v % 16) as u8;
+        lemma_hex_char(d3);
+        lemma_hex_char(d2);
+        lemma_hex_char(d1);
+        lemma_hex_char(d0);
+        assert(t[1] == 'u' && t[3] == hex_char(d3) && t[4] == hex_char(d2) && t[5] == hex_char(d1)
+            && t[6] == hex_char(d0));
+        assert(t.subrange(8, t.len() as int) =~= rest);
+        lemma_layout_digits_value(v);
+        assert((v as int) as char == c);
     } else {
         assert(t.drop_first() =~= rest);
+    }
+}
+
+/// The four hex digits of a code point below `U+10000` add up to it.
+proof fn lemma_layout_digits_value(v: u32)
+    requires
+        v < 0x10000,
+    ensures
+        ((v / 4096) % 16) as u8 as int * 4096 + ((v / 256) % 16) as u8 as int * 256 + ((v / 16)
+            % 16) as u8 as int * 16 + (v % 16) as u8 as int == v as int,
+{
+    let q1 = v / 16;
+    let q2 = q1 / 16;
+    let q3 = q2 / 16;
+    assert(v == 16 * q1 + v % 16);
+    assert(q1 == 16 * q2 + q1 % 16);
+    assert(q2 == 16 * q3 + q2 % 16);
+    assert(q3 < 16);
+    assert(v / 256 == q2) by {
+        vstd::arithmetic::div_mod::lemma_div_denominator(v as int, 16, 16);
+    }
+    assert(v / 4096 == q3) by {
+        vstd::arithmetic::div_mod::lemma_div_denominator(v as int, 256, 16);
     }
 }
 
@@ -1501,24 +1707,30 @@ pub proof fn lemma_escape_body_round_trip(s: Seq<char>)
     }
 }
 
-/// An escaped body has no control character.
+/// An escaped body has no control character or layout control.
 pub proof fn lemma_escape_body_clean(s: Seq<char>)
     ensures
         forall|i: int|
-            0 <= i < escape_body(s).len() ==> !is_control_char(#[trigger] escape_body(s)[i]),
+            0 <= i < escape_body(s).len() ==> !is_unsafe_char(#[trigger] escape_body(s)[i]),
     decreases s.len(),
 {
     if s.len() > 0 {
         lemma_escape_body_clean(s.drop_last());
         let c = s.last();
         let e = escape_char(c);
+        let v = c as u32;
         if is_control_char(c) && !(c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t') {
-            lemma_hex_char(((c as u32) / 16) as u8);
-            lemma_hex_char(((c as u32) % 16) as u8);
+            lemma_hex_char((v / 16) as u8);
+            lemma_hex_char((v % 16) as u8);
+        } else if is_layout_control(c) {
+            lemma_hex_char(((v / 4096) % 16) as u8);
+            lemma_hex_char(((v / 256) % 16) as u8);
+            lemma_hex_char(((v / 16) % 16) as u8);
+            lemma_hex_char((v % 16) as u8);
         }
-        assert forall|i: int| 0 <= i < e.len() implies !is_control_char(#[trigger] e[i]) by {}
+        assert forall|i: int| 0 <= i < e.len() implies !is_unsafe_char(#[trigger] e[i]) by {}
         let b = escape_body(s.drop_last());
-        assert forall|i: int| 0 <= i < escape_body(s).len() implies !is_control_char(
+        assert forall|i: int| 0 <= i < escape_body(s).len() implies !is_unsafe_char(
             #[trigger] escape_body(s)[i],
         ) by {
             if i < b.len() {
@@ -1531,15 +1743,16 @@ pub proof fn lemma_escape_body_clean(s: Seq<char>)
 }
 
 /// The display form of a field: identity on clean fields; otherwise quoted
-/// and escaped. It never contains a control character (so no `\n`, `\r`,
-/// `\t` or ESC can split a line, shift a column or reach the terminal), and
+/// and escaped. It never contains a control character or layout control (so
+/// no `\n`, `\r`, `\t`, ESC, line separator or bidi override can split a
+/// line, shift a column, reorder text or reach the terminal), and
 /// `unescape_field` recovers the field, so distinct fields display
 /// differently.
 pub proof fn lemma_display_field(s: Seq<char>)
     ensures
         is_clean_field(s) ==> display_field_spec(s) == s,
         forall|i: int|
-            0 <= i < display_field_spec(s).len() ==> !is_control_char(
+            0 <= i < display_field_spec(s).len() ==> !is_unsafe_char(
                 #[trigger] display_field_spec(s)[i],
             ),
         unescape_field(display_field_spec(s)) == s,
@@ -1550,7 +1763,7 @@ pub proof fn lemma_display_field(s: Seq<char>)
         let body = escape_body(s);
         lemma_escape_body_clean(s);
         lemma_escape_body_round_trip(s);
-        assert forall|i: int| 0 <= i < d.len() implies !is_control_char(#[trigger] d[i]) by {
+        assert forall|i: int| 0 <= i < d.len() implies !is_unsafe_char(#[trigger] d[i]) by {
             if 0 < i < d.len() - 1 {
                 assert(d[i] == body[i - 1]);
             }
@@ -1612,6 +1825,16 @@ fn push_escaped(out: &mut String, c: char)
         out.push('x');
         out.push(hex_char_of(v / 16));
         out.push(hex_char_of(v % 16));
+    } else if is_layout(c) {
+        let v = c as u32;
+        out.push('\\');
+        out.push('u');
+        out.push('{');
+        out.push(hex_char_of(v / 4096 % 16));
+        out.push(hex_char_of(v / 256 % 16));
+        out.push(hex_char_of(v / 16 % 16));
+        out.push(hex_char_of(v % 16));
+        out.push('}');
     } else {
         out.push(c);
     }
@@ -1628,13 +1851,21 @@ const fn is_control(c: char) -> (r: bool)
     matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}')
 }
 
+/// Whether `c` is a layout control (see `is_layout_control`).
+const fn is_layout(c: char) -> (r: bool)
+    ensures
+        r == is_layout_control(c),
+{
+    matches!(c, '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 /// Escapes user text for human-readable output (see `display_field_spec`
 /// and `lemma_display_field`).
 pub fn escape_display_field(s: &str) -> (out: String)
     ensures
         out@ == display_field_spec(s@),
         is_clean_field(s@) ==> out@ == s@,
-        forall|i: int| 0 <= i < out@.len() ==> !is_control_char(#[trigger] out@[i]),
+        forall|i: int| 0 <= i < out@.len() ==> !is_unsafe_char(#[trigger] out@[i]),
         unescape_field(out@) == s@,
 {
     let mut body = String::new();
@@ -1660,7 +1891,7 @@ pub fn escape_display_field(s: &str) -> (out: String)
         match chars.next() {
             Some(c) => {
                 let first = body.is_empty();
-                let control = is_control(c);
+                let control = is_control(c) || is_layout(c);
                 proof {
                     let pre = s@.subrange(0, k);
                     let next = s@.subrange(0, k + 1);
@@ -1678,7 +1909,7 @@ pub fn escape_display_field(s: &str) -> (out: String)
                         assert(next[0] == pre[0]);
                     }
                     if clean && !control && !(c == '"' && first) {
-                        assert forall|i: int| 0 <= i < next.len() implies !is_control_char(
+                        assert forall|i: int| 0 <= i < next.len() implies !is_unsafe_char(
                             #[trigger] next[i],
                         ) by {
                             if i < k {
@@ -1691,7 +1922,7 @@ pub fn escape_display_field(s: &str) -> (out: String)
                             assert(next[0] == '"');
                         } else {
                             let i = choose|i: int|
-                                0 <= i < pre.len() && is_control_char(#[trigger] pre[i]);
+                                0 <= i < pre.len() && is_unsafe_char(#[trigger] pre[i]);
                             assert(next[i] == pre[i]);
                         }
                         assert(!is_clean_field(next));
@@ -1882,21 +2113,21 @@ proof fn lemma_sorted_views(entries: Seq<GroupEntry>)
 /// tags and the same entries (as seen by rendering), listed in any order,
 /// have the same sorted assignments, so `render_group` produces the same
 /// text for both. This is why `HashMap` iteration order cannot leak into
-/// the output.
+/// the output. (`lemma_group_failure_order_independent` covers the error
+/// case.)
 pub proof fn lemma_group_order_independent(e1: Seq<GroupEntry>, e2: Seq<GroupEntry>)
     requires
-        is_sorted_order(tag_keys(e1), canonical_order(tag_keys(e1))),
-        is_sorted_order(tag_keys(e2), canonical_order(tag_keys(e2))),
-        forall|i: int, j: int|
-            0 <= i < j < e1.len() ==> (#[trigger] e1[i]).tag@ != (#[trigger] e1[j]).tag@,
-        forall|i: int, j: int|
-            0 <= i < j < e2.len() ==> (#[trigger] e2[i]).tag@ != (#[trigger] e2[j]).tag@,
-        forall|x: (Seq<u8>, Option<Seq<u8>>, u16)|
-            entry_views(e1).contains(x) <==> entry_views(e2).contains(x),
+        e1.len() <= usize::MAX,
+        e2.len() <= usize::MAX,
+        distinct_tags(e1),
+        distinct_tags(e2),
+        same_views(e1, e2),
     ensures
         sorted_views(e1) == sorted_views(e2),
         sorted_assignments(e1) == sorted_assignments(e2),
 {
+    lemma_canonical_order_sorted(tag_keys(e1));
+    lemma_canonical_order_sorted(tag_keys(e2));
     lemma_sorted_views(e1);
     lemma_sorted_views(e2);
     lemma_strictly_sorted_views_unique(sorted_views(e1), sorted_views(e2));
@@ -1906,6 +2137,245 @@ pub proof fn lemma_group_order_independent(e1: Seq<GroupEntry>, e2: Seq<GroupEnt
         assert(sorted_views(e1)[a] == sorted_views(e2)[a]);
     }
     assert(s1 =~= s2);
+}
+
+/// Entry `k` is the group's first failure in tag order: every entry that
+/// sorts before it is fine (`fine_before`), and it has no portable name or
+/// its name equals, ignoring ASCII case, the name of an entry that sorts
+/// before it. Every error of `render_group` names such an entry.
+pub open spec fn first_failure_at(entries: Seq<GroupEntry>, k: int) -> bool {
+    &&& 0 <= k < entries.len()
+    &&& fine_before(entries, k)
+    &&& (entry_name(entries[k]) is None || exists|j: int|
+        0 <= j < entries.len() && key_before(tag_keys(entries), j, k) && #[trigger] entry_name(
+            entries[j],
+        ) is Some && text::eq_ignore_ascii_case(name_of(entries[j]), name_of(entries[k])))
+}
+
+/// The entry a group error is about.
+pub open spec fn error_source(e: GroupError) -> int {
+    match e {
+        GroupError::Unresolved { source } => source as int,
+        GroupError::Collision { source, .. } => source as int,
+    }
+}
+
+/// A failing entry cannot sort before a first failure.
+proof fn lemma_failure_not_before(es: Seq<GroupEntry>, a: int, b: int)
+    requires
+        first_failure_at(es, a),
+        first_failure_at(es, b),
+        key_before(tag_keys(es), a, b),
+    ensures
+        false,
+{
+    let keys = tag_keys(es);
+    assert(entry_name(es[a]) is Some);
+    let j = choose|j: int|
+        0 <= j < es.len() && key_before(keys, j, a) && #[trigger] entry_name(es[j]) is Some
+            && text::eq_ignore_ascii_case(name_of(es[j]), name_of(es[a]));
+    lemma_key_before_order(keys, j, a, b);
+    lemma_key_before_order(keys, a, b, a);
+    assert(j != a);
+    assert(key_before(keys, j, b));
+    assert(!text::eq_ignore_ascii_case(name_of(es[j]), name_of(es[a])));
+}
+
+/// A group has at most one first failure, so the error `render_group`
+/// reports is determined by the group.
+pub proof fn lemma_first_failure_unique(es: Seq<GroupEntry>, k1: int, k2: int)
+    requires
+        first_failure_at(es, k1),
+        first_failure_at(es, k2),
+    ensures
+        k1 == k2,
+{
+    let keys = tag_keys(es);
+    if k1 != k2 {
+        lemma_key_before_order(keys, k1, k2, k1);
+        if key_before(keys, k1, k2) {
+            lemma_failure_not_before(es, k1, k2);
+        } else {
+            lemma_failure_not_before(es, k2, k1);
+        }
+    }
+}
+
+/// Tags are pairwise distinct.
+pub open spec fn distinct_tags(es: Seq<GroupEntry>) -> bool {
+    forall|i: int, j: int|
+        0 <= i < j < es.len() ==> (#[trigger] es[i]).tag@ != (#[trigger] es[j]).tag@
+}
+
+/// The two groups have the same entries as seen by rendering.
+pub open spec fn same_views(e1: Seq<GroupEntry>, e2: Seq<GroupEntry>) -> bool {
+    forall|x: (Seq<u8>, Option<Seq<u8>>, u16)|
+        entry_views(e1).contains(x) <==> entry_views(e2).contains(x)
+}
+
+/// The entry of `e2` that looks like `e1[i]`.
+spec fn counterpart(e1: Seq<GroupEntry>, e2: Seq<GroupEntry>, i: int) -> int {
+    choose|m: int| 0 <= m < e2.len() && entry_view(#[trigger] e2[m]) == entry_view(e1[i])
+}
+
+proof fn lemma_counterpart(e1: Seq<GroupEntry>, e2: Seq<GroupEntry>, i: int)
+    requires
+        same_views(e1, e2),
+        0 <= i < e1.len(),
+    ensures
+        0 <= counterpart(e1, e2, i) < e2.len(),
+        entry_view(e2[counterpart(e1, e2, i)]) == entry_view(e1[i]),
+{
+    assert(entry_views(e1)[i] == entry_view(e1[i]));
+    assert(entry_views(e1).contains(entry_view(e1[i])));
+    let m = choose|m: int| 0 <= m < e2.len() && entry_views(e2)[m] == entry_view(e1[i]);
+    assert(entry_view(e2[m]) == entry_view(e1[i]));
+}
+
+/// With distinct tags, `key_before` is the order of the tags.
+proof fn lemma_key_before_tags(es: Seq<GroupEntry>, i: int, j: int)
+    requires
+        distinct_tags(es),
+        0 <= i < es.len(),
+        0 <= j < es.len(),
+    ensures
+        key_before(tag_keys(es), i, j) == lex_lt(es[i].tag@, es[j].tag@),
+        es[i].tag@ == es[j].tag@ <==> i == j,
+{
+    lemma_lex_strict_total(es[i].tag@, es[j].tag@);
+    if i < j {
+        assert(es[i].tag@ != es[j].tag@);
+    } else if j < i {
+        assert(es[j].tag@ != es[i].tag@);
+    }
+}
+
+/// Whether a group resolves does not depend on input order.
+proof fn lemma_group_resolves_transfers(e1: Seq<GroupEntry>, e2: Seq<GroupEntry>)
+    requires
+        distinct_tags(e1),
+        distinct_tags(e2),
+        same_views(e1, e2),
+        same_views(e2, e1),
+        group_resolves(e1),
+    ensures
+        group_resolves(e2),
+{
+    assert forall|i: int| 0 <= i < e2.len() implies #[trigger] entry_name(e2[i]) is Some by {
+        lemma_counterpart(e2, e1, i);
+        assert(entry_name(e1[counterpart(e2, e1, i)]) is Some);
+    }
+    assert forall|i: int, j: int|
+        0 <= i < e2.len() && 0 <= j < e2.len() && i != j implies !text::eq_ignore_ascii_case(
+        name_of(#[trigger] e2[i]),
+        name_of(#[trigger] e2[j]),
+    ) by {
+        lemma_counterpart(e2, e1, i);
+        lemma_counterpart(e2, e1, j);
+        let a = counterpart(e2, e1, i);
+        let b = counterpart(e2, e1, j);
+        lemma_key_before_tags(e2, i, j);
+        lemma_key_before_tags(e1, a, b);
+        assert(name_of(e1[a]) == name_of(e2[i]));
+        assert(name_of(e1[b]) == name_of(e2[j]));
+    }
+}
+
+/// A first failure of `e1` is a first failure of `e2` at the entry that
+/// looks the same.
+proof fn lemma_failure_transfers(e1: Seq<GroupEntry>, e2: Seq<GroupEntry>, k: int)
+    requires
+        distinct_tags(e1),
+        distinct_tags(e2),
+        same_views(e1, e2),
+        same_views(e2, e1),
+        first_failure_at(e1, k),
+    ensures
+        first_failure_at(e2, counterpart(e1, e2, k)),
+{
+    let keys1 = tag_keys(e1);
+    let keys2 = tag_keys(e2);
+    lemma_counterpart(e1, e2, k);
+    let m = counterpart(e1, e2, k);
+    assert forall|j: int| 0 <= j < e2.len() && key_before(keys2, j, m) implies #[trigger] entry_name(
+        e2[j],
+    ) is Some by {
+        lemma_counterpart(e2, e1, j);
+        let a = counterpart(e2, e1, j);
+        lemma_key_before_tags(e2, j, m);
+        lemma_key_before_tags(e1, a, k);
+        assert(entry_name(e1[a]) is Some);
+    }
+    assert forall|i: int, j: int|
+        0 <= i < e2.len() && 0 <= j < e2.len() && i != j && key_before(keys2, i, m) && key_before(
+            keys2,
+            j,
+            m,
+        ) implies !text::eq_ignore_ascii_case(
+        name_of(#[trigger] e2[i]),
+        name_of(#[trigger] e2[j]),
+    ) by {
+        lemma_counterpart(e2, e1, i);
+        lemma_counterpart(e2, e1, j);
+        let a = counterpart(e2, e1, i);
+        let b = counterpart(e2, e1, j);
+        lemma_key_before_tags(e2, i, m);
+        lemma_key_before_tags(e2, j, m);
+        lemma_key_before_tags(e2, i, j);
+        lemma_key_before_tags(e1, a, k);
+        lemma_key_before_tags(e1, b, k);
+        lemma_key_before_tags(e1, a, b);
+        assert(name_of(e1[a]) == name_of(e2[i]));
+        assert(name_of(e1[b]) == name_of(e2[j]));
+    }
+    assert(fine_before(e2, m));
+    if entry_name(e1[k]) is Some {
+        let j = choose|j: int|
+            0 <= j < e1.len() && key_before(keys1, j, k) && #[trigger] entry_name(e1[j]) is Some
+                && text::eq_ignore_ascii_case(name_of(e1[j]), name_of(e1[k]));
+        lemma_counterpart(e1, e2, j);
+        let n = counterpart(e1, e2, j);
+        lemma_key_before_tags(e1, j, k);
+        lemma_key_before_tags(e2, n, m);
+        assert(name_of(e2[n]) == name_of(e1[j]));
+        assert(name_of(e2[m]) == name_of(e1[k]));
+        assert(entry_name(e2[n]) is Some);
+    }
+}
+
+/// Errors do not depend on input order either: for two groups with
+/// distinct tags and the same entries (as seen by rendering), listed in any
+/// order, either both resolve or neither does, and their first failures
+/// (the entries `render_group` reports) look the same. Since the glue
+/// reports a failure by its tag, the error message is the same too.
+pub proof fn lemma_group_failure_order_independent(
+    e1: Seq<GroupEntry>,
+    e2: Seq<GroupEntry>,
+    k1: int,
+    k2: int,
+)
+    requires
+        distinct_tags(e1),
+        distinct_tags(e2),
+        same_views(e1, e2),
+    ensures
+        group_resolves(e1) <==> group_resolves(e2),
+        first_failure_at(e1, k1) && first_failure_at(e2, k2) ==> entry_view(e1[k1]) == entry_view(
+            e2[k2],
+        ),
+{
+    assert(same_views(e2, e1));
+    if group_resolves(e1) {
+        lemma_group_resolves_transfers(e1, e2);
+    }
+    if group_resolves(e2) {
+        lemma_group_resolves_transfers(e2, e1);
+    }
+    if first_failure_at(e1, k1) && first_failure_at(e2, k2) {
+        lemma_failure_transfers(e1, e2, k1);
+        lemma_counterpart(e1, e2, k1);
+        lemma_first_failure_unique(e2, counterpart(e1, e2, k1), k2);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1936,7 +2406,7 @@ pub proof fn lemma_tab_row(fields: Seq<Seq<char>>)
         assert forall|j: int| 0 <= j < shown[i].len() implies shown[i][j] != '\t' && not_line_break(
             #[trigger] shown[i][j],
         ) by {
-            assert(!is_control_char(shown[i][j]));
+            assert(!is_unsafe_char(shown[i][j]));
         }
     }
     if fields.len() > 0 {

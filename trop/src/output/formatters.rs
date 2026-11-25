@@ -176,8 +176,11 @@ impl OutputFormatter for DotenvFormatter {
 /// Formatter for human-readable output.
 ///
 /// Tags are listed in byte order, one per line, and shown with
-/// [`display_field`], so a tag containing a newline or a terminal escape
-/// cannot forge or restyle a line.
+/// [`display_field`], so a tag containing a control character (newline,
+/// carriage return, tab, a terminal escape), a line or paragraph separator,
+/// or a bidi control is quoted and escaped, so it cannot forge or restyle a
+/// line or reorder it with bidi controls. Ports are shown as their canonical
+/// decimal text.
 pub struct HumanFormatter;
 
 impl OutputFormatter for HumanFormatter {
@@ -193,7 +196,8 @@ impl OutputFormatter for HumanFormatter {
         let mut lines = vec!["Reserved ports:".to_string()];
         for index in render::sort_order(&keys) {
             let (tag, port) = services[index];
-            lines.push(format!("  {}: {}", display_field(tag), port.value()));
+            let port = render::u16_decimal_string(port.value());
+            lines.push(format!("  {}: {}", display_field(tag), port));
         }
 
         Ok(lines.join("\n"))
@@ -1465,18 +1469,48 @@ mod tests {
         assert_eq!(display_field("\u{7f}"), "\"\\x7f\"");
         assert_eq!(display_field("\u{9f}"), "\"\\x9f\"");
         assert_eq!(display_field("\u{a0}"), "\u{a0}");
+        assert_eq!(display_field("\u{85}"), "\"\\x85\"");
+        assert_eq!(display_field("a\u{2028}b"), "\"a\\u{2028}b\"");
+        assert_eq!(display_field("\u{2029}"), "\"\\u{2029}\"");
+        assert_eq!(display_field("\u{61c}"), "\"\\u{061c}\"");
+        assert_eq!(display_field("\u{202e}abc"), "\"\\u{202e}abc\"");
+        assert_eq!(display_field("\u{2069}"), "\"\\u{2069}\"");
+        // Neighbours of the escaped ranges are shown as they are.
+        for clean in [
+            "\u{61b}", "\u{200d}", "\u{2027}", "\u{202f}", "\u{2065}", "\u{206a}",
+        ] {
+            assert_eq!(display_field(clean), clean);
+        }
         for code in 0..=0x10_FFFF_u32 {
             let Some(c) = char::from_u32(code) else {
                 continue;
             };
             let shown = display_field(&c.to_string());
-            assert!(!shown.chars().any(char::is_control), "{code:#x}");
+            assert!(!shown.chars().any(is_escaped_char), "{code:#x}");
             assert_eq!(
                 shown == c.to_string(),
-                !c.is_control() && c != '"',
+                !is_escaped_char(c) && c != '"',
                 "{code:#x}"
             );
+            if is_layout_control(c) {
+                assert_eq!(shown, format!("\"\\u{{{code:04x}}}\""), "{code:#x}");
+            }
         }
+    }
+
+    /// The Unicode bidi controls (property `Bidi_Control`) and the line and
+    /// paragraph separators (the only characters of categories `Zl` and
+    /// `Zp`), listed independently of the kernel.
+    fn is_layout_control(c: char) -> bool {
+        matches!(
+            c,
+            '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        ) || matches!(c, '\u{2028}' | '\u{2029}')
+    }
+
+    /// The characters `display_field` escapes (besides a leading `"`).
+    fn is_escaped_char(c: char) -> bool {
+        c.is_control() || is_layout_control(c)
     }
 
     mod differential {
@@ -1592,7 +1626,16 @@ mod tests {
             #[test]
             fn display_field_round_trips_and_is_line_safe(text in any::<String>()) {
                 let shown = display_field(&text);
-                prop_assert!(!shown.chars().any(char::is_control));
+                prop_assert!(!shown.chars().any(super::is_escaped_char));
+                prop_assert_eq!(unescape(&shown), text);
+            }
+
+            #[test]
+            fn display_field_round_trips_layout_controls(
+                text in "[a\\\\\"\u{2028}\u{2029}\u{202a}-\u{202e}\u{2066}-\u{2069}\u{61c}\u{200e}\u{200f}\n\u{1b}]{0,8}",
+            ) {
+                let shown = display_field(&text);
+                prop_assert!(!shown.chars().any(super::is_escaped_char));
                 prop_assert_eq!(unescape(&shown), text);
             }
 
@@ -1603,6 +1646,8 @@ mod tests {
                 let views: Vec<&str> = fields.iter().map(String::as_str).collect();
                 let row = tab_row(&views);
                 prop_assert!(!row.contains('\n') && !row.contains('\r'));
+                let separators = ['\u{2028}', '\u{2029}'];
+                prop_assert!(!row.contains(separators), "{:?}", row);
                 let columns: Vec<String> = row.split('\t').map(unescape).collect();
                 prop_assert_eq!(columns, fields);
             }
@@ -1657,6 +1702,15 @@ mod tests {
                                 char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap(),
                             );
                             i += 2;
+                        }
+                        'u' => {
+                            assert_eq!(body[i + 2], '{');
+                            assert_eq!(body[i + 7], '}');
+                            let hex: String = body[i + 3..i + 7].iter().collect();
+                            out.push(
+                                char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap(),
+                            );
+                            i += 6;
                         }
                         other => out.push(other),
                     }
