@@ -3,7 +3,9 @@
 use crate::error::CliError;
 use crate::invocation::InvocationContext;
 use clap::Args;
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use trop::cli_support::{assertion_outcome, AssertionOutcome};
 
 /// Assert that the data directory exists and is valid.
@@ -27,22 +29,10 @@ impl AssertDataDirCommand {
         // 1. Use the data directory selected once for this invocation.
         let data_dir = context.data_dir()?;
 
-        // 2. Validation must distinguish an absent directory (a clean false
-        // predicate) from a directory whose existence cannot be determined.
-        let exists = if self.validate {
-            data_dir.try_exists().map_err(|error| {
-                CliError::from(trop::Error::DatabaseCorruption {
-                    details: format!(
-                        "cannot access the selected data directory {}: {error}; \
-                         verify its path and permissions before retrying. \
-                         trop did not initialize or modify the data directory",
-                        data_dir.display()
-                    ),
-                })
-            })?
-        } else {
-            data_dir.exists()
-        };
+        // 2. Observe the directory, telling an absent one (a clean false
+        // predicate) from one whose existence cannot be determined, with or
+        // without validation.
+        let exists = observe_data_dir(data_dir)?;
 
         // 3. Validation failures are internal errors, not a false predicate
         // that --not may invert into success.
@@ -63,6 +53,32 @@ impl AssertDataDirCommand {
                 data_dir.display()
             ))),
         }
+    }
+}
+
+/// Whether the data directory exists: `Ok(true)` for a directory (following
+/// symbolic links), `Ok(false)` when nothing is there. A path that cannot be
+/// inspected (for example, permission denied on an ancestor) or that holds
+/// something other than a directory is neither a present nor an absent data
+/// directory, so it is an internal error that `--not` cannot invert, never a
+/// verdict. (`Path::exists` would report the first as absent and the second
+/// as present.)
+fn observe_data_dir(data_dir: &Path) -> Result<bool, CliError> {
+    let inaccessible = |reason: &dyn std::fmt::Display| {
+        CliError::from(trop::Error::DatabaseCorruption {
+            details: format!(
+                "cannot access the selected data directory {}: {reason}; \
+                 verify its path and permissions before retrying. \
+                 trop did not initialize or modify the data directory",
+                data_dir.display()
+            ),
+        })
+    };
+    match fs::metadata(data_dir) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(inaccessible(&"it is not a directory")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(inaccessible(&error)),
     }
 }
 

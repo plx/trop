@@ -13,8 +13,10 @@ just verify          # check every proof
 ```
 
 `just preflight-pr` runs the proofs when Verus is installed locally, and the
-`Verus verification` CI job runs them on every push and pull request. The
-`Test` jobs depend on it.
+`Verus verification` CI job runs them on every push to, and every pull
+request targeting, `main` or `develop` (and on manual dispatch). A push to
+any other branch is not verified in CI until a pull request targets one of
+them. The `Test` jobs depend on it.
 
 ## Architecture
 
@@ -42,8 +44,11 @@ trop-verification/        publish = false harness crate; mounts trop/src/verifie
   the filesystem, and git discovery are not modeled. Where an algorithm
   interleaves decisions with effects (for example, scanning ports and probing
   each one), the kernel is either generic over an oracle closure or proves
-  the pure parts (bounds, candidate order, minimality given the oracle's
-  answers).
+  the pure parts (bounds, the order of results, minimality given the
+  oracle's answers: for example, the least available port). The order and
+  number of oracle calls are not specified (closure calls leave no trace in
+  a specification); where they matter, they hold by construction and are
+  pinned by tests.
 
 ## Soundness at the verified/unverified boundary
 
@@ -109,16 +114,25 @@ trusted base too, and names the specific facts.
   are assumed to behave as specified in both. A few are checked under the
   build toolchain by exhaustive tests (`char::is_whitespace`,
   `char::len_utf8`, `char::escape_default`); most (`str::split_at`,
-  `str::chars`, `Vec::insert`, `String::push`, ...) are not;
+  `str::chars`, `Vec::insert`, `String::push`, ...) are not. A binary
+  installed from crates.io (`cargo install trop-cli`) is built with the
+  installer's toolchain instead: the published crates carry no
+  `rust-toolchain.toml` and declare no `rust-version`. For such a binary the
+  same facts are trusted for that toolchain as well, where no test has
+  checked them; the Unicode tables behind `char::is_whitespace` follow the
+  toolchain's Unicode version;
 - the `verus!` macro's erasure (it removes ghost code only);
 - the production glue that converts domain types to kernel inputs and back,
-  and the few checks glue makes on its own. For example, a group dry run
-  without a database (with auto-init enabled) checks that the database's
-  directory could be created (`check_database_directory_creatable`,
-  unverified), and every group dry run checks the busy timeout before it
-  opens its snapshot through `DatabaseConfig::check_busy_timeout`, the check
-  `Database::open` runs (the verified `config::busy_timeout_ok`, with the
-  same validation error); that it runs there is glue;
+  and the few checks glue makes on its own. For example, a dry run without
+  a database (`reserve`, `reserve-group` or `autoreserve`, with auto-init
+  enabled) checks that the database's directory could be created
+  (`check_database_directory_creatable`, unverified), and every dry run
+  that plans on an in-memory snapshot (`open_dry_run_snapshot`: every group
+  dry run, and a reserve dry run without a database) checks the busy
+  timeout before it opens the snapshot through
+  `DatabaseConfig::check_busy_timeout`, the check `Database::open` runs (the
+  verified `config::busy_timeout_ok`, with the same validation error); that
+  it runs there is glue;
 - the oracle closures production code passes to oracle-generic kernels. They
   must not panic on the inputs they are given. The kernels' specifications
   are relative to the closures' answers, so they do not assume the closures
@@ -130,9 +144,18 @@ trusted base too, and names the specific facts.
     The README's "No flag can take a port owned by another reservation key"
     rests on both;
   - the unrelated-path guard's physical fallback
-    (`Database::validate_path_relationship`, called by `reserve`,
-    `reserve-group`, `migrate` and `release`) decides a lexically unrelated
-    path by canonical comparison;
+    (`Database::validate_path_relationship`) decides a lexically unrelated
+    path by canonical comparison. The verified guard (`release::guard_paths`
+    for `reserve`, `reserve-group`, `autoreserve` and `release`;
+    `migrate::guard_moves` for `migrate`) decides whether the guard applies
+    and the lexical relation, and consults this fallback only for a
+    lexically unrelated path;
+  - the WAL attempt closure decides whether an error is lock contention
+    (retried) or a failure (`sqlite_error_is_lock_contention`, see
+    `verified::wal`);
+  - the symlink step closure decides whether a state is a link and where it
+    points, joining a relative target lexically onto the link's parent (see
+    `verified::symlink`);
 - the `std`/`core` behavior that glue relies on and kernels do not model,
   pinned by tests where noted per kernel (for example `std::path` component
   splitting, and the agreement of the kernels' decimal parsers with
@@ -223,12 +246,11 @@ exclusion-list edits below list the rest.
   lowest port with the verified stable merge sort
   (`verified::sort::stable_order`), and merged in one pass (`extend_runs`:
   each entry extends the last run or starts a new one). That is
-  `O(n log n)` for `n` entries; the previous construction copied the run
-  list once per entry. The proof carries the coverage of the sorted prefix
-  (`in_order`) and shows that a stable order excludes the same ports as the
-  list (`lemma_in_order_coverage`). Incremental inserts (`insert_port`,
-  `insert_span`, `insert_entry`) still rebuild the run list once per insert
-  (`insert_run`), which is linear in the number of runs.
+  `O(n log n)` for `n` entries. The proof carries the coverage of the
+  sorted prefix (`in_order`) and shows that a stable order excludes the
+  same ports as the list (`lemma_in_order_coverage`). Incremental inserts
+  (`insert_port`, `insert_span`, `insert_entry`) still rebuild the run list
+  once per insert (`insert_run`), which is linear in the number of runs.
 - `ExclusionSet` (inside `ExclusionManager`): type invariant "the run list is
   canonical"; its view is the set of valid ports covered, so port 0 is never
   a member. `from_entries` builds exactly the covered set or reports the
@@ -264,8 +286,8 @@ Trusted (in addition to the base): the agreement of `parse_u16` with
 `u16::from_str`, pinned by differential tests
 (`test_parse_u16_kernel_matches_from_str` in `trop/src/config/schema.rs`,
 `prop_decimal_parsers_match_std` in `trop/src/config/environment.rs`). The
-exclusion-text trim is no longer `str::trim`; that the switch kept behavior
-identical is pinned over every Unicode scalar value
+exclusion-text trim is the verified `identifier::trim`; its agreement with
+`str::trim` is pinned over every Unicode scalar value
 (`test_exclusion_text_trim_matches_str_trim`,
 `test_parse_excluded_ports_trim_matches_str_trim`).
 
@@ -316,7 +338,7 @@ Glue:
     ignored.
 - `is_compact`: holds exactly when the list is canonical, that is, when it is
   its own (unique) compaction. `compact-exclusions` and `scan --autocompact`
-  rewrite exactly when it is false; entry counts are no longer compared.
+  rewrite exactly when it is false, whatever the entry counts.
 - `first_reserved_port` (oracle-generic):
   - Its precondition grants the oracle's own precondition only at the valid
     ports the entry names (`callable_on_entry`). The kernel is therefore proved
@@ -382,14 +404,20 @@ What the glue does: it copies `PortConfig` field for field into
 from the returned `LayerLeaves`, and maps each kernel error to its historical
 `(field, message)`.
 
-- `resolve_port_bounds` (resolution): unchanged. It is the one resolution
-  behind the allocator, `trop scan`, and `reserve-group`'s base narrowing.
-  `verified::group::group_scan_bounds`, a second copy, was removed.
+- `resolve_port_bounds` (resolution) is the one resolution behind the
+  allocator, `trop scan`, and `reserve-group`'s base narrowing. A reference
+  model of the allocator's earlier resolution (`historical_range`) pins
+  their agreement (`port_range_from_config_matches_historical_resolution`
+  in `trop/src/port/allocator.rs`).
 - `check_port_bounds` (document rules): `ConfigValidator::validate_port_config`
-  delegates to it. A differential test shows every `(field, message)` is
-  byte-identical to the previous validator. The unreachable "Offset would
-  create invalid max port" branch was deleted
-  (`lemma_validated_offset_max_is_valid_port`).
+  delegates to it. A test over a grid of edge values
+  (`strict_port_bounds_kernel_agrees_with_config_validator`) pins the
+  `(field, message)` that `ConfigValidator::validate` reports for each kernel
+  violation against a table of the historical messages (`validator_error`).
+  Which violation is reported first is the kernel's `validation_error`; no
+  model of the earlier validator checks that order. A validated offset
+  always names a valid port (`lemma_validated_offset_max_is_valid_port`), so
+  there is no "Offset would create invalid max port" error.
 - `lemma_resolution_leniency` is an iff. A resolvable configuration is strictly
   valid exactly when it is neither "both `max` and `max_offset`" nor
   "`max_offset == 0`".
@@ -408,17 +436,30 @@ from the returned `LayerLeaves`, and maps each kernel error to its historical
     kept, and validation of the next state rejects them.
   - Such an unresolvable offset is the one value a later `min`-only layer
     re-evaluates. `ConfigBuilder` validates every file and the programmatic
-    layer on their own and checks the environment's declaration, and
-    `apply_cli_config` is transactional, so only a bare `ConfigMerger` merge
-    can produce it.
+    layer on their own and checks the environment's declaration. Its own
+    command-line layer (`with_cli_config`, `with_cli_config_fields`) is not
+    checked on its own, but it is the last layer, and the final validation
+    rejects an unresolvable offset in it. `EffectiveConfig::apply_cli_config`
+    is transactional. So only a bare `ConfigMerger` merge can carry one into
+    a later layer.
 - Theorems:
   - `{min: m, max_offset: o}` and `{min: m, max: m + o}` are interchangeable in
     every layer stack (`lemma_offset_form_interchangeable`).
-  - Every effective section that passes validation holds exactly one absolute
-    `max` (`lemma_validated_overlay_is_canonical`;
-    `lemma_overlay_all_canonical` gives the same before validation). So "Either
-    max or max_offset must be specified" and the offset errors are unreachable
-    for effective configurations (`lemma_canonical_bounds_checks`).
+  - Layering over the built-in defaults never loses the upper bound
+    (`lemma_overlay_all_has_upper`), so "Either max or max_offset must be
+    specified" is unreachable for every effective section.
+  - When every layer's upper-bound declaration resolves at the `min` in
+    effect there (`declarations_ok`), the result holds exactly one absolute
+    `max` (`lemma_overlay_all_canonical`), so the offset errors are
+    unreachable too (`lemma_canonical_bounds_checks`). `ConfigBuilder`
+    establishes that premise for the files, the environment and the
+    programmatic layer, each checked on its own, and for trop-cli's
+    command-line layer only because that layer sets no `max_offset` (glue).
+    A command-line layer that a library caller passes to
+    `ConfigBuilder::with_cli_config` is checked only by the final validation,
+    which reports its offset errors (for example "max_offset must be > 0").
+  - Conversely, every section that passes validation holds exactly one
+    absolute `max` (`lemma_validated_overlay_is_canonical`).
   - A complete valid document yields exactly its own range over anything below
     (`lemma_valid_document_layer`).
   - Layering is associative for layers that anchor their offsets at their own
@@ -459,8 +500,8 @@ from the returned `LayerLeaves`, and maps each kernel error to its historical
   fallback.
 - Not proved:
   - unconditional associativity;
-  - re-anchoring of an unresolvable `max_offset` by a bare `ConfigMerger` merge
-    (historical);
+  - re-anchoring of an unresolvable `max_offset` by a bare `ConfigMerger`
+    merge;
   - per-document prediction of the base for documents without a complete
     `ports` section;
   - the glue mappings, provenance and attribution, pinned by
@@ -516,12 +557,16 @@ Every result is specified relative to the oracles' answers
   - Without a preferred port, the result is exactly the forward scan from
     the range minimum with every check. It is never `PreferredUnavailable`.
   - An allocated port always lies in the range.
-- `exhaustion_blockers`: classifies every port of the range in ascending
-  order. A flag is set only if some port was classified that way, and every
-  port's classification is reflected in the flags. If no flag is set, some
-  port was found available. Failures propagate.
+- `exhaustion_blockers`: classifies every port of the range (in ascending
+  order by construction; the specification fixes no call order). A flag is
+  set only if some port was classified that way, and every port's
+  classification is reflected in the flags. If no flag is set, some port
+  was found available. Failures propagate.
 - `Availability::blocker` (behind `unavailable_reason`) is `None` exactly
-  for `Available`, so the `expect` in `group.rs` is unreachable.
+  for `Available`, and `plan_fresh_group` never reports
+  `PreferredOnlyUnavailable` with an `Available` verdict
+  (`verified::group`), so the `expect` in `preferred_only_unavailable`
+  (`trop/src/port/group.rs`) is unreachable.
 - `reserved_by_other` (`held_by_other`): the reservation check's answer for
   the holder class the glue reports. An `OtherKey` holder blocks; a
   `ReplacedKey` holder and `Nobody` never block. Which stored reservation
@@ -563,10 +608,10 @@ Not proved:
   body that asked an oracle again after an unfavourable answer and acted on
   a later "free" would also verify, so "fail closed" holds relative to some
   answer the oracle gave. Under `deterministic_oracles` the two coincide.
-- Calling each oracle at most once per port, laziness for valid ports
-  outside the range, and stopping a scan at the first failure. These hold
-  by construction and are pinned for the probe by the `RecordingChecker`
-  tests in `trop/src/port/allocator.rs`
+- Calling each oracle at most once per port, the ascending call order,
+  laziness for valid ports outside the range, and stopping a scan at the
+  first failure. These hold by construction and are pinned for the probe
+  by the `RecordingChecker` tests in `trop/src/port/allocator.rs`
   (`scan_probes_each_candidate_once_in_order_and_skips_blocked_ports`,
   `scan_errors_stop_at_the_first_failing_candidate`,
   `probe_failures_on_blocked_ports_do_not_abort_allocation`,
@@ -599,8 +644,8 @@ request and the fallback request.
   make the fallback request, with no preference. This call discipline is
   verified through the oracles' preconditions (`fallback_discipline`), and
   each oracle is `FnOnce`. `Fallback` cannot represent "preferred
-  unavailable", which removed three `unreachable!()` arms. An oracle that
-  violates its contract is reported as exhaustion, not a panic.
+  unavailable", so the glue has no `unreachable!()` arm for it. An oracle
+  that violates its contract is reported as exhaustion, not a panic.
 - `lemma_allocator_keeps_fallback_contract`: the verified `allocate_single`
   never reports a preferred port unavailable without a preference, and never
   reports the range exhausted with one. So, with the production allocator,
@@ -644,8 +689,9 @@ owner lookups stay outside the kernel.
   order has a non-failed observed outcome. Only probe failures produce
   errors.
 - `scan_ports` (the default `find_occupied_ports`, the mock's override, and
-  `find_occupied_reports`): inspects `lo..=hi` in ascending order. On success
-  it returns exactly the kept values in ascending port order. On error it
+  `find_occupied_reports`): inspects `lo..=hi` (in ascending order by
+  construction; the specification fixes no call order). On success it
+  returns exactly the kept values in ascending port order. On error it
   returns only the error: the inspection of some port in the range returned
   it, and every port before that one has an inspection observed without
   error. An empty range inspects nothing.
@@ -660,14 +706,16 @@ number of calls):
   reported instead of the first one's. So "the error is the first failure's"
   and "collected evidence never hides a failure" hold by construction, not
   by proof.
+- The call order: probes in matrix order, ports in ascending order.
 - That nothing runs after the first failure.
 - The glue mappings above (covered by exhaustive tests over all 729 settings
   and all 32 flag combinations).
 
-The first two are pinned by call-counting tests in
+The first three are pinned by call-counting and call-recording tests in
 `trop/src/port/occupancy.rs`
 (`test_failure_on_last_probe_runs_every_earlier_probe_and_fails_closed`,
-`test_default_find_occupied_ports_stops_at_first_failure`).
+`test_default_find_occupied_ports_stops_at_first_failure`, which records
+the ports in call order).
 `find_occupied_reports` delegates to
 `SystemOccupancyChecker::find_occupied_reports_with(range, config,
 run_probe)`, the `scan_ports` glue with an injectable probe runner. A test
@@ -789,10 +837,13 @@ no longer trims anything: the kernel does.
   replace the group.
 - `lemma_fresh_plan_is_compatible`: every fresh plan passes the
   shape-compatibility check `derive_compatible_base` under the same range,
-  with the same ports and base. That is one condition of the refresh path,
-  not all of it: no theorem states that `match_stored_tags` accepts the
-  stored rows of a fresh plan, that `plan_group_metadata` passes for
-  unchanged metadata, or that the glue's mapping to `CompatClass` is right.
+  with the same ports. A reported base is the plan's base; a plan without
+  a base reports none, and the check reports no base for a plan that has
+  one only when every service sits on its own preferred port. That is one
+  condition of the refresh path, not all of it: no theorem states that
+  `match_stored_tags` accepts the stored rows of a fresh plan, that
+  `plan_group_metadata` passes for unchanged metadata, or that the glue's
+  mapping to `CompatClass` is right.
   That a repeated `reserve-group`/`autoreserve` refreshes end to end is
   pinned by `repeating_a_fresh_allocation_refreshes_it_unchanged`
   (`trop/src/port/group.rs`).
@@ -1110,7 +1161,13 @@ Glue: `trop/src/path/normalize.rs` (`expand_tilde`, `resolve_components`,
     under the home directory.
   - `\` is a separator only on Windows; on Unix `~\x` is a literal name.
   - The expansion's segments are the home directory's segments followed by
-    the rest's (`lemma_tilde_join_segments`).
+    the rest's (`lemma_tilde_join_segments`), and the expansion is absolute
+    exactly when the home directory is. The glue refuses a home directory
+    that is not absolute (`HOME=relhome`) as undeterminable, as the
+    data-directory rule does, so every expansion is absolute; otherwise
+    normalization would resolve `~/x` under the current directory. Pinned
+    by `relative_home_is_not_used_for_tilde_expansion`
+    (`trop-cli/tests/cli_surface_regressions.rs`).
   - On Windows the glue also rejects a rest that `std` parses as starting
     with a drive prefix (`~/C:x`), which `join` would otherwise use to
     replace the home directory.
@@ -1257,9 +1314,13 @@ message.
     premise is trim idempotence, `identifier::lemma_trimmed_idempotent`; the
     lemma's `norm` works on bytes and that one on chars, and the step from
     one to the other is stated, not proved.
-  - Agreement with the group path (`lemma_decision_matches_group_row`):
-    `trop reserve` and `reserve-group`'s `plan_group_metadata` reject the same
-    requests, name the same field first, and store the same metadata.
+  - Agreement with the group path (`lemma_decision_matches_group_row`), for
+    requests that clear neither field (group requests cannot clear;
+    `trop reserve --clear-project`/`--clear-task` have no group
+    counterpart): `trop reserve` and `reserve-group`'s `plan_group_metadata`
+    reject the same requests, name the same field first, and, when they
+    accept, store the same project and task (per field,
+    `lemma_field_rule_matches_group`).
   Planning (`build_plan`) and deferred execution (`deferred_step`) both call
   it.
 - **`reserve_policy`**: its postcondition is `policy == policy_of(flags)`,
@@ -1339,15 +1400,25 @@ Bugs fixed with this kernel:
   propagate, and a plan run after a concurrent reallocation reports the
   current port.
 - An explicit `--project`/`--task` no longer triggers git discovery.
-- `trop reserve --dry-run` now plans on a read-only connection inside a
-  rolled-back transaction. It fails exactly like a live run, prints the plan
-  and the port, and never creates, initializes, or migrates a database. With
-  auto-init disabled, a missing database fails as in a live run. A dry run
-  says when it cannot predict the outcome: a database that is uninitialized
-  or needs migration, or an allocation deferred to automatic cleanup (a live
-  run cleans up and, only if that freed anything, retries once). Opening a
-  WAL database read-only may leave `trop.db-wal`/`trop.db-shm` behind; the
-  contents never change.
+- `trop reserve --dry-run` now plans inside a rolled-back transaction: on a
+  read-only connection to an existing database, or, when none exists yet,
+  on the empty initialized in-memory database a live run would create
+  (`open_dry_run_snapshot`, as for group dry runs). A missing database
+  first gets the live run's checks for creating one (`dry_run_database`):
+  with auto-init disabled, or a database directory that could not be
+  created, it fails as a live run fails. The dry run fails like a live run,
+  prints the plan and the port, and never creates, initializes, or migrates
+  a database. It says when it cannot predict the outcome: a database that is
+  uninitialized or needs migration, or an allocation deferred to automatic
+  cleanup (a live run cleans up and, only if that freed anything, retries
+  once). Opening a WAL database read-only may leave
+  `trop.db-wal`/`trop.db-shm` behind; the contents never change. A missing
+  database used to end the dry run before planning, so it exited 0 without
+  a port for requests a live run rejects (for example an unrelated path).
+  Pinned by `dry_run_without_a_database_creates_nothing`,
+  `dry_run_without_a_database_rejects_an_unrelated_path_like_a_live_run` and
+  `dry_run_without_a_creatable_data_directory_fails_like_a_live_run`
+  (`trop-cli/tests/reserve_dry_run.rs`).
 - The reserve dry-run message and the plan descriptions said a live run
   would retry after cleanup unconditionally; they now say it retries only
   if the cleanup freed anything. Pinned by
@@ -1356,11 +1427,15 @@ Bugs fixed with this kernel:
 
 Trusted: the char-to-byte step from `identifier::lemma_trimmed_idempotent`
 to the byte-level `norm` of `lemma_repeat_request_touches`, exercised by
-`trimmed_intent_values_are_fixed_points`. `str`/byte equality is checked by
-the exhaustive differential test
-`existing_decision_matches_the_previous_rules`.
+`trimmed_intent_values_are_fixed_points`. That the kernel's byte equality
+is the glue's `str` equality holds because UTF-8 encoding is injective; the
+differential test `existing_decision_matches_the_previous_rules` exercises
+it over every combination of 4 stored values and 6 intents per field and
+the 16 settings of `--force`, `--overwrite` and the two change
+permissions.
 The oracle closures are total. The dry run's read-only connection cannot
-write.
+write, and its in-memory database (when no database exists) is never
+written to a file.
 
 #### Shared cleanup policy (single and group reservations)
 
@@ -1448,8 +1523,8 @@ Glue:
 - `trop/src/database/config.rs`: `MAX_BUSY_TIMEOUT_MILLISECONDS`/`SECONDS` come
   from the kernel, and `DatabaseConfig::check_busy_timeout` calls
   `busy_timeout_ok(as_secs, subsec_nanos)`. `Database::open` and
-  `Database::validate` (through `validate_busy_timeout`) and the group dry
-  run's `open_dry_run_snapshot` all call it.
+  `Database::validate` (through `validate_busy_timeout`) and the dry runs'
+  `open_dry_run_snapshot` all call it.
 
 Numbers:
 - `exclusions::parse_unsigned(s, max)` generalizes the exclusion parser and is
@@ -1463,13 +1538,14 @@ Numbers:
   `maximum_lock_wait_seconds`, `cleanup.expire_after_days`, `reservations`
   base/offset/preferred) are parsed by `serde_yaml`, which also accepts
   `0x`/`0o`/`0b` and rejects leading zeros (`min: 05000` is a string). On
-  the command line only `trop exclude`'s argument reaches `parse_u16`
-  (through `PortExclusion`'s `FromStr`). `reserve`'s `--port`, `--min` and
-  `--max` are strings parsed by `str::parse::<u32>` and then range-checked
-  (`parse_port_string` in `trop-cli/src/commands/reserve.rs`). The typed
-  arguments (`scan --min`/`--max`, the `port` of `assert-port` and
-  `port-info`, `expire`/`autoclean --days`, `--busy-timeout`) are parsed by
-  `clap` (as an `i64`, then range-checked).
+  the command line, `trop exclude`'s argument reaches `parse_u16` (through
+  `PortExclusion`'s `FromStr`, after trimming), and every port argument
+  (`reserve --port`/`--min`/`--max`, `scan --min`/`--max`, the `PORT` of
+  `assert-port` and `port-info`) reaches `parse_u32_decimal` untrimmed
+  through the verified `cli::parse_port_arg` (`parse_port_string` in
+  `trop-cli/src/commands/reserve.rs`, see `verified::cli`). Only the typed
+  arguments `expire`/`autoclean --days` and `--busy-timeout` (`u32`) are
+  parsed by `clap` (as an `i64`, then range-checked).
 - `lemma_decimal_text_accepted` (completeness): every value up to `max`, with
   any leading zeros and an optional `+`, parses back to itself.
 
@@ -1827,8 +1903,15 @@ recheck render the kernel's verdicts through one message table in
 `trop/src/database/migrations.rs`: `version_corruption` (a `Corruption`
 verdict) and `unsupported_version` (a newer version). Validation
 (`schema_version_verdict` in `trop/src/database/validation.rs`) calls the
-same two functions, so opening, the post-lock recheck and validation report
-the same text for the same metadata by construction.
+same two functions, so the same verdict gets the same text from opening,
+the post-lock recheck and validation by construction. The verdicts
+themselves agree except in one case
+(`lemma_readers_differ_only_on_a_malformed_first_of_several_rows`): a
+first row that is text but not an `i32`, followed by a second row, is
+`MultipleVersionRows` to opening (which checks for a second row before the
+syntax) and `NotAnInteger` to validation (which checks the syntax first).
+`open_and_validate_differ_only_in_the_order_of_their_checks` pins both
+texts.
 `trop/tests/schema_version_messages.rs` pins the texts for type and
 row-count corruption and for a newer version, the text opening reports for
 a missing metadata table ("the metadata table is missing although a
@@ -1851,10 +1934,17 @@ columns), and that `validate_metadata_rows`' diagnostics name the key once
 - `classify_legacy_row`: each preflight category has an exact meaning. A v1 row
   violates none exactly when the migration copies it faithfully: every value
   already has its v2 storage class, and the copied row satisfies the v2 decoder
-  and keeps its key. The preflight therefore blocks exactly the rows the
-  migration would not copy faithfully. That includes every row that would make
-  the migrated database fail validation, and also a lone `''` tag or a `TEXT`
-  port the copy would change.
+  and keeps its key. Per row, the preflight therefore blocks exactly the rows
+  the migration would not copy faithfully. That includes every row that on
+  its own would make the migrated database fail validation, and also a lone
+  `''` tag or a `TEXT` port the copy would change. Rows that each copy
+  faithfully can still collide: the v1 primary key allows two `(path, NULL)`
+  rows, which both become `(path, '')`, and two rows can share a port. Those
+  cross-row checks (duplicate logical keys after `COALESCE(tag, '')`,
+  duplicate ports) and the metadata scalar-type check are SQL counts in
+  `collect_legacy_violations`, not kernel decisions; a collision they missed
+  would fail the copy's `INSERT` on a constraint and roll the migration
+  back.
 - `columns_match`: equal lengths and, at each position, byte-equal names,
   declared types equal ignoring ASCII case, equal `NOT NULL`, no hidden column,
   and equal primary-key position (when checked). `validate_metadata_rows`
@@ -1863,7 +1953,10 @@ columns), and that `validate_metadata_rows`' diagnostics name the key once
 
 Trusted: `i32::from_str` equivalence (differential test); SQLite metadata
 observations, `typeof` storage classes, and one-snapshot reads within a
-transaction (tested deterministically and under concurrent first opens).
+transaction (tested deterministically and under concurrent first opens);
+the preflight's unverified SQL counts in `collect_legacy_violations`
+(duplicate logical keys after `COALESCE(tag, '')`, duplicate ports, and
+non-`TEXT` metadata keys or values).
 
 ### `verified::escape` — escaping stored text in diagnostics
 
@@ -2058,7 +2151,7 @@ Trusted:
   stored key;
 - the working directory read for the tokens is the one the fallback reads.
 
-#### Reserve adopts the unrelated-path guard
+#### Reserve and reserve-group adopt the unrelated-path guard
 
 Glue: `ReservePlan::check_path_relationship` in
 `trop/src/operations/reserve.rs`:
@@ -2066,6 +2159,14 @@ Glue: `ReservePlan::check_path_relationship` in
   the verified `reserve_policy`;
 - `guard_paths` over `path_tokens(path)`;
 - `Database::validate_path_relationship(path, false)` as the physical fallback.
+
+`ReserveGroupPlan::build_plan` in `trop/src/operations/reserve_group.rs`
+(`reserve-group`, and `autoreserve`, which delegates to it) builds the same
+guard from its own flags, `path_guard(force, allow_unrelated_path, true)`,
+over the configuration file's directory, with the same fallback. Its flag
+rule is therefore the kernel's `path_check_required`, as for `release`;
+`test_reserve_group_path_guard_applies_exactly_without_an_override` pins
+all four flag combinations for an unrelated directory.
 
 - `lemma_reserve_guard_is_policy`: the guard's flag rule (`!force &&
   !allow_unrelated_path`) is reserve's verified policy field
@@ -2202,9 +2303,10 @@ Glue: `trop/src/output/formatters.rs` (`render_assignments` for
   which case it is quoted with inner quotes doubled. Fields are joined by the
   delimiter, with one `\n` terminator. A record of no fields, or of a single
   empty field, is written `""`. This is the `csv` crate's default writer byte
-  for byte: an exhaustive differential test covers the zero-field record and
-  all strings of up to 3 characters from `a , \t " \r \n é space`, alone and in
-  pairs, for both delimiters. `lemma_delimited_round_trip`: for a delimiter
+  for byte: an exhaustive differential test covers, for both delimiters, the
+  zero-field record, every string of up to 3 characters from
+  `a , \t " \r \n é space` as a single field, and every pair of such strings
+  of up to 2 characters. `lemma_delimited_round_trip`: for a delimiter
   other than `"`, `\r`, `\n`, a strict RFC 4180 reader model (`read_record`:
   quotes only open a field, a doubled quote is one quote, a line break outside
   quotes is malformed) reads every written non-empty record back as exactly its
@@ -2266,8 +2368,9 @@ Trusted for these kernels (no new escape hatches):
   restricted lines.
 - `lex_lt` is Rust's `str` order (tested).
 - ASCII folding equals Unicode `to_lowercase` on the accepted names (exhaustive
-  test over all scalar values; only U+212A lowers to an ASCII letter, and no
-  name contains `k`).
+  test over all scalar values: only U+212A has a lowercase made entirely of
+  ASCII letters, `k`; others keep a non-ASCII character, as U+0130 lowers to
+  `i` and U+0307; and no accepted name contains `k`).
 - `is_layout_control` is `Bidi_Control` plus `Zl`/`Zp` (Unicode data;
   independent table checked over all scalar values).
 - `vstd`'s specs of `String::push`/`push_str`/`as_str`, `str::to_owned`,
@@ -2380,8 +2483,11 @@ gathers `symlink_metadata`/`is_dir`/`exists` facts for `init`, and joins
   verdict. `prints_reservation_port` is `exists && !negate && !quiet`, and
   printing implies the assertion holds. Used by `assert-port`,
   `assert-reservation` and `assert-data-dir`. A failed `--validate` stays an
-  internal error that `--not` cannot invert, and the unreachable "database
-  validation failed" branch is gone.
+  internal error that `--not` cannot invert. The observation is glue:
+  `assert-data-dir` observes a directory (`fs::metadata`, following links)
+  in every mode, and a path it cannot inspect, or one that holds something
+  other than a directory, is an internal error, never a verdict
+  (`test_assert_data_dir_on_a_non_directory_is_internal_error`).
 - `cleanup_switches(prune, expire, clean)`: `(prune || clean, expire ||
   clean)`; with `--disable-autoclean` the reserve kernel's `cleanup_of` runs
   neither cleanup. `metadata_intent(clear, value)`: `Clear` exactly with
@@ -2417,11 +2523,15 @@ gathers `symlink_metadata`/`is_dir`/`exists` facts for `init`, and joins
   PORT`) goes through it, with the same messages and exit 4.
 
 Not proved (glue, pinned by tests): the clap `ErrorKind` and
-`CliError`/`trop::Error` classifications (exhaustive matches, unit-tested per
-class); that `Path::is_absolute` and `var_os` report the environment correctly
-(data-dir tests over empty, relative, `.` and absolute values, without touching
-the process environment); and the filesystem facts `init` observes
-(time-of-check to time-of-use; a permission-denied ancestor is not modeled).
+`CliError`/`trop::Error` classifications (total matches, unit-tested per
+class). The `CliError`/`trop::Error` match lists every variant, so a new
+library error does not compile until it is classified; the `ErrorKind`
+match ends in a wildcard, because clap's enum is `#[non_exhaustive]`. Also
+not proved: that `Path::is_absolute` and `var_os` report the environment
+correctly (data-dir tests over empty, relative, `.` and absolute values,
+without touching the process environment); and the filesystem facts `init`
+observes (time-of-check to time-of-use; a permission-denied ancestor is not
+modeled).
 Trusted with them: clap's error kinds and rusqlite's extended result codes
 (the latter checked against rusqlite's own classification, above).
 Also not proved: the configuration merger applying the occupancy layer leaf by
@@ -2634,6 +2744,15 @@ Glue: `sql.as_bytes()` of the `sqlite_schema` text and of the expected CREATE
 text (after `replacen("IF NOT EXISTS", "", 1)`), `Some(table.as_bytes())` as
 the allowed identifier, and `!=` on the normalized byte vectors.
 
+Trusted: that SQLite reads texts differing only in inter-token whitespace,
+the ASCII case of bare words and the quoting of the allowed table name as
+the same definition, so token equality means "same schema"; and that
+`sqlite_schema.sql` holds the CREATE text as written, with only SQLite's
+documented normalizations of its opening keywords (the glue removes
+`IF NOT EXISTS` from the expected text to match). The byte-level and
+historical `char`-level tokenizers' agreement is the differential test
+above.
+
 ### `verified::wal` — enabling WAL journal mode with a bounded retry
 
 Glue: `trop/src/database/connection.rs` (`enable_wal_with_retry`,
@@ -2695,6 +2814,12 @@ Each closure returns `call + 1` as its ticket.
   `u64` by parametricity. This is checked by reading: the kernel uses no
   type-inspecting operation (no `size_of`, `Any` or trait bound on the ticket).
 
+Trusted: the attempt closure's contention-versus-failure decision
+(`sqlite_error_is_lock_contention`, the verified `is_lock_contention_code`
+over rusqlite's extended result code), the journal mode string SQLite
+reports, a monotonic `Instant`, and a `thread::sleep` at least as long as
+requested.
+
 ### `verified::symlink` — bounded symlink following
 
 Glue: `trop/src/path/canonicalize.rs` (`canonicalize_safe`,
@@ -2712,9 +2837,11 @@ Glue: `trop/src/path/canonicalize.rs` (`canonicalize_safe`,
     a non-link. The historical loop checked the depth before reading the link
     and rejected both.
   - Loop detection is sound and complete for `same`. `Loop(s)` is reported only
-    when `s` is the same as an earlier state (at `walk.earlier`). On every
-    other outcome, `same` said "different" for every pair of visited states
-    (`distinct`).
+    when `s` is the same as an earlier state (at `walk.earlier`), and `same`
+    said "different" for `s` and every state before that one, so it is the
+    first match; later states were never compared with `s`. The states
+    before `s` are pairwise different. On every other outcome, `same` said
+    "different" for every pair of visited states (`distinct`).
   - Resolved, Missing and Failed are the last state's own answer.
   - It terminates, with measure `max_depth - depth`.
 - `PathResolver`'s `max_symlink_depth` (default 40) now bounds the links
@@ -2739,7 +2866,10 @@ Glue:
 - `canonicalize_bounded` names the input path in not-found, permission and
   depth errors, like `canonicalize`.
 
-Trusted-base additions: none (no
+Trusted: the step oracle's link classification (`fs::symlink_metadata`,
+`read_link`) and its lexical join of a relative target onto the link's
+parent (`Path::join`); `PathBuf` equality as `same`; `fs::canonicalize` of
+a resolved state; and the error mapping. No new escape hatches (no
 `assume`/`admit`/`external_body`/`assume_specification`).
 
 ### `verified::civil_time`: Unix time to UTC civil date and time, and its `%Y-%m-%d %H:%M:%S` text

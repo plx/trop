@@ -1911,10 +1911,11 @@ pub proof fn lemma_level_file_kinds()
 /// files present (`trop.yaml` when `has_project`, `trop.local.yaml` when
 /// `has_local`), each once, in strictly ascending precedence. So the level's
 /// `trop.yaml` is loaded before its `trop.local.yaml`, which is the order
-/// `ConfigLoader::discover_project_configs` returns. The builder's overlay
-/// order is not decided here: its callers (`load_all_effective`,
+/// `ConfigLoader::discover_project_configs` returns. Its one caller is
+/// `ConfigLoader::load_level`. The builder's overlay order is not decided
+/// here: the loader functions the builder calls (`load_all_effective`,
 /// `load_with_project_file`) re-sort the loaded sources by these
-/// precedences in glue before overlaying them.
+/// precedences (`sort_by_key`, glue) before the builder overlays them.
 pub fn level_load_order(has_project: bool, has_local: bool) -> (order: Vec<LevelFile>)
     ensures
         order@.contains(LevelFile::Project) <==> has_project,

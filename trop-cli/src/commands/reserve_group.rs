@@ -214,8 +214,9 @@ impl ReserveGroupCommand {
     }
 }
 
-/// The database a group dry run copies (`None` when none exists yet), and
-/// the lock wait for reading it. A missing database with auto-init disabled
+/// The database a dry run reads (`None` when none exists yet), and the lock
+/// wait for reading it; `reserve`, `reserve-group` and `autoreserve` share
+/// it. A missing database with auto-init disabled
 /// fails exactly as a live run fails when it opens the database; a missing
 /// database whose directory a live run could not create (an existing
 /// ancestor is not a directory) fails with the live run's error class and

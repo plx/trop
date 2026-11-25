@@ -323,6 +323,23 @@ pub proof fn lemma_readers_agree(meta: MetadataState)
 {
 }
 
+/// The readers give different verdicts only for a text first row that is
+/// not an `i32` followed by a second row: opening reports the second row
+/// (`MultipleVersionRows`), validation the first row's syntax
+/// (`NotAnInteger`). All other metadata gets the same verdict from both,
+/// including the same error.
+pub proof fn lemma_readers_differ_only_on_a_malformed_first_of_several_rows(
+    meta: MetadataState,
+)
+    ensures
+        open_version(meta) != validation_version(meta) ==> {
+            &&& meta matches MetadataState::VersionRow { value: Cell::Text(_), more_rows: true }
+            &&& open_version(meta) == Err::<i32, Corruption>(Corruption::MultipleVersionRows)
+            &&& validation_version(meta) == Err::<i32, Corruption>(Corruption::NotAnInteger)
+        },
+{
+}
+
 /// What opening a database does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenDisposition {

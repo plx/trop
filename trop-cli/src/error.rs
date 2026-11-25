@@ -38,11 +38,36 @@ impl CliError {
     pub fn class(&self) -> ErrorClass {
         match self {
             CliError::SemanticFailure(_) => ErrorClass::Semantic,
+            // Every variant is listed (no wildcard), so a new library error
+            // must be classified before `trop-cli` compiles.
             CliError::Library(lib_err) => match lib_err {
                 LibError::LockTimeout { .. } => ErrorClass::LockTimeout,
                 LibError::StickyFieldChange { .. } => ErrorClass::StickyField,
-                LibError::PathRelationshipViolation { .. } => ErrorClass::PathRelationship,
-                _ => ErrorClass::OtherLibrary,
+                LibError::PathRelationshipViolation { .. } | LibError::UnrelatedPath { .. } => {
+                    ErrorClass::PathRelationship
+                }
+                LibError::DataDirectoryNotFound { .. } => ErrorClass::NoDataDir,
+                LibError::InvalidPort { .. }
+                | LibError::InvalidPath { .. }
+                | LibError::Database(_)
+                | LibError::Configuration(_)
+                | LibError::Io(_)
+                | LibError::Validation { .. }
+                | LibError::PortUnavailable { .. }
+                | LibError::ReservationConflict { .. }
+                | LibError::NotFound { .. }
+                | LibError::InvalidPortRange { .. }
+                | LibError::DatabaseCorruption { .. }
+                | LibError::UnsupportedSchemaVersion { .. }
+                | LibError::MigrationRequired { .. }
+                | LibError::MigrationBlocked { .. }
+                | LibError::PathNotFound { .. }
+                | LibError::PermissionDenied { .. }
+                | LibError::SymlinkLoop { .. }
+                | LibError::PortExhausted { .. }
+                | LibError::OccupancyCheckFailed { .. }
+                | LibError::PreferredPortUnavailable { .. }
+                | LibError::GroupAllocationFailed { .. } => ErrorClass::OtherLibrary,
             },
             CliError::NoDataDirectory | CliError::DataDirectoryUndetermined(_) => {
                 ErrorClass::NoDataDir
@@ -142,6 +167,35 @@ mod tests {
                 6,
             ),
             (CliError::Config("bad".into()), 7),
+            // The library's own "data directory not found" is the
+            // specification's exit 3, and its "unrelated path" is a path
+            // relationship violation (exit 1), like
+            // `PathRelationshipViolation`.
+            (
+                CliError::Library(LibError::DataDirectoryNotFound {
+                    path: "/nowhere".into(),
+                }),
+                3,
+            ),
+            (
+                CliError::Library(LibError::UnrelatedPath {
+                    path: "/elsewhere".into(),
+                }),
+                1,
+            ),
+            (
+                CliError::Library(LibError::PathRelationshipViolation {
+                    details: "unrelated".into(),
+                }),
+                1,
+            ),
+            (
+                CliError::Library(LibError::StickyFieldChange {
+                    field: "project".into(),
+                    details: "d".into(),
+                }),
+                1,
+            ),
         ];
         for (error, code) in cases {
             assert_eq!(error.exit_code(), code, "{error:?}");

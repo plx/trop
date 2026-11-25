@@ -792,9 +792,12 @@ pub proof fn lemma_field_rule_matches_group(
 {
 }
 
-/// A whole stored row: `trop reserve` and `trop reserve-group` (via
+/// A whole stored row, for requests that clear neither field (group requests
+/// cannot clear): `trop reserve` and `trop reserve-group` (via
 /// `super::sticky::plan_group_metadata`) reject the same requests, report
-/// the same field first (project before task), and store the same metadata.
+/// the same field first (project before task), and, when they accept, store
+/// the same project and task (the single path's `resolved` value equals the
+/// group resolution's `resolved_value`).
 pub proof fn lemma_decision_matches_group_row(
     r: ExistingDecision,
     row: super::sticky::StoredMetadata,
@@ -839,6 +842,26 @@ pub proof fn lemma_decision_matches_group_row(
             flags.permissions.allow_project_change,
             flags.permissions.allow_task_change,
         ),
+        super::sticky::project_decision(
+            group_request(project),
+            row,
+            flags.force,
+            flags.permissions.allow_project_change,
+        ) matches Some(res) ==> super::sticky::resolved_value(
+            res,
+            group_request(project),
+            super::sticky::opt_vec_bytes(row.project),
+        ) == resolved(project, super::sticky::opt_vec_bytes(row.project)),
+        super::sticky::task_decision(
+            group_request(task),
+            row,
+            flags.force,
+            flags.permissions.allow_task_change,
+        ) matches Some(res) ==> super::sticky::resolved_value(
+            res,
+            group_request(task),
+            super::sticky::opt_vec_bytes(row.task),
+        ) == resolved(task, super::sticky::opt_vec_bytes(row.task)),
 {
     lemma_field_rule_matches_group(
         project,

@@ -16,9 +16,12 @@
 //!   `max_depth == 0` accepts a state that is not a link (the historical loop
 //!   checked the depth before reading the link and rejected both).
 //! - **Loop detection is sound and complete.** `Loop(s)` is reported only
-//!   when `s` is the same (per `same`) as an earlier state of the chain; on
-//!   every outcome, `same` said "different" for every other pair of states
-//!   that were visited (`distinct`).
+//!   when `s` is the same (per `same`) as an earlier state of the chain
+//!   (`walk.earlier`), and `same` said "different" for `s` and every state
+//!   before that one, so it is the first match; the states after it were
+//!   never compared with `s`. On every outcome, `same` said "different" for
+//!   every pair of states the `step` oracle inspected (`distinct`; for
+//!   `Loop` and `TooDeep`, every state but the last).
 //! - **Every other outcome is the last state's own answer:** `Resolved` (not
 //!   a link), `Missing`, or `Failed` with the oracle's error.
 //! - It terminates for every oracle: the measure is `max_depth - depth`.
@@ -130,12 +133,17 @@ pub open spec fn followed<S, E, St: Fn(&S) -> LinkStep<S, E>, Eq: Fn(&S, &S) -> 
             &&& chain.len() == max_depth + 2
             &&& distinct(same, chain.drop_last())
         },
+        // `s` repeats `chain[walk.earlier]`, the first earlier state `same`
+        // matched it with; the states after that one were never compared
+        // with `s`.
         Followed::Loop(s) => {
             &&& 2 <= chain.len() <= max_depth + 1
             &&& s == chain.last()
             &&& distinct(same, chain.drop_last())
             &&& 0 <= walk.earlier < chain.len() - 1
             &&& same.ensures((&chain[walk.earlier], &s), true)
+            &&& forall|q: int|
+                0 <= q < walk.earlier ==> #[trigger] same.ensures((&chain[q], &s), false)
         },
     }
 }
@@ -186,6 +194,12 @@ pub fn follow_links<S, E, St, Eq>(start: S, max_depth: usize, step: &St, same: &
                     assert(chain.drop_last() =~= visited@);
                     assert(chain[k as int] == visited@[k as int]);
                     assert(same.ensures((&chain[k as int], &current), true));
+                    assert forall|q: int| 0 <= q < k implies #[trigger] same.ensures(
+                        (&chain[q], &current),
+                        false,
+                    ) by {
+                        assert(chain[q] == visited@[q]);
+                    }
                 }
                 return (Followed::Loop(current), Ghost(Walk { chain, earlier: k as int }));
             }

@@ -14,6 +14,7 @@ use crate::config::{
 use crate::database::{check_schema_compatibility, Database, DatabaseConfig};
 use crate::error::{Error, Result};
 use crate::output::{OutputFormat, ShellType};
+use crate::path::relationship::path_tokens;
 use crate::port::allocator::{allocator_from_config, port_span_from_config};
 use crate::port::group::{
     GroupAllocationOutcome, GroupAllocationRequest, GroupCleanupCounts, GroupReconciliationPolicy,
@@ -22,6 +23,7 @@ use crate::port::group::{
 use crate::port::occupancy::OccupancyCheckConfig;
 use crate::verified::group::{self as group_kernel, config_service_offset, FormatArg, GroupOutput};
 use crate::verified::port_bounds::group_scan_span;
+use crate::verified::release::guard_paths;
 use crate::verified::reserve::{cleanup_policy, CleanupSwitches};
 use crate::{PathResolver, Port};
 use rusqlite::types::Value;
@@ -30,6 +32,7 @@ use rusqlite::{params_from_iter, Connection, OpenFlags};
 use super::cleanup::CleanupOperations;
 use super::executor::{ExecutionResult, PlanExecutor};
 use super::plan::{OperationPlan, PlanAction};
+use super::release::path_guard;
 
 /// Options for a reserve group operation.
 ///
@@ -320,12 +323,19 @@ impl ReserveGroupPlan {
             });
         }
 
-        // Apply the same invocation-path guard as a single reservation. Force
-        // is the broad override; the narrow path flag authorizes only this
-        // relationship check.
-        if !self.options.force && !self.options.allow_unrelated_path {
-            Database::validate_path_relationship(&self.reservation_path, false)?;
-        }
+        // Apply the same invocation-path guard as a single reservation and a
+        // release. Force is the broad override; the narrow path flag
+        // authorizes only this relationship check. The verified guard
+        // decides whether it applies (neither override) and the lexical
+        // relation to the current directory; the database's single-path
+        // check is the physical fallback for a lexically unrelated path, and
+        // its error is the refusal.
+        let path = &self.reservation_path;
+        let guard = path_guard(self.options.force, self.options.allow_unrelated_path, true)?;
+        guard_paths(&guard, &[path_tokens(path)], &|_index| {
+            Database::validate_path_relationship(path, false).err()
+        })
+        .map_err(|failure| failure.error)?;
 
         // Convert the reservation group to a GroupAllocationRequest
         let request = self.build_group_request(reservation_group)?;
@@ -875,6 +885,49 @@ reservations:
                 assert_eq!(request.project, Some("test-project".to_string()));
             }
             _ => panic!("Expected AllocateGroup action"),
+        }
+    }
+
+    /// The unrelated-path guard applies exactly when neither `--force` nor
+    /// `--allow-unrelated-path` is given (the verified guard's flag rule).
+    #[test]
+    fn test_reserve_group_path_guard_applies_exactly_without_an_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r"
+ports:
+  min: 5000
+  max: 7000
+reservations:
+  services:
+    web:
+      offset: 0
+";
+        // The temporary directory is unrelated to the test's working
+        // directory.
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let db = create_test_database();
+        for (force, allow_unrelated_path) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let options = ReserveGroupOptions::new(config_path.clone())
+                .with_force(force)
+                .with_allow_unrelated_path(allow_unrelated_path);
+            let result = ReserveGroupPlan::new(options)
+                .unwrap()
+                .build_plan(db.connection());
+            if force || allow_unrelated_path {
+                assert!(
+                    result.is_ok(),
+                    "force={force} allow={allow_unrelated_path}: {:?}",
+                    result.err()
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(Error::PathRelationshipViolation { .. })),
+                    "{:?}",
+                    result.err()
+                );
+            }
         }
     }
 

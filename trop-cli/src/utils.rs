@@ -135,9 +135,8 @@ mod tests {
     fn test_format_timestamp() {
         use std::time::{Duration, UNIX_EPOCH};
         // Create a known SystemTime
-        let st = UNIX_EPOCH + Duration::from_secs(1705323045); // 2024-01-15 10:30:45 UTC
-        let formatted = format_timestamp(st);
-        assert!(formatted.contains("2024-01-15"));
+        let st = UNIX_EPOCH + Duration::from_secs(1_705_323_045); // 2024-01-15 12:50:45 UTC
+        assert_eq!(format_timestamp(st), "2024-01-15 12:50:45");
     }
 
     #[test]

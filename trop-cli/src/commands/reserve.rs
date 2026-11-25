@@ -3,11 +3,13 @@
 //! This module implements the `reserve` command, which reserves a port
 //! for a directory with optional metadata and constraints.
 
+use super::reserve_group::dry_run_database;
 use crate::error::CliError;
 use crate::invocation::InvocationContext;
 use clap::Args;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use trop::operations::reserve_group::open_dry_run_snapshot;
 use trop::{
     Config, Database, DatabaseConfig, PlanAction, PlanExecutor, Port, ReservationKey,
     ReserveOptions, ReservePlan,
@@ -211,18 +213,22 @@ impl ReserveCommand {
 
 /// Runs `reserve --dry-run`.
 ///
-/// When the database exists, the plan is built exactly as a live run builds
-/// it, inside a read transaction on a read-only connection that is rolled
-/// back, and the dry-run executor reports it: the planned actions go to
-/// stderr (unless quiet) and the port a live run would report goes to
-/// stdout. Planning errors (an unrelated path, a sticky-field change, an
-/// exhausted range without automatic cleanup) fail the dry run exactly as
-/// they fail a live run.
+/// The plan is built exactly as a live run builds it, inside a read
+/// transaction that is rolled back, and the dry-run executor reports it: the
+/// planned actions go to stderr (unless quiet) and the port a live run would
+/// report goes to stdout. Planning errors (an unrelated path, a sticky-field
+/// change, an exhausted range without automatic cleanup) fail the dry run
+/// exactly as they fail a live run. The plan reads:
+/// - an existing database through a read-only connection;
+/// - when no database exists yet, the empty initialized in-memory database
+///   (`open_dry_run_snapshot`) that a live run would create and plan
+///   against, after the checks a live run makes before it creates one
+///   (`dry_run_database`, shared with `reserve-group`): with auto-init
+///   disabled, or when the database's directory could not be created, the
+///   dry run fails like the live run. Nothing is created.
 ///
 /// What a dry run cannot do, it says (unless quiet) instead of guessing, and
 /// succeeds:
-/// - a missing database is never created (with auto-init disabled the dry
-///   run fails like the live run instead);
 /// - a database that needs initialization or a schema migration is never
 ///   migrated;
 /// - an allocation deferred to automatic cleanup is never attempted, so its
@@ -237,32 +243,80 @@ fn dry_run(
     config: &Config,
     quiet: bool,
 ) -> Result<(), CliError> {
-    let effective = context.effective()?;
     let db_path = context.database_path()?;
-    if !db_path.exists() {
-        // The same check a live run makes before it would create the
-        // database.
-        if effective.disable_autoinit() {
-            return Err(CliError::NoDataDirectory);
+    // The checks a live run makes before it would create a missing
+    // database, and the lock wait.
+    let (existing, timeout) = dry_run_database(context)?;
+    let database;
+    let empty;
+    let connection = if let Some(db_path) = existing.as_deref() {
+        database = open_existing(db_path, timeout, quiet)?;
+        let Some(database) = database.as_ref() else {
+            return Ok(());
+        };
+        database.connection()
+    } else {
+        // The database a live run would create: empty and initialized.
+        empty = open_dry_run_snapshot(None, timeout).map_err(CliError::from)?;
+        &empty
+    };
+    // A deferred (read) transaction gives planning one consistent snapshot;
+    // dropping it rolls back, and neither connection writes to a file.
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(trop::Error::from)
+        .map_err(CliError::from)?;
+    let plan = ReservePlan::new(options, config)
+        .build_plan(&tx)
+        .map_err(CliError::from)?;
+    let result = PlanExecutor::new(&tx)
+        .dry_run()
+        .execute(&plan)
+        .map_err(CliError::from)?;
+    drop(tx);
+
+    if !quiet {
+        eprintln!("Dry run - would perform the following actions:");
+        for (i, action) in result.actions_taken.iter().enumerate() {
+            eprintln!("  {}. {action}", i + 1);
         }
-        if !quiet {
-            eprintln!("Dry run - would perform the following actions:");
-            eprintln!("  1. Reserve port");
+        for warning in &result.warnings {
+            eprintln!("Warning: {warning}");
+        }
+        if existing.is_none() {
             eprintln!(
                 "No database exists yet at {}; a live run would create it.",
                 db_path.display()
             );
         }
-        return Ok(());
+        if plan.actions.iter().any(allocates_after_cleanup) {
+            eprintln!(
+                "The range is exhausted: a live run would run automatic cleanup and, \
+                 if that freed anything, retry once. A dry run does neither, so it \
+                 cannot predict the port or whether the reservation would succeed."
+            );
+        }
     }
+    if let Some(port) = result.port {
+        println!("{}", port.value());
+    }
+    Ok(())
+}
 
-    let timeout = Duration::from_secs(effective.maximum_lock_wait_seconds());
-    let db = match Database::open(
-        DatabaseConfig::new(&db_path)
+/// Opens the existing database at `db_path` read-only for a dry run, or
+/// returns `None`, after saying so (unless quiet), when a live run would
+/// first initialize or migrate it, which a dry run must not do.
+fn open_existing(
+    db_path: &Path,
+    timeout: Duration,
+    quiet: bool,
+) -> Result<Option<Database>, CliError> {
+    match Database::open(
+        DatabaseConfig::new(db_path)
             .with_busy_timeout(timeout)
             .read_only(),
     ) {
-        Ok(db) => db,
+        Ok(db) => Ok(Some(db)),
         // A live run initializes or migrates the database before it plans;
         // a dry run must not, so it cannot plan.
         Err(trop::Error::MigrationRequired { found, target, .. }) => {
@@ -285,46 +339,10 @@ fn dry_run(
                     );
                 }
             }
-            return Ok(());
+            Ok(None)
         }
-        Err(error) => return Err(CliError::from(error)),
-    };
-    // A deferred (read) transaction gives planning one consistent snapshot;
-    // dropping it rolls back, and the read-only connection cannot write.
-    let tx = db
-        .connection()
-        .unchecked_transaction()
-        .map_err(trop::Error::from)
-        .map_err(CliError::from)?;
-    let plan = ReservePlan::new(options, config)
-        .build_plan(&tx)
-        .map_err(CliError::from)?;
-    let result = PlanExecutor::new(&tx)
-        .dry_run()
-        .execute(&plan)
-        .map_err(CliError::from)?;
-    drop(tx);
-
-    if !quiet {
-        eprintln!("Dry run - would perform the following actions:");
-        for (i, action) in result.actions_taken.iter().enumerate() {
-            eprintln!("  {}. {action}", i + 1);
-        }
-        for warning in &result.warnings {
-            eprintln!("Warning: {warning}");
-        }
-        if plan.actions.iter().any(allocates_after_cleanup) {
-            eprintln!(
-                "The range is exhausted: a live run would run automatic cleanup and, \
-                 if that freed anything, retry once. A dry run does neither, so it \
-                 cannot predict the port or whether the reservation would succeed."
-            );
-        }
+        Err(error) => Err(CliError::from(error)),
     }
-    if let Some(port) = result.port {
-        println!("{}", port.value());
-    }
-    Ok(())
 }
 
 /// The action allocates at execution, after automatic cleanup.
