@@ -12,8 +12,9 @@
 //!   permission never turns an accepted request into a rejection, and that
 //!   the single and group paths accept, reject, and store exactly alike.
 //! - **The reserve policy** (`reserve_policy`): the effective checks derived
-//!   from the request flags; `--force` dominates every protection and the
-//!   policy is monotone in the permissive flags.
+//!   from the request flags. `--force` dominance and monotonicity in the
+//!   permissive flags are proved over `policy_of`, a spec copy of
+//!   `reserve_policy`'s postcondition (the two are not tied by an `ensures`).
 //! - **Cleanup-then-retry** (`allocate_with_cleanup_retry`): generic over the
 //!   allocation, cleanup, and retry oracles. Its contract covers when each
 //!   oracle may run (`retry_discipline`, stated as the oracles' own
@@ -26,8 +27,9 @@
 //!   shared by live execution and dry runs.
 //!
 //! Strings are compared as the UTF-8 bytes of the (already trimmed) values;
-//! byte equality of UTF-8 encodings coincides with `str` equality. Trimming
-//! (`str::trim`) stays in the production glue.
+//! byte equality of UTF-8 encodings coincides with `str` equality. The
+//! production glue trims with the verified `super::identifier::trim` before
+//! a value reaches this kernel.
 //!
 //! Production glue: `crate::operations::reserve` (`ReservePlan::build_plan`,
 //! `reconcile_deferred_key`, `execute_reserve_after_cleanup_with_barrier`,
@@ -52,7 +54,8 @@ use super::sticky::{can_change_field, opt_bytes_eq};
 /// The requested operation for one optional metadata field (project or task).
 ///
 /// Production glue maps `MetadataIntent` one to one, trimming the value of
-/// `Set` (`str::trim`) before it reaches the kernel.
+/// `Set` with the verified `super::identifier::trim` before it reaches the
+/// kernel.
 pub enum Intent<T> {
     /// Keep the stored value of an existing reservation; use the inferred
     /// value for a new one.
@@ -240,7 +243,9 @@ impl CleanupPolicy {
 /// `--force` or `--allow-unrelated-path`; `--force` acts as `--overwrite`,
 /// `--ignore-occupied`, and `--ignore-exclusions` together; each automatic
 /// cleanup is on unless disabled. (`lemma_force_dominates` and
-/// `lemma_policy_monotone` state the consequences.)
+/// `lemma_policy_monotone` state the consequences for `policy_of`, which
+/// restates this postcondition; nothing but reading checks that the two
+/// agree.)
 pub const fn reserve_policy(flags: ReserveFlags) -> (policy: ReservePolicy)
     ensures
         policy.check_path_relationship == (!flags.force && !flags.allow_unrelated_path),
@@ -264,7 +269,8 @@ pub const fn reserve_policy(flags: ReserveFlags) -> (policy: ReservePolicy)
     }
 }
 
-/// The policy `reserve_policy` returns (its postcondition as a value).
+/// The policy `reserve_policy` returns (its postcondition as a value). A
+/// hand-written copy: no `ensures` clause ties it to `reserve_policy`.
 pub open spec fn policy_of(flags: ReserveFlags) -> ReservePolicy {
     ReservePolicy {
         check_path_relationship: !flags.force && !flags.allow_unrelated_path,
@@ -288,10 +294,10 @@ pub open spec fn cleanup_of(switches: CleanupSwitches) -> CleanupPolicy {
 
 /// The automatic cleanups an exhausted allocation may run (`cleanup_of`).
 ///
-/// `reserve-group` and `autoreserve` call this for their group allocations,
-/// and `reserve_policy` applies the same rule to single reservations
-/// (`lemma_cleanup_policy_shared`), so both paths clean up alike for the
-/// same switches.
+/// `reserve-group` and `autoreserve` call this for their group allocations.
+/// `reserve_policy` states the same formula for single reservations in its
+/// own postcondition (it does not call this function), so both paths clean
+/// up alike for the same switches.
 pub const fn cleanup_policy(switches: CleanupSwitches) -> (policy: CleanupPolicy)
     ensures
         policy == cleanup_of(switches),
@@ -299,9 +305,10 @@ pub const fn cleanup_policy(switches: CleanupSwitches) -> (policy: CleanupPolicy
     CleanupPolicy { prune: !switches.disable_autoprune, expire: !switches.disable_autoexpire }
 }
 
-/// Single and group reservations share the cleanup rule: the cleanup part
-/// of a reserve policy is exactly `cleanup_of` its switches, so a retry is
-/// possible unless both automatic cleanups are disabled.
+/// A definitional identity: `policy_of`'s cleanup field is `cleanup_of` its
+/// switches (the same expression), and a retry is possible unless both
+/// automatic cleanups are disabled. It constrains neither the exec
+/// `reserve_policy` nor where each path reads its switches from.
 pub proof fn lemma_cleanup_policy_shared(flags: ReserveFlags)
     ensures
         policy_of(flags).cleanup == cleanup_of(flags.cleanup),
@@ -654,7 +661,8 @@ pub open spec fn written(norm: spec_fn(Seq<u8>) -> Seq<u8>, value: Option<Seq<u8
 }
 
 /// `norm` leaves an intent's explicit value unchanged (the glue trims `Set`
-/// values, and trimming a trimmed string changes nothing).
+/// values, and trimming a trimmed string changes nothing:
+/// `super::identifier::lemma_trimmed_idempotent`).
 pub open spec fn normalized_intent(norm: spec_fn(Seq<u8>) -> Seq<u8>, intent: Intent<Seq<u8>>) -> bool {
     intent matches Intent::Set(value) ==> norm(value) == value
 }
@@ -667,9 +675,11 @@ pub open spec fn normalized_intent(norm: spec_fn(Seq<u8>) -> Seq<u8>, intent: In
 /// This covers both an accepted decision on an existing reservation
 /// (`stored_*` are the values it held) and a fresh reservation (`stored_*`
 /// are the inferred values `resolve` used). The only assumption is that the
-/// explicit values are fixed points of the writer's normalization; for the
-/// production writer (`str::trim`) that is trim idempotence, a trusted fact
-/// about `std` pinned by tests.
+/// explicit values are fixed points of the writer's normalization. The
+/// production writer trims with `super::identifier::trim`, whose idempotence
+/// is `super::identifier::lemma_trimmed_idempotent` (over chars; the step to
+/// this lemma's byte-level `norm` is stated, not proved, and exercised by
+/// tests).
 pub proof fn lemma_repeat_request_touches(
     norm: spec_fn(Seq<u8>) -> Seq<u8>,
     stored_project: Option<Seq<u8>>,

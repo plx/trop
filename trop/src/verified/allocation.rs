@@ -8,14 +8,19 @@
 //! connection, the exclusion manager, and the occupancy checker:
 //!
 //! - `reserved: Fn(u16) -> Result<bool, E>` — reserved by a key other than the
-//!   one being replaced;
+//!   one being replaced (the glue decides that ownership rule; no
+//!   specification here mentions the replaced key);
 //! - `excluded: Fn(u16) -> bool` — on the exclusion list;
 //! - `occupied: Fn(u16) -> Result<bool, E>` — the occupancy probe.
 //!
 //! Every result is specified *relative to what the oracles answered*
 //! (`oracle.ensures((p,), answer)`): the database and the OS are not modeled,
-//! and nothing here rules out the world changing between two queries. Under a
-//! consistent snapshot (`deterministic_oracles`), the lemmas show that the
+//! and nothing here rules out the world changing between two queries. Each
+//! outcome is justified by *some* answer of each oracle, so the
+//! specifications do not rule out asking an oracle twice and acting on the
+//! later answer; calling each oracle at most once per port holds by
+//! construction (and is pinned for the probe by tests). Under a consistent
+//! snapshot (`deterministic_oracles`), the lemmas show that the
 //! classification is a function of the snapshot and that the forward scan
 //! returns the least available port.
 //!
@@ -203,7 +208,9 @@ pub open spec fn exclusion_clear<X: Fn(u16) -> bool>(p: u16, checks: Checks, exc
 /// occupancy — and each outcome is justified by exactly the answers that
 /// order requires:
 ///
-/// - a port outside the scope is `Excluded`, and no oracle is consulted;
+/// - a port outside the scope is `Excluded` (that no oracle is consulted for
+///   it is proved only for port 0, where `oracles_callable` grants no
+///   precondition);
 /// - `Reserved` needs the reservation oracle to have said "reserved"; no flag
 ///   bypasses it;
 /// - `Excluded` needs "not reserved" and the (non-ignored) exclusion list to
@@ -211,7 +218,8 @@ pub open spec fn exclusion_clear<X: Fn(u16) -> bool>(p: u16, checks: Checks, exc
 /// - `Occupied` needs "not reserved", the exclusion check passing, and the
 ///   (non-ignored) probe to have said "occupied";
 /// - `Available` needs *every* applicable check to have said "free" (fail
-///   closed);
+///   closed, relative to some answer each oracle gave: `answered` is
+///   `ensures`, not "the only answer");
 /// - an error is exactly an error the reservation oracle returned, or one the
 ///   probe returned after the reservation and exclusion checks passed (so a
 ///   probe failure never surfaces for a reserved or excluded port, nor when

@@ -22,7 +22,13 @@
 //!   every input (and specify the result for invalid ones too), or take a
 //!   kernel type whose private fields and `#[verifier::type_invariant]`
 //!   guarantee the precondition — Rust privacy then enforces it even for
-//!   unverified callers.
+//!   unverified callers — or, for a kernel generic over oracle closures,
+//!   require only the closures' own preconditions (`f.requires(..)`), which
+//!   ordinary Rust closures always meet. Those may be restricted to a domain
+//!   (valid ports, indices below a length) or made conditional (only when a
+//!   guard applies, only after an earlier answer); the proof then shows the
+//!   kernel never calls a closure outside that domain, which glue relies on
+//!   when it rebuilds a `Port` or indexes with a value a closure receives.
 //! - **No trusted escapes without a record.** `assume`, `admit`,
 //!   `#[verifier::external_body]`, and `assume_specification` extend the
 //!   trusted computing base; each use must be justified in a comment and

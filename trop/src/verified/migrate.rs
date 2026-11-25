@@ -1321,6 +1321,12 @@ fn check_keys(key_count: usize, sources: &[usize], dests: &[usize]) -> (r: Resul
 /// items whose destination already holds a reservation that is not itself
 /// being moved (`is_conflict`). Fails exactly when the key lists do not
 /// describe a migration or `dest_exists` has the wrong length.
+///
+/// The code checks the lengths, then scans the sources left to right and
+/// reports the first out-of-range id or repeat it meets, then the
+/// destinations the same way. The postconditions pin `LengthMismatch` and
+/// tie each other error to its cause, but do not fix which of an
+/// out-of-range id and a repeat is reported when both occur.
 pub fn classify_conflicts(
     key_count: usize,
     sources: &[usize],
@@ -1423,7 +1429,8 @@ pub fn classify_conflicts(
 /// The migration plan for well-formed key lists: exactly `spec_schedule`
 /// (all deletes, then every create once; see `lemma_schedule_correct`,
 /// `lemma_schedule_port_safe`, and `lemma_schedule_shape`). Fails exactly
-/// when the key lists do not describe a migration.
+/// when the key lists do not describe a migration, with errors checked and
+/// specified as for `classify_conflicts`.
 pub fn schedule_migration(key_count: usize, sources: &[usize], dests: &[usize]) -> (r: Result<
     Vec<MigAction>,
     MigrationKeyError,

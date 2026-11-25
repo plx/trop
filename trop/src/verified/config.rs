@@ -2,9 +2,10 @@
 //! and discovery decisions.
 //!
 //! - Environment-variable text: unsigned decimal numbers (one parser for
-//!   every numeric `TROP_*` variable, with exactly the syntax of the
-//!   unsigned `from_str` implementations), boolean words, and output-format
-//!   keywords.
+//!   every numeric `TROP_*` variable, deciding the kernel's decimal syntax;
+//!   that this is the syntax of the unsigned `from_str` implementations is
+//!   trusted and pinned by differential tests), boolean words, and
+//!   output-format keywords. YAML numbers are parsed by `serde_yaml`.
 //! - The `reservations` group rules (`check_config_group`): accepted exactly
 //!   when every service is well formed and tags, defaulted offsets, preferred
 //!   ports, and resolved environment-variable names are pairwise distinct;
@@ -13,9 +14,11 @@
 //! - Database lock-wait bounds: the configured seconds and a `Duration`'s
 //!   milliseconds against `SQLite`'s signed 32-bit millisecond limit.
 //! - Built-in defaults, boolean flags, and the permission derivation.
-//! - Layering: the per-leaf overlay of configuration layers and its fold,
-//!   file placement rules, the reservation-group overlay, and project-file
-//!   discovery over an existence oracle.
+//! - Layering: the per-leaf overlay of configuration layers (exec), lemmas
+//!   about spec-only models of its fold, of accumulated exclusions and of
+//!   the reservation-group overlay (no exec code is checked against these
+//!   models), file placement rules, and the choice of the project-file level
+//!   over an existence oracle.
 //!
 //! Production glue: `crate::config` (`environment`, `validator`, `merger`,
 //! `effective`, `builder`, `loader`, `schema`) and `crate::database::config`.
@@ -31,7 +34,9 @@ verus! {
 // Unsigned decimal numbers
 // ---------------------------------------------------------------------------
 
-/// Parses a `u32` with exactly the syntax and range of `u32::from_str`.
+/// Parses a `u32` in the kernel's unsigned decimal syntax and range
+/// (`is_unsigned_text` with `u32::MAX`). That this is `u32::from_str`'s
+/// syntax is trusted, pinned by differential tests.
 pub fn parse_u32_decimal(s: &[u8]) -> (r: Option<u32>)
     ensures
         r matches Some(v) ==> super::exclusions::is_unsigned_text(s@, v as int, u32::MAX as int),
@@ -43,7 +48,9 @@ pub fn parse_u32_decimal(s: &[u8]) -> (r: Option<u32>)
     }
 }
 
-/// Parses a `u64` with exactly the syntax and range of `u64::from_str`.
+/// Parses a `u64` in the kernel's unsigned decimal syntax and range
+/// (`is_unsigned_text` with `u64::MAX`). That this is `u64::from_str`'s
+/// syntax is trusted, pinned by differential tests.
 pub fn parse_u64_decimal(s: &[u8]) -> (r: Option<u64>)
     ensures
         r matches Some(v) ==> super::exclusions::is_unsigned_text(s@, v as int, u64::MAX as int),
@@ -1505,10 +1512,11 @@ pub open spec fn fold_overlay<T>(start: Option<T>, layers: Seq<Option<T>>) -> Op
     }
 }
 
-/// Precedence: the effective value of a leaf is the value of the
-/// highest-precedence layer that sets it (`w`, which is also the last layer
-/// whose overlay reported "set", i.e. the recorded provenance), or the
-/// starting value (the built-in default) when no layer sets it.
+/// Precedence, in the model: the fold's value for a leaf is the value of
+/// the highest-precedence layer that sets it (`w`, which is also the last
+/// layer whose overlay reported "set"), or the starting value (the built-in
+/// default) when no layer sets it. Production layering and its provenance
+/// bookkeeping are not checked against `fold_overlay`.
 pub proof fn lemma_fold_overlay_precedence<T>(start: Option<T>, layers: Seq<Option<T>>, w: int)
     ensures
         0 <= w < layers.len() && layers[w] is Some && (forall|j: int|
@@ -1576,8 +1584,10 @@ pub open spec fn accumulate_exclusions(
     }
 }
 
-/// Exclusions accumulate: the effective list excludes exactly the ports
-/// some layer excludes (the union of the layers' sets), whatever the order.
+/// Exclusions accumulate, in the model: `accumulate_exclusions` excludes
+/// exactly the ports some layer excludes (the union of the layers' sets),
+/// whatever the order. The production `Vec::extend` sites are not checked
+/// against it.
 pub proof fn lemma_accumulated_exclusions_union(
     layers: Seq<Seq<super::exclusions::ExclusionEntry>>,
     p: int,
@@ -1720,9 +1730,11 @@ pub open spec fn group_winner(overlays: Seq<GroupOverlay>) -> Option<int>
     }
 }
 
-/// The effective group is the group of the last document that mentions
-/// `reservations`, unless that document cleared it: `Some(i)` exactly when
-/// document `i` replaced the group and every later document inherits it.
+/// In the model, the effective group is the group of the last document
+/// that mentions `reservations`, unless that document cleared it:
+/// `Some(i)` exactly when document `i` replaced the group and every later
+/// document inherits it. The builder's replace/clear loop is not checked
+/// against `group_winner`.
 pub proof fn lemma_group_winner(overlays: Seq<GroupOverlay>, i: int)
     ensures
         group_winner(overlays) == Some(i) <==> (0 <= i < overlays.len() && overlays[i]
@@ -1784,8 +1796,8 @@ pub open spec fn no_config_below<F: Fn(usize) -> (bool, bool)>(has_files: F, k: 
 /// Finds the nearest directory holding a project file: the first of `levels`
 /// directories (from the starting directory up to the root) at which the
 /// oracle reports `trop.yaml` or `trop.local.yaml`, with what it reported.
-/// Its `trop.yaml` (`PROJECT_PRECEDENCE`) is loaded before its
-/// `trop.local.yaml` (`LOCAL_PRECEDENCE`).
+/// It loads nothing; the glue loads the level's `trop.yaml`
+/// (`PROJECT_PRECEDENCE`) before its `trop.local.yaml` (`LOCAL_PRECEDENCE`).
 pub fn first_config_level<F: Fn(usize) -> (bool, bool)>(levels: usize, has_files: &F) -> (r:
     Option<(usize, bool, bool)>)
     requires
@@ -1826,8 +1838,8 @@ pub fn first_config_level<F: Fn(usize) -> (bool, bool)>(levels: usize, has_files
     None
 }
 
-/// The precedences are ordered user < project < local, so a level's files
-/// are loaded in precedence order after the user file.
+/// A check of the constants: user < project < local. The load order itself
+/// is the glue's (push order, then a stable sort by precedence).
 pub proof fn lemma_precedence_order()
     ensures
         USER_PRECEDENCE < PROJECT_PRECEDENCE < LOCAL_PRECEDENCE,

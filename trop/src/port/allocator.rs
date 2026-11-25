@@ -349,9 +349,11 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
 
     /// Find the next available port that can be atomically allocated.
     ///
-    /// This method performs allocation without checking occupancy or reservations
-    /// in advance. Instead, it relies on the atomic insertion with UNIQUE constraint
-    /// to detect conflicts. This is suitable for use within a reservation transaction.
+    /// This method performs allocation without checking reservations in
+    /// advance (its reservation oracle never reports a port reserved).
+    /// Instead, it relies on the atomic insertion with UNIQUE constraint to
+    /// detect conflicts. This is suitable for use within a reservation
+    /// transaction.
     ///
     /// The method scans forward from `start` checking only exclusions and occupancy,
     /// then returns the first candidate port. The caller should attempt to insert
@@ -359,7 +361,9 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     ///
     /// # Errors
     ///
-    /// Returns an error if occupancy checks fail.
+    /// Returns an error if `start` is above the range maximum, or if an
+    /// occupancy check fails: the scan stops at the first port whose probe
+    /// failed.
     pub fn find_next_allocatable(
         &self,
         start: Port,
