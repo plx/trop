@@ -24,8 +24,8 @@ use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use crate::error::{Error, Result};
 use crate::path::PathRelationship;
 use crate::verified::storage::{
-    Cell, KeyError, PathVerdict, RecordError, RecordFields, SecsDecodeError, SecsEncodeError,
-    StoredKey, StoredRow, TagDecode,
+    encode_metadata_update, Cell, KeyError, PathVerdict, RecordError, RecordFields,
+    SecsDecodeError, SecsEncodeError, StoredKey, StoredRow, TagDecode,
 };
 use crate::{Port, PortRange, Reservation, ReservationKey};
 
@@ -144,20 +144,6 @@ pub(super) fn encode_reservation(reservation: &Reservation) -> Result<StoredRow<
 /// Returns a validation error for a key the database could not read back.
 pub(super) fn storable_key(key: &ReservationKey) -> Result<StoredKey<'_>> {
     key.storage_key().map_err(key_error)
-}
-
-/// Checks an optional project or task identifier before it is written: it
-/// must be absent or canonical, as the row decoder requires.
-fn check_stored_identifier(value: Option<&str>, field: &str) -> Result<()> {
-    match value {
-        Some(value) if !crate::identifier::is_canonical_identifier(value) => {
-            Err(Error::Validation {
-                field: field.into(),
-                message: format!("{field} must be absent or exact trimmed nonempty text"),
-            })
-        }
-        _ => Ok(()),
-    }
 }
 
 /// A stored SQLite value as the verified kernels see it: valid UTF-8 text,
@@ -906,13 +892,24 @@ impl Database {
         task: Option<&str>,
         last_used_at: SystemTime,
     ) -> Result<bool> {
+        // Every bound value comes from the verified storage kernel: the key
+        // columns from `encode_storage_key`, the new project, task and last
+        // use from `encode_metadata_update`, which checks them exactly as
+        // `encode_record` does. A last use before the epoch has no `u64`
+        // seconds and is reported first, as in `encode_reservation`.
         let stored = storable_key(key)?;
-        check_stored_identifier(project, "project")?;
-        check_stored_identifier(task, "task")?;
-        let last_used_at = systemtime_to_unix_secs(last_used_at)?;
+        let last_used_secs = secs_since_epoch(last_used_at)?;
+        let update =
+            encode_metadata_update(stored, project, task, last_used_secs).map_err(record_error)?;
         let rows_affected = conn.execute(
             UPDATE_METADATA_AND_LAST_USED,
-            params![project, task, last_used_at, stored.path(), stored.tag()],
+            params![
+                update.project(),
+                update.task(),
+                update.last_used_at(),
+                update.path(),
+                update.tag()
+            ],
         )?;
         Ok(rows_affected > 0)
     }
@@ -1857,6 +1854,68 @@ mod tests {
             .unwrap();
         assert_eq!(updated.project(), Some("p"));
         assert_eq!(updated.task(), Some("t"));
+    }
+
+    /// The metadata update's last use goes through the same timestamp codec
+    /// as inserts (`encode_metadata_update`): the storable boundaries are
+    /// written and read back exactly, one second beyond is rejected before
+    /// any write, and clearing project and task writes NULLs.
+    #[test]
+    fn metadata_update_last_use_boundaries() {
+        use crate::verified::storage::MAX_STORABLE_UNIX_SECS;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let db = create_test_database();
+        let reservation = create_test_reservation("/test/metadata", 5000);
+        Database::create_reservation_simple(db.connection(), &reservation).unwrap();
+        let key = reservation.key();
+        let update = |project: Option<&str>, task: Option<&str>, secs: u64| {
+            Database::update_metadata_and_last_used_simple(
+                db.connection(),
+                key,
+                project,
+                task,
+                UNIX_EPOCH + Duration::from_secs(secs),
+            )
+        };
+        let stored_last_use = || -> i64 {
+            db.connection()
+                .query_row(
+                    "SELECT last_used_at FROM reservations WHERE path = '/test/metadata'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        for secs in [0, 1, MAX_STORABLE_UNIX_SECS] {
+            assert!(update(Some("p"), Some("t"), secs).unwrap(), "{secs}");
+            assert_eq!(stored_last_use(), i64::try_from(secs).unwrap());
+            assert!(Database::get_reservation(db.connection(), key)
+                .unwrap()
+                .is_some());
+        }
+        match update(Some("p"), Some("t"), MAX_STORABLE_UNIX_SECS + 1) {
+            Err(Error::Validation { field, .. }) => assert_eq!(field, "timestamp"),
+            other => panic!("expected a timestamp validation error, got {other:?}"),
+        }
+        // The project is checked before the last use.
+        match update(Some(" p"), None, MAX_STORABLE_UNIX_SECS + 1) {
+            Err(Error::Validation { field, .. }) => assert_eq!(field, "project"),
+            other => panic!("expected a project validation error, got {other:?}"),
+        }
+        assert_eq!(
+            stored_last_use(),
+            i64::try_from(MAX_STORABLE_UNIX_SECS).unwrap()
+        );
+
+        assert!(update(None, None, 7).unwrap());
+        let cleared = Database::get_reservation(db.connection(), key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.project(), None);
+        assert_eq!(cleared.task(), None);
+        assert_eq!(stored_last_use(), 7);
     }
 
     /// Exact-path lookups match the path's own text: a corrupt row stored

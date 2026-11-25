@@ -9,10 +9,18 @@
 //!   change the result (`lemma_basename_ignores_directory`). The result
 //!   table is `shell_program` (`lemma_program_table_posix`,
 //!   `lemma_program_table_others`, `lemma_selfish_bash_is_bash`).
-//! - `detect_shell` keeps the version-variable precedence (`ZSH_VERSION`,
-//!   then `FISH_VERSION`, then `PSModulePath`) and otherwise classifies
-//!   `SHELL`; `None` means the shell cannot be determined, which production
-//!   reports as an error asking for `--shell`.
+//! - `detect_shell` keeps the version-variable precedence inherited from the
+//!   original detection code (`ZSH_VERSION`, then `FISH_VERSION`, then
+//!   `PSModulePath`) and only otherwise classifies `SHELL`; `None` means the
+//!   shell cannot be determined, which production reports as an error asking
+//!   for `--shell`. Any of the three variables outranks `SHELL`, so a set
+//!   variable decides even when `SHELL` names another shell. In particular,
+//!   Windows sets `PSModulePath` for every process, so on Windows detection
+//!   always answers PowerShell, also inside Git Bash, MSYS2 or Cygwin with
+//!   `SHELL=/usr/bin/bash`; there (and in any child of `pwsh` on Unix, which
+//!   inherits `PSModulePath`) a POSIX shell needs an explicit
+//!   `--shell bash`. This precedence is a maintainer decision, not a
+//!   verified property of correct detection.
 //! - `push_export_line` / `export_line` render `export N=V`, `set -x N V`,
 //!   or `$env:N="V"`. For a portable name and an inert value
 //!   (`is_inert_value`: a non-empty word of `[A-Za-z0-9_./:@+,-]` that does
@@ -626,7 +634,10 @@ pub struct ShellSignals {
 }
 
 /// Detection: `ZSH_VERSION`, then `FISH_VERSION`, then `PSModulePath`, then
-/// the basename of `SHELL`. `None` means undetermined.
+/// the basename of `SHELL`. `None` means undetermined. A set variable
+/// outranks `SHELL` whatever `SHELL` says, so wherever `PSModulePath` is set
+/// (every process on Windows, including Git Bash; children of `pwsh`)
+/// detection answers PowerShell (see the module documentation).
 pub open spec fn detected_shell(signals: ShellSignals, shell_var: Option<Seq<u8>>) -> Option<
     ShellKind,
 > {

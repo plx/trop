@@ -1044,6 +1044,202 @@ pub proof fn lemma_decoded_row_re_encodes(row: StoredRow, platform: PathPlatform
 }
 
 // ===========================================================================
+// Metadata updates
+// ===========================================================================
+
+/// The values the metadata `UPDATE` (project, task and last use of one
+/// stored key) binds. The fields are private and only
+/// `encode_metadata_update` constructs it, so the key columns come from
+/// `encode_storage_key` (through `StoredKey`) and the new values pass the
+/// checks `encode_record` applies to the same fields.
+#[derive(Clone, Copy, Debug)]
+pub struct StoredMetadataUpdate<'a> {
+    path: &'a str,
+    tag: &'a str,
+    project: Option<&'a str>,
+    task: Option<&'a str>,
+    last_used_at: i64,
+}
+
+impl<'a> StoredMetadataUpdate<'a> {
+    /// The key's stored path.
+    pub closed spec fn spec_path(self) -> &'a str {
+        self.path
+    }
+
+    /// The key's stored tag.
+    pub closed spec fn spec_tag(self) -> &'a str {
+        self.tag
+    }
+
+    /// The new project.
+    pub closed spec fn spec_project(self) -> Option<&'a str> {
+        self.project
+    }
+
+    /// The new task.
+    pub closed spec fn spec_task(self) -> Option<&'a str> {
+        self.task
+    }
+
+    /// The new last use.
+    pub closed spec fn spec_last_used_at(self) -> i64 {
+        self.last_used_at
+    }
+
+    /// The key's stored path (TEXT, in the `WHERE` clause).
+    pub fn path(&self) -> (path: &'a str)
+        ensures
+            path == self.spec_path(),
+    {
+        self.path
+    }
+
+    /// The key's stored tag (TEXT, `""` for no tag, in the `WHERE` clause).
+    pub fn tag(&self) -> (tag: &'a str)
+        ensures
+            tag == self.spec_tag(),
+    {
+        self.tag
+    }
+
+    /// The new `project` (TEXT or NULL).
+    pub fn project(&self) -> (project: Option<&'a str>)
+        ensures
+            project == self.spec_project(),
+    {
+        self.project
+    }
+
+    /// The new `task` (TEXT or NULL).
+    pub fn task(&self) -> (task: Option<&'a str>)
+        ensures
+            task == self.spec_task(),
+    {
+        self.task
+    }
+
+    /// The new `last_used_at` (INTEGER).
+    pub fn last_used_at(&self) -> (last_used_at: i64)
+        ensures
+            last_used_at == self.spec_last_used_at(),
+    {
+        self.last_used_at
+    }
+}
+
+/// The first check a metadata update fails, in the order project, task,
+/// last use; `None` when the new values may be written. (The key was
+/// checked when it was encoded as a `StoredKey`.)
+pub open spec fn first_update_error(
+    project: Option<&str>,
+    task: Option<&str>,
+    last_used_secs: u64,
+) -> Option<RecordError> {
+    if !opt_canonical(opt_chars(project)) {
+        Some(RecordError::ProjectNotCanonical)
+    } else if !opt_canonical(opt_chars(task)) {
+        Some(RecordError::TaskNotCanonical)
+    } else {
+        match secs_error(last_used_secs) {
+            Some(e) => Some(RecordError::LastUsedAt(e)),
+            None => None,
+        }
+    }
+}
+
+/// The values an update writes are what the row decoder accepts: an absent
+/// or canonical project and task, and a storable last use.
+pub open spec fn update_values_valid(u: StoredMetadataUpdate) -> bool {
+    &&& opt_canonical(opt_chars(u.spec_project()))
+    &&& opt_canonical(opt_chars(u.spec_task()))
+    &&& storable_secs(u.spec_last_used_at() as int)
+}
+
+/// The update's checks are exactly the record rule's checks of the same
+/// fields: for a record whose key, port and creation time are storable,
+/// `first_record_error` is `first_update_error` of its project, task and
+/// last use. So the update and the insert can never disagree about these
+/// values (one rule, not a second copy).
+pub proof fn lemma_update_checks_are_record_checks(f: RecordFields)
+    requires
+        key_error(f.path, f.platform, f.tag) is None,
+        f.port != 0,
+        secs_error(f.created_secs) is None,
+    ensures
+        first_record_error(f) == first_update_error(f.project, f.task, f.last_used_secs),
+{
+}
+
+/// An update keeps a row readable: if the row's column values decode, then
+/// after replacing its project, task and last use with the values of a
+/// successful update they still decode, to exactly the new values (the key,
+/// port and creation time are untouched).
+pub proof fn lemma_update_preserves_decoding(
+    path: Seq<u8>,
+    platform: PathPlatform,
+    tag: Seq<char>,
+    port: int,
+    project: Option<Seq<char>>,
+    task: Option<Seq<char>>,
+    created_at: int,
+    last_used_at: int,
+    u: StoredMetadataUpdate,
+)
+    requires
+        values_decode(path, platform, tag, port, project, task, created_at, last_used_at),
+        update_values_valid(u),
+    ensures
+        values_decode(
+            path,
+            platform,
+            tag,
+            port,
+            opt_chars(u.spec_project()),
+            opt_chars(u.spec_task()),
+            created_at,
+            u.spec_last_used_at() as int,
+        ),
+{
+}
+
+/// The write path for a metadata update of the stored key `key`: checks the
+/// new project, task and last use as `encode_record` does and returns the
+/// values to bind. Total. It succeeds exactly when `first_update_error` is
+/// `None`, and an error is that first failing check. (The glue rejects a
+/// last use before the Unix epoch, which has no `u64` seconds, before
+/// calling this, as it does for `encode_record`.)
+pub fn encode_metadata_update<'a>(
+    key: StoredKey<'a>,
+    project: Option<&'a str>,
+    task: Option<&'a str>,
+    last_used_secs: u64,
+) -> (r: Result<StoredMetadataUpdate<'a>, RecordError>)
+    ensures
+        r is Ok <==> first_update_error(project, task, last_used_secs) is None,
+        r matches Err(e) ==> first_update_error(project, task, last_used_secs) == Some(e),
+        r matches Ok(u) ==> u.spec_path() == key.spec_path() && u.spec_tag() == key.spec_tag()
+            && u.spec_project() == project && u.spec_task() == task && u.spec_last_used_at() as int
+            == last_used_secs as int && update_values_valid(u),
+{
+    if let Some(project) = project {
+        if !super::identifier::is_canonical_identifier(project) {
+            return Err(RecordError::ProjectNotCanonical);
+        }
+    }
+    if let Some(task) = task {
+        if !super::identifier::is_canonical_identifier(task) {
+            return Err(RecordError::TaskNotCanonical);
+        }
+    }
+    let last_used_at = match encode_unix_secs(last_used_secs) {
+        Ok(v) => v,
+        Err(e) => return Err(RecordError::LastUsedAt(e)),
+    };
+    Ok(StoredMetadataUpdate { path: key.path, tag: key.tag, project, task, last_used_at })
+}
+
+// ===========================================================================
 // SQL cell values (storage classes)
 // ===========================================================================
 

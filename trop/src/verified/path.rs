@@ -2021,8 +2021,9 @@ pub open spec fn named_from(kinds: Seq<CompKind>, k: int) -> bool {
 /// the remainder `kinds[k..]` consists of named components only. `Err(m)`:
 /// the prefix of length `m` was observed not to exist (as was every longer
 /// one), and the search cannot step further up (`m == 0`, or the component
-/// before it is not a named one). Each prefix length is asked at most once,
-/// from longest to shortest.
+/// before it is not a named one). (By construction the search asks each
+/// prefix length at most once, from longest to shortest; that order is not
+/// part of the specification, which speaks only of the answers.)
 ///
 /// The oracle's precondition is only granted for prefix lengths `k` whose
 /// remainder `kinds[k..]` is all named components, so the search provably
