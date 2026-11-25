@@ -22,6 +22,10 @@
 //!   (`lemma_schedule_port_safe`). The previous interleaved schedule loses a
 //!   row when a destination is another item's source
 //!   (`lemma_legacy_schedule_loses_data`).
+//! - `guard_moves`: the unrelated-path guard over every source and every
+//!   destination key of the same id lists (see `super::release` for the
+//!   per-key gate: lexical relation decided here, physical fallback as an
+//!   oracle).
 //! - `rebase_canonical`: moves a canonical absolute path from under `from`
 //!   to under `to` (`super::path_relation::spec_rebase` on segments), and the
 //!   result is canonical.
@@ -1281,13 +1285,18 @@ fn check_keys(key_count: usize, sources: &[usize], dests: &[usize]) -> (r: Resul
     ensures
         r is Ok <==> well_formed(key_count, sources@, dests@),
         r matches Ok(pos) ==> indexes(pos@, sources@, key_count),
+        sources.len() != dests.len() ==> r == Err::<Vec<Option<usize>>, MigrationKeyError>(
+            MigrationKeyError::LengthMismatch,
+        ),
         r matches Err(MigrationKeyError::LengthMismatch) ==> sources.len() != dests.len(),
         r matches Err(MigrationKeyError::KeyOutOfRange) ==> sources.len() == dests.len() && !(
         in_range(sources@, key_count) && in_range(dests@, key_count)),
-        r matches Err(MigrationKeyError::DuplicateSource { first, second }) ==> first < second
-            < sources.len() && sources@[first as int] == sources@[second as int],
-        r matches Err(MigrationKeyError::DuplicateDest { first, second }) ==> first < second
-            < dests.len() && dests@[first as int] == dests@[second as int],
+        r matches Err(MigrationKeyError::DuplicateSource { first, second }) ==> sources.len()
+            == dests.len() && first < second < sources.len() && sources@[first as int]
+            == sources@[second as int],
+        r matches Err(MigrationKeyError::DuplicateDest { first, second }) ==> sources.len()
+            == dests.len() && in_range(sources@, key_count) && distinct(sources@) && first
+            < second < dests.len() && dests@[first as int] == dests@[second as int],
 {
     if sources.len() != dests.len() {
         return Err(MigrationKeyError::LengthMismatch);
@@ -1321,12 +1330,22 @@ pub fn classify_conflicts(
     ensures
         r is Ok <==> (well_formed(key_count, sources@, dests@) && dest_exists.len() == dests.len()),
         r matches Ok(c) ==> conflict_list(c@, sources@, dests@, dest_exists@),
+        // Every error names its cause, checked in this order: lengths, then
+        // the sources (range, repeats), then the destinations.
+        (sources.len() != dests.len() || dest_exists.len() != dests.len()) ==> r == Err::<
+            Vec<usize>,
+            MigrationKeyError,
+        >(MigrationKeyError::LengthMismatch),
         r matches Err(MigrationKeyError::LengthMismatch) ==> sources.len() != dests.len()
             || dest_exists.len() != dests.len(),
-        r matches Err(MigrationKeyError::DuplicateSource { first, second }) ==> first < second
-            < sources.len() && sources@[first as int] == sources@[second as int],
-        r matches Err(MigrationKeyError::DuplicateDest { first, second }) ==> first < second
-            < dests.len() && dests@[first as int] == dests@[second as int],
+        r matches Err(MigrationKeyError::KeyOutOfRange) ==> sources.len() == dests.len() && !(
+        in_range(sources@, key_count) && in_range(dests@, key_count)),
+        r matches Err(MigrationKeyError::DuplicateSource { first, second }) ==> sources.len()
+            == dests.len() && first < second < sources.len() && sources@[first as int]
+            == sources@[second as int],
+        r matches Err(MigrationKeyError::DuplicateDest { first, second }) ==> sources.len()
+            == dests.len() && in_range(sources@, key_count) && distinct(sources@) && first
+            < second < dests.len() && dests@[first as int] == dests@[second as int],
 {
     if dest_exists.len() != dests.len() {
         return Err(MigrationKeyError::LengthMismatch);
@@ -1431,11 +1450,20 @@ pub fn schedule_migration(key_count: usize, sources: &[usize], dests: &[usize]) 
                 payload,
                 port,
             ),
+        // Every error names its cause, checked in this order: lengths, then
+        // the sources (range, repeats), then the destinations.
+        sources.len() != dests.len() ==> r == Err::<Vec<MigAction>, MigrationKeyError>(
+            MigrationKeyError::LengthMismatch,
+        ),
         r matches Err(MigrationKeyError::LengthMismatch) ==> sources.len() != dests.len(),
-        r matches Err(MigrationKeyError::DuplicateSource { first, second }) ==> first < second
-            < sources.len() && sources@[first as int] == sources@[second as int],
-        r matches Err(MigrationKeyError::DuplicateDest { first, second }) ==> first < second
-            < dests.len() && dests@[first as int] == dests@[second as int],
+        r matches Err(MigrationKeyError::KeyOutOfRange) ==> sources.len() == dests.len() && !(
+        in_range(sources@, key_count) && in_range(dests@, key_count)),
+        r matches Err(MigrationKeyError::DuplicateSource { first, second }) ==> sources.len()
+            == dests.len() && first < second < sources.len() && sources@[first as int]
+            == sources@[second as int],
+        r matches Err(MigrationKeyError::DuplicateDest { first, second }) ==> sources.len()
+            == dests.len() && in_range(sources@, key_count) && distinct(sources@) && first
+            < second < dests.len() && dests@[first as int] == dests@[second as int],
 {
     let src_pos = check_keys(key_count, sources, dests)?;
     let mut acts: Vec<MigAction> = Vec::new();
@@ -1527,6 +1555,195 @@ pub fn schedule_migration(key_count: usize, sources: &[usize], dests: &[usize]) 
         }
     }
     Ok(acts)
+}
+
+// ===========================================================================
+// The unrelated-path guard over every key a migration touches
+// ===========================================================================
+
+/// Why the unrelated-path guard stopped a migration.
+pub enum MoveGuardError<E> {
+    /// A key id is not below the number of key paths.
+    KeyOutOfRange,
+    /// The guard refused a key. `index` is its position in
+    /// `affected_ids(sources, dests)` (sources first, then destinations).
+    Refused(super::release::GuardFailure<E>),
+}
+
+/// The key ids a migration affects, in the order the guard checks them:
+/// every source (deleted), then every destination (written).
+pub open spec fn affected_ids(srcs: Seq<usize>, dsts: Seq<usize>) -> Seq<usize> {
+    srcs + dsts
+}
+
+/// The guard permitted key `k`: its path is lexically related to the
+/// working directory or the physical fallback permitted it.
+pub open spec fn key_permitted<E, F: Fn(usize) -> Option<E>>(
+    cwd: Seq<(super::path::CompKind, Seq<u8>)>,
+    key_paths: Seq<Vec<super::path_relation::PathToken>>,
+    fallback: F,
+    k: usize,
+) -> bool {
+    k < key_paths.len() && super::release::permitted(
+        cwd,
+        super::path_relation::tok_views(key_paths[k as int]@),
+        fallback,
+        k,
+    )
+}
+
+/// The unrelated-path guard over every key a migration touches: each source
+/// (whose reservation is deleted) and each destination (which is written).
+/// `key_paths[k]` is the path of key id `k`, and `sources` / `dests` are the
+/// same id lists `classify_conflicts` and `schedule_migration` take.
+///
+/// - Soundness: when the guard applies, success means every source and every
+///   destination key is lexically related to the working directory or
+///   permitted by the physical fallback.
+/// - A refusal names the first refused key in `affected_ids` order; every
+///   earlier key was permitted.
+/// - With `--force` or `--allow-unrelated-path` the guard passes and the
+///   fallback is never consulted.
+pub fn guard_moves<E, F: Fn(usize) -> Option<E>>(
+    force: bool,
+    allow_unrelated: bool,
+    cwd: &[super::path_relation::PathToken],
+    key_paths: &[Vec<super::path_relation::PathToken>],
+    sources: &[usize],
+    dests: &[usize],
+    fallback: &F,
+) -> (r: Result<(), MoveGuardError<E>>)
+    requires
+        super::release::path_check_required(force, allow_unrelated) ==> forall|k: usize|
+            k < key_paths.len() ==> fallback.requires((k,)),
+    ensures
+        !super::release::path_check_required(force, allow_unrelated) ==> r is Ok,
+        r is Ok && super::release::path_check_required(force, allow_unrelated) ==> (forall|i: int|
+            0 <= i < sources.len() ==> key_permitted(
+                super::path_relation::tok_views(cwd@),
+                key_paths@,
+                *fallback,
+                #[trigger] sources@[i],
+            )) && (forall|i: int|
+            0 <= i < dests.len() ==> key_permitted(
+                super::path_relation::tok_views(cwd@),
+                key_paths@,
+                *fallback,
+                #[trigger] dests@[i],
+            )),
+        r matches Err(MoveGuardError::KeyOutOfRange) ==> super::release::path_check_required(
+            force,
+            allow_unrelated,
+        ) && !(in_range(sources@, key_paths.len()) && in_range(dests@, key_paths.len())),
+        r matches Err(MoveGuardError::Refused(f)) ==> super::release::path_check_required(
+            force,
+            allow_unrelated,
+        ) && f.index < sources.len() + dests.len() && affected_ids(sources@, dests@)[f.index as int]
+            < key_paths.len() && super::release::refused(
+            super::path_relation::tok_views(cwd@),
+            super::path_relation::tok_views(
+                key_paths@[affected_ids(sources@, dests@)[f.index as int] as int]@,
+            ),
+            *fallback,
+            affected_ids(sources@, dests@)[f.index as int],
+            f.error,
+        ) && forall|p: int|
+            0 <= p < f.index ==> key_permitted(
+                super::path_relation::tok_views(cwd@),
+                key_paths@,
+                *fallback,
+                #[trigger] affected_ids(sources@, dests@)[p],
+            ),
+{
+    if !super::release::requires_path_check(force, allow_unrelated) {
+        return Ok(());
+    }
+    let ghost c = super::path_relation::tok_views(cwd@);
+    let ghost ids = affected_ids(sources@, dests@);
+    let mut chain: Vec<usize> = Vec::new();
+    let mut i: usize = 0;
+    while i < sources.len()
+        invariant
+            i <= sources.len(),
+            chain@ == sources@.take(i as int),
+        decreases sources.len() - i,
+    {
+        proof {
+            assert(sources@.take(i + 1) =~= sources@.take(i as int).push(sources@[i as int]));
+        }
+        chain.push(sources[i]);
+        i += 1;
+    }
+    let mut i: usize = 0;
+    while i < dests.len()
+        invariant
+            i <= dests.len(),
+            chain@ == sources@ + dests@.take(i as int),
+        decreases dests.len() - i,
+    {
+        proof {
+            assert(sources@.take(sources.len() as int) =~= sources@);
+            assert(sources@ + dests@.take(i + 1) =~= (sources@ + dests@.take(i as int)).push(
+                dests@[i as int],
+            ));
+        }
+        chain.push(dests[i]);
+        i += 1;
+    }
+    proof {
+        assert(sources@.take(sources.len() as int) =~= sources@);
+        assert(dests@.take(dests.len() as int) =~= dests@);
+        assert(chain@ =~= ids);
+    }
+    let mut p: usize = 0;
+    while p < chain.len()
+        invariant
+            p <= chain.len(),
+            chain@ == ids,
+            ids == affected_ids(sources@, dests@),
+            c == super::path_relation::tok_views(cwd@),
+            super::release::path_check_required(force, allow_unrelated),
+            forall|k: usize| k < key_paths.len() ==> fallback.requires((k,)),
+            forall|q: int| 0 <= q < p ==> key_permitted(c, key_paths@, *fallback, #[trigger] ids[q]),
+        decreases chain.len() - p,
+    {
+        let k = chain[p];
+        if k >= key_paths.len() {
+            proof {
+                if p < sources.len() {
+                    assert(ids[p as int] == sources@[p as int]);
+                    assert(!in_range(sources@, key_paths.len()));
+                } else {
+                    assert(ids[p as int] == dests@[p - sources.len()]);
+                    assert(!in_range(dests@, key_paths.len()));
+                }
+            }
+            return Err(MoveGuardError::KeyOutOfRange);
+        }
+        if let Some(error) = super::release::gate_path(cwd, key_paths[k].as_slice(), fallback, k) {
+            return Err(MoveGuardError::Refused(super::release::GuardFailure { index: p, error }));
+        }
+        p += 1;
+    }
+    proof {
+        assert forall|i: int| 0 <= i < sources.len() implies key_permitted(
+            c,
+            key_paths@,
+            *fallback,
+            #[trigger] sources@[i],
+        ) by {
+            assert(ids[i] == sources@[i]);
+        }
+        assert forall|i: int| 0 <= i < dests.len() implies key_permitted(
+            c,
+            key_paths@,
+            *fallback,
+            #[trigger] dests@[i],
+        ) by {
+            assert(ids[sources.len() + i] == dests@[i]);
+        }
+    }
+    Ok(())
 }
 
 // ===========================================================================

@@ -64,7 +64,7 @@ impl MigrateCommand {
 
         // 4. Create and build migration plan
         let mut plan = MigratePlan::new(options);
-        plan.build(&db).map_err(CliError::from)?;
+        plan.build(&db).map_err(with_override_hint)?;
 
         // 5. Display migration plan
         if !global.quiet {
@@ -135,7 +135,7 @@ impl MigrateCommand {
                 eprintln!("Dry run - no changes made.");
             }
         } else {
-            let result = execute_migrate(&plan, &mut db).map_err(CliError::from)?;
+            let result = execute_migrate(&plan, &mut db).map_err(with_override_hint)?;
 
             if !global.quiet {
                 eprintln!("Migration complete:");
@@ -152,5 +152,25 @@ impl MigrateCommand {
         }
 
         Ok(())
+    }
+}
+
+/// Names the overrides when the unrelated-path guard refuses a migration.
+///
+/// The guard checks every source and destination reservation against the
+/// current directory, so migrating after moving a directory (run from the
+/// new location) needs `--allow-unrelated-path` (or `--force`, or
+/// `allow_unrelated_path: true` in the configuration).
+fn with_override_hint(error: trop::Error) -> CliError {
+    match error {
+        trop::Error::PathRelationshipViolation { details } => {
+            CliError::from(trop::Error::PathRelationshipViolation {
+                details: format!(
+                    "{details} (migrate checks every source and destination reservation; \
+                     use --allow-unrelated-path or --force to migrate it anyway)"
+                ),
+            })
+        }
+        other => CliError::from(other),
     }
 }

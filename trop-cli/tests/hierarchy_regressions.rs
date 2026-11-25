@@ -6,7 +6,9 @@
 //!   `migrate --from P --to P` and re-rooting a subtree onto its parent
 //!   succeed without `--force`.
 //! - The unrelated-path guard covers every reservation a recursive release
-//!   deletes and every source and destination of a migration.
+//!   deletes and every source and destination of a migration; for migrate,
+//!   `--allow-unrelated-path`, `--force`, or `allow_unrelated_path: true` in
+//!   the configuration overrides it, and the refusal names the overrides.
 
 mod common;
 
@@ -212,4 +214,70 @@ fn migrate_guards_sources_and_destinations() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(port_at(&env, &sideways), Some(port));
     assert_eq!(port_at(&env, &below), None);
+}
+
+/// The specification's motivating migration: after `mv old new`, migrate
+/// `old` to `new` from inside the new directory. The old path is unrelated to the working
+/// directory, so the guard refuses (naming the overrides) unless
+/// `--allow-unrelated-path` is given or the configuration allows unrelated
+/// paths.
+#[test]
+fn migrate_after_moving_a_directory_needs_an_override() {
+    let env = TestEnv::new();
+    let old = env.create_dir("projects/old");
+    let port = env.reserve_simple(&old);
+    let new = env.temp_path.join("projects/new");
+    std::fs::rename(&old, &new).unwrap();
+
+    let migrate = |extra: &[&str]| {
+        let mut args: Vec<&std::ffi::OsStr> = vec![
+            "migrate".as_ref(),
+            "--from".as_ref(),
+            old.as_os_str(),
+            "--to".as_ref(),
+            new.as_os_str(),
+        ];
+        args.extend(extra.iter().map(|arg| -> &std::ffi::OsStr { arg.as_ref() }));
+        run_in(&env, &new, &args)
+    };
+
+    let output = migrate(&[]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unrelated paths"), "{stderr}");
+    assert!(stderr.contains("--allow-unrelated-path"), "{stderr}");
+    assert_eq!(port_at(&env, &old), Some(port));
+
+    let output = migrate(&["--allow-unrelated-path"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(port_at(&env, &old), None);
+    assert_eq!(port_at(&env, &new), Some(port));
+}
+
+/// `allow_unrelated_path: true` in the project configuration authorizes a
+/// migration whose source is unrelated to the working directory, like the
+/// flag.
+#[test]
+fn configured_allow_unrelated_path_reaches_migrate() {
+    let env = TestEnv::new();
+    let old = env.create_dir("projects/old");
+    let port = env.reserve_simple(&old);
+    let new = env.temp_path.join("projects/new");
+    std::fs::rename(&old, &new).unwrap();
+    std::fs::write(new.join("trop.yaml"), "allow_unrelated_path: true\n").unwrap();
+
+    let output = run_in(
+        &env,
+        &new,
+        &[
+            "migrate".as_ref(),
+            "--from".as_ref(),
+            old.as_os_str(),
+            "--to".as_ref(),
+            new.as_os_str(),
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(port_at(&env, &old), None);
+    assert_eq!(port_at(&env, &new), Some(port));
 }

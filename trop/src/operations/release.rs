@@ -3,18 +3,19 @@
 //! This module implements the release planning logic, including
 //! path validation and idempotent behavior.
 
-use std::ffi::OsStr;
-use std::path::{Component, Path};
+use std::path::PathBuf;
 
 use crate::database::Database;
 use crate::error::Result;
+use crate::path::relationship::path_tokens;
+use crate::verified::path_relation::PathToken;
 use crate::verified::release::{
-    plan_flags, select_rows, selector_from_plan, tag_selector, ReleaseRow, TagSelector,
+    guard_paths, plan_flags, requires_path_check, select_and_guard, selector_from_plan,
+    tag_selector, ReleaseRow, TagSelector,
 };
 use crate::ReservationKey;
 use rusqlite::Connection;
 
-use super::migrate::guard_affected_paths;
 use super::plan::{OperationPlan, PlanAction};
 
 /// Options for a release operation.
@@ -134,12 +135,13 @@ impl ReleasePlan {
     /// It does NOT modify the database. Release operations are idempotent -
     /// if the reservation doesn't exist, a warning is added but no error occurs.
     ///
-    /// The candidate rows come from the database (every row at the key's
-    /// path, or, recursively, every row whose path starts with it); the
-    /// verified kernel `verified::release::select_rows` then selects exactly
-    /// the rows at the path (or a component descendant of it) whose tag the
-    /// request selects. Unless `force` or `allow_unrelated_path` is set, the
-    /// key's path and the path of every selected reservation must pass the
+    /// The candidate rows come from the database (recursively, every row
+    /// whose path starts with the key's path; with all tags, every row at
+    /// the path; otherwise the key's own row). The verified kernel
+    /// `verified::release::select_and_guard` then selects exactly the rows
+    /// at the path (or a component descendant of it) whose tag the request
+    /// selects. Unless `force` or `allow_unrelated_path` is set, the key's
+    /// path and the path of every selected reservation must pass the
     /// unrelated-path check, so a recursive release cannot delete a
     /// reservation sideways of the current directory.
     ///
@@ -166,57 +168,77 @@ impl ReleasePlan {
     pub fn build_plan(&self, conn: &Connection) -> Result<OperationPlan> {
         let mut plan = OperationPlan::new(format!("Release reservation for {}", self.options.key));
         let target = &self.options.key.path;
+        let force = self.options.force;
+        let allow_unrelated_path = self.options.allow_unrelated_path;
 
-        // Step 1: Validate the requested path's relationship.
-        guard_affected_paths(
-            self.options.force,
-            self.options.allow_unrelated_path,
-            &[target.as_path()],
-        )?;
+        // Step 1: Validate the requested path's relationship. The kernel
+        // decides the lexical relation to the current directory; the
+        // database's single-path check is the physical fallback for a path
+        // that is lexically unrelated.
+        let cwd = guard_cwd_tokens(force, allow_unrelated_path, true)?;
+        guard_paths(
+            force,
+            allow_unrelated_path,
+            &cwd,
+            &[path_tokens(target)],
+            &|_index| Database::validate_path_relationship(target, false).err(),
+        )
+        .map_err(|failure| failure.error)?;
 
-        // Step 2: Read the candidate rows and select the recursive set,
-        // exact-path set, or exact key requested by the caller.
+        // Step 2: Read the candidate rows: every row under the path
+        // (recursive), every row at the path (all tags), or the requested
+        // key's row.
         let candidates = if self.recursive {
             Database::get_reservations_by_path_prefix(conn, target)?
-        } else {
+        } else if self.all_exact_path_tags {
             Database::get_reservations_by_exact_path(conn, target)?
+        } else {
+            Database::get_reservation(conn, &self.options.key)?
+                .into_iter()
+                .collect()
         };
+
+        // Step 3: The kernel selects the rows the release deletes and applies
+        // the unrelated-path guard to exactly those rows. Selection compares
+        // stored identities: the target as the database stores its path, and
+        // the requested tag as the database stores it (an empty tag is the
+        // untagged sentinel).
+        let stored_target = PathBuf::from(self.options.key.path_as_string());
         let selector = selector_from_plan(
-            self.options
-                .key
-                .tag
-                .as_ref()
-                .map(|tag| tag.as_bytes().to_vec()),
+            stored_tag(self.options.key.tag.as_deref()),
             self.all_exact_path_tags,
         );
         let rows: Vec<ReleaseRow> = candidates
             .iter()
             .map(|reservation| ReleaseRow {
-                path: component_keys(&reservation.key().path),
-                tag: reservation
-                    .key()
-                    .tag
-                    .as_ref()
-                    .map(|tag| tag.as_bytes().to_vec()),
+                path: path_tokens(&reservation.key().path),
+                tag: stored_tag(reservation.key().tag.as_deref()),
             })
             .collect();
-        let selected: Vec<&ReservationKey> =
-            select_rows(&selector, self.recursive, &component_keys(target), &rows)
-                .into_iter()
-                .map(|index| candidates[index].key())
-                .collect();
+        let selected = select_and_guard(
+            &selector,
+            self.recursive,
+            &path_tokens(&stored_target),
+            &rows,
+            force,
+            allow_unrelated_path,
+            &cwd,
+            &|index| {
+                Database::validate_path_relationship(&candidates[index].key().path, false).err()
+            },
+        )
+        .map_err(|failure| {
+            log::debug!(
+                "Unrelated-path guard refused {}",
+                candidates[failure.index].key()
+            );
+            failure.error
+        })?;
 
-        // Step 3: Every reservation the release deletes must pass the same
-        // path check as the requested path.
-        let affected: Vec<&Path> = selected.iter().map(|key| key.path.as_path()).collect();
-        guard_affected_paths(
-            self.options.force,
-            self.options.allow_unrelated_path,
-            &affected,
-        )?;
-
-        for key in &selected {
-            plan = plan.add_action(PlanAction::DeleteReservation((*key).clone()));
+        for &index in &selected {
+            plan = plan.add_action(PlanAction::DeleteReservation(
+                candidates[index].key().clone(),
+            ));
         }
         if selected.is_empty() {
             let warning = if self.recursive {
@@ -239,6 +261,31 @@ impl ReleasePlan {
         }
 
         Ok(plan)
+    }
+}
+
+/// A tag's bytes as the database stores it: the empty tag is the untagged
+/// sentinel, so it denotes the untagged reservation.
+fn stored_tag(tag: Option<&str>) -> Option<Vec<u8>> {
+    tag.filter(|tag| !tag.is_empty())
+        .map(|tag| tag.as_bytes().to_vec())
+}
+
+/// The current directory's component tokens for the unrelated-path guard.
+///
+/// The directory is read only when the guard applies (neither `force` nor
+/// `allow_unrelated_path`) and there is a path to check; otherwise the
+/// kernels never consult it. The per-path physical fallback,
+/// [`Database::validate_path_relationship`], reads the same directory.
+pub(crate) fn guard_cwd_tokens(
+    force: bool,
+    allow_unrelated_path: bool,
+    has_paths: bool,
+) -> Result<Vec<PathToken>> {
+    if has_paths && requires_path_check(force, allow_unrelated_path) {
+        Ok(path_tokens(&std::env::current_dir()?))
+    } else {
+        Ok(Vec::new())
     }
 }
 
@@ -297,55 +344,12 @@ impl std::fmt::Display for ConflictingReleaseTagFlags {
 
 impl std::error::Error for ConflictingReleaseTagFlags {}
 
-/// A path's components as equality keys for the verified selection: a kind
-/// byte followed by the component's encoded bytes (a Windows prefix is keyed
-/// by its parsed form, which is how `std` compares prefixes). Two paths get
-/// equal key lists exactly when their components are equal, and one list is
-/// a prefix of another exactly when `Path::starts_with` holds.
-fn component_keys(path: &Path) -> Vec<Vec<u8>> {
-    path.components()
-        .map(|component| {
-            let (kind, payload) = match component {
-                Component::Prefix(prefix) => (0u8, format!("{:?}", prefix.kind()).into_bytes()),
-                Component::RootDir => (1, Vec::new()),
-                Component::CurDir => (2, Vec::new()),
-                Component::ParentDir => (3, Vec::new()),
-                Component::Normal(name) => (4, os_str_bytes(name)),
-            };
-            let mut key = Vec::with_capacity(payload.len() + 1);
-            key.push(kind);
-            key.extend(payload);
-            key
-        })
-        .collect()
-}
-
-/// An injective byte encoding of an `OsStr`.
-#[cfg(unix)]
-fn os_str_bytes(value: &OsStr) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    value.as_bytes().to_vec()
-}
-
-/// An injective byte encoding of an `OsStr`: its UTF-16 code units.
-#[cfg(windows)]
-fn os_str_bytes(value: &OsStr) -> Vec<u8> {
-    use std::os::windows::ffi::OsStrExt;
-    value.encode_wide().flat_map(u16::to_le_bytes).collect()
-}
-
-/// An injective byte encoding of an `OsStr`: its `Debug` spelling.
-#[cfg(not(any(unix, windows)))]
-fn os_str_bytes(value: &OsStr) -> Vec<u8> {
-    format!("{value:?}").into_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::database::test_util::create_test_database;
     use crate::{Port, Reservation};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     // Property-based testing module
     // These tests verify mathematical properties and invariants of the release system
@@ -913,18 +917,24 @@ mod tests {
         );
     }
 
-    /// `component_keys` agrees with `Path::starts_with` and component
-    /// equality, which is what the verified selection relies on.
+    /// The component tokens the verified selection compares agree with
+    /// `Path::starts_with` and component equality.
     #[test]
-    fn test_component_keys_agree_with_std() {
+    fn test_path_tokens_agree_with_std() {
         let paths = [
             "/", "/a", "/a/", "/a/b", "/a/bc", "/a/b/c", "/ab", "a", "a/b", "./a", "/a/./b",
             "/a/../b",
         ];
+        let views = |path: &Path| -> Vec<_> {
+            path_tokens(path)
+                .into_iter()
+                .map(|token| (token.kind, token.name))
+                .collect()
+        };
         for first in paths {
             for second in paths {
                 let (p, s) = (Path::new(first), Path::new(second));
-                let (kp, ks) = (component_keys(p), component_keys(s));
+                let (kp, ks) = (views(p), views(s));
                 assert_eq!(
                     kp == ks,
                     p.components().eq(s.components()),
@@ -937,6 +947,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Inserts a row directly, bypassing the write-side validation.
+    fn insert_raw_row(db: &Database, path: &str, tag: &str, port: u16) {
+        db.connection()
+            .execute(
+                "INSERT INTO reservations (path, tag, port, project, task, created_at, last_used_at) \
+                 VALUES (?1, ?2, ?3, NULL, NULL, 1, 1)",
+                rusqlite::params![path, tag, port],
+            )
+            .unwrap();
+    }
+
+    /// Exact-key release reads only the requested key's row, so a corrupt
+    /// row with another tag at the same path does not block it.
+    #[test]
+    fn test_exact_key_release_ignores_a_corrupt_sibling_row() {
+        let mut db = create_test_database();
+        let path = PathBuf::from("/test/path");
+        for key in [
+            ReservationKey::new(path.clone(), None).unwrap(),
+            ReservationKey::new(path.clone(), Some("api".to_string())).unwrap(),
+        ] {
+            let port = if key.tag.is_some() { 8081 } else { 8080 };
+            let reservation = Reservation::builder(key, Port::try_from(port).unwrap())
+                .build()
+                .unwrap();
+            db.create_reservation(&reservation).unwrap();
+        }
+        insert_raw_row(&db, "/test/path", " web ", 8082);
+
+        for tag in [None, Some("api".to_string())] {
+            let key = ReservationKey::new(path.clone(), tag).unwrap();
+            let options = ReleaseOptions::new(key.clone()).with_allow_unrelated_path(true);
+            let plan = ReleasePlan::new(options)
+                .build_plan(db.connection())
+                .unwrap();
+            assert_eq!(planned_keys(&plan), vec![key]);
+        }
+
+        // Selecting every tag at the path reads the corrupt row, as before.
+        let key = ReservationKey::new(path, None).unwrap();
+        let result = ReleasePlan::new(ReleaseOptions::new(key).with_allow_unrelated_path(true))
+            .with_all_exact_path_tags(true)
+            .build_plan(db.connection());
+        assert!(matches!(
+            result,
+            Err(crate::Error::DatabaseCorruption { .. })
+        ));
+    }
+
+    /// A key whose tag is the empty string denotes the untagged reservation,
+    /// as it does in storage.
+    #[test]
+    fn test_empty_tag_key_releases_the_untagged_reservation() {
+        let mut db = create_test_database();
+        let path = PathBuf::from("/test/path");
+        let untagged = ReservationKey::new(path.clone(), None).unwrap();
+        let reservation = Reservation::builder(untagged.clone(), Port::try_from(8080).unwrap())
+            .build()
+            .unwrap();
+        db.create_reservation(&reservation).unwrap();
+
+        let empty_tag = ReservationKey {
+            path,
+            tag: Some(String::new()),
+        };
+        let options = ReleaseOptions::new(empty_tag).with_allow_unrelated_path(true);
+        let plan = ReleasePlan::new(options)
+            .build_plan(db.connection())
+            .unwrap();
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.warnings, Vec::<String>::new());
+        let mut executor = crate::operations::PlanExecutor::new(db.connection());
+        executor.execute(&plan).unwrap();
+        assert!(Database::get_reservation(db.connection(), &untagged)
+            .unwrap()
+            .is_none());
+    }
+
+    /// A key path that is not valid UTF-8 is stored lossily; release selects
+    /// its stored row in every non-recursive mode.
+    #[test]
+    #[cfg(unix)]
+    fn test_non_utf8_key_path_is_released() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut db = create_test_database();
+        let path = PathBuf::from(OsStr::from_bytes(b"/test/\xff"));
+        let key = ReservationKey {
+            path: path.clone(),
+            tag: None,
+        };
+        let reservation = Reservation::builder(key.clone(), Port::try_from(8080).unwrap())
+            .build()
+            .unwrap();
+        db.create_reservation(&reservation).unwrap();
+
+        for all_tags in [false, true] {
+            let options = ReleaseOptions::new(key.clone()).with_allow_unrelated_path(true);
+            let plan = ReleasePlan::new(options)
+                .with_all_exact_path_tags(all_tags)
+                .build_plan(db.connection())
+                .unwrap();
+            assert_eq!(plan.actions.len(), 1, "all_tags={all_tags}");
+            assert!(plan.warnings.is_empty(), "all_tags={all_tags}");
+        }
+        let options = ReleaseOptions::new(key.clone()).with_allow_unrelated_path(true);
+        let plan = ReleasePlan::new(options)
+            .build_plan(db.connection())
+            .unwrap();
+        let mut executor = crate::operations::PlanExecutor::new(db.connection());
+        executor.execute(&plan).unwrap();
+        assert!(Database::get_reservation(db.connection(), &key)
+            .unwrap()
+            .is_none());
     }
 
     /// Exact-key release (`--tag` or `--untagged-only`) selects only the

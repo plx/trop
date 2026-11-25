@@ -12,13 +12,16 @@ use rusqlite::Connection;
 use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::path::normalize::normalize;
+use crate::path::relationship::path_tokens;
 use crate::verified::migrate::{
-    classify_conflicts, schedule_migration, MigAction, MigrationKeyError,
+    classify_conflicts, guard_moves, schedule_migration, MigAction, MigrationKeyError,
+    MoveGuardError,
 };
-use crate::verified::release::check_affected;
+use crate::verified::path_relation::PathToken;
 use crate::{Reservation, ReservationKey};
 
 use super::plan::{OperationPlan, PlanAction};
+use super::release::guard_cwd_tokens;
 
 /// Options for migration operation.
 #[derive(Debug, Clone)]
@@ -187,7 +190,8 @@ impl MigratePlan {
     /// - No reservations found at `from_path` (non-recursive mode only)
     /// - A source or destination path is unrelated to the current directory
     ///   (without `force` or `allow_unrelated_path`)
-    /// - Two source reservations would migrate to the same destination
+    /// - Two source reservations would migrate to the same destination (a
+    ///   defensive check: rebasing canonical stored paths is injective)
     /// - Conflicts exist at destination without `--force`
     ///
     /// # Examples
@@ -273,26 +277,44 @@ impl MigratePlan {
             });
         }
 
-        // Step 4: The unrelated-path guard covers every reservation the
-        // migration deletes (sources) or writes (destinations).
-        let affected: Vec<&Path> = self
-            .migrations
-            .iter()
-            .map(|item| item.from_key.path.as_path())
-            .chain(
-                self.migrations
+        // Step 4: The unrelated-path guard covers every key the migration
+        // deletes (sources) or writes (destinations): the kernel checks every
+        // id of the same key lists it classifies and schedules, deciding the
+        // lexical relation to the current directory itself and consulting the
+        // database's single-path check as the physical fallback.
+        let keys = KeyTable::intern(&self.migrations);
+        let force = self.options.force;
+        let allow_unrelated_path = self.options.allow_unrelated_path;
+        let cwd = guard_cwd_tokens(force, allow_unrelated_path, !keys.keys.is_empty())?;
+        let key_paths: Vec<Vec<PathToken>> =
+            keys.keys.iter().map(|key| path_tokens(&key.path)).collect();
+        guard_moves(
+            force,
+            allow_unrelated_path,
+            &cwd,
+            &key_paths,
+            &keys.sources,
+            &keys.dests,
+            &|id| Database::validate_path_relationship(&keys.keys[id].path, false).err(),
+        )
+        .map_err(|error| match error {
+            MoveGuardError::Refused(failure) => {
+                let position = failure.index;
+                let id = keys
+                    .sources
                     .iter()
-                    .map(|item| item.to_key.path.as_path()),
-            )
-            .collect();
-        guard_affected_paths(
-            self.options.force,
-            self.options.allow_unrelated_path,
-            &affected,
-        )?;
+                    .chain(&keys.dests)
+                    .nth(position)
+                    .copied();
+                if let Some(id) = id {
+                    log::debug!("Unrelated-path guard refused {}", keys.keys[id]);
+                }
+                failure.error
+            }
+            MoveGuardError::KeyOutOfRange => inconsistent_plan(&MigrationKeyError::KeyOutOfRange),
+        })?;
 
         // Step 5: Classify conflicts with the verified kernel.
-        let keys = KeyTable::intern(&self.migrations);
         let mut dest_exists = Vec::with_capacity(self.migrations.len());
         for item in &self.migrations {
             dest_exists.push(Database::get_reservation(conn, &item.to_key)?.is_some());
@@ -330,36 +352,28 @@ impl MigratePlan {
         self.conflicts.len()
     }
 
-    /// Whether `other` selects the same moves and conflicts as this plan.
+    /// Whether `other` makes the same moves, with the same reservation data,
+    /// and finds the same conflicts as this plan.
     fn same_selection(&self, other: &Self) -> bool {
         self.conflicts == other.conflicts
             && self.migrations.len() == other.migrations.len()
-            && self
-                .migrations
-                .iter()
-                .zip(&other.migrations)
-                .all(|(a, b)| a.from_key == b.from_key && a.to_key == b.to_key)
+            && self.migrations.iter().zip(&other.migrations).all(|(a, b)| {
+                a.from_key == b.from_key
+                    && a.to_key == b.to_key
+                    && same_reservation_data(&a.reservation, &b.reservation)
+            })
     }
 }
 
-/// Applies the unrelated-path guard (`verified::release::check_affected`) to
-/// `paths`, gating each one with the single-path check
-/// [`Database::validate_path_relationship`].
-pub(crate) fn guard_affected_paths(
-    force: bool,
-    allow_unrelated_path: bool,
-    paths: &[&Path],
-) -> Result<()> {
-    check_affected(force, allow_unrelated_path, paths.len(), &|index| {
-        Database::validate_path_relationship(paths[index], false).err()
-    })
-    .map_err(|failure| {
-        log::debug!(
-            "Unrelated-path guard refused {}",
-            paths[failure.index].display()
-        );
-        failure.error
-    })
+/// Whether two reservations carry the same data (key, port, project, task,
+/// and timestamps): everything a migration moves.
+fn same_reservation_data(a: &Reservation, b: &Reservation) -> bool {
+    a.key() == b.key()
+        && a.port() == b.port()
+        && a.project() == b.project()
+        && a.task() == b.task()
+        && a.created_at() == b.created_at()
+        && a.last_used_at() == b.last_used_at()
 }
 
 /// Reservation keys interned to dense ids by their database identity (the
@@ -408,10 +422,15 @@ fn key_error(items: &[MigrationItem], error: MigrationKeyError) -> Error {
                 items[first].from_key, items[second].from_key, items[first].to_key
             ),
         },
-        other => Error::Validation {
-            field: "migration".to_string(),
-            message: format!("inconsistent migration plan: {other:?}"),
-        },
+        other => inconsistent_plan(&other),
+    }
+}
+
+/// An internal inconsistency between the migration items and their key ids.
+fn inconsistent_plan(error: &MigrationKeyError) -> Error {
+    Error::Validation {
+        field: "migration".to_string(),
+        message: format!("inconsistent migration plan: {error:?}"),
     }
 }
 
@@ -550,13 +569,18 @@ pub fn to_operation_plan(migrate_plan: &MigratePlan) -> Result<OperationPlan> {
 
 /// Executes a migration plan.
 ///
-/// The migration runs in one `IMMEDIATE` transaction. Inside it, the plan is
-/// rebuilt from `plan.options` against the locked database, and the
-/// migration is refused (with no changes) unless the rebuilt plan selects
-/// the same moves and conflicts as `plan`. So the plan that runs is exactly
-/// the plan that was shown, and it is a snapshot of the state it modifies:
-/// a destination reserved after planning is never overwritten without
-/// `--force`, and a source released after planning is never resurrected.
+/// `plan` must come from [`MigratePlan::build`]. The migration runs in one
+/// `IMMEDIATE` transaction. Inside it, the plan is rebuilt from
+/// `plan.options` against the locked database, and the migration is refused
+/// (with no changes) unless the rebuilt plan makes the same moves, carrying
+/// the same reservation data (port, project, task, timestamps), and finds
+/// the same conflicts as `plan`. So the moves that run are the moves `plan`
+/// describes, and they are a snapshot of the state they modify: a
+/// destination reserved after planning is never overwritten without
+/// `--force`, a source released after planning is never resurrected, and a
+/// source changed after planning is never moved with data `plan` did not
+/// show. A plan that was never built, or was edited by hand, is refused the
+/// same way (or fails as building it would, for example with `NotFound`).
 ///
 /// # Arguments
 ///
@@ -570,7 +594,8 @@ pub fn to_operation_plan(migrate_plan: &MigratePlan) -> Result<OperationPlan> {
 /// # Errors
 ///
 /// Returns an error if:
-/// - The migration plan contains conflicts without force
+/// - Building the plan inside the transaction fails (for example, conflicts
+///   without force, or a path unrelated to the current directory)
 /// - The reservations changed since the plan was built
 /// - Database operations fail
 ///
@@ -642,8 +667,7 @@ fn execute_migrate_inner(plan: &MigratePlan, db: &mut Database) -> Result<Migrat
 mod tests {
     use super::*;
     use crate::database::test_util::create_test_database;
-    #[cfg(unix)]
-    use crate::{Port, Reservation};
+    use crate::Port;
 
     #[test]
     fn test_migrate_options_new() {
@@ -1033,12 +1057,73 @@ mod tests {
         );
     }
 
-    /// Two stored rows whose paths normalize to the same path would both
-    /// migrate to one destination; the kernel refuses instead of silently
-    /// keeping only one of them.
+    /// Two items sharing a destination key cannot come from
+    /// `MigratePlan::build` (stored paths are canonical, and rebasing
+    /// canonical paths is injective: `lemma_rebase_canonical_injective`), but
+    /// a hand-built plan can contain them. The kernel refuses to schedule it
+    /// (`DuplicateDest`), and the error names both sources and the shared
+    /// destination instead of silently keeping one reservation.
+    #[test]
+    fn test_plan_with_a_shared_destination_is_refused() {
+        let item = |from: &str, port: u16| {
+            let from_key = ReservationKey::new(PathBuf::from(from), None).unwrap();
+            let to_key = ReservationKey::new(PathBuf::from("/w/b"), None).unwrap();
+            let reservation = Reservation::builder(from_key.clone(), Port::try_from(port).unwrap())
+                .build()
+                .unwrap();
+            MigrationItem {
+                from_key,
+                to_key,
+                reservation,
+            }
+        };
+        let mut plan = MigratePlan::new(options("/w", "/w/b"));
+        plan.migrations = vec![item("/w/a", 5000), item("/w/c", 5001)];
+
+        match to_operation_plan(&plan) {
+            Err(Error::ReservationConflict { details }) => {
+                assert_eq!(
+                    details,
+                    "Reservations /w/a and /w/c would both migrate to /w/b"
+                );
+            }
+            other => panic!("expected a reservation conflict, got {other:?}"),
+        }
+    }
+
+    /// A hand-built plan whose items repeat a source key is an internal
+    /// inconsistency, reported without scheduling anything.
+    #[test]
+    fn test_plan_with_a_repeated_source_is_refused() {
+        let key = ReservationKey::new(PathBuf::from("/w/a"), None).unwrap();
+        let reservation = Reservation::builder(key.clone(), Port::try_from(5000).unwrap())
+            .build()
+            .unwrap();
+        let mut plan = MigratePlan::new(options("/w/a", "/w/b"));
+        plan.migrations = ["/w/b", "/w/c"]
+            .iter()
+            .map(|to| MigrationItem {
+                from_key: key.clone(),
+                to_key: ReservationKey::new(PathBuf::from(to), None).unwrap(),
+                reservation: reservation.clone(),
+            })
+            .collect();
+
+        match to_operation_plan(&plan) {
+            Err(Error::Validation { field, message }) => {
+                assert_eq!(field, "migration");
+                assert!(message.contains("DuplicateSource"), "{message}");
+            }
+            other => panic!("expected an inconsistent-plan error, got {other:?}"),
+        }
+    }
+
+    /// Stored paths must already be canonical: a legacy row spelled `/w/a/`
+    /// is reported as database corruption before any migration item is
+    /// built, so two spellings of one path never reach the planner.
     #[test]
     #[cfg(unix)]
-    fn test_colliding_destinations_are_refused() {
+    fn test_non_canonical_stored_path_is_reported_as_corruption() {
         let db = create_test_database();
         for (path, port) in [("/w/a", 5000), ("/w/a/", 5001)] {
             db.connection()
@@ -1050,8 +1135,13 @@ mod tests {
                 .unwrap();
         }
 
-        let mut plan = MigratePlan::new(options("/w/a", "/w/b"));
-        assert!(plan.build(&db).is_err());
+        for recursive in [false, true] {
+            let mut plan = MigratePlan::new(options("/w/a", "/w/b").with_recursive(recursive));
+            assert!(
+                matches!(plan.build(&db), Err(Error::DatabaseCorruption { .. })),
+                "recursive={recursive}"
+            );
+        }
         let count: i64 = db
             .connection()
             .query_row("SELECT COUNT(*) FROM reservations", [], |row| row.get(0))
@@ -1104,6 +1194,33 @@ mod tests {
         assert!(execute_migrate(&plan, &mut db).is_err());
         assert_eq!(port_at(&db, "/w/dst"), None);
         assert_eq!(port_at(&db, "/w/src"), None);
+    }
+
+    /// A source whose reservation data changed after planning (here: the
+    /// same key re-reserved at another port) is not moved with data the plan
+    /// never showed; the migration is refused without changes.
+    #[test]
+    #[cfg(unix)]
+    fn test_execute_refuses_source_changed_after_planning() {
+        let (_directory, mut db, mut other) = two_connections();
+        reserve(&mut db, "/w/src", 5300);
+
+        let mut plan = MigratePlan::new(options("/w/src", "/w/dst"));
+        plan.build(&db).unwrap();
+        assert_eq!(plan.migrations[0].reservation.port().value(), 5300);
+
+        let key = ReservationKey::new(PathBuf::from("/w/src"), None).unwrap();
+        assert!(other.delete_reservation(&key).unwrap());
+        reserve(&mut other, "/w/src", 5301);
+
+        match execute_migrate(&plan, &mut db) {
+            Err(Error::ReservationConflict { details }) => {
+                assert!(details.contains("changed while the migration"), "{details}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(port_at(&db, "/w/src"), Some(5301));
+        assert_eq!(port_at(&db, "/w/dst"), None);
     }
 
     /// The plan executed is rebuilt against the locked database; an

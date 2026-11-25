@@ -256,7 +256,7 @@ impl PathRelationship {
 /// prefixes by their parsed form (so `c:` equals `C:`), so a prefix is keyed
 /// by its parsed `Prefix` value and every other component by its encoded
 /// bytes.
-fn path_tokens(path: &Path) -> Vec<PathToken> {
+pub(crate) fn path_tokens(path: &Path) -> Vec<PathToken> {
     path.components()
         .map(|component| PathToken {
             kind: component_kind(component),

@@ -782,7 +782,7 @@ fn kind_eq(a: CompKind, b: CompKind) -> (eq: bool)
 }
 
 /// Whether two tokens are equal (same kind, same key bytes).
-fn token_eq(a: &PathToken, b: &PathToken) -> (eq: bool)
+pub fn token_eq(a: &PathToken, b: &PathToken) -> (eq: bool)
     ensures
         eq == (tok_view(*a) == tok_view(*b)),
 {
