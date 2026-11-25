@@ -595,6 +595,8 @@ pub proof fn lemma_canonical_run_start(c: Seq<ExclusionEntry>, i: int)
         covers(c, entry_hi(c[i])),
 {
     assert(entry_canonical(c[i]));
+    assert(entry_covers(c[i], entry_lo(c[i])));
+    assert(entry_covers(c[i], entry_hi(c[i])));
 }
 
 /// Minimality: every exclusion list (valid or not) that excludes the same
@@ -1447,12 +1449,26 @@ proof fn lemma_decimal_value_monotone(s: Seq<u8>, k: int)
     }
 }
 
-/// Parses a `u16` with exactly the syntax and range of `u16::from_str`
-/// (for any byte input).
-pub fn parse_u16(s: &[u8]) -> (r: Option<u16>)
+/// `s` is the decimal text of `v` in the syntax that the unsigned integer
+/// `from_str` implementations accept (an optional `+`, then one or more ASCII
+/// digits, leading zeros allowed; no whitespace, no `-`), and `v` is at most
+/// `max`. `is_u16_text(s, v)` is `is_unsigned_text(s, v, 65535)`.
+pub open spec fn is_unsigned_text(s: Seq<u8>, v: int, max: int) -> bool {
+    let d = unsigned_digits(s);
+    d.len() > 0 && all_digits(d) && decimal_value(d) == v && v <= max
+}
+
+/// Parses an unsigned decimal number of at most `max` with exactly the syntax
+/// of the unsigned integer `from_str` implementations (for any byte input),
+/// without overflow: the result is the value of the text exactly when the
+/// text is well formed and its value is at most `max`.
+///
+/// With `max` equal to `u16::MAX`, `u32::MAX` or `u64::MAX` this is exactly
+/// `u16::from_str`, `u32::from_str` or `u64::from_str`.
+pub fn parse_unsigned(s: &[u8], max: u64) -> (r: Option<u64>)
     ensures
-        r matches Some(v) ==> is_u16_text(s@, v as int),
-        r is None ==> forall|v: int| !is_u16_text(s@, v),
+        r matches Some(v) ==> is_unsigned_text(s@, v as int, max as int),
+        r is None ==> forall|v: int| !is_unsigned_text(s@, v, max as int),
 {
     let n = s.len();
     let mut start: usize = 0;
@@ -1466,7 +1482,7 @@ pub fn parse_u16(s: &[u8]) -> (r: Option<u16>)
     if start == n {
         return None;
     }
-    let mut value: u16 = 0;
+    let mut value: u64 = 0;
     let mut i = start;
     while i < n
         invariant
@@ -1504,8 +1520,8 @@ pub fn parse_u16(s: &[u8]) -> (r: Option<u16>)
                 }
             }
         }
-        // On overflow the digits read so far already exceed 65535, and more
-        // digits only increase the value.
+        // On overflow the digits read so far already exceed `u64::MAX` (so
+        // `max`), and more digits only increase the value.
         let Some(shifted) = value.checked_mul(10) else {
             proof {
                 lemma_decimal_value_nonneg(next.drop_last());
@@ -1515,7 +1531,7 @@ pub fn parse_u16(s: &[u8]) -> (r: Option<u16>)
             }
             return None;
         };
-        let Some(next_value) = shifted.checked_add(u16::from(digit)) else {
+        let Some(next_value) = shifted.checked_add(u64::from(digit)) else {
             proof {
                 if all_digits(d) {
                     lemma_decimal_value_monotone(d, i - start + 1);
@@ -1529,7 +1545,32 @@ pub fn parse_u16(s: &[u8]) -> (r: Option<u16>)
     proof {
         assert(d.take(n - start) =~= d);
     }
-    Some(value)
+    if value <= max {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Parses a `u16` with exactly the syntax and range of `u16::from_str`
+/// (for any byte input).
+pub fn parse_u16(s: &[u8]) -> (r: Option<u16>)
+    ensures
+        r matches Some(v) ==> is_u16_text(s@, v as int),
+        r is None ==> forall|v: int| !is_u16_text(s@, v),
+{
+    let parsed = parse_unsigned(s, 0xFFFF);
+    proof {
+        assert forall|v: int| #[trigger] is_u16_text(s@, v) implies is_unsigned_text(
+            s@,
+            v,
+            65535,
+        ) by {}
+    }
+    match parsed {
+        Some(v) => u16::try_from(v).ok(),
+        None => None,
+    }
 }
 
 /// `s[i..i + 2]` is the range separator `..`.

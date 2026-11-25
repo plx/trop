@@ -6,6 +6,8 @@
 use crate::config::effective::ConfigField;
 use crate::config::schema::{Config, OutputFormat, PortConfig, PortExclusion};
 use crate::error::{Error, Result};
+use crate::verified::config::{parse_bool_word, parse_u32_decimal, parse_u64_decimal};
+use crate::verified::exclusions::parse_u16;
 use crate::verified::port_bounds::{
     check_upper_declaration, overlay_port_bounds, PortBoundsViolation, PortLayer,
 };
@@ -78,9 +80,9 @@ impl EnvironmentConfig {
             on_field(ConfigField::ExcludedPorts, "TROP_EXCLUDED_PORTS");
         }
 
-        // TROP_EXPIRE_AFTER_DAYS
+        // TROP_EXPIRE_AFTER_DAYS (`u32` decimal text; validation rejects 0)
         if let Ok(days) = env::var("TROP_EXPIRE_AFTER_DAYS") {
-            let days = days.parse().map_err(|_| Error::Validation {
+            let days = parse_u32_decimal(days.as_bytes()).ok_or_else(|| Error::Validation {
                 field: "TROP_EXPIRE_AFTER_DAYS".into(),
                 message: "Must be a positive integer".into(),
             })?;
@@ -97,29 +99,25 @@ impl EnvironmentConfig {
         if let Some((seconds, variable)) =
             Self::read_with_alias("TROP_BUSY_TIMEOUT", &["TROP_MAXIMUM_LOCK_WAIT_SECONDS"])
         {
-            config.maximum_lock_wait_seconds =
-                Some(seconds.parse().map_err(|_| Error::Validation {
+            config.maximum_lock_wait_seconds = Some(
+                parse_u64_decimal(seconds.as_bytes()).ok_or_else(|| Error::Validation {
                     field: variable.into(),
                     message: "Must be a positive integer".into(),
-                })?);
+                })?,
+            );
             on_field(ConfigField::MaximumLockWaitSeconds, variable);
         }
 
         if let Ok(format) = env::var("TROP_OUTPUT_FORMAT") {
-            config.output_format = Some(match format.to_ascii_lowercase().as_str() {
-                "table" => OutputFormat::Table,
-                "json" => OutputFormat::Json,
-                "csv" => OutputFormat::Csv,
-                "tsv" => OutputFormat::Tsv,
-                _ => {
-                    return Err(Error::Validation {
+            config.output_format =
+                Some(
+                    OutputFormat::parse_keyword(&format).ok_or_else(|| Error::Validation {
                         field: "TROP_OUTPUT_FORMAT".into(),
                         message: format!(
                             "Invalid output format: '{format}' (expected table/json/csv/tsv)"
                         ),
-                    });
-                }
-            });
+                    })?,
+                );
             on_field(ConfigField::OutputFormat, "TROP_OUTPUT_FORMAT");
         }
 
@@ -229,11 +227,14 @@ impl EnvironmentConfig {
     }
 
     /// Read and parse one port-valued `TROP_PORT_*` variable, if it is set.
+    ///
+    /// The value is `u16` decimal text (`u16::from_str`'s syntax), decided by
+    /// the verified decimal parser that every numeric `TROP_*` variable uses.
     fn read_port_variable(variable: &'static str, message: &str) -> Result<Option<u16>> {
         env::var(variable)
             .ok()
             .map(|value| {
-                value.parse().map_err(|_| Error::Validation {
+                parse_u16(value.as_bytes()).ok_or_else(|| Error::Validation {
                     field: variable.into(),
                     message: message.into(),
                 })
@@ -311,18 +312,20 @@ impl EnvironmentConfig {
 
     /// Parse a boolean value from a string.
     ///
-    /// Accepts: true/1/yes/on for true, false/0/no/off for false (case-insensitive).
+    /// Accepts: true/1/yes/on for true, false/0/no/off for false
+    /// (case-insensitive). The decision is the verified kernel's
+    /// `parse_bool_word`, which ignores ASCII case. The words are ASCII, so
+    /// this is exactly matching `s.to_lowercase()` against them: the only
+    /// non-ASCII char whose lowercase is ASCII is the Kelvin sign (`k`), and
+    /// no word contains `k` (pinned by
+    /// `test_parse_bool_ascii_folding_matches_unicode_lowercase`).
     fn parse_bool(field: &str, s: &str) -> Result<bool> {
-        match s.to_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Ok(true),
-            "false" | "0" | "no" | "off" => Ok(false),
-            _ => Err(Error::Validation {
-                field: field.into(),
-                message: format!(
-                    "Invalid boolean value: '{s}' (expected true/false/1/0/yes/no/on/off)"
-                ),
-            }),
-        }
+        parse_bool_word(s.as_bytes()).ok_or_else(|| Error::Validation {
+            field: field.into(),
+            message: format!(
+                "Invalid boolean value: '{s}' (expected true/false/1/0/yes/no/on/off)"
+            ),
+        })
     }
 
     /// Parse excluded ports from comma-separated string.
@@ -514,6 +517,182 @@ mod tests {
         assert_eq!(ports.min, 8000);
         assert_eq!(ports.max, Some(8025));
         assert_eq!(ports.max_offset, None);
+    }
+
+    /// The pre-kernel boolean parser (Unicode lowercasing), as an oracle.
+    pub(super) fn reference_parse_bool(s: &str) -> Option<bool> {
+        match s.to_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// The kernel folds only ASCII case; the old parser used Unicode
+    /// `to_lowercase`. They agree because the only non-ASCII char whose
+    /// lowercase is all-ASCII is the Kelvin sign (to `k`), and no boolean word
+    /// contains `k`.
+    #[test]
+    fn test_parse_bool_ascii_folding_matches_unicode_lowercase() {
+        let lowers_to_ascii: Vec<char> = (0..=0x10_FFFF_u32)
+            .filter_map(char::from_u32)
+            .filter(|c| !c.is_ascii() && c.to_lowercase().all(|l| l.is_ascii()))
+            .collect();
+        assert_eq!(lowers_to_ascii, ['\u{212A}']);
+        assert_eq!('\u{212A}'.to_lowercase().to_string(), "k");
+        let words = ["true", "1", "yes", "on", "false", "0", "no", "off"];
+        assert!(words.iter().all(|word| !word.contains('k')));
+
+        let mut inputs: Vec<String> = Vec::new();
+        for word in words {
+            inputs.push(word.to_string());
+            inputs.push(word.to_ascii_uppercase());
+            inputs.push(format!(" {word}"));
+            inputs.push(format!("{word} "));
+            inputs.push(format!("{word}\n"));
+            inputs.push(word.replace('o', "\u{d8}"));
+            inputs.push(word.replace('e', "\u{c9}"));
+        }
+        inputs.extend(
+            [
+                "",
+                "\u{212A}",
+                "o\u{212A}",
+                "\u{130}",
+                "TrUe",
+                "yEs",
+                "ON",
+                "nO",
+                "OfF",
+                "2",
+                "10",
+                "00",
+                "truee",
+                "fals",
+                "y",
+                "n",
+                "t",
+                "f",
+            ]
+            .map(str::to_string),
+        );
+        for input in &inputs {
+            assert_eq!(
+                EnvironmentConfig::parse_bool("TEST", input).ok(),
+                reference_parse_bool(input),
+                "{input:?}"
+            );
+        }
+    }
+
+    /// The verified decimal parsers accept exactly what the unsigned
+    /// `from_str` implementations accept, with the same values.
+    #[test]
+    fn test_decimal_parsers_match_std_at_the_edges() {
+        use crate::verified::config::{parse_u32_decimal, parse_u64_decimal};
+        use crate::verified::exclusions::parse_u16;
+
+        for text in [
+            "",
+            "+",
+            "-",
+            "-0",
+            "0",
+            "+0",
+            "00",
+            "007",
+            "1",
+            "65535",
+            "65536",
+            "+65535",
+            "0065535",
+            "4294967295",
+            "4294967296",
+            "18446744073709551615",
+            "18446744073709551616",
+            "99999999999999999999999",
+            " 1",
+            "1 ",
+            "1_000",
+            "1e3",
+            "0x10",
+            "++1",
+            "+-1",
+            "\u{663}",
+            "\u{ff11}",
+            "1\0",
+            "/",
+            ":",
+        ] {
+            assert_eq!(
+                parse_u16(text.as_bytes()),
+                text.parse::<u16>().ok(),
+                "{text:?}"
+            );
+            assert_eq!(
+                parse_u32_decimal(text.as_bytes()),
+                text.parse::<u32>().ok(),
+                "{text:?}"
+            );
+            assert_eq!(
+                parse_u64_decimal(text.as_bytes()),
+                text.parse::<u64>().ok(),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_output_format_keywords_round_trip_and_ignore_ascii_case() {
+        use crate::config::OutputFormat;
+
+        let reference = |text: &str| match text.to_ascii_lowercase().as_str() {
+            "table" => Some(OutputFormat::Table),
+            "json" => Some(OutputFormat::Json),
+            "csv" => Some(OutputFormat::Csv),
+            "tsv" => Some(OutputFormat::Tsv),
+            _ => None,
+        };
+        for format in [
+            OutputFormat::Json,
+            OutputFormat::Csv,
+            OutputFormat::Tsv,
+            OutputFormat::Table,
+        ] {
+            let keyword = format.to_string();
+            assert_eq!(OutputFormat::parse_keyword(&keyword), Some(format));
+            assert_eq!(
+                OutputFormat::parse_keyword(&keyword.to_ascii_uppercase()),
+                Some(format)
+            );
+            // Display agrees with the YAML (serde) spelling.
+            assert_eq!(
+                serde_yaml::to_string(&format).unwrap().trim(),
+                keyword.as_str()
+            );
+        }
+        for text in [
+            "json",
+            "JSON",
+            "Csv",
+            "tSv",
+            "TABLE",
+            "",
+            "jso",
+            "jsonn",
+            " json",
+            "json ",
+            "csv\n",
+            "t\u{e1}ble",
+            "\u{212A}",
+            "yaml",
+        ] {
+            assert_eq!(
+                OutputFormat::parse_keyword(text),
+                reference(text),
+                "{text:?}"
+            );
+        }
     }
 }
 
@@ -834,6 +1013,45 @@ mod property_tests {
             for exclusion in result {
                 prop_assert_eq!(exclusion, PortExclusion::Single(port), "All should be same port");
             }
+        }
+    }
+
+    /// Property: the verified decimal parsers are differentially equal to
+    /// `u16`/`u32`/`u64::from_str` on arbitrary text, including digit-heavy
+    /// text near the overflow boundaries.
+    proptest! {
+        #[test]
+        fn prop_decimal_parsers_match_std(
+            text in prop_oneof![
+                any::<String>(),
+                "[+-]?[0-9]{0,25}",
+                "[ +0-9a-f_.-]{0,8}",
+            ]
+        ) {
+            use crate::verified::config::{parse_u32_decimal, parse_u64_decimal};
+            use crate::verified::exclusions::parse_u16;
+            prop_assert_eq!(parse_u16(text.as_bytes()), text.parse::<u16>().ok());
+            prop_assert_eq!(parse_u32_decimal(text.as_bytes()), text.parse::<u32>().ok());
+            prop_assert_eq!(parse_u64_decimal(text.as_bytes()), text.parse::<u64>().ok());
+        }
+    }
+
+    /// Property: the verified boolean parser agrees with the pre-kernel
+    /// (Unicode-lowercasing) parser on arbitrary text and on case mixes of
+    /// the words.
+    proptest! {
+        #[test]
+        fn prop_bool_parser_matches_reference(
+            text in prop_oneof![
+                any::<String>(),
+                "(?i)(true|false|yes|no|on|off|1|0)",
+                "[tTrRuUeEfFaAlLsSyYnNoO01\u{212A}\u{130} ]{0,6}",
+            ]
+        ) {
+            prop_assert_eq!(
+                EnvironmentConfig::parse_bool("TEST", &text).ok(),
+                super::tests::reference_parse_bool(&text)
+            );
         }
     }
 }

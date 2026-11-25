@@ -6,6 +6,7 @@
 use crate::config::loader::ConfigSource;
 use crate::config::schema::{CleanupConfig, Config, OccupancyConfig, PortConfig};
 use crate::config::ConfigField;
+use crate::verified::config::overlay_leaf;
 use crate::verified::port_bounds::{overlay_port_bounds, LayerLeaves, PortBounds, PortLayer};
 
 /// Merges configuration sources according to precedence rules.
@@ -66,50 +67,29 @@ impl ConfigMerger {
             on_field(ConfigField::Project);
         }
 
-        if source.disable_autoinit.is_some() {
-            target.disable_autoinit = source.disable_autoinit;
-            on_field(ConfigField::DisableAutoinit);
+        // Scalar leaves: the verified kernel's `overlay_leaf` returns the
+        // source's value when it sets one (and reports it as set), otherwise
+        // the target's. Folded over the layers, each leaf ends up with the
+        // value of the highest-precedence layer that sets it
+        // (`lemma_fold_overlay_precedence`).
+        macro_rules! leaf {
+            ($leaf:ident, $field:ident) => {{
+                let (value, set) = overlay_leaf(target.$leaf, source.$leaf);
+                target.$leaf = value;
+                if set {
+                    on_field(ConfigField::$field);
+                }
+            }};
         }
-
-        if source.disable_autoprune.is_some() {
-            target.disable_autoprune = source.disable_autoprune;
-            on_field(ConfigField::DisableAutoprune);
-        }
-
-        if source.disable_autoexpire.is_some() {
-            target.disable_autoexpire = source.disable_autoexpire;
-            on_field(ConfigField::DisableAutoexpire);
-        }
-
-        if source.allow_unrelated_path.is_some() {
-            target.allow_unrelated_path = source.allow_unrelated_path;
-            on_field(ConfigField::AllowUnrelatedPath);
-        }
-
-        if source.allow_change_project.is_some() {
-            target.allow_change_project = source.allow_change_project;
-            on_field(ConfigField::AllowChangeProject);
-        }
-
-        if source.allow_change_task.is_some() {
-            target.allow_change_task = source.allow_change_task;
-            on_field(ConfigField::AllowChangeTask);
-        }
-
-        if source.allow_change.is_some() {
-            target.allow_change = source.allow_change;
-            on_field(ConfigField::AllowChange);
-        }
-
-        if source.maximum_lock_wait_seconds.is_some() {
-            target.maximum_lock_wait_seconds = source.maximum_lock_wait_seconds;
-            on_field(ConfigField::MaximumLockWaitSeconds);
-        }
-
-        if source.output_format.is_some() {
-            target.output_format = source.output_format;
-            on_field(ConfigField::OutputFormat);
-        }
+        leaf!(disable_autoinit, DisableAutoinit);
+        leaf!(disable_autoprune, DisableAutoprune);
+        leaf!(disable_autoexpire, DisableAutoexpire);
+        leaf!(allow_unrelated_path, AllowUnrelatedPath);
+        leaf!(allow_change_project, AllowChangeProject);
+        leaf!(allow_change_task, AllowChangeTask);
+        leaf!(allow_change, AllowChange);
+        leaf!(maximum_lock_wait_seconds, MaximumLockWaitSeconds);
+        leaf!(output_format, OutputFormat);
 
         // Merge ports config
         if let Some(ref source_ports) = source.ports {
@@ -139,13 +119,16 @@ impl ConfigMerger {
             on_field(ConfigField::ExcludedPorts);
         }
 
-        // Merge cleanup config
+        // Merge cleanup config: a source section (even an empty one) makes
+        // the target section present; its leaf is overlaid.
         if let Some(ref source_cleanup) = source.cleanup {
-            target.cleanup = Some(match &target.cleanup {
-                Some(target_cleanup) => Self::merge_cleanup(target_cleanup, source_cleanup),
-                None => source_cleanup.clone(),
-            });
-            if source_cleanup.expire_after_days.is_some() {
+            let lower = target
+                .cleanup
+                .as_ref()
+                .and_then(|cleanup| cleanup.expire_after_days);
+            let (expire_after_days, set) = overlay_leaf(lower, source_cleanup.expire_after_days);
+            target.cleanup = Some(CleanupConfig { expire_after_days });
+            if set {
                 on_field(ConfigField::CleanupExpireAfterDays);
             }
         }
@@ -201,15 +184,6 @@ impl ConfigMerger {
         (PortConfig::from_bounds(bounds), leaves)
     }
 
-    /// Merge cleanup configuration.
-    ///
-    /// Source values take precedence over target values.
-    fn merge_cleanup(target: &CleanupConfig, source: &CleanupConfig) -> CleanupConfig {
-        CleanupConfig {
-            expire_after_days: source.expire_after_days.or(target.expire_after_days),
-        }
-    }
-
     fn merge_occupancy(
         target: &mut OccupancyConfig,
         source: &OccupancyConfig,
@@ -243,8 +217,9 @@ impl ConfigMerger {
                 ConfigField::OccupancyCheckAllInterfaces,
             ),
         ] {
-            if let Some(value) = source_value {
-                *target_value = Some(value);
+            let (value, set) = overlay_leaf(*target_value, source_value);
+            *target_value = value;
+            if set {
                 on_field(field);
             }
         }
@@ -491,6 +466,64 @@ mod tests {
         ConfigMerger::merge_into(&mut target, &source);
         assert_eq!(target.project, Some("existing".to_string()));
         assert_eq!(target.disable_autoinit, Some(true));
+    }
+
+    /// The leaf overlay reports exactly the leaves the source sets, and keeps
+    /// the historical section semantics: a source section, even one with no
+    /// leaves, makes the target section present.
+    #[test]
+    fn test_merge_reports_exactly_the_set_leaves_and_keeps_section_presence() {
+        let mut target = Config::default();
+        let source = Config {
+            cleanup: Some(CleanupConfig::default()),
+            occupancy_check: Some(OccupancyConfig::default()),
+            output_format: Some(crate::config::OutputFormat::Csv),
+            maximum_lock_wait_seconds: Some(0),
+            ..Default::default()
+        };
+        let mut fields = Vec::new();
+        ConfigMerger::merge_into_observed(&mut target, &source, |field| fields.push(field));
+        assert_eq!(target.cleanup, Some(CleanupConfig::default()));
+        assert_eq!(target.occupancy_check, Some(OccupancyConfig::default()));
+        assert_eq!(
+            fields,
+            [
+                ConfigField::MaximumLockWaitSeconds,
+                ConfigField::OutputFormat
+            ]
+        );
+
+        // A later layer that sets a leaf wins; one that leaves it unset keeps it.
+        let higher = Config {
+            cleanup: Some(CleanupConfig {
+                expire_after_days: Some(7),
+            }),
+            occupancy_check: Some(OccupancyConfig {
+                skip_udp: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut fields = Vec::new();
+        ConfigMerger::merge_into_observed(&mut target, &higher, |field| fields.push(field));
+        let empty_sections = Config {
+            cleanup: Some(CleanupConfig::default()),
+            occupancy_check: Some(OccupancyConfig::default()),
+            ..Default::default()
+        };
+        ConfigMerger::merge_into_observed(&mut target, &empty_sections, |field| {
+            fields.push(field);
+        });
+        assert_eq!(target.cleanup.unwrap().expire_after_days, Some(7));
+        assert_eq!(target.occupancy_check.unwrap().skip_udp, Some(true));
+        assert_eq!(target.output_format, Some(crate::config::OutputFormat::Csv));
+        assert_eq!(
+            fields,
+            [
+                ConfigField::CleanupExpireAfterDays,
+                ConfigField::OccupancySkipUdp
+            ]
+        );
     }
 }
 

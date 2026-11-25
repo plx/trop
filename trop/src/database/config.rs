@@ -8,8 +8,13 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 
-pub(crate) const MAX_BUSY_TIMEOUT_MILLISECONDS: u128 = i32::MAX as u128;
-pub(crate) const MAX_BUSY_TIMEOUT_SECONDS: u64 = (i32::MAX as u64) / 1000;
+/// `SQLite`'s busy-timeout limit (`i32::MAX` milliseconds), from the verified
+/// configuration kernel.
+pub(crate) const MAX_BUSY_TIMEOUT_MILLISECONDS: u64 =
+    crate::verified::config::MAX_BUSY_TIMEOUT_MILLIS;
+/// The largest whole number of seconds within the limit (derived from it in
+/// the verified kernel, which proves it tight).
+pub(crate) const MAX_BUSY_TIMEOUT_SECONDS: u64 = crate::verified::config::MAX_LOCK_WAIT_SECONDS;
 
 /// Configuration for database connections.
 ///
@@ -96,8 +101,16 @@ impl DatabaseConfig {
         self
     }
 
+    /// Reject a busy timeout `SQLite` cannot store (more than `i32::MAX`
+    /// milliseconds, as `Duration::as_millis` counts them). Decided by the
+    /// verified kernel's `busy_timeout_ok` over the duration's parts, which
+    /// also proves every configuration-validated `maximum_lock_wait_seconds`
+    /// passes.
     pub(super) fn validate_busy_timeout(&self) -> Result<()> {
-        if self.busy_timeout.as_millis() > MAX_BUSY_TIMEOUT_MILLISECONDS {
+        if !crate::verified::config::busy_timeout_ok(
+            self.busy_timeout.as_secs(),
+            self.busy_timeout.subsec_nanos(),
+        ) {
             return Err(Error::Validation {
                 field: "maximum_lock_wait_seconds".into(),
                 message: format!(
@@ -222,9 +235,8 @@ mod tests {
 
     #[test]
     fn test_config_rejects_busy_timeout_larger_than_sqlite_limit() {
-        let config = DatabaseConfig::new("/tmp/test.db").with_busy_timeout(Duration::from_millis(
-            u64::try_from(MAX_BUSY_TIMEOUT_MILLISECONDS).unwrap() + 1,
-        ));
+        let config = DatabaseConfig::new("/tmp/test.db")
+            .with_busy_timeout(Duration::from_millis(MAX_BUSY_TIMEOUT_MILLISECONDS + 1));
         let error = config.validate_busy_timeout().unwrap_err();
         assert!(matches!(
             error,
@@ -234,6 +246,36 @@ mod tests {
             } if field == "maximum_lock_wait_seconds"
                 && message.contains(&MAX_BUSY_TIMEOUT_MILLISECONDS.to_string())
         ));
+    }
+
+    #[test]
+    fn test_busy_timeout_limit_is_exact_at_millisecond_resolution() {
+        let accepts = |timeout: Duration| {
+            DatabaseConfig::new("/tmp/test.db")
+                .with_busy_timeout(timeout)
+                .validate_busy_timeout()
+                .is_ok()
+        };
+        assert_eq!(MAX_BUSY_TIMEOUT_MILLISECONDS, 2_147_483_647);
+        assert_eq!(MAX_BUSY_TIMEOUT_SECONDS, 2_147_483);
+        assert!(accepts(Duration::from_millis(
+            MAX_BUSY_TIMEOUT_MILLISECONDS
+        )));
+        // Sub-millisecond remainders do not count (`as_millis` truncates).
+        assert!(accepts(
+            Duration::from_millis(MAX_BUSY_TIMEOUT_MILLISECONDS) + Duration::from_nanos(999_999)
+        ));
+        assert!(!accepts(Duration::from_millis(
+            MAX_BUSY_TIMEOUT_MILLISECONDS + 1
+        )));
+        assert!(!accepts(Duration::MAX));
+        assert!(!accepts(Duration::from_secs(u64::MAX / 1000 + 1)));
+        // Every whole-second lock wait the configuration accepts is accepted
+        // here, and the next second is not.
+        assert!(accepts(Duration::from_secs(MAX_BUSY_TIMEOUT_SECONDS)));
+        assert!(!accepts(Duration::from_secs(MAX_BUSY_TIMEOUT_SECONDS + 1)));
+        assert!(accepts(Duration::ZERO));
+        assert!(accepts(Duration::from_nanos(1)));
     }
 
     #[test]
