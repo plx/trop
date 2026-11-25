@@ -32,6 +32,8 @@
 //! assert_eq!(range.len(), 11);
 //! ```
 
+#[doc(hidden)]
+pub mod cli_support;
 pub mod config;
 pub mod database;
 pub mod error;

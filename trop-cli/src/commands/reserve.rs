@@ -342,25 +342,54 @@ fn allocates_after_cleanup(action: &PlanAction) -> bool {
 /// Parse a port number from a string, validating it's in the valid range (1-65535).
 ///
 /// Returns an error if the string cannot be parsed as a number or if the number
-/// is outside the valid port range.
+/// is outside the valid port range. The verified kernel
+/// (`trop::cli_support::parse_port_arg`) decides, with `u32::from_str`
+/// syntax and the precedence not-a-number, then zero, then too large; every
+/// command that takes a port argument uses this function, so they all accept
+/// the same text and report the same messages. The rejected text is shown
+/// with control characters escaped.
 pub(crate) fn parse_port_string(s: &str) -> Result<u16, CliError> {
-    // Try to parse as u32 first to detect values > 65535
-    let parsed = s.parse::<u32>().map_err(|_| {
-        CliError::InvalidArguments(format!("Invalid port number: '{s}' is not a valid number"))
-    })?;
+    use trop::cli_support::{parse_port_arg, PortArgError};
 
-    // Validate port is in valid range (1-65535)
-    if parsed == 0 {
-        return Err(CliError::InvalidArguments(
-            "Invalid port number: port 0 is reserved and cannot be used".to_string(),
-        ));
+    parse_port_arg(s).map_err(|error| {
+        CliError::InvalidArguments(match error {
+            PortArgError::NotANumber => format!(
+                "Invalid port number: '{}' is not a valid number",
+                trop::output::display_field(s)
+            ),
+            PortArgError::Zero => {
+                "Invalid port number: port 0 is reserved and cannot be used".to_string()
+            }
+            PortArgError::TooLarge(value) => {
+                format!("Invalid port number: {value} is greater than maximum port 65535")
+            }
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The messages and precedence of the historical `u32` parser.
+    #[test]
+    fn port_strings_keep_their_messages() {
+        assert_eq!(parse_port_string("8080").unwrap(), 8080);
+        assert_eq!(parse_port_string("+1").unwrap(), 1);
+        assert_eq!(parse_port_string("65535").unwrap(), 65535);
+        for (text, message) in [
+            ("abc", "Invalid arguments: Invalid port number: 'abc' is not a valid number"),
+            ("", "Invalid arguments: Invalid port number: '' is not a valid number"),
+            ("99999999999", "Invalid arguments: Invalid port number: '99999999999' is not a valid number"),
+            ("a\nb", "Invalid arguments: Invalid port number: '\"a\\nb\"' is not a valid number"),
+            ("0", "Invalid arguments: Invalid port number: port 0 is reserved and cannot be used"),
+            ("00", "Invalid arguments: Invalid port number: port 0 is reserved and cannot be used"),
+            ("65536", "Invalid arguments: Invalid port number: 65536 is greater than maximum port 65535"),
+            ("4294967295", "Invalid arguments: Invalid port number: 4294967295 is greater than maximum port 65535"),
+        ] {
+            let error = parse_port_string(text).unwrap_err();
+            assert_eq!(error.to_string(), message, "{text:?}");
+            assert_eq!(error.exit_code(), 4);
+        }
     }
-
-    if parsed > 65535 {
-        return Err(CliError::InvalidArguments(format!(
-            "Invalid port number: {parsed} is greater than maximum port 65535"
-        )));
-    }
-
-    Ok(parsed as u16)
 }

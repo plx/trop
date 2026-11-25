@@ -2,17 +2,24 @@ use clap::Parser;
 use trop_cli::Cli;
 
 fn main() {
-    // Parse CLI arguments
-    let cli = Cli::parse();
-
-    // Initialize logging based on verbosity
-    let _logger = trop::init_logger(cli.verbose, cli.quiet);
+    // Parse CLI arguments. `--help` and `--version` exit 0; every other
+    // parse failure is a usage error and exits with the invalid-arguments
+    // code, never with clap's default 2 (reserved for lock timeouts).
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            // Printing can only fail if the stream is closed; the exit code
+            // still reports the failure.
+            let _ = error.print();
+            std::process::exit(trop_cli::parse_failure_exit_code(error.kind()));
+        }
+    };
 
     let result = trop_cli::run(cli);
 
     // Handle errors and set exit code
     match result {
-        Ok(()) => std::process::exit(0),
+        Ok(()) => std::process::exit(trop_cli::success_exit_code()),
         Err(e) => {
             eprintln!("Error: {e}");
             std::process::exit(e.exit_code());
