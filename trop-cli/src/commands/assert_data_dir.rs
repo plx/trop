@@ -58,28 +58,52 @@ impl AssertDataDirCommand {
 
 /// Whether the data directory exists: `Ok(true)` for a directory (following
 /// symbolic links), `Ok(false)` when nothing is there. A path that cannot be
-/// inspected (for example, permission denied on an ancestor) or that holds
-/// something other than a directory is neither a present nor an absent data
-/// directory, so it is an internal error that `--not` cannot invert, never a
-/// verdict. (`Path::exists` would report the first as absent and the second
-/// as present.)
+/// inspected (for example, permission denied on an ancestor), that holds
+/// something other than a directory, or whose deepest existing ancestor is
+/// not a directory is neither a present nor an absent data directory, so it
+/// is an internal error that `--not` cannot invert, never a verdict.
+/// (`Path::exists` would report the first and third as absent and the
+/// second as present.)
+///
+/// The ancestor walk makes a path below a regular file an error on every
+/// platform: Unix reports it as "not a directory", but Windows reports it as
+/// "not found".
 fn observe_data_dir(data_dir: &Path) -> Result<bool, CliError> {
     let inaccessible = |reason: &dyn std::fmt::Display| {
-        CliError::from(trop::Error::DatabaseCorruption {
-            details: format!(
-                "cannot access the selected data directory {}: {reason}; \
+        CliError::from(trop::Error::InvalidPath {
+            path: data_dir.to_path_buf(),
+            reason: format!(
+                "cannot access the selected data directory: {reason}; \
                  verify its path and permissions before retrying. \
-                 trop did not initialize or modify the data directory",
-                data_dir.display()
+                 trop did not initialize or modify the data directory"
             ),
         })
     };
     match fs::metadata(data_dir) {
-        Ok(metadata) if metadata.is_dir() => Ok(true),
-        Ok(_) => Err(inaccessible(&"it is not a directory")),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(inaccessible(&error)),
+        Ok(metadata) if metadata.is_dir() => return Ok(true),
+        Ok(_) => return Err(inaccessible(&"it is not a directory")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(inaccessible(&error)),
     }
+    // Nothing is at the path. It is absent only if its deepest existing
+    // ancestor is a directory.
+    let mut ancestor = data_dir.parent();
+    while let Some(path) = ancestor.filter(|path| !path.as_os_str().is_empty()) {
+        match fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => return Ok(false),
+            Ok(_) => {
+                return Err(inaccessible(&format!(
+                    "{} exists and is not a directory",
+                    path.display()
+                )))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                ancestor = path.parent();
+            }
+            Err(error) => return Err(inaccessible(&error)),
+        }
+    }
+    Ok(false)
 }
 
 fn validate_database(context: &InvocationContext) -> Result<(), CliError> {

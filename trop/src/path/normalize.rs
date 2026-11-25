@@ -28,11 +28,14 @@ use crate::verified::path::{classify_tilde, resolve_component_kinds, CompKind, T
 /// (`~/C:x`) is rejected, because joining it would replace the home
 /// directory.
 ///
-/// The home directory must be absolute. A relative one (for example
-/// `HOME=relhome`) is treated as undeterminable, as the data-directory rule
-/// treats it: expanding against it would resolve `~/x` under whatever the
-/// current directory is. With an absolute home directory every expansion is
-/// absolute (the verified `lemma_tilde_join_segments`).
+/// The home directory comes from the `home` crate (`HOME`, if set, on Unix; on
+/// Windows, `USERPROFILE` or the profile folder). It must be absolute: a
+/// relative one (for example `HOME=relhome` on Unix) is treated as
+/// undeterminable and the expansion fails, because expanding against it
+/// would resolve `~/x` under whatever the current directory is. (The
+/// data-directory rule also refuses a relative `HOME`, but it then falls
+/// back to `USERPROFILE`.) With an absolute home directory every expansion
+/// is absolute (the verified `lemma_tilde_join_segments`).
 ///
 /// # Errors
 ///

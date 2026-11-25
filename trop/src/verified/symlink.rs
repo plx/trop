@@ -18,10 +18,11 @@
 //! - **Loop detection is sound and complete.** `Loop(s)` is reported only
 //!   when `s` is the same (per `same`) as an earlier state of the chain
 //!   (`walk.earlier`), and `same` said "different" for `s` and every state
-//!   before that one, so it is the first match; the states after it were
-//!   never compared with `s`. On every outcome, `same` said "different" for
-//!   every pair of states the `step` oracle inspected (`distinct`; for
-//!   `Loop` and `TooDeep`, every state but the last).
+//!   before that one, so it is the first match. (That the states after it
+//!   were never compared with `s` holds by construction; it is not proved.)
+//!   On every outcome, `same` said "different" for every pair of states the
+//!   `step` oracle inspected (`distinct`; for `Loop` and `TooDeep`, every
+//!   state but the last).
 //! - **Every other outcome is the last state's own answer:** `Resolved` (not
 //!   a link), `Missing`, or `Failed` with the oracle's error.
 //! - It terminates for every oracle: the measure is `max_depth - depth`.

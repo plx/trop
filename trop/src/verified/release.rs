@@ -741,11 +741,12 @@ pub open spec fn paths_permitted<E, F: Fn(usize) -> Option<E>>(
 }
 
 /// The unrelated-path guard over explicit paths (the requested path of a
-/// release). With neither `--force` nor `--allow-unrelated-path`, success
-/// means every path is lexically related to the working directory or the
-/// fallback permitted it; a failure names the first refused path. With
-/// either flag the guard passes and the fallback is never consulted (its
-/// precondition is only granted when the guard applies).
+/// release or reserve, or the configuration directory of a reserve-group).
+/// With neither `--force` nor `--allow-unrelated-path`, success means every
+/// path is lexically related to the working directory or the fallback
+/// permitted it; a failure names the first refused path. With either flag
+/// the guard passes and the fallback is never consulted (its precondition is
+/// only granted when the guard applies).
 pub fn guard_paths<E, F: Fn(usize) -> Option<E>>(
     guard: &PathGuard,
     paths: &[Vec<super::path_relation::PathToken>],

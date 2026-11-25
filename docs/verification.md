@@ -45,10 +45,12 @@ trop-verification/        publish = false harness crate; mounts trop/src/verifie
   interleaves decisions with effects (for example, scanning ports and probing
   each one), the kernel is either generic over an oracle closure or proves
   the pure parts (bounds, the order of results, minimality given the
-  oracle's answers: for example, the least available port). The order and
-  number of oracle calls are not specified (closure calls leave no trace in
-  a specification); where they matter, they hold by construction and are
-  pinned by tests.
+  oracle's answers: for example, the least available port). Some kernels
+  also restrict which calls are allowed, through the closures' preconditions
+  (`fallback_discipline`, `retry_discipline`, `guard_paths`) or by taking
+  `FnOnce` closures. Beyond that, the order and number of oracle calls are
+  not specified (closure calls leave no trace in a specification); where
+  they matter, they hold by construction and are pinned by tests.
 
 ## Soundness at the verified/unverified boundary
 
@@ -711,11 +713,12 @@ number of calls):
 - The glue mappings above (covered by exhaustive tests over all 729 settings
   and all 32 flag combinations).
 
-The first three are pinned by call-counting and call-recording tests in
-`trop/src/port/occupancy.rs`
-(`test_failure_on_last_probe_runs_every_earlier_probe_and_fails_closed`,
-`test_default_find_occupied_ports_stops_at_first_failure`, which records
-the ports in call order).
+The first three are pinned by call-recording tests in
+`trop/src/port/occupancy.rs`:
+`test_failure_on_last_probe_runs_every_earlier_probe_and_fails_closed`
+records all eight probes in call order, and
+`test_default_find_occupied_ports_stops_at_first_failure` records the ports
+in call order.
 `find_occupied_reports` delegates to
 `SystemOccupancyChecker::find_occupied_reports_with(range, config,
 run_probe)`, the `scan_ports` glue with an injectable probe runner. A test
@@ -1162,11 +1165,14 @@ Glue: `trop/src/path/normalize.rs` (`expand_tilde`, `resolve_components`,
   - `\` is a separator only on Windows; on Unix `~\x` is a literal name.
   - The expansion's segments are the home directory's segments followed by
     the rest's (`lemma_tilde_join_segments`), and the expansion is absolute
-    exactly when the home directory is. The glue refuses a home directory
-    that is not absolute (`HOME=relhome`) as undeterminable, as the
-    data-directory rule does, so every expansion is absolute; otherwise
-    normalization would resolve `~/x` under the current directory. Pinned
-    by `relative_home_is_not_used_for_tilde_expansion`
+    exactly when the home directory is. The glue takes the home directory
+    from the `home` crate (`HOME`, if set, on Unix; `USERPROFILE` or the
+    profile folder on Windows) and fails the expansion when it is not absolute
+    (`HOME=relhome`), so every expansion is absolute; otherwise
+    normalization would resolve `~/x` under the current directory. (The
+    data-directory rule also refuses a relative `HOME`, but falls back to
+    `USERPROFILE`.) Pinned on Unix by
+    `relative_home_is_not_used_for_tilde_expansion`
     (`trop-cli/tests/cli_surface_regressions.rs`).
   - On Windows the glue also rejects a rest that `std` parses as starting
     with a drive prefix (`~/C:x`), which `join` would otherwise use to
@@ -1405,8 +1411,9 @@ Bugs fixed with this kernel:
   on the empty initialized in-memory database a live run would create
   (`open_dry_run_snapshot`, as for group dry runs). A missing database
   first gets the live run's checks for creating one (`dry_run_database`):
-  with auto-init disabled, or a database directory that could not be
-  created, it fails as a live run fails. The dry run fails like a live run,
+  with auto-init disabled, or with an existing ancestor of the database
+  directory that is not a directory, it fails as a live run fails
+  (permissions are not checked). The dry run fails like a live run,
   prints the plan and the port, and never creates, initializes, or migrates
   a database. It says when it cannot predict the outcome: a database that is
   uninitialized or needs migration, or an allocation deferred to automatic
@@ -2160,14 +2167,6 @@ Glue: `ReservePlan::check_path_relationship` in
 - `guard_paths` over `path_tokens(path)`;
 - `Database::validate_path_relationship(path, false)` as the physical fallback.
 
-`ReserveGroupPlan::build_plan` in `trop/src/operations/reserve_group.rs`
-(`reserve-group`, and `autoreserve`, which delegates to it) builds the same
-guard from its own flags, `path_guard(force, allow_unrelated_path, true)`,
-over the configuration file's directory, with the same fallback. Its flag
-rule is therefore the kernel's `path_check_required`, as for `release`;
-`test_reserve_group_path_guard_applies_exactly_without_an_override` pins
-all four flag combinations for an unrelated directory.
-
 - `lemma_reserve_guard_is_policy`: the guard's flag rule (`!force &&
   !allow_unrelated_path`) is reserve's verified policy field
   `check_path_relationship`. The guard is built from that field, so it applies
@@ -2180,6 +2179,16 @@ all four flag combinations for an unrelated directory.
   tested path under all four flag combinations. The paths include `.`/`..`
   components, a trailing separator, and a string prefix that is not a component
   prefix.
+
+`ReserveGroupPlan::build_plan` in `trop/src/operations/reserve_group.rs`
+(`reserve-group`, and `autoreserve`, which delegates to it) builds the same
+guard from its own flags, `path_guard(force, allow_unrelated_path, true)`,
+over the configuration file's directory, with the same fallback. Its flag
+rule is therefore the kernel's `path_check_required`, as for `release`. The
+bullets above are reserve's; for reserve-group,
+`test_reserve_group_path_guard_applies_exactly_without_an_override` pins
+all four flag combinations for an unrelated directory (there is no
+differential test).
 
 ### `verified::shell` — `--shell` names, shell detection, export lines
 
@@ -2485,9 +2494,12 @@ gathers `symlink_metadata`/`is_dir`/`exists` facts for `init`, and joins
   `assert-reservation` and `assert-data-dir`. A failed `--validate` stays an
   internal error that `--not` cannot invert. The observation is glue:
   `assert-data-dir` observes a directory (`fs::metadata`, following links)
-  in every mode, and a path it cannot inspect, or one that holds something
-  other than a directory, is an internal error, never a verdict
-  (`test_assert_data_dir_on_a_non_directory_is_internal_error`).
+  in every mode. A path it cannot inspect, one that holds something other
+  than a directory, or one whose deepest existing ancestor is not a
+  directory is an internal error (an invalid path), never a verdict
+  (`test_assert_data_dir_on_a_non_directory_is_internal_error`). The
+  ancestor walk gives a path below a regular file the same outcome on
+  Windows, which reports it as not found, as on Unix.
 - `cleanup_switches(prune, expire, clean)`: `(prune || clean, expire ||
   clean)`; with `--disable-autoclean` the reserve kernel's `cleanup_of` runs
   neither cleanup. `metadata_intent(clear, value)`: `Clear` exactly with
@@ -2839,8 +2851,9 @@ Glue: `trop/src/path/canonicalize.rs` (`canonicalize_safe`,
   - Loop detection is sound and complete for `same`. `Loop(s)` is reported only
     when `s` is the same as an earlier state (at `walk.earlier`), and `same`
     said "different" for `s` and every state before that one, so it is the
-    first match; later states were never compared with `s`. The states
-    before `s` are pairwise different. On every other outcome, `same` said
+    first match. (That the states after it were never compared with `s`
+    holds by construction; it is not proved.) The states before `s` are
+    pairwise different. On every other outcome, `same` said
     "different" for every pair of visited states (`distinct`).
   - Resolved, Missing and Failed are the last state's own answer.
   - It terminates, with measure `max_depth - depth`.

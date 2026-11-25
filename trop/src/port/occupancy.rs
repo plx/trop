@@ -1838,10 +1838,10 @@ mod tests {
             check_all_interfaces: true,
             ..Default::default()
         };
-        let mut calls = 0;
-        let error = SystemOccupancyChecker::report_with(port, &config, |_| {
-            calls += 1;
-            if calls == 8 {
+        let mut calls = Vec::new();
+        let error = SystemOccupancyChecker::report_with(port, &config, |probe| {
+            calls.push((probe.protocol, probe.address));
+            if calls.len() == 8 {
                 Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "synthetic last-probe failure",
@@ -1856,7 +1856,27 @@ mod tests {
         .unwrap_err();
         let diagnostic = error.to_string();
 
-        assert_eq!(calls, 8);
+        // Every probe runs once, in matrix order: IPv4 before IPv6,
+        // localhost before wildcard, TCP before UDP.
+        let tcp = OccupancyProtocol::Tcp;
+        let udp = OccupancyProtocol::Udp;
+        let v4_local = SocketAddr::from((Ipv4Addr::LOCALHOST, 5050));
+        let v4_any = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5050));
+        let v6_local = SocketAddr::from((Ipv6Addr::LOCALHOST, 5050));
+        let v6_any = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 5050));
+        assert_eq!(
+            calls,
+            vec![
+                (tcp, v4_local),
+                (udp, v4_local),
+                (tcp, v4_any),
+                (udp, v4_any),
+                (tcp, v6_local),
+                (udp, v6_local),
+                (tcp, v6_any),
+                (udp, v6_any),
+            ]
+        );
         assert!(matches!(error, Error::OccupancyCheckFailed { port: p, .. } if p == port));
         assert!(diagnostic.contains("UDP IPv6 wildcard bind at [::]:5050"));
         assert!(diagnostic.contains("synthetic last-probe failure"));
