@@ -6,7 +6,8 @@ use crate::invocation::InvocationContext;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 use std::fmt::Write as _;
-use trop::config::{Config, PortExclusion, DEFAULT_MAX_PORT, DEFAULT_MIN_PORT};
+use trop::config::{Config, PortConfig, PortExclusion};
+use trop::port::allocator::port_range_from_config;
 use trop::port::occupancy::{
     OccupancyCheckConfig, OccupancyReport, OccupiedProbe, SystemOccupancyChecker,
 };
@@ -146,23 +147,15 @@ impl ScanCommand {
     }
 
     fn determine_range(&self, config: &Config) -> Result<PortRange, CliError> {
-        let min = config
-            .ports
-            .as_ref()
-            .map(|p| p.min)
-            .unwrap_or(DEFAULT_MIN_PORT);
-        let max = config
-            .ports
-            .as_ref()
-            .and_then(|p| p.max)
-            .unwrap_or(DEFAULT_MAX_PORT);
-
-        let min_port =
-            Port::try_from(min).map_err(|e| CliError::InvalidArguments(e.to_string()))?;
-        let max_port =
-            Port::try_from(max).map_err(|e| CliError::InvalidArguments(e.to_string()))?;
-
-        PortRange::new(min_port, max_port).map_err(|e| CliError::Library(e.into()))
+        // Resolve the configured bounds exactly as the allocator does: an
+        // explicit `max`, or `min + max_offset`. Without a `ports` section the
+        // built-in default range applies.
+        let default_ports = PortConfig::default();
+        let ports = config.ports.as_ref().unwrap_or(&default_ports);
+        port_range_from_config(ports).map_err(|error| match error {
+            trop::Error::InvalidPort { .. } => CliError::InvalidArguments(error.to_string()),
+            other => CliError::Library(other),
+        })
     }
 
     fn add_exclusions(&self, ports: &[Port], context: &InvocationContext) -> Result<(), CliError> {
@@ -368,6 +361,120 @@ fn load_raw_config(path: &std::path::Path) -> Result<Config, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scan_command() -> ScanCommand {
+        ScanCommand {
+            min: None,
+            max: None,
+            autoexclude: false,
+            autocompact: false,
+            format: ScanOutputFormat::Json,
+            skip_tcp: false,
+            skip_udp: false,
+            skip_ipv4: false,
+            skip_ipv6: false,
+            check_all_interfaces: false,
+        }
+    }
+
+    fn config_with_ports(min: u16, max: Option<u16>, max_offset: Option<u16>) -> Config {
+        Config {
+            ports: Some(PortConfig {
+                min,
+                max,
+                max_offset,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn bounds(range: &PortRange) -> (u16, u16) {
+        (range.min().value(), range.max().value())
+    }
+
+    #[test]
+    fn determine_range_honors_max_offset() {
+        // Regression: `max_offset` used to be ignored, so this scanned (or,
+        // with min above 7000, failed on) the default maximum instead.
+        let range = scan_command()
+            .determine_range(&config_with_ports(8000, None, Some(100)))
+            .unwrap();
+        assert_eq!(bounds(&range), (8000, 8100));
+
+        let range = scan_command()
+            .determine_range(&config_with_ports(6000, None, Some(100)))
+            .unwrap();
+        assert_eq!(bounds(&range), (6000, 6100));
+    }
+
+    #[test]
+    fn determine_range_matches_the_allocator_range() {
+        for (min, max, max_offset) in [
+            (5000, Some(7000), None),
+            (8000, None, Some(100)),
+            (1, Some(65535), None),
+            (65535, None, Some(0)),
+            (65000, None, Some(535)),
+            (5000, Some(5100), Some(1)),
+        ] {
+            let config = config_with_ports(min, max, max_offset);
+            let scanned = scan_command().determine_range(&config).unwrap();
+            let allocator = trop::port::allocator::allocator_from_config(&config).unwrap();
+            assert_eq!(scanned, *allocator.range(), "{min} {max:?} {max_offset:?}");
+        }
+    }
+
+    #[test]
+    fn determine_range_defaults_without_ports_section() {
+        let range = scan_command().determine_range(&Config::default()).unwrap();
+        assert_eq!(
+            bounds(&range),
+            (
+                trop::config::DEFAULT_MIN_PORT,
+                trop::config::DEFAULT_MAX_PORT
+            )
+        );
+    }
+
+    #[test]
+    fn determine_range_error_kinds_are_preserved() {
+        let error = scan_command()
+            .determine_range(&config_with_ports(0, Some(10), None))
+            .unwrap_err();
+        assert!(
+            matches!(&error, CliError::InvalidArguments(message) if message == "invalid port 0: port 0 is invalid"),
+            "{error:?}"
+        );
+        assert_eq!(error.exit_code(), 4);
+
+        let error = scan_command()
+            .determine_range(&config_with_ports(10, Some(0), None))
+            .unwrap_err();
+        assert!(matches!(error, CliError::InvalidArguments(_)), "{error:?}");
+
+        let error = scan_command()
+            .determine_range(&config_with_ports(6000, Some(5000), None))
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                CliError::Library(trop::Error::InvalidPortRange {
+                    min: 6000,
+                    max: 5000,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+
+        let error = scan_command()
+            .determine_range(&config_with_ports(65000, None, Some(1000)))
+            .unwrap_err();
+        assert!(
+            matches!(&error, CliError::Library(trop::Error::Validation { field, .. }) if field == "ports.max_offset"),
+            "{error:?}"
+        );
+    }
 
     fn unavailable_result() -> ScanResult {
         ScanResult {
