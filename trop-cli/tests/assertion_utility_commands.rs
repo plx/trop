@@ -1904,6 +1904,58 @@ fn test_scan_uses_config_range() {
     );
 }
 
+/// Test scan resolves `ports.max_offset` exactly like the allocator.
+///
+/// Regression: scan used to ignore `max_offset` and fall back to the default
+/// maximum (7000), so a configured `min` above 7000 failed with an invalid
+/// range and a lower `min` scanned (and could auto-exclude) the wrong ports.
+#[test]
+fn test_scan_uses_configured_max_offset_range() {
+    let env = TestEnv::new();
+    let project = env.create_dir("max-offset-project");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("Failed to bind TCP fixture");
+    let port = listener.local_addr().unwrap().port();
+    // The range `port - 1 ..= port` (via max_offset) contains the bound port
+    // and cannot overflow. Ephemeral ports lie far above the default maximum.
+    let min = port - 1;
+    fs::write(
+        project.join("trop.yaml"),
+        format!("ports:\n  min: {min}\n  max_offset: 1\n"),
+    )
+    .expect("Failed to write max_offset config");
+
+    let output = env
+        .command()
+        .current_dir(&project)
+        .arg("scan")
+        .arg("--skip-udp")
+        .arg("--skip-ipv6")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to run scan");
+    assert!(
+        output.status.success(),
+        "scan must use min..=min+max_offset, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("scan output must be JSON");
+    let rows = rows.as_array().expect("scan output must be a JSON array");
+    assert!(
+        rows.iter().any(|row| row["port"] == port),
+        "the bound port {port} must be reported: {rows:?}"
+    );
+    for row in rows {
+        let scanned = row["port"].as_u64().expect("port must be a number");
+        assert!(
+            (u64::from(min)..=u64::from(port)).contains(&scanned),
+            "port {scanned} lies outside the configured range {min}..={port}"
+        );
+    }
+    drop(listener);
+}
+
 // Note: --autoexclude and --autocompact flags are difficult to test in
 // integration tests because they require actually occupied ports.
 // These are better tested manually or with mock occupancy checkers.
