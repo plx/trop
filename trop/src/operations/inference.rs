@@ -8,7 +8,6 @@ use gix::bstr::ByteSlice;
 use std::ffi::OsStr;
 use std::path::Path;
 
-use crate::config::ConfigValidator;
 use crate::verified::inference::{self as kernel, NameSource};
 
 // Counts git discoveries made by this thread (test instrumentation: it
@@ -28,11 +27,15 @@ fn discover(path: &Path) -> Option<gix::Repository> {
     gix::open(std_path).ok()
 }
 
-fn normalize_inferred_identifier(field: &str, value: &str) -> Option<String> {
-    let value = value.trim();
-    ConfigValidator::validate_runtime_identifier(field, value)
+/// An inferred project or task name in canonical form, or `None` when it is
+/// not a valid identifier. The verified identifier kernel both trims
+/// (Unicode `White_Space`) and applies the identifier rule (non-blank, no
+/// NUL, at most 255 UTF-8 bytes after trimming); the value kept is the
+/// kernel's trimmed sub-slice, so it is canonical.
+fn normalize_inferred_identifier(value: &str) -> Option<String> {
+    crate::identifier::check_identifier(value)
         .ok()
-        .map(|()| value.to_string())
+        .map(str::to_owned)
 }
 
 /// Infer project name from git repository.
@@ -80,7 +83,7 @@ pub fn infer_project(path: &Path) -> Option<String> {
         .and_then(OsStr::to_str);
 
     // Discard any candidate that is not a valid identifier.
-    normalize_inferred_identifier("project", repository_name(common_name, parent_name)?)
+    normalize_inferred_identifier(repository_name(common_name, parent_name)?)
 }
 
 /// The repository name for a canonical common directory whose last
@@ -153,7 +156,7 @@ pub fn infer_task(path: &Path) -> Option<String> {
         get_current_branch(&repo)
     }?;
 
-    normalize_inferred_identifier("task", &task)
+    normalize_inferred_identifier(&task)
 }
 
 /// Check if the repository is a git worktree.
@@ -277,14 +280,40 @@ mod tests {
 
     #[test]
     fn invalid_inferred_identifiers_are_ignored() {
-        assert_eq!(normalize_inferred_identifier("project", "   "), None);
+        assert_eq!(normalize_inferred_identifier("   "), None);
+        assert_eq!(normalize_inferred_identifier(""), None);
+        assert_eq!(normalize_inferred_identifier(&"x".repeat(256)), None);
+        assert_eq!(normalize_inferred_identifier("a\0b"), None);
         assert_eq!(
-            normalize_inferred_identifier("task", &"x".repeat(256)),
-            None
-        );
-        assert_eq!(
-            normalize_inferred_identifier("project", "  valid-project  "),
+            normalize_inferred_identifier("  valid-project  "),
             Some("valid-project".to_string())
         );
+        // The 255-byte limit applies after trimming.
+        let longest = "x".repeat(255);
+        assert_eq!(
+            normalize_inferred_identifier(&format!(" {longest}\u{3000}")),
+            Some(longest)
+        );
+    }
+
+    /// The inferred name is trimmed by the verified kernel. Pins that this is
+    /// exactly the previous `str::trim` + rule behavior for every Unicode
+    /// scalar value used as padding, and that the result is canonical.
+    #[test]
+    fn inferred_identifier_trim_matches_str_trim() {
+        for c in (0..=0x0010_FFFF_u32).filter_map(char::from_u32) {
+            for text in [format!("{c}name{c}"), format!("{c}"), format!("a{c}b")] {
+                let reference = Some(text.trim())
+                    .filter(|value| {
+                        !value.is_empty() && !value.contains('\0') && value.len() <= 255
+                    })
+                    .map(str::to_owned);
+                let normalized = normalize_inferred_identifier(&text);
+                assert_eq!(normalized, reference, "{text:?}");
+                if let Some(value) = normalized {
+                    assert!(crate::identifier::is_canonical_identifier(&value));
+                }
+            }
+        }
     }
 }

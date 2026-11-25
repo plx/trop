@@ -23,6 +23,10 @@ pub(crate) use crate::verified::identifier::IdentifierError;
 pub(crate) const MAX_ENVIRONMENT_VARIABLE_NAME_LEN: usize = env_name::MAX_ENV_NAME_BYTES;
 
 /// Removes leading and trailing Unicode whitespace; identical to `str::trim`.
+///
+/// The one whitespace trim of the crate's verified text paths: identifiers,
+/// and exclusion text (`PortExclusion`'s `FromStr` and the items of
+/// `TROP_EXCLUDED_PORTS`).
 pub(crate) fn trim_identifier(value: &str) -> &str {
     identifier_kernel::trim(value)
 }
@@ -114,8 +118,12 @@ impl EnvironmentVariableName {
     }
 }
 
-/// Constant diagnostics: they never echo the rejected input.
-const fn environment_variable_name_message(error: EnvNameError) -> &'static str {
+/// The diagnostic for an environment-variable name that breaks the portable
+/// grammar. Constant: it never echoes the rejected input.
+///
+/// The one message table for these errors: `EnvironmentVariableName` and the
+/// configuration validator's group checks both report it.
+pub(crate) const fn environment_variable_name_message(error: EnvNameError) -> &'static str {
     match error {
         EnvNameError::Empty => "must not be empty and must match [A-Za-z_][A-Za-z0-9_]*",
         EnvNameError::TooLong => "must not exceed 255 bytes",
@@ -131,10 +139,15 @@ fn invalid_environment_variable_name(error: EnvNameError) -> Error {
     }
 }
 
+/// The diagnostic for an unmapped service tag that derives no portable
+/// environment-variable name. Shared with the configuration validator's
+/// group checks.
+pub(crate) const NON_CONVERTIBLE_SERVICE_TAG_MESSAGE: &str = "service tag cannot be converted to a portable environment-variable name; provide an explicit valid env mapping";
+
 fn non_convertible_service_tag() -> Error {
     Error::Validation {
         field: "reservations.services.tag".to_owned(),
-        message: "service tag cannot be converted to a portable environment-variable name; provide an explicit valid env mapping".to_owned(),
+        message: NON_CONVERTIBLE_SERVICE_TAG_MESSAGE.to_owned(),
     }
 }
 

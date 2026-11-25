@@ -154,6 +154,77 @@ fn exclude_single_then_one_port_range_is_a_no_op() {
     assert_eq!(read(&config), "project: demo\nexcluded_ports:\n- 8080\n");
 }
 
+/// Reserves a port for `dir` and returns it.
+fn reserve_port(env: &TestEnv, dir: &Path) -> u16 {
+    let output = env
+        .command()
+        .current_dir(dir)
+        .arg("reserve")
+        .arg("--path")
+        .arg(dir)
+        .arg("--allow-unrelated-path")
+        .output()
+        .expect("Failed to run reserve");
+    assert!(output.status.success(), "{output:?}");
+    stdout(&output)
+        .trim()
+        .parse()
+        .expect("reserve prints the port")
+}
+
+/// Regression: the reserved-port guard ran before the no-op decision, so an
+/// exclusion identical to an existing entry (or covered by one) failed with
+/// "Port N is reserved" once N was reserved. The spec: an identical exclusion
+/// is a no-op. The guard now runs only when the list would change.
+#[test]
+fn exclude_of_an_already_excluded_reserved_port_is_a_no_op() {
+    let env = TestEnv::new();
+    let dir = env.create_dir("reserved-noop");
+    let config = dir.join("trop.yaml");
+    fs::write(&config, "project: demo\noccupancy_check:\n  skip: true\n").unwrap();
+    let port = reserve_port(&env, &dir);
+    let port_text = port.to_string();
+    let lower = port.saturating_sub(1).max(1);
+    let upper = port.saturating_add(1);
+    let block = format!("{lower}..{upper}");
+
+    // Excluding the reserved port needs --force.
+    let output = exclude(&env, &dir, &[&port_text]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr(&output).contains(&format!("Port {port} is reserved")),
+        "{}",
+        stderr(&output)
+    );
+    let output = exclude(&env, &dir, &[&block, "--force"]);
+    assert!(output.status.success(), "{output:?}");
+    let after_force = read(&config);
+
+    // Identical, and covered: no-ops, even without --force.
+    for argument in [block.as_str(), port_text.as_str()] {
+        let output = exclude(&env, &dir, &[argument]);
+        assert!(output.status.success(), "{argument}: {output:?}");
+        assert!(
+            stdout(&output).contains("already excluded"),
+            "{argument}: {}",
+            stdout(&output)
+        );
+        assert_eq!(read(&config), after_force, "{argument}");
+    }
+
+    // An exclusion that would change the list still runs the guard, even
+    // when it overlaps the existing entry.
+    let wider = format!("{lower}..{}", upper.saturating_add(5));
+    let output = exclude(&env, &dir, &[&wider]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr(&output).contains(&format!("Port {port} is reserved")),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(read(&config), after_force);
+}
+
 /// Regression: a parse failure was reported twice over
 /// (`Invalid arguments: Invalid port number: Invalid port: abc`).
 #[test]
@@ -390,6 +461,51 @@ fn compact_exclusions_canonicalizes_lists_of_minimal_size() {
         .expect("Failed to run compact-exclusions");
     assert!(stdout(&output).contains("already optimal"), "{output:?}");
     assert_eq!(read(&config), before);
+}
+
+/// Regression: a file whose content is an explicit `null` was read as an
+/// empty configuration ("No exclusions to compact", exit 0), while the
+/// configuration loader rejects it. compact-exclusions now reads the file
+/// exactly as the loader does.
+#[test]
+fn compact_exclusions_reads_null_documents_as_the_loader_does() {
+    let env = TestEnv::new();
+    for (name, document) in [("null.yaml", "null\n"), ("tilde.yaml", "~\n")] {
+        let config = env.path().join(name);
+        fs::write(&config, document).unwrap();
+        let output = env
+            .command()
+            .current_dir(env.path())
+            .arg("compact-exclusions")
+            .arg(&config)
+            .output()
+            .expect("Failed to run compact-exclusions");
+        assert_eq!(output.status.code(), Some(7), "{name}: {output:?}");
+        assert!(
+            stderr(&output).contains("Configuration error: Parse error:"),
+            "{name}: {}",
+            stderr(&output)
+        );
+        assert!(!stdout(&output).contains("No exclusions"), "{output:?}");
+        assert_eq!(read(&config), document);
+    }
+
+    // A document with no content is still an empty configuration.
+    let config = env.path().join("comment.yaml");
+    fs::write(&config, "# nothing here\n").unwrap();
+    let output = env
+        .command()
+        .current_dir(env.path())
+        .arg("compact-exclusions")
+        .arg(&config)
+        .output()
+        .expect("Failed to run compact-exclusions");
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        stdout(&output).contains("No exclusions to compact"),
+        "{}",
+        stdout(&output)
+    );
 }
 
 /// compact-exclusions keeps absent keys absent in `trop.local.yaml`.

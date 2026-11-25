@@ -359,10 +359,15 @@ where
     Option::<serde::de::IgnoredAny>::deserialize(deserializer).map(|value| Some(value.is_some()))
 }
 
-/// Reads a configuration document the way `ConfigLoader` reads a file
-/// (`serde_yaml::from_str` into [`Config`] and into the reservations
-/// probe). An empty document (or one holding only comments or `null`) reads
-/// as the default configuration.
+/// Reads a configuration document exactly the way `ConfigLoader` reads a
+/// file: `serde_yaml::from_str` into [`Config`] and into the reservations
+/// probe, with no special cases.
+///
+/// A document with no content (empty, only comments, or only a `---`
+/// marker) reads as the default configuration, because `serde_yaml` reads it
+/// as an empty mapping. A document whose content is an explicit null
+/// (`null`, `~`, or a tagged null) is not a mapping, and is rejected here as
+/// it is by the loader.
 ///
 /// The error message is `serde_yaml`'s description of the problem, under the
 /// field `configuration`.
@@ -371,15 +376,6 @@ fn read_configuration(document: &str) -> crate::Result<LoadedDocument> {
         field: "configuration".into(),
         message: error.to_string(),
     };
-    if serde_yaml::from_str::<Value>(document)
-        .map_err(unreadable)?
-        .is_null()
-    {
-        return Ok(LoadedDocument {
-            config: Config::default(),
-            reservations: None,
-        });
-    }
     Ok(LoadedDocument {
         config: serde_yaml::from_str(document).map_err(unreadable)?,
         reservations: serde_yaml::from_str::<ReservationsKey>(document)
@@ -1545,6 +1541,35 @@ mod tests {
         );
         assert!(compact_exclusions(&[single(0), single(1)]).is_err());
         assert!(compact_exclusions(&[single(6000), range(0, 3)]).is_err());
+    }
+
+    /// Compaction sorts the entries and merges them in one pass, so long
+    /// lists in any order compact quickly (the previous construction copied
+    /// the run list once per entry). Every valid port as a single, in a
+    /// scrambled order, compacts to the full range; tens of thousands of
+    /// disjoint singles in descending order compact to the ascending list.
+    #[test]
+    fn test_compaction_of_long_lists_in_any_order() {
+        // 7919 is prime, so `k * 7919 mod 65535` visits every residue once.
+        let scrambled: Vec<PortExclusion> = (0..65_535_u32)
+            .map(|k| single(u16::try_from(k * 7919 % 65_535 + 1).unwrap()))
+            .collect();
+        assert_eq!(
+            compact_exclusions(&scrambled).unwrap(),
+            vec![range(1, 65_535)]
+        );
+        assert_eq!(
+            ExclusionManager::from_config(&scrambled).unwrap().len(),
+            65_535
+        );
+
+        let descending: Vec<PortExclusion> =
+            (1..=32_767_u16).rev().map(|k| single(2 * k)).collect();
+        let mut ascending = descending.clone();
+        ascending.reverse();
+        assert_eq!(compact_exclusions(&descending).unwrap(), ascending);
+        assert!(is_compact(&ascending));
+        assert!(!is_compact(&descending));
     }
 
     #[test]

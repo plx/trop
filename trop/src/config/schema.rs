@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
+use crate::identifier::trim_identifier;
 use crate::verified::config::{output_format_keyword, parse_output_format, OutputFormatCode};
 use crate::verified::exclusions::{find_range_separator, parse_u16};
 use crate::verified::port_bounds::{
@@ -286,8 +287,9 @@ impl FromStr for PortExclusion {
     /// number has the verified kernel's syntax (an optional `+`, then ASCII
     /// digits, at most 65535); that this is also `u16::from_str`'s syntax is
     /// trusted, pinned by `test_parse_u16_kernel_matches_from_str`. The
-    /// separator search and the number parsing are verified kernels; the
-    /// trimming is `str::trim`. Parsing does not validate:
+    /// separator search, the trimming (Unicode `White_Space`, the verified
+    /// trim the identifier rule uses, equal to `str::trim`) and the number
+    /// parsing are verified kernels. Parsing does not validate:
     /// `"0"` and `"5010..5000"` parse, and validation rejects them.
     ///
     /// # Examples
@@ -303,7 +305,7 @@ impl FromStr for PortExclusion {
     /// assert!("5000..".parse::<PortExclusion>().is_err());
     /// ```
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let port = |part: &str| parse_u16(part.trim().as_bytes());
+        let port = |part: &str| parse_u16(trim_identifier(part).as_bytes());
         if let Some(at) = find_range_separator(text.as_bytes()) {
             // `text[at..at + 2]` is the ASCII `..`, so both slice bounds are
             // character boundaries.
@@ -780,6 +782,50 @@ cleanup:
         for text in exclusion_text_corpus() {
             check(&text);
         }
+    }
+
+    /// The exclusion-text parser trims with the verified whitespace trim
+    /// (`crate::identifier::trim_identifier`). Pins that this is exactly the
+    /// previous `str::trim` behavior: every Unicode scalar value, as padding
+    /// around a port and around each side of `..`, parses as the `str::trim`
+    /// reference does.
+    #[test]
+    fn test_exclusion_text_trim_matches_str_trim() {
+        fn reference(text: &str) -> Option<PortExclusion> {
+            let port = |part: &str| part.trim().parse::<u16>().ok();
+            match text.split_once("..") {
+                Some((start, end)) => Some(PortExclusion::Range {
+                    start: port(start)?,
+                    end: port(end)?,
+                }),
+                None => port(text).map(PortExclusion::Single),
+            }
+        }
+        let mut whitespace = 0;
+        for c in (0..=0x0010_FFFF_u32).filter_map(char::from_u32) {
+            if c.is_whitespace() {
+                whitespace += 1;
+            }
+            for text in [
+                format!("{c}8080{c}"),
+                format!("{c}{c}8080..{c}8090{c}{c}"),
+                format!("8080{c}..8090"),
+            ] {
+                assert_eq!(text.parse().ok(), reference(&text), "{text:?}");
+            }
+        }
+        // Every `White_Space` code point was exercised (and accepted).
+        assert_eq!(whitespace, 25);
+        assert_eq!(
+            "\u{3000}8080\u{85}..\u{2029}8090\u{a0}".parse(),
+            Ok(PortExclusion::Range {
+                start: 8080,
+                end: 8090
+            })
+        );
+        // Zero-width and BOM characters are not whitespace.
+        assert!("\u{200b}8080".parse::<PortExclusion>().is_err());
+        assert!("\u{feff}8080".parse::<PortExclusion>().is_err());
     }
 
     #[test]
