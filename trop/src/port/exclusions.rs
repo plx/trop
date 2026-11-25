@@ -6,17 +6,27 @@
 //! The decisions are made by the verified `verified::exclusions` kernel:
 //! entry validation (with the configuration validator's error precedence),
 //! the excluded-port set (stored as its canonical run list), membership,
-//! insertion, range queries, counting, and compaction. The code here only
-//! converts between [`PortExclusion`] / [`Port`] and the kernel's primitive
-//! values.
+//! insertion, range queries, counting, compaction, the canonical-form check,
+//! adding exclusions to a list (`trop exclude`, `trop scan --autoexclude`),
+//! and the reserved-port guard of `trop exclude`. The verified
+//! `verified::config_rewrite` kernel plans configuration-file rewrites that
+//! change only `excluded_ports`, and chooses the file an exclusion edit
+//! writes to. The code here only converts between [`PortExclusion`] /
+//! [`Port`] / YAML values and the kernels' primitive values.
 
 use super::{Port, PortRange};
 use crate::config::PortExclusion;
 use crate::error::Error;
+use crate::verified::config_rewrite::{plan_key_rewrite, RewriteStep};
 use crate::verified::exclusions::{
-    compact_exclusions as compact_entries, validate_entries, ExclusionEntry, ExclusionError,
+    add_exclusion as add_entry, add_ports as add_port_entries,
+    compact_exclusions as compact_entries, first_reserved_port as first_reserved_entry_port,
+    is_compact as entries_are_compact, validate_entries, ExclusionEntry, ExclusionError,
     ExclusionSet,
 };
+use serde_yaml::{Mapping, Value};
+
+pub use crate::verified::config_rewrite::{select_write_target, WriteScope, WriteTarget};
 
 /// Converts a configuration entry to the kernel's field-for-field mirror.
 const fn to_entry(exclusion: &PortExclusion) -> ExclusionEntry {
@@ -150,6 +160,292 @@ pub fn compact_exclusions(exclusions: &[PortExclusion]) -> crate::Result<Vec<Por
     compact_entries(&to_entries(exclusions))
         .map(|runs| runs.into_iter().map(from_entry).collect())
         .map_err(|(index, error)| validation_error(index, error))
+}
+
+/// Whether an exclusion list is already in its compacted (canonical) form.
+///
+/// This holds exactly when [`compact_exclusions`] would return the list
+/// unchanged: every entry is valid, the entries are sorted, every two
+/// entries are separated by at least one port that is not excluded, and
+/// `Single` is used exactly for one-port entries. Lists of minimal length can
+/// still be non-canonical (`[9000, 8000]`, or `[5000..5000]`), so callers
+/// that rewrite a list after compaction decide by this, not by comparing
+/// entry counts. Verified by the `verified::exclusions` kernel.
+///
+/// # Examples
+///
+/// ```
+/// use trop::config::PortExclusion;
+/// use trop::port::exclusions::is_compact;
+///
+/// assert!(is_compact(&[PortExclusion::Single(7000), PortExclusion::Single(9000)]));
+/// assert!(!is_compact(&[PortExclusion::Single(9000), PortExclusion::Single(7000)]));
+/// assert!(!is_compact(&[PortExclusion::Range { start: 7000, end: 7000 }]));
+/// ```
+#[must_use]
+pub fn is_compact(exclusions: &[PortExclusion]) -> bool {
+    entries_are_compact(&to_entries(exclusions))
+}
+
+/// Adds an exclusion to a list, the way `trop exclude` does, and reports
+/// whether the list changed.
+///
+/// - The result excludes exactly the ports of `exclusions` plus the ports of
+///   `exclusion`.
+/// - If one entry already excludes every port of `exclusion` (in particular
+///   an identical entry), the list is returned unchanged and the flag is
+///   `false`.
+/// - Otherwise the entries that overlap the new one (directly, or through
+///   other merged entries) are merged with it into one range at the position
+///   of the first of them; every other entry keeps its place. Adjacent
+///   entries do not overlap, so `5010` next to `5000..5009` is appended.
+///
+/// The flag is `true` exactly when the returned list differs from the input.
+/// These properties are verified by the `verified::exclusions` kernel.
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] for the first invalid entry: field
+/// `excluded_ports[i]` for an entry of `exclusions`, or field `exclusion`
+/// for the added entry. Nothing is added then.
+///
+/// # Examples
+///
+/// ```
+/// use trop::config::PortExclusion;
+/// use trop::port::exclusions::add_exclusion_to_list;
+///
+/// let list = vec![PortExclusion::Range { start: 8080, end: 8090 }];
+///
+/// // Already excluded: unchanged.
+/// let (same, changed) = add_exclusion_to_list(&list, &PortExclusion::Single(8085)).unwrap();
+/// assert!(!changed);
+/// assert_eq!(same, list);
+///
+/// // Overlapping: merged.
+/// let (merged, changed) =
+///     add_exclusion_to_list(&list, &PortExclusion::Range { start: 8085, end: 8095 }).unwrap();
+/// assert!(changed);
+/// assert_eq!(merged, vec![PortExclusion::Range { start: 8080, end: 8095 }]);
+/// ```
+pub fn add_exclusion_to_list(
+    exclusions: &[PortExclusion],
+    exclusion: &PortExclusion,
+) -> crate::Result<(Vec<PortExclusion>, bool)> {
+    match add_entry(&to_entries(exclusions), to_entry(exclusion)) {
+        Ok((entries, changed)) => Ok((entries.into_iter().map(from_entry).collect(), changed)),
+        Err((index, error)) if index < exclusions.len() => Err(validation_error(index, error)),
+        Err((_, error)) => Err(Error::Validation {
+            field: "exclusion".into(),
+            message: validation_message(error),
+        }),
+    }
+}
+
+/// Adds a single-port exclusion for each port, the way
+/// `trop scan --autoexclude` does, and returns the new list with the number
+/// of ports newly excluded.
+///
+/// Ports the list already excludes (and repeated ports) are skipped; every
+/// other port is appended as a `Single`, in order. The count is the number
+/// of entries appended, which is the number of distinct ports newly
+/// excluded. Verified by the `verified::exclusions` kernel.
+///
+/// # Examples
+///
+/// ```
+/// use trop::config::PortExclusion;
+/// use trop::port::exclusions::add_ports_to_list;
+/// use trop::Port;
+///
+/// let list = vec![PortExclusion::Range { start: 8080, end: 8090 }];
+/// let ports = [8085, 9000, 9000].map(|p| Port::try_from(p).unwrap());
+/// let (updated, added) = add_ports_to_list(&list, &ports);
+/// assert_eq!(added, 1);
+/// assert_eq!(updated[1], PortExclusion::Single(9000));
+/// ```
+#[must_use]
+pub fn add_ports_to_list(
+    exclusions: &[PortExclusion],
+    ports: &[Port],
+) -> (Vec<PortExclusion>, usize) {
+    let ports: Vec<u16> = ports.iter().map(|port| port.value()).collect();
+    let (entries, added) = add_port_entries(&to_entries(exclusions), &ports);
+    (entries.into_iter().map(from_entry).collect(), added)
+}
+
+/// The lowest port of `exclusion` for which `is_reserved` answers `true`.
+///
+/// The valid ports the exclusion names are checked one at a time in
+/// ascending order, stopping at the first reserved port or the first error.
+/// An error is returned, never treated as "not reserved". Port 0 is never
+/// checked. Verified by the `verified::exclusions` kernel.
+///
+/// # Errors
+///
+/// Returns the first error `is_reserved` reports.
+///
+/// # Examples
+///
+/// ```
+/// use trop::config::PortExclusion;
+/// use trop::port::exclusions::first_reserved_port;
+///
+/// let range = PortExclusion::Range { start: 8081, end: 8090 };
+/// let found = first_reserved_port(&range, |port| Ok::<_, ()>(port.value() % 4 == 0));
+/// assert_eq!(found.unwrap().map(|port| port.value()), Some(8084));
+/// ```
+pub fn first_reserved_port<E, F>(
+    exclusion: &PortExclusion,
+    is_reserved: F,
+) -> Result<Option<Port>, E>
+where
+    F: Fn(Port) -> Result<bool, E>,
+{
+    // The kernel consults the oracle only at valid ports (never 0) and
+    // returns one of them, so `Port` is built directly.
+    first_reserved_entry_port(to_entry(exclusion), &|port: u16| is_reserved(Port(port)))
+        .map(|found| found.map(Port))
+        .map_err(|failure| failure.error)
+}
+
+/// The top-level key of the exclusion list.
+const EXCLUDED_PORTS_KEY: &str = "excluded_ports";
+
+/// The `excluded_ports` list of a YAML configuration document, or `None`
+/// when the document has no list (an empty document has none).
+///
+/// The document is read as a configuration, so unknown keys and malformed
+/// values are rejected; the entries themselves are not validated (see
+/// [`validate_exclusions`]).
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] if the document is not valid YAML or not a
+/// valid configuration.
+///
+/// # Examples
+///
+/// ```
+/// use trop::config::PortExclusion;
+/// use trop::port::exclusions::excluded_ports_in;
+///
+/// assert_eq!(excluded_ports_in("").unwrap(), None);
+/// assert_eq!(
+///     excluded_ports_in("excluded_ports:\n  - 8080\n").unwrap(),
+///     Some(vec![PortExclusion::Single(8080)])
+/// );
+/// ```
+pub fn excluded_ports_in(document: &str) -> crate::Result<Option<Vec<PortExclusion>>> {
+    let invalid = |error: serde_yaml::Error| Error::Validation {
+        field: "configuration".into(),
+        message: format!("Invalid YAML: {error}"),
+    };
+    let value: Value = serde_yaml::from_str(document).map_err(invalid)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let config: crate::config::Config = serde_yaml::from_value(value).map_err(invalid)?;
+    Ok(config.excluded_ports)
+}
+
+/// Rewrites the `excluded_ports` list of a YAML configuration document,
+/// leaving every other top-level key exactly as it was.
+///
+/// The document is read as a YAML mapping (an empty document is an empty
+/// mapping). The verified `verified::config_rewrite` kernel plans the
+/// result: every other entry is copied unchanged and in order, and
+/// `excluded_ports` is replaced in place, or appended when absent. A key
+/// that was absent stays absent and an explicit `null` stays `null`, so the
+/// rewrite does not change how the file overlays the files below it (for
+/// example, an omitted `reservations` key keeps inheriting the group of
+/// `trop.yaml`). The emitted text is parsed back and compared with the
+/// planned mapping, and with the original document (every other key keeps
+/// its exact value, and no key is added), before it is returned.
+///
+/// YAML comments and the original formatting are not preserved.
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] if the document is not valid YAML or not a
+/// mapping, or if the rewritten document cannot be emitted.
+///
+/// # Examples
+///
+/// ```
+/// use trop::config::PortExclusion;
+/// use trop::port::exclusions::rewrite_excluded_ports;
+///
+/// let text = rewrite_excluded_ports("project: demo\n", &[PortExclusion::Single(8080)]).unwrap();
+/// assert_eq!(text, "project: demo\nexcluded_ports:\n- 8080\n");
+/// ```
+pub fn rewrite_excluded_ports(
+    document: &str,
+    exclusions: &[PortExclusion],
+) -> crate::Result<String> {
+    let invalid = |message: String| Error::Validation {
+        field: EXCLUDED_PORTS_KEY.into(),
+        message,
+    };
+    let original = match serde_yaml::from_str::<Value>(document)
+        .map_err(|error| invalid(format!("Invalid YAML: {error}")))?
+    {
+        Value::Null => Mapping::new(),
+        Value::Mapping(mapping) => mapping,
+        _ => return Err(invalid("the configuration is not a YAML mapping".into())),
+    };
+    let key = Value::from(EXCLUDED_PORTS_KEY);
+    let value = serde_yaml::to_value(exclusions)
+        .map_err(|error| invalid(format!("Failed to serialize exclusions: {error}")))?;
+    let entries: Vec<(&Value, &Value)> = original.iter().collect();
+    let is_target: Vec<bool> = entries
+        .iter()
+        .map(|(entry_key, _)| **entry_key == key)
+        .collect();
+
+    // Execute the kernel's plan. The kept keys are distinct (they come from
+    // one mapping) and differ from `excluded_ports`, so every `insert`
+    // appends.
+    let mut planned = Mapping::new();
+    for step in plan_key_rewrite(&is_target) {
+        let (entry_key, entry_value) = match step {
+            RewriteStep::Keep(index) => (entries[index].0.clone(), entries[index].1.clone()),
+            RewriteStep::Set => (key.clone(), value.clone()),
+        };
+        planned.insert(entry_key, entry_value);
+    }
+    let planned = Value::Mapping(planned);
+
+    let text = serde_yaml::to_string(&planned)
+        .map_err(|error| invalid(format!("Failed to serialize configuration: {error}")))?;
+    // Check the trusted YAML emitter against the plan: the text must read
+    // back as exactly the planned mapping.
+    let reread: Value = serde_yaml::from_str(&text).map_err(|error| {
+        invalid(format!(
+            "Rewritten configuration is not valid YAML: {error}"
+        ))
+    })?;
+    if reread != planned {
+        return Err(invalid(
+            "the rewritten configuration does not read back unchanged".into(),
+        ));
+    }
+    // Check the result against the original as well (independently of how
+    // the plan was executed): every other key reads back with its exact
+    // value, `excluded_ports` holds the new list, and no key was added.
+    let preserved = reread.as_mapping().is_some_and(|rewritten| {
+        rewritten.len() == original.len() + usize::from(!original.contains_key(&key))
+            && rewritten.get(&key) == Some(&value)
+            && original.iter().all(|(entry_key, entry_value)| {
+                *entry_key == key || rewritten.get(entry_key) == Some(entry_value)
+            })
+    });
+    if !preserved {
+        return Err(invalid(
+            "the rewrite would change keys other than excluded_ports".into(),
+        ));
+    }
+    Ok(text)
 }
 
 /// Manages excluded port lists with efficient checking.

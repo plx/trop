@@ -1,13 +1,14 @@
 //! Command to scan port range for occupied ports.
 
-use crate::commands::compact_exclusions::compact_exclusion_list;
+use crate::commands::exclude::{current_exclusions, read_config_document, write_exclusions};
 use crate::error::CliError;
 use crate::invocation::InvocationContext;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 use std::fmt::Write as _;
-use trop::config::{Config, PortConfig, PortExclusion};
+use trop::config::{Config, PortConfig};
 use trop::port::allocator::port_range_from_config;
+use trop::port::exclusions::{add_ports_to_list, compact_exclusions, is_compact, WriteScope};
 use trop::port::occupancy::{
     OccupancyCheckConfig, OccupancyReport, OccupiedProbe, SystemOccupancyChecker,
 };
@@ -131,13 +132,9 @@ impl ScanCommand {
             .copied()
             .collect();
 
-        // 6. Auto-exclude if requested
+        // 6. Auto-exclude (and auto-compact) if requested
         if self.autoexclude && !unreserved_occupied.is_empty() {
             self.add_exclusions(&unreserved_occupied, context)?;
-
-            if self.autocompact {
-                self.compact_exclusions(context)?;
-            }
         }
 
         // 7. Format and output results
@@ -158,64 +155,50 @@ impl ScanCommand {
         })
     }
 
+    /// Excludes the occupied, unreserved `ports` in the write target (the
+    /// loaded `trop.local.yaml` or `trop.yaml`, else the global
+    /// `config.yaml`) and, with `--autocompact`, compacts the list when it
+    /// changed. The file is rewritten at most once, and only its
+    /// `excluded_ports` key changes.
     fn add_exclusions(&self, ports: &[Port], context: &InvocationContext) -> Result<(), CliError> {
-        let config_path = context.config_file_for_write(false)?;
-        let mut config = load_raw_config(&config_path)?;
+        let config_path = context.config_file_for_write(WriteScope::ProjectOrGlobal)?;
+        let document = read_config_document(&config_path)?;
+        let current = current_exclusions(&config_path, &document)?;
+        let quiet = context.global().quiet;
 
-        // Ensure excluded_ports exists
-        if config.excluded_ports.is_none() {
-            config.excluded_ports = Some(Vec::new());
+        // Ports the list already excludes are skipped; `added` counts the
+        // ports newly excluded (verified by the exclusions kernel).
+        let (mut updated, added) = add_ports_to_list(&current, ports);
+        if !quiet {
+            eprintln!("Added {added} exclusions to {}", config_path.display());
+        }
+        if added == 0 {
+            return Ok(());
         }
 
-        // Add new exclusions
-        if let Some(ref mut exclusions) = config.excluded_ports {
-            for port in ports {
-                let exclusion = PortExclusion::Single(port.value());
-                if !exclusions.contains(&exclusion) {
-                    exclusions.push(exclusion);
+        // `--autocompact` compacts the list because it changed. Invalid
+        // entries are reported; the list is rewritten in canonical form when
+        // it is not already canonical.
+        if self.autocompact {
+            let compacted = compact_exclusions(&updated).map_err(|error| {
+                CliError::Config(format!(
+                    "cannot compact the exclusions in {}: {error}",
+                    config_path.display()
+                ))
+            })?;
+            if !is_compact(&updated) {
+                if !quiet {
+                    eprintln!(
+                        "Compacted {} exclusions to {}",
+                        updated.len(),
+                        compacted.len()
+                    );
                 }
+                updated = compacted;
             }
         }
 
-        // Save config
-        let yaml = serde_yaml::to_string(&config)
-            .map_err(|e| CliError::Config(format!("Failed to serialize config: {e}")))?;
-        std::fs::write(&config_path, yaml)?;
-
-        if !context.global().quiet {
-            eprintln!(
-                "Added {} exclusions to {}",
-                ports.len(),
-                config_path.display()
-            );
-        }
-
-        Ok(())
-    }
-
-    fn compact_exclusions(&self, context: &InvocationContext) -> Result<(), CliError> {
-        let config_path = context.config_file_for_write(false)?;
-        let mut config = load_raw_config(&config_path)?;
-        if let Some(ref mut exclusions) = config.excluded_ports {
-            let original_count = exclusions.len();
-            let compacted = compact_exclusion_list(exclusions);
-            let new_count = compacted.len();
-
-            if original_count != new_count {
-                *exclusions = compacted;
-
-                // Save compacted config
-                let yaml = serde_yaml::to_string(&config)
-                    .map_err(|e| CliError::Config(format!("Failed to serialize config: {e}")))?;
-                std::fs::write(&config_path, yaml)?;
-
-                if !context.global().quiet {
-                    eprintln!("Compacted {original_count} exclusions to {new_count}");
-                }
-            }
-        }
-
-        Ok(())
+        write_exclusions(&config_path, &document, &updated)
     }
 
     fn output_results(
@@ -347,15 +330,6 @@ fn render_delimited(results: &[ScanResult], delimiter: u8) -> Result<String, Cli
     let output = String::from_utf8(bytes)
         .map_err(|error| CliError::Config(format!("Delimited output was not UTF-8: {error}")))?;
     Ok(output)
-}
-
-fn load_raw_config(path: &std::path::Path) -> Result<Config, CliError> {
-    if !path.exists() {
-        return Ok(Config::default());
-    }
-    let contents = std::fs::read_to_string(path)?;
-    serde_yaml::from_str(&contents)
-        .map_err(|error| CliError::Config(format!("Failed to parse config: {error}")))
 }
 
 #[cfg(test)]

@@ -1,11 +1,12 @@
 //! Command to compact exclusion list to minimal representation.
 
+use crate::commands::exclude::write_exclusions;
 use crate::error::CliError;
 use crate::utils::GlobalOptions;
 use clap::Args;
 use std::path::PathBuf;
-use trop::config::{Config, PortExclusion};
-use trop::port::exclusions::compact_exclusions;
+use trop::config::PortExclusion;
+use trop::port::exclusions::{compact_exclusions, excluded_ports_in, is_compact};
 
 /// Compact exclusion list to minimal representation.
 #[derive(Args)]
@@ -29,41 +30,40 @@ impl CompactExclusionsCommand {
             )));
         }
 
-        let contents = std::fs::read_to_string(&self.path)?;
-        let mut config: Config = serde_yaml::from_str(&contents)
-            .map_err(|e| CliError::Config(format!("Parse error: {e}")))?;
+        let document = std::fs::read_to_string(&self.path)?;
+        let Some(exclusions) = excluded_ports_in(&document)
+            .map_err(|e| CliError::Config(format!("Parse error: {e}")))?
+        else {
+            println!("No exclusions to compact");
+            return Ok(());
+        };
 
         // 2. Compact exclusions. Invalid entries (port 0, reversed ranges)
         //    are reported, never dropped: compaction must not change the set
         //    of excluded ports.
-        if let Some(ref mut exclusions) = config.excluded_ports {
-            let original_count = exclusions.len();
-            let compacted =
-                compact_exclusions(exclusions).map_err(|e| CliError::Config(e.to_string()))?;
-            let new_count = compacted.len();
+        let compacted =
+            compact_exclusions(&exclusions).map_err(|e| CliError::Config(e.to_string()))?;
 
-            // The compacted list is verified to be count-minimal, so an
-            // unchanged count means the list already has the minimal size.
-            if original_count != new_count {
-                println!("Compacted {original_count} exclusions to {new_count}");
+        // The list is rewritten exactly when it is not already in canonical
+        // form (`is_compact` holds exactly when compaction returns the list
+        // unchanged), even when compaction keeps the number of entries.
+        if is_compact(&exclusions) {
+            println!("Exclusions already optimal");
+            return Ok(());
+        }
+        println!(
+            "Compacted {} exclusions to {}",
+            exclusions.len(),
+            compacted.len()
+        );
 
-                if !self.dry_run {
-                    *exclusions = compacted;
-
-                    // 3. Save configuration (YAML comments will be lost)
-                    let yaml = serde_yaml::to_string(&config)
-                        .map_err(|e| CliError::Config(format!("Serialize error: {e}")))?;
-                    std::fs::write(&self.path, yaml)?;
-                    println!("Updated {}", self.path.display());
-                } else {
-                    println!("Dry run - no changes made");
-                    println!("Would save: {compacted:?}");
-                }
-            } else {
-                println!("Exclusions already optimal");
-            }
+        if self.dry_run {
+            println!("Dry run - no changes made");
+            println!("Would save: {compacted:?}");
         } else {
-            println!("No exclusions to compact");
+            // 3. Rewrite only `excluded_ports` (YAML comments will be lost)
+            write_exclusions(&self.path, &document, &compacted)?;
+            println!("Updated {}", self.path.display());
         }
 
         Ok(())
