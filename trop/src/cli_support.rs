@@ -168,7 +168,8 @@ pub fn unreserved_ports(occupied: &[Port], reserved: &[Port]) -> Vec<Port> {
 /// One CSV or TSV record: the fields joined by `delimiter`, each written
 /// verbatim unless it contains the delimiter, `"`, `\r` or `\n`, in which
 /// case it is quoted with inner quotes doubled, followed by `\n` (a record
-/// of one empty field is written `""`). This is byte for byte what the
+/// of no fields or of one empty field is written `""`). This is byte for
+/// byte what the
 /// `csv` crate's default writer produces, and the verified kernel proves
 /// that a strict RFC 4180 reader reads every such record back as exactly
 /// its fields (for a delimiter other than `"`, `\r`, `\n`).
@@ -180,6 +181,8 @@ pub fn unreserved_ports(occupied: &[Port], reserved: &[Port]) -> Vec<Port> {
 ///
 /// assert_eq!(delimited_record(&["5001", "/srv/a,b", "say \"hi\""], ','), "5001,\"/srv/a,b\",\"say \"\"hi\"\"\"\n");
 /// assert_eq!(delimited_record(&["a", "b\tc"], '\t'), "a\t\"b\tc\"\n");
+/// assert_eq!(delimited_record(&[""], ','), "\"\"\n");
+/// assert_eq!(delimited_record(&[], ','), "\"\"\n");
 /// ```
 #[must_use]
 pub fn delimited_record(fields: &[&str], delimiter: char) -> String {
@@ -195,14 +198,15 @@ pub fn trim_identifier(value: &str) -> &str {
 
 /// Whether `TROP_LOG_MODE` is set to something that is not a level name
 /// (`quiet`, `normal`, `verbose`, in any ASCII case). Such a value is
-/// ignored; the CLI warns about it.
+/// ignored; the CLI warns about it. An empty value counts as unset (it is
+/// ignored like an invalid one but not diagnosed).
 #[must_use]
 pub fn invalid_log_mode(log_mode: Option<&str>) -> bool {
     crate::verified::verbosity::invalid_log_mode(log_mode.map(str::as_bytes))
 }
 
 /// `path` shortened relative to the home directory `home`, compared
-/// component by component (like `Path::strip_prefix`): `~` for the home
+/// component by component (like `Path::strip_prefix`): `~/` for the home
 /// directory itself, `~/rest` below it, and `None` for any other path (and
 /// for an empty `home`).
 ///
@@ -214,13 +218,14 @@ pub fn invalid_log_mode(log_mode: Option<&str>) -> bool {
 ///
 /// let home = Path::new("/home/al");
 /// assert_eq!(home_relative_display(Path::new("/home/al/src/x"), home), Some("~/src/x".into()));
-/// assert_eq!(home_relative_display(Path::new("/home/al"), home), Some("~".into()));
+/// assert_eq!(home_relative_display(Path::new("/home/al"), home), Some("~/".into()));
 /// assert_eq!(home_relative_display(Path::new("/home/alice/x"), home), None);
 /// ```
 #[must_use]
 pub fn home_relative_display(path: &Path, home: &Path) -> Option<String> {
     match home_display(&path_tokens(path), &path_tokens(home)) {
-        HomeDisplay::Home => Some("~".to_string()),
+        // The home directory itself, shown as before: `~/`.
+        HomeDisplay::Home => Some("~/".to_string()),
         HomeDisplay::Below { rest_start } => {
             let rest: PathBuf = path.components().skip(rest_start).collect();
             Some(format!("~/{}", rest.display()))
@@ -407,7 +412,8 @@ mod tests {
         for valid in ["quiet", "NORMAL", "Verbose"] {
             assert!(!invalid_log_mode(Some(valid)), "{valid}");
         }
-        for invalid in ["", " quiet", "loud", "quiet\n", "\u{fffd}"] {
+        assert!(!invalid_log_mode(Some("")), "empty counts as unset");
+        for invalid in [" ", " quiet", "loud", "quiet\n", "\u{fffd}"] {
             assert!(invalid_log_mode(Some(invalid)), "{invalid:?}");
         }
     }
@@ -417,8 +423,8 @@ mod tests {
     fn home_relative_display_is_component_wise() {
         let home = Path::new("/home/al");
         let show = |path: &str| home_relative_display(Path::new(path), home);
-        assert_eq!(show("/home/al"), Some("~".to_string()));
-        assert_eq!(show("/home/al/"), Some("~".to_string()));
+        assert_eq!(show("/home/al"), Some("~/".to_string()));
+        assert_eq!(show("/home/al/"), Some("~/".to_string()));
         assert_eq!(show("/home/al/x/y"), Some("~/x/y".to_string()));
         assert_eq!(show("/home/al/./x"), Some("~/x".to_string()));
         assert_eq!(show("/home/alice"), None);
@@ -432,13 +438,11 @@ mod tests {
         // The shortened form agrees with `Path::strip_prefix`.
         for path in ["/home/al/a", "/home/al/a/b/c", "/home/alx", "/home/al"] {
             let path = Path::new(path);
-            let expected = path.strip_prefix(home).ok().map(|rest| {
-                if rest.as_os_str().is_empty() {
-                    "~".to_string()
-                } else {
-                    format!("~/{}", rest.display())
-                }
-            });
+            // Exactly the shortening `trop list` used before.
+            let expected = path
+                .strip_prefix(home)
+                .ok()
+                .map(|rest| format!("~/{}", rest.display()));
             assert_eq!(home_relative_display(path, home), expected, "{path:?}");
         }
     }

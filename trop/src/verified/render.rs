@@ -29,7 +29,7 @@
 //!   (`lemma_delimited_round_trip`).
 //!
 //! Production glue: `crate::output` (`formatters`, `display_field`,
-//! `tab_row`, `delimited_record`).
+//! `tab_row`) and `crate::cli_support` (`delimited_record`).
 
 use vstd::prelude::*;
 
@@ -2500,10 +2500,11 @@ pub open spec fn delimited_field(f: Seq<char>, d: char) -> Seq<char> {
 }
 
 /// A record's text without its terminator: the written fields joined by the
-/// delimiter. A record made of one empty field is written `""` (an empty
-/// line would read as no field at all), as the `csv` crate writes it.
+/// delimiter. A record of no fields, or of one empty field, is written `""`
+/// (an empty line would read as no field at all), as the `csv` crate writes
+/// both.
 pub open spec fn record_text(fs: Seq<Seq<char>>, d: char) -> Seq<char> {
-    if fs.len() == 1 && fs[0].len() == 0 {
+    if fs.len() == 0 || (fs.len() == 1 && fs[0].len() == 0) {
         seq!['"', '"']
     } else {
         join_with(fs.map_values(|f: Seq<char>| delimited_field(f, d)), d)
@@ -2960,7 +2961,8 @@ fn push_delimited_field(out: &mut String, f: &str, d: char)
 /// `csv` crate's default writer does: each field verbatim unless it contains
 /// the delimiter, `"`, `\r` or `\n`, in which case it is quoted with inner
 /// quotes doubled; fields joined by the delimiter; one `\n` terminator; a
-/// record of one empty field written `""`. See `lemma_delimited_round_trip`.
+/// record of no fields or of one empty field written `""`. See
+/// `lemma_delimited_round_trip`.
 pub fn delimited_record(fields: &[&str], d: char) -> (out: String)
     ensures
         out@ == delimited_record_spec(fields@.map_values(|f: &str| f@), d),
@@ -2968,12 +2970,19 @@ pub fn delimited_record(fields: &[&str], d: char) -> (out: String)
     let ghost views = fields@.map_values(|f: &str| f@);
     let ghost shown = views.map_values(|f: Seq<char>| delimited_field(f, d));
     let mut out = String::new();
-    if fields.len() == 1 && fields[0].is_empty() {
+    let blank = match fields.len() {
+        0 => true,
+        1 => fields[0].is_empty(),
+        _ => false,
+    };
+    if blank {
         out.push('"');
         out.push('"');
         out.push('\n');
         proof {
-            assert(views[0] == fields@[0]@);
+            if fields@.len() == 1 {
+                assert(views[0] == fields@[0]@);
+            }
             assert(out@ =~= seq!['"', '"'].push('\n'));
         }
         return out;

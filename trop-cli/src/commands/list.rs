@@ -317,7 +317,8 @@ mod tests {
     /// Every short string over the characters that matter (delimiters,
     /// quotes, line breaks, multibyte text, empty) is written byte for byte
     /// as the `csv` crate writes it, alone and in two-field records, and
-    /// reads back unchanged.
+    /// reads back unchanged. A record of no fields is written as the `csv`
+    /// crate writes it too.
     #[test]
     fn delimited_record_matches_the_csv_crate_exhaustively() {
         let alphabet = ["a", ",", "\t", "\"", "\r", "\n", "é", " "];
@@ -339,6 +340,11 @@ mod tests {
             String::from_utf8(writer.into_inner().unwrap()).unwrap()
         };
         for delimiter in [',', '\t'] {
+            assert_eq!(
+                delimited_record(&[], delimiter),
+                csv_record(&[], delimiter),
+                "no fields {delimiter:?}"
+            );
             let check = |fields: &[&str]| {
                 let ours = delimited_record(fields, delimiter);
                 assert_eq!(

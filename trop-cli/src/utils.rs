@@ -40,7 +40,7 @@ pub fn format_timestamp(ts: std::time::SystemTime) -> String {
 /// Shorten a path for display.
 ///
 /// If the path is within the home directory, show it as `~/...` (and the
-/// home directory itself as `~`); otherwise, show the full path. Paths are
+/// home directory itself as `~/`); otherwise, show the full path. Paths are
 /// compared component by component, so `/home/al` never shortens
 /// `/home/alice` (the verified `trop::cli_support::home_relative_display`
 /// decides).
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn test_shorten_path_inside_home() {
         if let Some(home) = home::home_dir() {
-            assert_eq!(shorten_path(&home), "~");
+            assert_eq!(shorten_path(&home), "~/");
             assert_eq!(
                 shorten_path(&home.join("a").join("b")),
                 format!("~/{}", Path::new("a").join("b").display())

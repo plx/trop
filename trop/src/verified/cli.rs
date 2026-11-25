@@ -9,13 +9,16 @@
 //!   result-code families (any extended code whose low byte is 5 or 6) are
 //!   lock contention.
 //! - `select_data_dir`: the default data directory is the first usable
-//!   source of `TROP_DATA_DIR` (explicit), `HOME/.trop` and
+//!   source of `TROP_DATA_DIR` (explicit, used as given), `HOME/.trop` and
 //!   `USERPROFILE/.trop`; a home variable is usable only when it is set,
-//!   non-empty and absolute, so the default never depends on the working
-//!   directory.
+//!   non-empty and absolute, so a home-derived default never depends on the
+//!   working directory (a relative `TROP_DATA_DIR` is an explicit choice
+//!   and is kept as given).
 //! - `plan_init`: `trop init`'s steps, shared by the live run and the dry
 //!   run, specified by the state they produce, what they may never destroy,
-//!   and minimality.
+//!   and minimality; it refuses a data-directory path blocked by something
+//!   that is not a directory, and an existing database without
+//!   `--overwrite`.
 //! - `assertion_outcome` / `prints_reservation_port`: the `assert-*`
 //!   commands' verdicts and the truthfulness of their failure messages.
 //! - `cleanup_switches`, `metadata_intent`, `occupancy_layer`,
@@ -301,6 +304,24 @@ pub open spec fn candidate_usable(
     }
 }
 
+/// The selected source: the first usable one in the order `TROP_DATA_DIR`,
+/// `HOME`, `USERPROFILE`, or `None` when none is usable.
+pub open spec fn selected_source(
+    trop_data_dir: bool,
+    home: Option<HomeFacts>,
+    userprofile: Option<HomeFacts>,
+) -> Option<DataDirSource> {
+    if candidate_usable(trop_data_dir, home, userprofile, 0) {
+        Some(DataDirSource::TropDataDir)
+    } else if candidate_usable(trop_data_dir, home, userprofile, 1) {
+        Some(DataDirSource::Home)
+    } else if candidate_usable(trop_data_dir, home, userprofile, 2) {
+        Some(DataDirSource::UserProfile)
+    } else {
+        None
+    }
+}
+
 /// Decides `usable_home`.
 fn home_is_usable(h: Option<HomeFacts>) -> (u: bool)
     ensures
@@ -323,6 +344,7 @@ pub fn select_data_dir(
     userprofile: Option<HomeFacts>,
 ) -> (r: Option<DataDirSource>)
     ensures
+        r == selected_source(trop_data_dir, home, userprofile),
         r matches Some(s) ==> candidate_usable(trop_data_dir, home, userprofile, source_rank(s))
             && forall|j: int|
             0 <= j < source_rank(s) ==> !candidate_usable(trop_data_dir, home, userprofile, j),
@@ -347,27 +369,36 @@ pub fn select_data_dir(
     r
 }
 
-/// Consequences of the selection rule: `TROP_DATA_DIR` always wins; a home
-/// variable is only ever selected when it is a non-empty absolute path, so
-/// a selected default never depends on the current directory; and an
-/// unusable `HOME` falls through to `USERPROFILE` rather than shadowing it.
+/// Consequences of the selection rule (`select_data_dir` returns
+/// `selected_source`): `TROP_DATA_DIR` always wins whatever the home
+/// variables say; `HOME` or `USERPROFILE` is only ever selected when it is a
+/// non-empty absolute path, so a home-derived default never depends on the
+/// current directory; an unusable `HOME` falls through to `USERPROFILE`
+/// rather than shadowing it; a usable `HOME` is preferred to
+/// `USERPROFILE`; and there is no default exactly when no source is usable.
 pub proof fn lemma_data_dir_selection(
     trop_data_dir: bool,
     home: Option<HomeFacts>,
     userprofile: Option<HomeFacts>,
 )
     ensures
-        trop_data_dir ==> candidate_usable(trop_data_dir, home, userprofile, 0),
-        candidate_usable(trop_data_dir, home, userprofile, 1) ==> (home matches Some(f)
-            && f.absolute && f.nonempty),
-        candidate_usable(trop_data_dir, home, userprofile, 2) ==> (userprofile matches Some(f)
-            && f.absolute && f.nonempty),
-        !trop_data_dir && !usable_home(home) && usable_home(userprofile) ==> candidate_usable(
+        trop_data_dir ==> selected_source(trop_data_dir, home, userprofile) == Some(
+            DataDirSource::TropDataDir,
+        ),
+        selected_source(trop_data_dir, home, userprofile) == Some(DataDirSource::Home) ==> (
+        !trop_data_dir && (home matches Some(f) && f.absolute && f.nonempty)),
+        selected_source(trop_data_dir, home, userprofile) == Some(DataDirSource::UserProfile) ==> (
+        !trop_data_dir && !usable_home(home) && (userprofile matches Some(f) && f.absolute
+            && f.nonempty)),
+        !trop_data_dir && usable_home(home) ==> selected_source(trop_data_dir, home, userprofile)
+            == Some(DataDirSource::Home),
+        !trop_data_dir && !usable_home(home) && usable_home(userprofile) ==> selected_source(
             trop_data_dir,
             home,
             userprofile,
-            2,
-        ) && forall|j: int| 0 <= j < 2 ==> !candidate_usable(trop_data_dir, home, userprofile, j),
+        ) == Some(DataDirSource::UserProfile),
+        selected_source(trop_data_dir, home, userprofile) is None <==> (!trop_data_dir
+            && !usable_home(home) && !usable_home(userprofile)),
 {
 }
 
@@ -380,7 +411,11 @@ pub proof fn lemma_data_dir_selection(
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InitFacts {
-    /// The data directory exists.
+    /// Something other than a directory (a file, or a link that does not
+    /// lead to a directory) occupies the data directory's path, so no
+    /// directory can be created there.
+    pub dir_blocked: bool,
+    /// The data directory exists (as a directory).
     pub dir_exists: bool,
     /// `trop.db` exists.
     pub db_exists: bool,
@@ -393,8 +428,8 @@ pub struct InitFacts {
 }
 
 /// The steps of an initialization that proceeds. A database is always
-/// created; `remove_db` says it replaces an existing one (with its `-wal`
-/// and `-shm` files).
+/// created; `remove_db` says it replaces an existing one (with its `-wal`,
+/// `-shm` and `-journal` files).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InitSteps {
     /// Create the data directory.
@@ -408,6 +443,9 @@ pub struct InitSteps {
 /// `trop init`'s decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitPlan {
+    /// The data directory's path is occupied by something that is not a
+    /// directory: fail, change nothing.
+    RefuseNotADirectory,
     /// A database exists and `--overwrite` was not given: fail, change
     /// nothing.
     RefuseExistingDatabase,
@@ -443,7 +481,9 @@ pub open spec fn outcome(f: InitFacts, s: InitSteps) -> InitOutcome {
 
 /// The goal: a data directory with a fresh database, and a configuration
 /// file exactly when one existed or `--with-config` asked for one, never
-/// replacing an existing one.
+/// replacing an existing one. `--overwrite` ("overwrite existing files")
+/// applies to the database only: an existing `config.yaml` may hold the
+/// user's edits and is kept even with `--overwrite` (as before this kernel).
 pub open spec fn achieves_goal(f: InitFacts, s: InitSteps) -> bool {
     let o = outcome(f, s);
     o.dir && o.fresh_db && o.config == (f.config_exists || f.with_config) && o.config_preserved
@@ -460,7 +500,9 @@ pub open spec fn safe_and_minimal(f: InitFacts, s: InitSteps) -> bool {
 
 /// The plan for facts `f` (see `plan_init`).
 pub open spec fn planned(f: InitFacts) -> InitPlan {
-    if f.db_exists && !f.overwrite {
+    if f.dir_blocked {
+        InitPlan::RefuseNotADirectory
+    } else if f.db_exists && !f.overwrite {
         InitPlan::RefuseExistingDatabase
     } else {
         InitPlan::Proceed(
@@ -474,15 +516,23 @@ pub open spec fn planned(f: InitFacts) -> InitPlan {
 }
 
 /// Plans `trop init`. The live run and `--dry-run` both use this plan, so
-/// the dry run fails exactly when the live run would (on the same facts).
+/// the dry run fails exactly when the live run would (on the same facts):
+/// when something other than a directory occupies the data directory's
+/// path (checked first: nothing can be created there), or when a database
+/// exists and `--overwrite` was not given.
 #[must_use]
 pub fn plan_init(f: InitFacts) -> (p: InitPlan)
     ensures
         p == planned(f),
-        p == InitPlan::RefuseExistingDatabase <==> (f.db_exists && !f.overwrite),
-        p matches InitPlan::Proceed(s) ==> achieves_goal(f, s) && safe_and_minimal(f, s),
+        p == InitPlan::RefuseNotADirectory <==> f.dir_blocked,
+        p == InitPlan::RefuseExistingDatabase <==> (!f.dir_blocked && f.db_exists
+            && !f.overwrite),
+        p matches InitPlan::Proceed(s) ==> !f.dir_blocked && achieves_goal(f, s)
+            && safe_and_minimal(f, s),
 {
-    if f.db_exists && !f.overwrite {
+    if f.dir_blocked {
+        InitPlan::RefuseNotADirectory
+    } else if f.db_exists && !f.overwrite {
         InitPlan::RefuseExistingDatabase
     } else {
         InitPlan::Proceed(
@@ -509,15 +559,16 @@ pub proof fn lemma_init_steps_unique(f: InitFacts, s: InitSteps, t: InitSteps)
 {
 }
 
-/// Without a database there is nothing to refuse, and `--overwrite` then
-/// changes nothing: the plan is the same with or without it. (So a fresh
-/// directory is never reported as "recreated".)
+/// Without a database `--overwrite` changes nothing: the plan is the same
+/// with or without it, and (when the path is not blocked) it proceeds
+/// without removing anything. (So a fresh directory is never reported as
+/// "recreated".)
 pub proof fn lemma_overwrite_irrelevant_without_database(f: InitFacts)
     requires
         !f.db_exists,
     ensures
         planned(f) == planned(InitFacts { overwrite: !f.overwrite, ..f }),
-        planned(f) matches InitPlan::Proceed(s) && !s.remove_db,
+        !f.dir_blocked ==> (planned(f) matches InitPlan::Proceed(s) && !s.remove_db),
 {
 }
 
@@ -881,21 +932,27 @@ pub fn identifier_filter_matches(filter: &str, stored: Option<&str>) -> (r: bool
 }
 
 /// The filter behaves like the stored identifier rule: whitespace padding
-/// around a filter does not matter, a blank filter selects nothing, and a
-/// stored canonical identifier is selected by its own text (and by any
-/// padded form of it).
-pub proof fn lemma_filter_canonical(filter: Seq<char>, pad: Seq<char>, stored: Seq<char>)
+/// on either side of a filter (any amount, independently on each side) does
+/// not matter, a blank filter selects nothing, and a stored canonical
+/// identifier is selected by its own text and by any padded form of it.
+pub proof fn lemma_filter_canonical(
+    filter: Seq<char>,
+    lpad: Seq<char>,
+    rpad: Seq<char>,
+    stored: Seq<char>,
+)
     requires
-        super::identifier::all_ws(pad),
+        super::identifier::all_ws(lpad),
+        super::identifier::all_ws(rpad),
     ensures
-        filter_selects(pad + filter + pad, Some(stored)) == filter_selects(filter, Some(stored)),
+        filter_selects(lpad + filter + rpad, Some(stored)) == filter_selects(filter, Some(stored)),
         super::identifier::all_ws(filter) ==> !filter_selects(filter, Some(stored)),
         super::identifier::is_canonical(stored) ==> filter_selects(stored, Some(stored))
-            && filter_selects(pad + stored + pad, Some(stored)),
+            && filter_selects(lpad + stored + rpad, Some(stored)),
 {
-    super::identifier::lemma_trimmed_padding(pad, filter, pad);
+    super::identifier::lemma_trimmed_padding(lpad, filter, rpad);
     super::identifier::lemma_trimmed_empty_iff_all_ws(filter);
-    super::identifier::lemma_trimmed_padding(pad, stored, pad);
+    super::identifier::lemma_trimmed_padding(lpad, stored, rpad);
 }
 
 // ===========================================================================

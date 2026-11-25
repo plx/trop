@@ -5,7 +5,7 @@
 //! configuration file creation.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -80,9 +80,8 @@ pub struct InitResult {
 ///
 /// [`init_database`] carries out exactly this plan, and a dry run reports
 /// it, so both agree on every step (and on refusing to replace an existing
-/// database without `overwrite`, see [`plan_init`]).
-// One flag per independent step (and the one observed fact it reports).
-#[allow(clippy::struct_excessive_bools)]
+/// database without `overwrite`, or to use a path that is not a directory,
+/// see [`plan_init`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitPlan {
     /// The data directory.
@@ -94,8 +93,6 @@ pub struct InitPlan {
     pub replace_database: bool,
     /// The default configuration file will be written.
     pub create_config: bool,
-    /// A configuration file exists and will be kept as it is.
-    pub config_exists: bool,
 }
 
 impl InitPlan {
@@ -157,36 +154,56 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r##"# trop user configuration
 # output_format: table
 "##;
 
+/// The deepest entry that exists on `path` (the path itself, or its
+/// nearest existing ancestor) when that entry is not a directory (or a link
+/// to one): no directory can be created at `path` then.
+fn blocking_entry(path: &Path) -> Option<&Path> {
+    path.ancestors()
+        .find(|entry| !entry.as_os_str().is_empty() && fs::symlink_metadata(entry).is_ok())
+        .filter(|entry| !entry.is_dir())
+}
+
 /// Plans an initialization from the current state of the data directory.
 ///
 /// The decision is made by the formally verified kernel
-/// `verified::cli::plan_init` (see `docs/verification.md`): an existing
-/// database is refused unless `overwrite` is set; otherwise the plan creates
-/// the data directory if it is missing, replaces an existing database only
-/// with `overwrite`, and writes the default configuration only when
-/// `create_config` is set and no configuration file exists. Those steps are
-/// the only ones that reach that state, and no step is taken whose effect
-/// already holds.
+/// `verified::cli::plan_init` (see `docs/verification.md`): a data directory
+/// path occupied by something that is not a directory (or below such an
+/// entry) is refused, and so is an existing database unless `overwrite` is
+/// set; otherwise the plan creates the data directory if it is missing,
+/// replaces an existing database only with `overwrite`, and writes the
+/// default configuration only when `create_config` is set and no
+/// configuration file exists (`overwrite` never replaces an existing
+/// configuration file). Those steps are the only ones that reach that
+/// state, and no step is taken whose effect already holds.
 ///
 /// # Errors
 ///
-/// Returns a validation error for the `database` field if the database
-/// exists and `overwrite` is not set; [`init_database`] fails with the same
-/// error.
+/// Returns an invalid-path error if the data directory cannot be created
+/// because an entry on its path is not a directory, and a validation error
+/// for the `database` field if the database exists and `overwrite` is not
+/// set; [`init_database`] fails with the same errors.
 pub fn plan_init(options: &InitOptions) -> Result<InitPlan> {
     use crate::verified::cli::{self as kernel, InitFacts};
 
     let data_dir = options.data_dir.clone();
     let db_path = data_dir.join(DATABASE_FILE);
-    let config_exists = data_dir.join(CONFIG_FILE).exists();
+    let blocking = blocking_entry(&data_dir);
     let facts = InitFacts {
-        dir_exists: data_dir.exists(),
+        dir_blocked: blocking.is_some(),
+        dir_exists: data_dir.is_dir(),
         db_exists: db_path.exists(),
-        config_exists,
+        config_exists: data_dir.join(CONFIG_FILE).exists(),
         overwrite: options.overwrite,
         with_config: options.create_config,
     };
     match kernel::plan_init(facts) {
+        kernel::InitPlan::RefuseNotADirectory => Err(Error::InvalidPath {
+            path: data_dir.clone(),
+            reason: format!(
+                "cannot create the data directory: {} exists and is not a directory",
+                blocking.unwrap_or(&data_dir).display()
+            ),
+        }),
         kernel::InitPlan::RefuseExistingDatabase => Err(Error::Validation {
             field: "database".into(),
             message: format!(
@@ -199,7 +216,6 @@ pub fn plan_init(options: &InitOptions) -> Result<InitPlan> {
             create_data_dir: steps.create_dir,
             replace_database: steps.remove_db,
             create_config: steps.write_config,
-            config_exists,
         }),
     }
 }
@@ -390,7 +406,6 @@ mod tests {
                 "a fresh directory is never replaced"
             );
             assert!(plan.create_config);
-            assert!(!plan.config_exists);
         }
         let result =
             init_database(&InitOptions::new(data_dir.clone()).with_overwrite(true)).unwrap();
@@ -414,6 +429,61 @@ mod tests {
         let result = init_database(&options).unwrap();
         assert!(result.database_replaced);
         assert!(!result.data_dir_created);
+    }
+
+    /// Regression: when the data directory's path (or an entry above it) is
+    /// a file, the plan reported "Data directory already exists" and a dry
+    /// run succeeded while the live run failed. Both now refuse, with the
+    /// same error, and change nothing.
+    #[test]
+    fn test_plan_refuses_a_path_that_is_not_a_directory() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("notadir");
+        fs::write(&file, b"x").unwrap();
+
+        for data_dir in [file.clone(), file.join("trop")] {
+            for overwrite in [false, true] {
+                let options = InitOptions::new(data_dir.clone())
+                    .with_overwrite(overwrite)
+                    .with_create_config(true);
+                let planned = plan_init(&options).unwrap_err();
+                assert!(
+                    matches!(planned, Error::InvalidPath { .. }),
+                    "{data_dir:?}: {planned:?}"
+                );
+                let planned = planned.to_string();
+                assert!(planned.contains("is not a directory"), "{planned}");
+                let live = init_database(&options).unwrap_err().to_string();
+                assert_eq!(planned, live);
+            }
+        }
+        assert_eq!(fs::read(&file).unwrap(), b"x");
+
+        // An existing directory, and a missing one below it, are fine.
+        assert!(blocking_entry(temp.path()).is_none());
+        assert!(blocking_entry(&temp.path().join("a").join("b")).is_none());
+        assert_eq!(blocking_entry(&file.join("a")), Some(file.as_path()));
+    }
+
+    /// A link to a directory is a directory; a dangling link blocks the
+    /// path.
+    #[cfg(unix)]
+    #[test]
+    fn test_plan_follows_links_to_directories() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let plan = plan_init(&InitOptions::new(link.clone())).unwrap();
+        assert!(!plan.create_data_dir);
+
+        let dangling = temp.path().join("dangling");
+        std::os::unix::fs::symlink(temp.path().join("missing"), &dangling).unwrap();
+        let error = plan_init(&InitOptions::new(dangling.clone())).unwrap_err();
+        assert!(matches!(error, Error::InvalidPath { .. }), "{error:?}");
+        let live = init_database(&InitOptions::new(dangling)).unwrap_err();
+        assert_eq!(error.to_string(), live.to_string());
     }
 
     /// Regression: `--overwrite` removed only `trop.db`, leaving stale

@@ -21,8 +21,9 @@ pub struct ReserveGroupCommand {
     /// Configuration file path
     pub config_path: PathBuf,
 
-    /// Task identifier; omission preserves an existing value (clearing unsupported)
-    #[arg(long, env = "TROP_TASK")]
+    /// Task identifier (overrides TROP_TASK); omission preserves an existing
+    /// value (clearing unsupported)
+    #[arg(long)]
     pub task: Option<String>,
 
     /// Output format
@@ -138,7 +139,9 @@ impl ReserveGroupCommand {
 
         // 2. Build ReserveGroupOptions
         let options = ReserveGroupOptions::new(self.config_path.clone())
-            .with_task(self.task)
+            // The effective task: `--task`, else `TROP_TASK`, validated (and
+            // attributed to its source) like `reserve`'s.
+            .with_task(context.effective()?.task().map(str::to_owned))
             .with_force(self.force)
             .with_allow_unrelated_path(context.effective()?.allow_unrelated_path())
             .with_allow_project_change(context.effective()?.allow_project_change())

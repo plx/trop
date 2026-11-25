@@ -162,10 +162,30 @@ fn invalid_trop_log_mode_is_diagnosed_with_escaping() {
     assert!(output.status.success(), "{output:?}");
     let text = stderr(&output);
     assert!(
-        text.contains("WARN: ignoring invalid TROP_LOG_MODE value \"loud\\n\\x1b[2J\""),
+        text.contains("WARN: ignoring invalid TROP_LOG_MODE value `\"loud\\n\\x1b[2J\"`"),
         "{text}"
     );
     assert!(!text.contains('\u{1b}'));
+
+    // Padding stays visible; an empty value counts as unset (no warning).
+    let padded = env
+        .command()
+        .arg("list")
+        .env("TROP_LOG_MODE", " quiet")
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&padded).contains("TROP_LOG_MODE value ` quiet`:"),
+        "{padded:?}"
+    );
+    let empty = env
+        .command()
+        .arg("list")
+        .env("TROP_LOG_MODE", "")
+        .output()
+        .unwrap();
+    assert!(empty.status.success(), "{empty:?}");
+    assert_eq!(stderr(&empty), "");
 
     let quiet = env
         .command()
@@ -281,6 +301,46 @@ fn list_table_keeps_each_reservation_on_one_line() {
     assert!(info.contains("Task: \"t\\tx\"\n"), "{info}");
 }
 
+/// `trop list` shortens paths under `HOME` component by component, and shows
+/// the home directory itself as `~/` (as it always has); a sibling that
+/// merely shares the home directory's text as a prefix is not shortened.
+#[test]
+fn list_shortens_home_paths_component_wise() {
+    let env = TestEnv::new();
+    let home = env.create_dir("home");
+    let below = env.create_dir("home/src");
+    let sibling = env.create_dir("homestead");
+    for path in [&home, &below, &sibling] {
+        let output = env
+            .command()
+            .env("HOME", &home)
+            .args(["reserve", "--allow-unrelated-path", "--path"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    let output = env
+        .command()
+        .env("HOME", &home)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let table = stdout(&output);
+    let paths: Vec<&str> = table
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').nth(1).unwrap())
+        .collect();
+    assert!(paths.contains(&"~/"), "{table}");
+    assert!(paths.contains(&"~/src"), "{table}");
+    assert!(
+        paths.contains(&sibling.display().to_string().as_str()),
+        "{table}"
+    );
+}
+
 // ============================================================================
 // (f) init
 // ============================================================================
@@ -313,6 +373,35 @@ fn init_dry_run_fails_exactly_like_the_live_run() {
     let dry = init(&["--dry-run", "--overwrite"]);
     assert!(dry.status.success(), "{dry:?}");
     assert!(stdout(&dry).contains("Remove existing database"));
+}
+
+/// When the data directory's path is a file, `init --dry-run` reported "Data
+/// directory already exists" and exited 0 while the live run failed. Both
+/// now fail the same way (exit 6, same message) and change nothing.
+#[test]
+fn init_dry_run_fails_like_the_live_run_when_the_path_is_a_file() {
+    let env = TestEnv::new();
+    let file = env.create_dir("parent").join("notadir");
+    fs::write(&file, b"x").unwrap();
+    for data_dir in [file.clone(), file.join("trop")] {
+        let init = |extra: &[&str]| {
+            env.command_bare()
+                .arg("init")
+                .arg("--data-dir")
+                .arg(&data_dir)
+                .args(extra)
+                .output()
+                .unwrap()
+        };
+        let dry = init(&["--dry-run"]);
+        let live = init(&[]);
+        assert_eq!(dry.status.code(), Some(6), "{dry:?}");
+        assert_eq!(live.status.code(), Some(6), "{live:?}");
+        assert_eq!(stderr(&dry), stderr(&live));
+        assert!(stderr(&live).contains("is not a directory"), "{live:?}");
+        assert!(!stdout(&dry).contains("already exists"), "{dry:?}");
+    }
+    assert_eq!(fs::read(&file).unwrap(), b"x");
 }
 
 /// `init --overwrite` on a fresh directory reported "Recreated database".
@@ -569,6 +658,45 @@ fn invalid_task_exits_like_reserve_for_group_commands() {
         .output()
         .unwrap();
     assert_eq!(reserve.status.code(), Some(7), "{reserve:?}");
+    assert_eq!(group.status.code(), Some(7), "{group:?}");
+    assert_eq!(auto.status.code(), Some(7), "{auto:?}");
+    assert_eq!(stderr(&group), stderr(&reserve));
+    assert_eq!(stderr(&auto), stderr(&reserve));
+    assert_eq!(env.reservation_count(), 0);
+}
+
+/// An invalid `TROP_TASK` (no `--task` flag) is reported as coming from
+/// `TROP_TASK` by all three commands, with the same message and exit code;
+/// the group commands must not blame the command line for it.
+#[test]
+fn invalid_trop_task_is_attributed_to_the_environment_everywhere() {
+    let env = TestEnv::new();
+    let project = env.create_dir("project");
+    let config = project.join("trop.yaml");
+    fs::write(
+        &config,
+        "ports:\n  min: 21000\n  max: 21999\noccupancy_check:\n  skip: true\nreservations:\n  base: 21000\n  services:\n    web:\n      offset: 0\n",
+    )
+    .unwrap();
+
+    let run = |args: &[&std::ffi::OsStr]| {
+        env.command()
+            .current_dir(&project)
+            .env("TROP_TASK", "   ")
+            .args(args)
+            .arg("--allow-unrelated-path")
+            .output()
+            .unwrap()
+    };
+    let reserve = run(&["reserve".as_ref()]);
+    let group = run(&["reserve-group".as_ref(), config.as_os_str()]);
+    let auto = run(&["autoreserve".as_ref()]);
+    assert_eq!(reserve.status.code(), Some(7), "{reserve:?}");
+    assert!(
+        stderr(&reserve).contains("'task (TROP_TASK)'"),
+        "{}",
+        stderr(&reserve)
+    );
     assert_eq!(group.status.code(), Some(7), "{group:?}");
     assert_eq!(auto.status.code(), Some(7), "{auto:?}");
     assert_eq!(stderr(&group), stderr(&reserve));

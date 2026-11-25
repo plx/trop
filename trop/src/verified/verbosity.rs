@@ -13,7 +13,8 @@
 //!   taking precedence over `--verbose` when both are given (a request to
 //!   suppress output is never overridden), so either flag overrides
 //!   `TROP_LOG_MODE`. `invalid_log_mode` says when `TROP_LOG_MODE` is set to
-//!   something that is not a level name, so the CLI can diagnose it.
+//!   something that is not a level name, so the CLI can diagnose it; an
+//!   empty value counts as unset (`lemma_empty_log_mode_is_unset`).
 //! - `should_emit` is the logger's filter: a message is printed exactly when
 //!   the level's rank reaches the severity's threshold (`Quiet` prints
 //!   nothing, `Normal` errors and warnings, `Verbose` everything); it is
@@ -232,9 +233,26 @@ pub proof fn lemma_cli_level(verbose: bool, quiet: bool, e1: Option<Seq<u8>>, e2
     lemma_resolution_monotone(false, e1);
 }
 
-/// `TROP_LOG_MODE` is set to something that is not a level name.
+/// `TROP_LOG_MODE` is set to something that is not a level name. An empty
+/// value (`TROP_LOG_MODE=`, the usual way to clear a variable) counts as
+/// unset: it is not diagnosed, and `resolved_level` gives `Normal` for it,
+/// as for an unset variable (`lemma_empty_log_mode_is_unset`).
 pub open spec fn is_invalid_log_mode(env: Option<Seq<u8>>) -> bool {
-    env matches Some(e) && parse_level(e) is None
+    env matches Some(e) && e.len() > 0 && parse_level(e) is None
+}
+
+/// An empty `TROP_LOG_MODE` behaves exactly like an unset one: it resolves
+/// to the same level for every combination of flags, and it is not
+/// diagnosed. Every other value that is not a level name is diagnosed.
+pub proof fn lemma_empty_log_mode_is_unset(verbose: bool, quiet: bool, e: Seq<u8>)
+    ensures
+        cli_level(verbose, quiet, Some(Seq::<u8>::empty())) == cli_level(verbose, quiet, None),
+        !is_invalid_log_mode(Some(Seq::<u8>::empty())),
+        !is_invalid_log_mode(None),
+        e.len() > 0 ==> (is_invalid_log_mode(Some(e)) <==> parse_level(e) is None),
+{
+    // Every accepted name has 5 to 7 bytes.
+    lemma_parse_level_exact(Seq::<u8>::empty(), Verbosity::Normal);
 }
 
 /// A message severity.
@@ -380,7 +398,7 @@ pub fn invalid_log_mode(env: Option<&[u8]>) -> (r: bool)
         ),
 {
     match env {
-        Some(e) => parse_verbosity(e).is_none(),
+        Some(e) => !e.is_empty() && parse_verbosity(e).is_none(),
         None => false,
     }
 }

@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::io::Write;
 use trop_cli::Cli;
 
 fn main() {
@@ -8,9 +9,12 @@ fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
-            // Printing can only fail if the stream is closed; the exit code
-            // still reports the failure.
+            // Printing (or flushing) can only fail if the stream is closed;
+            // the exit code still reports the failure. Flush both streams
+            // before exiting, as clap's own `Error::exit` does.
             let _ = error.print();
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
             std::process::exit(trop_cli::parse_failure_exit_code(error.kind()));
         }
     };

@@ -392,10 +392,11 @@ impl Command {
 }
 
 /// Route a `reserve-group`/`autoreserve` `--task` through the configuration
-/// layer `reserve` uses for its own `--task`, so the same invalid value is
-/// rejected the same way (a configuration error naming the command line,
-/// exit 7) by all three commands. The group commands still take their task
-/// from their own options; the resolved metadata is only validated here.
+/// layer `reserve` uses for its own `--task`. The group commands then take
+/// their task from the effective configuration (`--task`, else `TROP_TASK`),
+/// exactly as `reserve` does, so the same invalid value is rejected the same
+/// way by all three commands (a configuration error naming its source, the
+/// command line or `TROP_TASK`, exit 7).
 fn validate_task_like_reserve(command_line: &mut CommandLineConfig, task: Option<&String>) {
     if let Some(task) = task {
         command_line.reservation_metadata = Some(ReservationMetadataRequest {

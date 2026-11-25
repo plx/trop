@@ -19,7 +19,7 @@
 //!   segment-prefix (`lemma_component_prefix_iff_segs`), and
 //!   `spec_rebase` moves a path from one ancestor to another.
 //! - `home_display` decides how `trop list` shortens a path below the home
-//!   directory: component-wise (like `Path::strip_prefix`), `~` for the home
+//!   directory: component-wise (like `Path::strip_prefix`), `~/` for the home
 //!   directory itself and `~/rest` below it, and the shortened form names
 //!   exactly the original path (`lemma_home_display_round_trip`).
 //!
@@ -1326,7 +1326,7 @@ pub proof fn lemma_rebase_canonical(x: Seq<Seq<u8>>, from: Seq<Seq<u8>>, to: Seq
 /// How `trop list` shows a path relative to the home directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HomeDisplay {
-    /// The path is the home directory: show `~`.
+    /// The path is the home directory: show `~/`.
     Home,
     /// The path lies strictly below the home directory: show `~/` followed
     /// by the path's components from `rest_start` on.

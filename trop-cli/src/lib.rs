@@ -43,18 +43,13 @@ pub fn run(cli: Cli) -> Result<(), error::CliError> {
     // One verbosity, resolved once, drives both the logger and the commands'
     // quiet/verbose behavior: `--quiet` wins over `--verbose`, either flag
     // overrides `TROP_LOG_MODE`, and an invalid `TROP_LOG_MODE` is ignored
-    // (with a warning).
+    // (with a warning; an empty value counts as unset and is not diagnosed).
     let log_mode =
         std::env::var_os("TROP_LOG_MODE").map(|value| value.to_string_lossy().into_owned());
     let level = trop::logging::resolve_log_level(cli.verbose, cli.quiet, log_mode.as_deref());
     let logger = Logger::new(level);
-    if trop::cli_support::invalid_log_mode(log_mode.as_deref()) {
-        if let Some(value) = &log_mode {
-            logger.warn(&format!(
-                "ignoring invalid TROP_LOG_MODE value {}: expected quiet, normal, or verbose",
-                trop::output::display_field(value)
-            ));
-        }
+    if let Some(warning) = log_mode_warning(log_mode.as_deref()) {
+        logger.warn(&warning);
     }
 
     let global = GlobalOptions {
@@ -79,6 +74,19 @@ pub fn run(cli: Cli) -> Result<(), error::CliError> {
         }),
         None => result,
     }
+}
+
+/// The warning for an invalid `TROP_LOG_MODE` value (the verified
+/// `invalid_log_mode` decides; an empty value is not diagnosed). The value is
+/// shown with the verified `display_field` escaping, between backticks, so
+/// control characters cannot reach the terminal and leading or trailing
+/// spaces stay visible.
+fn log_mode_warning(log_mode: Option<&str>) -> Option<String> {
+    let value = log_mode.filter(|value| trop::cli_support::invalid_log_mode(Some(value)))?;
+    Some(format!(
+        "ignoring invalid TROP_LOG_MODE value `{}`: expected quiet, normal, or verbose",
+        trop::output::display_field(value)
+    ))
 }
 
 /// The data directory: `--data-dir` (or `TROP_DATA_DIR`, which clap reads
@@ -119,5 +127,16 @@ mod tests {
             assert_eq!(parse_failure_exit_code(kind), 4, "{kind:?}");
         }
         assert_eq!(success_exit_code(), 0);
+    }
+
+    #[test]
+    fn log_mode_warnings_delimit_and_escape_the_value() {
+        assert_eq!(log_mode_warning(None), None);
+        assert_eq!(log_mode_warning(Some("")), None);
+        assert_eq!(log_mode_warning(Some("Quiet")), None);
+        let warning = |value| log_mode_warning(Some(value)).unwrap();
+        assert!(warning(" quiet").contains("value ` quiet`: expected"));
+        assert!(warning(" ").contains("value ` `: expected"));
+        assert!(warning("loud\u{1b}").contains("value `\"loud\\x1b\"`: expected"));
     }
 }
