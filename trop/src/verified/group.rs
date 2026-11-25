@@ -12,17 +12,20 @@
 //!   checking that a stored group still has the requested shape
 //!   (`derive_compatible_base`), with the theorem that a fresh plan always
 //!   passes that check (`lemma_fresh_plan_is_compatible`);
-//! - the reconciliation decision (`decide_group_reconciliation`) and
-//!   configuration helpers. (The scan range derived from `reservations.base`
+//! - the reconciliation decision (`decide_group_reconciliation`, applied by
+//!   `reconcile_group`, which classifies the stored group only when there
+//!   are stored rows) and configuration helpers. (The scan range derived from
+//!   `reservations.base`
 //!   is `super::port_bounds::group_scan_span`, next to the one resolution of
 //!   the configured bounds.)
 //! - the output selection of `reserve-group` and `autoreserve`
 //!   (`select_group_output`: an explicit `--shell` is parsed, and the shell
 //!   detected, only for the export format).
 //!
-//! Exhausted fresh allocations are retried once after automatic cleanup by
-//! the shared control `super::reserve::allocate_with_cleanup_retry`, under
-//! the cleanup policy `super::reserve::cleanup_policy`.
+//! An exhausted fresh allocation runs one automatic cleanup, and is retried
+//! once when that cleanup freed something, by the shared control
+//! `super::reserve::allocate_with_cleanup_retry`, under the cleanup policy
+//! `super::reserve::cleanup_policy`.
 //!
 //! Production glue: `crate::port::group`, `crate::operations::reserve_group`,
 //! and `crate::operations::autoreserve`.
@@ -878,6 +881,45 @@ pub open spec fn pattern_rejected<E, F: Fn(u16) -> Result<bool, E>>(
         0 <= i < pattern.len() && #[trigger] port_rejected(probe, range_max, avoid, b + pattern[i])
 }
 
+/// The probe failed with `e` on the pattern port of offset `i` at base `c`
+/// (in range and not avoided), after the ports of every earlier offset (in
+/// pattern order) at `c` were usable.
+pub open spec fn pattern_failed_at<E, F: Fn(u16) -> Result<bool, E>>(
+    probe: F,
+    range_max: int,
+    pattern: Seq<u16>,
+    avoid: Seq<u16>,
+    c: int,
+    i: int,
+    e: E,
+) -> bool {
+    &&& 0 <= i < pattern.len()
+    &&& forall|k: int|
+        0 <= k < i ==> #[trigger] port_usable(probe, range_max, avoid, c + pattern[k])
+    &&& c + pattern[i] <= range_max
+    &&& !avoid.contains((c + pattern[i]) as u16)
+    &&& probe.ensures(((c + pattern[i]) as u16,), Err::<bool, E>(e))
+}
+
+/// The search failed with `e` at base `c`: every lower base (from
+/// `range_min`) was rejected, and the probe failed with `e` on a port of `c`
+/// whose earlier pattern ports were usable (`pattern_failed_at`).
+pub open spec fn search_failed_at<E, F: Fn(u16) -> Result<bool, E>>(
+    probe: F,
+    range_min: int,
+    range_max: int,
+    pattern: Seq<u16>,
+    avoid: Seq<u16>,
+    c: int,
+    i: int,
+    e: E,
+) -> bool {
+    &&& range_min <= c
+    &&& forall|d: int|
+        range_min <= d < c ==> pattern_rejected(probe, range_max, pattern, avoid, d)
+    &&& pattern_failed_at(probe, range_max, pattern, avoid, c, i, e)
+}
+
 /// Checks the whole pattern at base `b` (pattern order, stopping at the
 /// first rejected port, skipping the probe for avoided ports).
 fn check_base<E, F: Fn(u16) -> Result<bool, E>>(
@@ -907,6 +949,8 @@ fn check_base<E, F: Fn(u16) -> Result<bool, E>>(
                 (q,),
                 Err::<bool, E>(e),
             ),
+        r matches Err(e) ==> exists|i: int| #[trigger]
+            pattern_failed_at(*probe, range_max as int, pattern@, avoid@, b as int, i, e),
 {
     let mut i: usize = 0;
     while i < pattern.len()
@@ -937,6 +981,15 @@ fn check_base<E, F: Fn(u16) -> Result<bool, E>>(
             Err(e) => {
                 assert(probe_domain(range_min as int, range_max as int, avoid@, port)
                     && probe.ensures((port,), Err::<bool, E>(e)));
+                assert(pattern_failed_at(
+                    *probe,
+                    range_max as int,
+                    pattern@,
+                    avoid@,
+                    b as int,
+                    i as int,
+                    e,
+                ));
                 return Err(e);
             },
             Ok(false) => {
@@ -960,7 +1013,14 @@ fn check_base<E, F: Fn(u16) -> Result<bool, E>>(
 /// is never called for an avoided or out-of-range port (the `requires` clause
 /// only grants the probe's precondition on that domain), and a probe error is
 /// returned unchanged. Scanning stops at `pattern_scan_end`, past which every
-/// base overshoots `range_max`, so `Ok(None)` means no base at all fits.
+/// base overshoots `range_max`, so `Ok(None)` means no base at all fits. An
+/// empty pattern is `Ok(None)` without any probe.
+///
+/// Error precedence is part of the contract (`search_failed_at`): an error
+/// comes from some base `c >= range_min` such that every lower base was
+/// rejected, from the probe of a pattern port of `c` whose earlier pattern
+/// ports were usable. So an error never pre-empts a lower base that fits,
+/// and the ascending order is proved, not just implemented.
 pub fn find_pattern_base<E, F: Fn(u16) -> Result<bool, E>>(
     range_min: u16,
     range_max: u16,
@@ -987,10 +1047,22 @@ pub fn find_pattern_base<E, F: Fn(u16) -> Result<bool, E>>(
         },
         r matches Ok(None) ==> pattern@.len() == 0 || forall|c: int|
             range_min <= c ==> pattern_rejected(*probe, range_max as int, pattern@, avoid@, c),
+        pattern@.len() == 0 ==> r matches Ok(None),
         r matches Err(e) ==> exists|q: u16|
             #[trigger] probe_domain(range_min as int, range_max as int, avoid@, q) && probe.ensures(
                 (q,),
                 Err::<bool, E>(e),
+            ),
+        r matches Err(e) ==> exists|c: int, i: int| #[trigger]
+            search_failed_at(
+                *probe,
+                range_min as int,
+                range_max as int,
+                pattern@,
+                avoid@,
+                c,
+                i,
+                e,
             ),
 {
     let Some(end) = pattern_scan_end(range_min, range_max, pattern) else {
@@ -1037,6 +1109,28 @@ pub fn find_pattern_base<E, F: Fn(u16) -> Result<bool, E>>(
         let fits = check_base(Ghost(range_min), Ghost(range_max), pattern, avoid, probe, b);
         match fits {
             Err(e) => {
+                proof {
+                    let i = choose|i: int| #[trigger]
+                        pattern_failed_at(
+                            *probe,
+                            range_max as int,
+                            pattern@,
+                            avoid@,
+                            b as int,
+                            i,
+                            e,
+                        );
+                    assert(search_failed_at(
+                        *probe,
+                        range_min as int,
+                        range_max as int,
+                        pattern@,
+                        avoid@,
+                        b as int,
+                        i,
+                        e,
+                    ));
+                }
                 return Err(e);
             },
             Ok(true) => {
@@ -1220,6 +1314,103 @@ pub open spec fn probe_error_source<E, G, F>(
         range_min <= q <= range_max && #[trigger] scan_probe.ensures((q,), Err::<bool, E>(e))
 }
 
+/// The preferred probe failed with `e` on the preferred port of service
+/// `index`, after every earlier service was pinned or fell back consistently
+/// with the probe's answers (services are classified in order, and the first
+/// failure ends the classification).
+pub open spec fn preferred_failed_at<E, G: Fn(u16) -> Result<PreferredVerdict, E>>(
+    preferred_probe: G,
+    s: Seq<RawService>,
+    index: int,
+    e: E,
+) -> bool {
+    &&& 0 <= index < s.len()
+    &&& preferred_failed(preferred_probe, s[index], e)
+    &&& forall|j: int|
+        0 <= j < index ==> pinned_ok(preferred_probe, #[trigger] s[j]) || fallback_ok(
+            preferred_probe,
+            s[j],
+        )
+}
+
+/// At base `b`, the fallback port of service `i` is usable: in range, not a
+/// pinned port, and reported available by the scan probe.
+pub open spec fn fallback_port_usable<E, F: Fn(u16) -> Result<bool, E>>(
+    scan_probe: F,
+    range_max: int,
+    s: Seq<RawService>,
+    pinned: Seq<bool>,
+    i: int,
+    b: int,
+) -> bool {
+    let port = b + s[i].offset->Some_0;
+    &&& port <= range_max
+    &&& !is_pinned_port(s, pinned, port as u16)
+    &&& scan_probe.ensures((port as u16,), Ok::<bool, E>(true))
+}
+
+/// The base search failed with `e` at base `c` on fallback service `i`,
+/// under the classification `pinned` (consistent with the preferred probe's
+/// answers): every lower base from `range_min` was rejected, the fallback
+/// ports of the earlier fallback services (in service order) at `c` were
+/// usable, and the scan probe failed with `e` on service `i`'s port at `c`,
+/// which is in range and not pinned.
+pub open spec fn scan_failed_at<E, G, F>(
+    preferred_probe: G,
+    scan_probe: F,
+    s: Seq<RawService>,
+    pinned: Seq<bool>,
+    range_min: int,
+    range_max: int,
+    c: int,
+    i: int,
+    e: E,
+) -> bool where G: Fn(u16) -> Result<PreferredVerdict, E>, F: Fn(u16) -> Result<bool, E> {
+    &&& classified(preferred_probe, s, pinned)
+    &&& range_min <= c
+    &&& forall|d: int|
+        range_min <= d < c ==> base_rejected(scan_probe, range_max, s, pinned, d)
+    &&& 0 <= i < s.len()
+    &&& !pinned[i]
+    &&& s[i].offset is Some
+    &&& forall|j: int|
+        0 <= j < i && !pinned[j] ==> #[trigger] fallback_port_usable(
+            scan_probe,
+            range_max,
+            s,
+            pinned,
+            j,
+            c,
+        )
+    &&& c + s[i].offset->Some_0 <= range_max
+    &&& !is_pinned_port(s, pinned, (c + s[i].offset->Some_0) as u16)
+    &&& scan_probe.ensures(((c + s[i].offset->Some_0) as u16,), Err::<bool, E>(e))
+}
+
+/// The first probe error of a fresh plan came from the preferred probe: of
+/// some service, after every earlier service was classified.
+pub open spec fn preferred_error_first<E, G: Fn(u16) -> Result<PreferredVerdict, E>>(
+    preferred_probe: G,
+    s: Seq<RawService>,
+    e: E,
+) -> bool {
+    exists|index: int| #[trigger] preferred_failed_at(preferred_probe, s, index, e)
+}
+
+/// The first probe error of a fresh plan came from the base search, under a
+/// classification consistent with the preferred probe (`scan_failed_at`).
+pub open spec fn scan_error_first<E, G, F>(
+    preferred_probe: G,
+    scan_probe: F,
+    s: Seq<RawService>,
+    range_min: int,
+    range_max: int,
+    e: E,
+) -> bool where G: Fn(u16) -> Result<PreferredVerdict, E>, F: Fn(u16) -> Result<bool, E> {
+    exists|pinned: Seq<bool>, c: int, i: int| #[trigger]
+        scan_failed_at(preferred_probe, scan_probe, s, pinned, range_min, range_max, c, i, e)
+}
+
 /// The number of services that fall back to their offsets.
 pub open spec fn count_unpinned(pinned: Seq<bool>) -> nat
     decreases pinned.len(),
@@ -1374,6 +1565,8 @@ pub open spec fn classification_state<E, G: Fn(u16) -> Result<PreferredVerdict, 
     &&& forall|j: int|
         0 <= j < n && !#[trigger] pinned[j] ==> exists|k: int|
             0 <= k < pat_idx.len() && #[trigger] pat_idx[k] == j
+    &&& forall|a: int, b: int|
+        0 <= a < b < pat_idx.len() ==> #[trigger] pat_idx[a] < #[trigger] pat_idx[b]
 }
 
 /// Classifying service `i` (pinned to its preferred port, or falling back to
@@ -1469,6 +1662,16 @@ proof fn lemma_classify_step<E, G: Fn(u16) -> Result<PreferredVerdict, E>>(
             && !np[nidx[k]] && s[nidx[k]].offset == Some(npat[k]) by {
             if k < pat_idx.len() {
                 assert(nidx[k] == pat_idx[k]);
+            }
+        }
+        assert forall|a: int, b: int| 0 <= a < b < nidx.len() implies #[trigger] nidx[a]
+            < #[trigger] nidx[b] by {
+            assert(nidx[a] == pat_idx[a]);
+            if b < pat_idx.len() {
+                assert(nidx[b] == pat_idx[b]);
+            } else {
+                assert(nidx[b] == i);
+                assert(pat_idx[a] < pinned.len());
             }
         }
         assert forall|j: int| 0 <= j < i + 1 && !#[trigger] np[j] implies exists|k: int|
@@ -1706,6 +1909,77 @@ proof fn lemma_fresh_plan_valid<E, G, F>(
     }
 }
 
+/// A failure of the pattern search (`search_failed_at`) is a failure of the
+/// fresh plan's base search (`scan_failed_at`) at the same base, on the
+/// fallback service behind the failing pattern entry.
+proof fn lemma_scan_failure_maps<E, G, F>(
+    preferred_probe: G,
+    scan_probe: F,
+    s: Seq<RawService>,
+    pinned: Seq<bool>,
+    avoid: Seq<u16>,
+    pattern: Seq<u16>,
+    pat_idx: Seq<int>,
+    range_min: int,
+    range_max: int,
+    e: E,
+) where G: Fn(u16) -> Result<PreferredVerdict, E>, F: Fn(u16) -> Result<bool, E>
+    requires
+        classification_state(preferred_probe, s, s.len() as int, pinned, avoid, pattern, pat_idx),
+        exists|c: int, k: int| #[trigger]
+            search_failed_at(scan_probe, range_min, range_max, pattern, avoid, c, k, e),
+    ensures
+        scan_error_first(preferred_probe, scan_probe, s, range_min, range_max, e),
+{
+    let (c, k) = choose|c: int, k: int| #[trigger]
+        search_failed_at(scan_probe, range_min, range_max, pattern, avoid, c, k, e);
+    let i = pat_idx[k];
+    assert(0 <= i < s.len() && !pinned[i] && s[i].offset == Some(pattern[k]));
+    assert(classified(preferred_probe, s, pinned));
+    assert forall|d: int| range_min <= d < c implies base_rejected(
+        scan_probe,
+        range_max,
+        s,
+        pinned,
+        d,
+    ) by {
+        assert(pattern_rejected(scan_probe, range_max, pattern, avoid, d));
+        lemma_pattern_rejection_maps(
+            scan_probe,
+            range_max,
+            s,
+            pinned,
+            pattern,
+            avoid,
+            pat_idx,
+            d,
+        );
+    }
+    assert forall|j: int| 0 <= j < i && !pinned[j] implies #[trigger] fallback_port_usable(
+        scan_probe,
+        range_max,
+        s,
+        pinned,
+        j,
+        c,
+    ) by {
+        let kj = choose|kj: int| 0 <= kj < pat_idx.len() && #[trigger] pat_idx[kj] == j;
+        if kj >= k {
+            if kj > k {
+                assert(pat_idx[k] < pat_idx[kj]);
+            }
+        }
+        assert(kj < k);
+        assert(port_usable(scan_probe, range_max, avoid, c + pattern[kj]));
+        assert(s[j].offset == Some(pattern[kj]));
+        assert(!avoid.contains((c + pattern[kj]) as u16));
+    }
+    let port = (c + s[i].offset->Some_0) as u16;
+    assert(!avoid.contains(port));
+    assert(!is_pinned_port(s, pinned, port));
+    assert(scan_failed_at(preferred_probe, scan_probe, s, pinned, range_min, range_max, c, i, e));
+}
+
 /// The pinned flags, pinned ports, fallback offset pattern, and (ghost) the
 /// service index of each pattern entry; or the classification error.
 type ClassifyResult<E> = Result<(Vec<bool>, Vec<u16>, Vec<u16>, Ghost<Seq<int>>), FreshGroupError<E>>;
@@ -1742,6 +2016,11 @@ fn classify_services<E, G: Fn(u16) -> Result<PreferredVerdict, E>>(
             shape.services_view(),
             e,
         ),
+        r matches Err(FreshGroupError::Probe(e)) ==> preferred_error_first(
+            *preferred_probe,
+            shape.services_view(),
+            e,
+        ),
         !(r matches Err(FreshGroupError::PatternExhausted { .. })),
 {
     let ss = shape.services();
@@ -1769,6 +2048,17 @@ fn classify_services<E, G: Fn(u16) -> Result<PreferredVerdict, E>>(
                 Err(e) => {
                     assert(preferred_failed(*preferred_probe, s[i as int], e));
                     assert(some_preferred_failed(*preferred_probe, s, e));
+                    proof {
+                        assert forall|k: int| 0 <= k < i implies pinned_ok(
+                            *preferred_probe,
+                            #[trigger] s[k],
+                        ) || fallback_ok(*preferred_probe, s[k]) by {
+                            if pinned@[k] {
+                            }
+                        }
+                        assert(preferred_failed_at(*preferred_probe, s, i as int, e));
+                        assert(preferred_error_first(*preferred_probe, s, e));
+                    }
                     return Err(FreshGroupError::Probe(e));
                 },
             };
@@ -1819,6 +2109,13 @@ fn classify_services<E, G: Fn(u16) -> Result<PreferredVerdict, E>>(
 /// pattern for `find_pattern_base` over the scan range, avoiding the pinned
 /// ports. The plan gives every service a valid port, and all ports are
 /// pairwise distinct.
+///
+/// A probe error is the first one in that order: either the preferred probe
+/// of a service after every earlier service was classified
+/// (`preferred_failed_at`), or the scan probe at a base every lower base of
+/// which was rejected, on a fallback port whose earlier fallback ports at
+/// that base were usable (`scan_failed_at`). No probe runs before the
+/// classification, and an error never pre-empts a lower base that fits.
 pub fn plan_fresh_group<E, G, F>(
     shape: &ValidatedGroupShape,
     span: PortSpan,
@@ -1874,6 +2171,18 @@ pub fn plan_fresh_group<E, G, F>(
             span.spec_max() as int,
             e,
         ),
+        r matches Err(FreshGroupError::Probe(e)) ==> preferred_error_first(
+            *preferred_probe,
+            shape.services_view(),
+            e,
+        ) || scan_error_first(
+            *preferred_probe,
+            *scan_probe,
+            shape.services_view(),
+            span.spec_min() as int,
+            span.spec_max() as int,
+            e,
+        ),
 {
     let ss = shape.services();
     let ghost s = shape.services_view();
@@ -1911,6 +2220,8 @@ pub fn plan_fresh_group<E, G, F>(
                         #[trigger] probe_domain(range_min as int, range_max as int, avoid@, q)
                             && scan_probe.ensures((q,), Err::<bool, E>(e));
                     assert(range_min <= q <= range_max);
+                    lemma_scan_failure_maps(*preferred_probe, *scan_probe, s, pinned@, avoid@,
+                        pattern@, pat_idx, range_min as int, range_max as int, e);
                 }
                 return Err(FreshGroupError::Probe(e));
             },
@@ -2669,6 +2980,68 @@ pub fn decide_group_reconciliation(stored_count: usize, compat: CompatClass, for
             GroupDecision::Fail
         },
         CompatClass::OtherError => GroupDecision::Fail,
+    }
+}
+
+/// A reconciliation decision together with the compatibility result it was
+/// based on (`T`, the caller's representation of that result).
+pub enum Reconciliation<T> {
+    /// No stored rows: allocate a fresh group. The stored group was never
+    /// classified.
+    AllocateFresh,
+    /// Refresh the stored group; `T` is its (compatible) result.
+    Refresh(T),
+    /// Delete the stored group and allocate a fresh one (forced); `T` is the
+    /// conflict.
+    Replace(T),
+    /// Report `T`, the compatibility error.
+    Fail(T),
+}
+
+/// Decides how to reconcile a group request with its `stored_count` stored
+/// rows, classifying the stored group with `classify` only when there are
+/// stored rows (`decide_group_reconciliation` over the class it returns).
+///
+/// - Laziness is verified through `classify`'s precondition, which is granted
+///   only when `stored_count > 0`: with no stored rows the stored group is
+///   never classified.
+/// - The result carries what `classify` returned, and each variant states
+///   which class that was: `Refresh` exactly for `Compatible`, `Replace` for
+///   `Conflict` with `force`, `Fail` for `OtherError` or `Conflict` without
+///   `force`. So the glue needs no case analysis of its own: a `Refresh`
+///   carries a compatible result and a `Fail` an error.
+pub fn reconcile_group<T, F: FnOnce() -> (CompatClass, T)>(
+    stored_count: usize,
+    force: bool,
+    classify: F,
+) -> (r: Reconciliation<T>)
+    requires
+        stored_count > 0 ==> classify.requires(()),
+    ensures
+        (r is AllocateFresh) <==> stored_count == 0,
+        r matches Reconciliation::Refresh(t) ==> stored_count > 0 && classify.ensures(
+            (),
+            (CompatClass::Compatible, t),
+        ),
+        r matches Reconciliation::Replace(t) ==> stored_count > 0 && force && classify.ensures(
+            (),
+            (CompatClass::Conflict, t),
+        ),
+        r matches Reconciliation::Fail(t) ==> stored_count > 0 && (classify.ensures(
+            (),
+            (CompatClass::OtherError, t),
+        ) || (!force && classify.ensures((), (CompatClass::Conflict, t)))),
+        !force ==> !(r is Replace),
+{
+    if stored_count == 0 {
+        return Reconciliation::AllocateFresh;
+    }
+    let (class, result) = classify();
+    match decide_group_reconciliation(stored_count, class, force) {
+        GroupDecision::Refresh => Reconciliation::Refresh(result),
+        GroupDecision::Replace => Reconciliation::Replace(result),
+        // `AllocateFresh` is impossible here (`stored_count > 0`).
+        GroupDecision::Fail | GroupDecision::AllocateFresh => Reconciliation::Fail(result),
     }
 }
 

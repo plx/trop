@@ -8,8 +8,10 @@
 //! connection, the exclusion manager, and the occupancy checker:
 //!
 //! - `reserved: Fn(u16) -> Result<bool, E>` — reserved by a key other than the
-//!   one being replaced (the glue decides that ownership rule; no
-//!   specification here mentions the replaced key);
+//!   one being replaced. The ownership rule behind that answer (a port held by
+//!   the replaced key never blocks; any other holder always does) is
+//!   `reserved_by_other`, which the glue's oracle calls; the glue only looks
+//!   up the holder and compares its key with the replaced one;
 //! - `excluded: Fn(u16) -> bool` — on the exclusion list;
 //! - `occupied: Fn(u16) -> Result<bool, E>` — the occupancy probe.
 //!
@@ -112,6 +114,18 @@ pub struct ScanFailure<E> {
     pub port: u16,
     /// The oracle's error, unchanged.
     pub error: E,
+}
+
+/// Who holds a port in the database, relative to an allocation request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holder {
+    /// No stored reservation holds the port.
+    Nobody,
+    /// The reservation being replaced (the request's own key, when an
+    /// existing reservation is reallocated) holds the port.
+    ReplacedKey,
+    /// A reservation under any other key holds the port.
+    OtherKey,
 }
 
 /// Which kinds of blockers were seen across a range.
@@ -503,9 +517,34 @@ pub open spec fn witnessed<
         )
 }
 
+/// The ownership rule of the reservation check: a stored reservation blocks a
+/// port exactly when it is held under a key other than the one being
+/// replaced. A port held by the replaced key never blocks (the request may
+/// keep or reuse it), and nothing lets a request take another key's port.
+pub open spec fn held_by_other(holder: Holder) -> bool {
+    holder is OtherKey
+}
+
 // ---------------------------------------------------------------------------
 // Executable kernels
 // ---------------------------------------------------------------------------
+
+/// The reservation oracle's answer for a port with this holder
+/// (`held_by_other`): blocked exactly when another key holds it.
+///
+/// Production's reservation oracle (`PortAllocator::is_reserved_by_other`)
+/// looks up the port's holder, compares its key with the replaced key, and
+/// returns this. With `lemma_other_holder_always_blocks`, a port another key
+/// holds is never classified `Available`, whatever the ignore flags say.
+pub const fn reserved_by_other(holder: Holder) -> (blocks: bool)
+    ensures
+        blocks == held_by_other(holder),
+        holder is Nobody ==> !blocks,
+        holder is ReplacedKey ==> !blocks,
+        holder is OtherKey ==> blocks,
+{
+    matches!(holder, Holder::OtherKey)
+}
 
 impl Availability {
     /// The blocker behind an unavailable classification: `None` exactly for
@@ -819,6 +858,183 @@ pub fn exhaustion_blockers<
 // ---------------------------------------------------------------------------
 // Lemmas
 // ---------------------------------------------------------------------------
+
+/// "No flag can take a port owned by another reservation key": when the
+/// reservation oracle reports the answer `reserved_by_other` gives for a port
+/// another key holds (and, in a consistent snapshot, only that answer), the
+/// port is classified `Reserved` under every combination of ignore flags
+/// (`--force` included), or `Excluded` when it is outside the scope. It is
+/// never `Available`, and no probe error is reported for it.
+pub proof fn lemma_other_holder_always_blocks<
+    E,
+    R: Fn(u16) -> Result<bool, E>,
+    X: Fn(u16) -> bool,
+    O: Fn(u16) -> Result<bool, E>,
+>(
+    p: u16,
+    checks: Checks,
+    range: PortSpan,
+    reserved: R,
+    excluded: X,
+    occupied: O,
+    r: Result<Availability, E>,
+)
+    requires
+        deterministic_oracles(reserved, excluded, occupied),
+        answered(reserved, p, held_by_other(Holder::OtherKey)),
+        classified(p, checks, range, reserved, excluded, occupied, r),
+    ensures
+        in_scope(p, checks, range) ==> r == Ok::<Availability, E>(Availability::Reserved),
+        !in_scope(p, checks, range) ==> r == Ok::<Availability, E>(Availability::Excluded),
+        r != Ok::<Availability, E>(Availability::Available),
+{
+    if in_scope(p, checks, range) {
+        // The oracle answered `Ok(true)`, and in a snapshot that is its only
+        // answer, so every outcome that needs "not reserved" or a reservation
+        // error is impossible.
+        assert(reserved.ensures((p,), Ok::<bool, E>(true)));
+        match r {
+            Ok(Availability::Reserved) => {},
+            Ok(_) => {
+                assert(reserved.ensures((p,), Ok::<bool, E>(false)));
+            },
+            Err(e) => {
+                if failed(reserved, p, e) {
+                    assert(reserved.ensures((p,), Err::<bool, E>(e)));
+                } else {
+                    assert(reserved.ensures((p,), Ok::<bool, E>(false)));
+                }
+            },
+        }
+    }
+}
+
+/// The exhaustion diagnostics are exact under a consistent snapshot: given
+/// `exhaustion_blockers`' success postcondition (every port accounted for,
+/// and each flag witnessed), each flag is set *exactly* when some port of the
+/// range is classified that way. `exhaustion_blockers` proves the "only if"
+/// direction outright; this lemma adds "if": no blocker kind that occurred is
+/// left out of the report.
+pub proof fn lemma_blockers_exact<
+    E,
+    R: Fn(u16) -> Result<bool, E>,
+    X: Fn(u16) -> bool,
+    O: Fn(u16) -> Result<bool, E>,
+>(range: PortSpan, reserved: R, excluded: X, occupied: O, b: Blockers)
+    requires
+        deterministic_oracles(reserved, excluded, occupied),
+        forall|p: u16|
+            range.spec_min() <= p <= range.spec_max() ==> #[trigger] accounted(
+                b,
+                p,
+                range,
+                reserved,
+                excluded,
+                occupied,
+            ),
+        b.reserved ==> witnessed(range, reserved, excluded, occupied, Availability::Reserved),
+        b.excluded ==> witnessed(range, reserved, excluded, occupied, Availability::Excluded),
+        b.occupied ==> witnessed(range, reserved, excluded, occupied, Availability::Occupied),
+    ensures
+        b.reserved <==> witnessed(range, reserved, excluded, occupied, Availability::Reserved),
+        b.excluded <==> witnessed(range, reserved, excluded, occupied, Availability::Excluded),
+        b.occupied <==> witnessed(range, reserved, excluded, occupied, Availability::Occupied),
+{
+    lemma_witnessed_kind_is_flagged(range, reserved, excluded, occupied, b, Availability::Reserved);
+    lemma_witnessed_kind_is_flagged(range, reserved, excluded, occupied, b, Availability::Excluded);
+    lemma_witnessed_kind_is_flagged(range, reserved, excluded, occupied, b, Availability::Occupied);
+}
+
+/// The flag for blocker kind `a`, read from `b`.
+pub open spec fn flag_for(b: Blockers, a: Availability) -> bool {
+    match a {
+        Availability::Reserved => b.reserved,
+        Availability::Excluded => b.excluded,
+        Availability::Occupied => b.occupied,
+        Availability::Available => true,
+    }
+}
+
+/// One direction of `lemma_blockers_exact`, for one blocker kind `a`: a
+/// port classified `a` is accounted for only by `a`'s flag (the
+/// classification is unique), so the flag is set.
+pub proof fn lemma_witnessed_kind_is_flagged<
+    E,
+    R: Fn(u16) -> Result<bool, E>,
+    X: Fn(u16) -> bool,
+    O: Fn(u16) -> Result<bool, E>,
+>(range: PortSpan, reserved: R, excluded: X, occupied: O, b: Blockers, a: Availability)
+    requires
+        deterministic_oracles(reserved, excluded, occupied),
+        forall|p: u16|
+            range.spec_min() <= p <= range.spec_max() ==> #[trigger] accounted(
+                b,
+                p,
+                range,
+                reserved,
+                excluded,
+                occupied,
+            ),
+    ensures
+        witnessed(range, reserved, excluded, occupied, a) ==> flag_for(b, a),
+{
+    if witnessed(range, reserved, excluded, occupied, a) && a != Availability::Available {
+        let p = choose|p: u16|
+            range.spec_min() <= p <= range.spec_max() && #[trigger] classified(
+                p,
+                scan_checks(),
+                range,
+                reserved,
+                excluded,
+                occupied,
+                Ok::<Availability, E>(a),
+            );
+        assert(accounted(b, p, range, reserved, excluded, occupied));
+        // Every disjunct of `accounted` other than `a`'s own flag names a
+        // different classification of `p`, which uniqueness rules out.
+        let others = seq![
+            Availability::Available,
+            Availability::Reserved,
+            Availability::Excluded,
+            Availability::Occupied,
+        ];
+        assert forall|i: int|
+            0 <= i < 4 && others[i] != a implies !#[trigger] classified(
+            p,
+            scan_checks(),
+            range,
+            reserved,
+            excluded,
+            occupied,
+            Ok::<Availability, E>(others[i]),
+        ) by {
+            if classified(
+                p,
+                scan_checks(),
+                range,
+                reserved,
+                excluded,
+                occupied,
+                Ok::<Availability, E>(others[i]),
+            ) {
+                lemma_classification_unique(
+                    p,
+                    scan_checks(),
+                    range,
+                    reserved,
+                    excluded,
+                    occupied,
+                    Ok::<Availability, E>(a),
+                    Ok::<Availability, E>(others[i]),
+                );
+            }
+        }
+        assert(others[0] == Availability::Available);
+        assert(others[1] == Availability::Reserved);
+        assert(others[2] == Availability::Excluded);
+        assert(others[3] == Availability::Occupied);
+    }
+}
 
 /// Under a consistent snapshot, a port has exactly one classification: the
 /// specification determines the result completely (including which error).

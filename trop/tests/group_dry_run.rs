@@ -261,3 +261,129 @@ fn dry_run_refuses_an_unsupported_schema_like_the_live_run() {
     );
     assert_eq!(dry.to_string(), live.to_string());
 }
+
+const PUBLISHED_V1_SCHEMA: &str = include_str!("fixtures/published-v1-schema.sql");
+
+/// The stored schema version, read without changing the file.
+fn schema_version(db_path: &Path) -> i32 {
+    let connection =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    trop::database::get_schema_version(&connection).unwrap()
+}
+
+/// A schema-v1 database (the published 0.1.0 layout) is migrated only in
+/// the dry run's private copy: the dry run predicts the ports the live run
+/// (which migrates the file) then reserves, and the file's bytes and schema
+/// version are unchanged by the dry run.
+#[test]
+fn dry_run_migrates_a_v1_database_only_in_memory() {
+    let dir = TempDir::new().unwrap();
+    let config_path = group_config(dir.path(), 7000, 0);
+    let db_path = dir.path().join("trop.db");
+    {
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection.execute_batch(PUBLISHED_V1_SCHEMA).unwrap();
+        // One untagged v1 row (NULL tag) holding the first base.
+        connection
+            .execute(
+                "INSERT INTO reservations
+                 (path, tag, port, project, task, created_at, last_used_at)
+                 VALUES ('/elsewhere', NULL, 5000, 'other', NULL, 1700000000, 1700000000)",
+                [],
+            )
+            .unwrap();
+    }
+    let before = fs::read(&db_path).unwrap();
+    let planner = planner(&config_path);
+
+    let dry = planner.dry_run(Some(&db_path), TIMEOUT).unwrap();
+
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        before,
+        "a dry run never migrates or writes the file"
+    );
+    assert_eq!(schema_version(&db_path), 1);
+    let ports = dry.allocated_ports.clone().unwrap();
+    assert_eq!(ports.get("web"), Some(&port(5001)));
+    assert_eq!(ports.get("api"), Some(&port(5003)));
+
+    let live = live(&db_path, &planner).unwrap();
+    assert_eq!(dry.allocated_ports, live.allocated_ports);
+    assert_eq!(
+        schema_version(&db_path),
+        2,
+        "the live run migrates the file"
+    );
+}
+
+/// A busy timeout `SQLite` cannot store (above `i32::MAX` milliseconds) is
+/// rejected by the dry run with the live run's validation error, with or
+/// without a database file. It used to panic inside rusqlite for an
+/// existing database, and to be ignored without one.
+#[test]
+fn dry_run_rejects_a_busy_timeout_sqlite_cannot_store_like_a_live_run() {
+    let dir = TempDir::new().unwrap();
+    let config_path = group_config(dir.path(), 7000, 0);
+    let db_path = dir.path().join("trop.db");
+    Database::open(DatabaseConfig::new(&db_path)).unwrap();
+    let planner = planner(&config_path);
+    let limit = Duration::from_millis(i32::MAX.unsigned_abs().into());
+    let too_long = limit + Duration::from_millis(1);
+
+    let live = Database::open(DatabaseConfig::new(&db_path).with_busy_timeout(too_long))
+        .unwrap_err()
+        .to_string();
+    for database in [Some(db_path.as_path()), None] {
+        let dry = planner.dry_run(database, too_long).unwrap_err();
+        assert!(matches!(dry, Error::Validation { .. }), "{dry}");
+        assert_eq!(dry.to_string(), live);
+    }
+    // Sub-millisecond excess does not count, as `Duration::as_millis` rounds
+    // down; `Database::open` accepts it too.
+    let just_within = limit + Duration::from_nanos(999_999);
+    Database::open(DatabaseConfig::new(&db_path).with_busy_timeout(just_within)).unwrap();
+    for database in [Some(db_path.as_path()), None] {
+        planner.dry_run(database, just_within).unwrap();
+        planner.dry_run(database, limit).unwrap();
+        planner.dry_run(database, Duration::ZERO).unwrap();
+    }
+}
+
+/// The dry run's stand-in for the live run's directory creation: it accepts
+/// an existing directory or missing directories under one, and rejects (with
+/// an I/O error, the live run's error class) a database whose directory or
+/// any ancestor of it is not a directory -- creating nothing either way.
+#[test]
+fn dry_run_checks_that_the_database_directory_can_be_created() {
+    use trop::operations::reserve_group::check_database_directory_creatable;
+
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("plain-file");
+    fs::write(&file, "not a directory").unwrap();
+
+    check_database_directory_creatable(&dir.path().join("trop.db")).unwrap();
+    let nested = dir.path().join("a").join("b").join("trop.db");
+    check_database_directory_creatable(&nested).unwrap();
+    assert!(!dir.path().join("a").exists(), "nothing is created");
+    check_database_directory_creatable(Path::new("trop.db")).unwrap();
+
+    for db_path in [
+        file.join("trop.db"),
+        file.join("data").join("trop.db"),
+        file.join("data").join("deeper").join("trop.db"),
+    ] {
+        let dry = check_database_directory_creatable(&db_path).unwrap_err();
+        assert!(matches!(dry, Error::Io(_)), "{dry}");
+        assert!(dry.to_string().contains("is not a directory"), "{dry}");
+        // The live open fails with the same error class.
+        let live = Database::open(DatabaseConfig::new(&db_path)).unwrap_err();
+        assert!(matches!(live, Error::Io(_)), "{live}");
+    }
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "not a directory",
+        "the obstruction is left alone"
+    );
+}
