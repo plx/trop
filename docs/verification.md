@@ -47,10 +47,13 @@ trop-verification/        publish = false harness crate; mounts trop/src/verifie
   the pure parts (bounds, the order of results, minimality given the
   oracle's answers: for example, the least available port). Some kernels
   also restrict which calls are allowed, through the closures' preconditions
-  (`fallback_discipline`, `retry_discipline`, `guard_paths`) or by taking
-  `FnOnce` closures. Beyond that, the order and number of oracle calls are
-  not specified (closure calls leave no trace in a specification); where
-  they matter, they hold by construction and are pinned by tests.
+  (for example `fallback_discipline`, `retry_discipline`, `guard_paths`, and
+  cleanup's `delete_permitted`) or by taking `FnOnce` closures, and
+  `verified::wal` threads a ticket through its oracles so that the order and
+  number of its calls are proved (`calls_chained`). Elsewhere, the order and
+  number of oracle calls are not specified (closure calls leave no trace in
+  a specification); where they matter, they hold by construction and are
+  pinned by tests.
 
 ## Soundness at the verified/unverified boundary
 
@@ -127,8 +130,9 @@ trusted base too, and names the specific facts.
 - the production glue that converts domain types to kernel inputs and back,
   and the few checks glue makes on its own. For example, a dry run without
   a database (`reserve`, `reserve-group` or `autoreserve`, with auto-init
-  enabled) checks that the database's directory could be created
-  (`check_database_directory_creatable`, unverified), and every dry run
+  enabled) checks that nothing on the database directory's path blocks
+  creating it (`check_database_directory_creatable`, unverified), and every
+  dry run
   that plans on an in-memory snapshot (`open_dry_run_snapshot`: every group
   dry run, and a reserve dry run without a database) checks the busy
   timeout before it opens the snapshot through
@@ -713,12 +717,14 @@ number of calls):
 - The glue mappings above (covered by exhaustive tests over all 729 settings
   and all 32 flag combinations).
 
-The first three are pinned by call-recording tests in
+The first three are pinned by call-recording and call-counting tests in
 `trop/src/port/occupancy.rs`:
 `test_failure_on_last_probe_runs_every_earlier_probe_and_fails_closed`
-records all eight probes in call order, and
+records all eight probes in call order;
+`test_detailed_report_does_not_hide_later_probe_failures` fails the second
+probe and counts exactly two calls; and
 `test_default_find_occupied_ports_stops_at_first_failure` records the ports
-in call order.
+in call order up to the failing one.
 `find_occupied_reports` delegates to
 `SystemOccupancyChecker::find_occupied_reports_with(range, config,
 run_probe)`, the `scan_ports` glue with an injectable probe runner. A test
@@ -1170,8 +1176,10 @@ Glue: `trop/src/path/normalize.rs` (`expand_tilde`, `resolve_components`,
     profile folder on Windows) and fails the expansion when it is not absolute
     (`HOME=relhome`), so every expansion is absolute; otherwise
     normalization would resolve `~/x` under the current directory. (The
-    data-directory rule also refuses a relative `HOME`, but falls back to
-    `USERPROFILE`.) Pinned on Unix by
+    data-directory rule reads `HOME` and then `USERPROFILE` on every
+    platform, skipping an unusable one, and never consults the user
+    database or the profile folder, so `~` and the default data directory
+    can name different home directories.) Pinned on Unix by
     `relative_home_is_not_used_for_tilde_expansion`
     (`trop-cli/tests/cli_surface_regressions.rs`).
   - On Windows the glue also rejects a rest that `std` parses as starting
@@ -1411,9 +1419,10 @@ Bugs fixed with this kernel:
   on the empty initialized in-memory database a live run would create
   (`open_dry_run_snapshot`, as for group dry runs). A missing database
   first gets the live run's checks for creating one (`dry_run_database`):
-  with auto-init disabled, or with an existing ancestor of the database
-  directory that is not a directory, it fails as a live run fails
-  (permissions are not checked). The dry run fails like a live run,
+  with auto-init disabled, or with an ancestor of the database directory
+  that exists but is not a directory or cannot be inspected, it fails as a
+  live run fails (write permission is not checked). The dry run fails like
+  a live run,
   prints the plan and the port, and never creates, initializes, or migrates
   a database. It says when it cannot predict the outcome: a database that is
   uninitialized or needs migration, or an allocation deferred to automatic

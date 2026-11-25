@@ -135,8 +135,8 @@ pub open spec fn followed<S, E, St: Fn(&S) -> LinkStep<S, E>, Eq: Fn(&S, &S) -> 
             &&& distinct(same, chain.drop_last())
         },
         // `s` repeats `chain[walk.earlier]`, the first earlier state `same`
-        // matched it with; the states after that one were never compared
-        // with `s`.
+        // matched it with. (That the states after that one were never
+        // compared with `s` holds by construction and is not stated here.)
         Followed::Loop(s) => {
             &&& 2 <= chain.len() <= max_depth + 1
             &&& s == chain.last()

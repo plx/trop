@@ -224,9 +224,9 @@ impl ReserveCommand {
 ///   (`open_dry_run_snapshot`) that a live run would create and plan
 ///   against, after the checks a live run makes before it creates one
 ///   (`dry_run_database`, shared with `reserve-group`): with auto-init
-///   disabled, or when an existing ancestor of the database's directory is
-///   not a directory, the dry run fails like the live run (permissions are
-///   not checked). Nothing is created.
+///   disabled, or when an ancestor of the database's directory exists but
+///   is not a directory or cannot be inspected, the dry run fails like the
+///   live run (write permission is not checked). Nothing is created.
 ///
 /// What a dry run cannot do, it says (unless quiet) instead of guessing, and
 /// succeeds:

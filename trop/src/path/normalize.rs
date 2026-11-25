@@ -33,9 +33,11 @@ use crate::verified::path::{classify_tilde, resolve_component_kinds, CompKind, T
 /// relative one (for example `HOME=relhome` on Unix) is treated as
 /// undeterminable and the expansion fails, because expanding against it
 /// would resolve `~/x` under whatever the current directory is. (The
-/// data-directory rule also refuses a relative `HOME`, but it then falls
-/// back to `USERPROFILE`.) With an absolute home directory every expansion
-/// is absolute (the verified `lemma_tilde_join_segments`).
+/// data-directory rule instead reads `HOME` and then `USERPROFILE` on every
+/// platform, skipping an unusable one, and never consults the user database
+/// or the profile folder, so `~` and the default data directory can name
+/// different home directories.) With an absolute home directory every
+/// expansion is absolute (the verified `lemma_tilde_join_segments`).
 ///
 /// # Errors
 ///
