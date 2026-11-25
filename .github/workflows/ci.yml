@@ -93,6 +93,33 @@ jobs:
         run: just ci-check-licenses
 
 
+  verus:
+    name: Verus verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Just
+        uses: extractions/setup-just@v4
+
+      - name: Install Rust toolchain
+        # Version pinned in rust-toolchain.toml; bump both together. The
+        # verifier's own toolchain is installed by scripts/install-verus.sh.
+        uses: dtolnay/rust-toolchain@1.99.1
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: verus
+
+      - name: Install Verus
+        # Downloads the pinned release and checks its SHA-256.
+        run: just ci-install-verus
+
+      - name: Verify trop/src/verified
+        run: just ci-verify
+
   build:
     name: Build
     needs: [fmt, navigation-guide]
@@ -177,7 +204,7 @@ jobs:
 
   test:
     name: Test (${{ matrix.profile }}) on ${{ matrix.os }}
-    needs: [build, fmt, clippy, docs, issue-selector, navigation-guide, licenses]
+    needs: [build, fmt, clippy, docs, issue-selector, navigation-guide, licenses, verus]
     runs-on: ${{ matrix.os }}
 
     strategy:

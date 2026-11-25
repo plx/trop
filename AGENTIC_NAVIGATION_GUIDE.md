@@ -16,6 +16,7 @@
   - workflows/site-check.yml # Validates the Astro/Starlight site on pull requests
   - workflows/site-publish.yml # Builds and deploys the Astro/Starlight site to GitHub Pages
 - docs/ # Maintainer-facing project records and operational guidance
+  - verification.md # Verus architecture, trusted base, verified-property inventory, and workflow
   - audits/ # Production-readiness baselines, remediation execution, and re-audit guidance
     - 2026-07-25-pre-release-due-diligence.md # Historical baseline audit and release verdict
     - 2026-07-25-remediation-roadmap.md # GitHub epic, label, ticket, and dependency index
@@ -26,6 +27,7 @@
     - production-readiness-work-selection.md # Live GitHub scheduling contract and selector operations
 - scripts/ # Dependency-free maintainer automation
   - get_next_production_readiness_issue.py # Selects one ready audit issue from complete live GitHub snapshots
+  - install-verus.sh # Installs the pinned, checksum-verified Verus release and its Rust toolchain
   - tests/test_get_next_production_readiness_issue.py # Selector taxonomy, dependency, PR-coverage, race, and CLI tests
 - reference/ # Authoritative project specifications (DO NOT MODIFY)
   - ImplementationSpecification.md # Complete spec - SOURCE OF TRUTH
@@ -52,10 +54,16 @@
     - logging.rs # Logging infrastructure (stderr output)
     - port.rs # Port and PortRange types with validation
     - reservation.rs # Reservation and ReservationKey types
+    - verified/ # Verus-verified kernels (specs + proofs); production code delegates to these
+      - mod.rs # Kernel list and the rules for code in this tree
+      - port.rs # Port validity/arithmetic, PortSpan (range invariant), PortCursor (iteration)
   - tests/ # Integration tests
     - common/ # Shared test utilities
       - mod.rs # Common test helpers
     - integration_test.rs # Integration test suite
+- trop-verification/ # Unpublished harness: mounts trop/src/verified for `cargo verus verify`
+  - Cargo.toml # vstd dependency and [package.metadata.verus] verify = true
+  - src/lib.rs # #[path] mount of trop/src/verified
 - trop-cli/ # Binary workspace member - CLI interface
   - Cargo.toml # Binary manifest with dependencies
   - README.md # CLI documentation

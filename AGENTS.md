@@ -28,6 +28,23 @@ Additionally, this repository is an experiment in "hands off", "high-autonomy" a
 - Run clippy: `cargo clippy`
 - Format code: `cargo fmt`
 - Build release: `cargo build --release`
+- Verify proofs: `just verify` (after `just install-verus`)
+
+## Formal Verification (Verus)
+
+Core decision logic lives in verified kernels under `trop/src/verified/`,
+written in Verus `verus! { ... }` blocks and checked by `just verify`
+(the `trop-verification/` crate mounts the same files for `cargo verus`).
+Production code delegates to the kernels through thin glue.
+
+- Read `docs/verification.md` before changing anything under
+  `trop/src/verified/` or the glue that calls it.
+- Never weaken a specification, or add `assume`, `admit`,
+  `#[verifier::external_body]`, or `assume_specification`, to make a proof go
+  through. Any new trusted assumption must be justified and recorded in the
+  trusted-base table in `docs/verification.md`.
+- If you change behavior that a kernel decides, change the kernel and its
+  specification, re-run `just verify`, and keep the glue trivial.
 
 ## Website and Design System
 

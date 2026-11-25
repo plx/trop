@@ -42,6 +42,7 @@ pub mod output;
 pub mod path;
 pub mod port;
 pub mod reservation;
+mod verified;
 
 // Re-export key types at crate root for convenience
 pub use config::{
