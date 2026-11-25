@@ -8,9 +8,11 @@ use crate::invocation::InvocationContext;
 use crate::utils::format_allocations;
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
+use std::time::Duration;
+use trop::operations::reserve_group::{select_group_output, GroupOutputFormat};
 use trop::operations::{ReserveGroupOptions, ReserveGroupPlan};
-use trop::output::{OutputFormat, ShellType};
-use trop::PlanExecutor;
+use trop::output::OutputFormat;
+use trop::{Config, ExecutionResult, PlanExecutor};
 
 /// Reserve ports for a group of services defined in a config file.
 #[derive(Args)]
@@ -98,21 +100,20 @@ pub enum OutputFormatArg {
 }
 
 impl OutputFormatArg {
-    /// Convert to `OutputFormat`, detecting shell type if needed.
+    /// Convert to `OutputFormat`.
+    ///
+    /// The shell matters only for the export format: an explicit `--shell` is
+    /// parsed (an unknown one is an error), and otherwise the shell is
+    /// detected. Other formats ignore `--shell`. The `trop` library's
+    /// verified `select_group_output` decides.
     pub fn to_output_format(self, shell_arg: Option<&str>) -> Result<OutputFormat, CliError> {
-        match self {
-            Self::Export => {
-                let shell = if let Some(shell_str) = shell_arg {
-                    ShellType::from_string(shell_str).map_err(CliError::from)?
-                } else {
-                    ShellType::detect().map_err(CliError::from)?
-                };
-                Ok(OutputFormat::Export(shell))
-            }
-            Self::Json => Ok(OutputFormat::Json),
-            Self::Dotenv => Ok(OutputFormat::Dotenv),
-            Self::Human => Ok(OutputFormat::Human),
-        }
+        let format = match self {
+            Self::Export => GroupOutputFormat::Export,
+            Self::Json => GroupOutputFormat::Json,
+            Self::Dotenv => GroupOutputFormat::Dotenv,
+            Self::Human => GroupOutputFormat::Human,
+        };
+        select_group_output(format, shell_arg).map_err(CliError::from)
     }
 }
 
@@ -150,20 +151,19 @@ impl ReserveGroupCommand {
         let planner =
             ReserveGroupPlan::from_effective(options, effective).map_err(CliError::from)?;
 
-        // 4. Handle dry-run mode
-        if self.dry_run {
-            if !global.quiet {
-                eprintln!("Dry run - would perform the following actions:");
-                eprintln!(
-                    "  1. Reserve group of services from {}",
-                    self.config_path.display()
-                );
-            }
-            return Ok(());
-        }
-
-        // 5. Validate the selected output format before opening a transaction.
+        // 4. Validate the selected output format before any database access,
+        // in live runs and dry runs alike.
         let output_format = self.format.to_output_format(self.shell.as_deref())?;
+
+        // 5. A dry run plans and executes exactly as a live run does, against
+        // a private in-memory copy of the database, and prints the result.
+        if self.dry_run {
+            let (database, timeout) = dry_run_database(context)?;
+            let result = planner
+                .dry_run(database.as_deref(), timeout)
+                .map_err(CliError::from)?;
+            return report_dry_run(global.quiet, &output_format, planner.config(), &result);
+        }
 
         // 6. Open the database only after planner construction succeeds.
         let mut db = context.open_database()?;
@@ -207,4 +207,52 @@ impl ReserveGroupCommand {
 
         Ok(())
     }
+}
+
+/// The database a group dry run copies (`None` when none exists yet), and
+/// the lock wait for reading it. A missing database with auto-init disabled
+/// fails exactly as a live run fails when it opens the database.
+pub(crate) fn dry_run_database(
+    context: &InvocationContext,
+) -> Result<(Option<PathBuf>, Duration), CliError> {
+    let effective = context.effective()?;
+    let db_path = context.database_path()?;
+    let timeout = Duration::from_secs(effective.maximum_lock_wait_seconds());
+    if db_path.exists() {
+        return Ok((Some(db_path), timeout));
+    }
+    if effective.disable_autoinit() {
+        return Err(CliError::NoDataDirectory);
+    }
+    Ok((None, timeout))
+}
+
+/// Reports a group dry run: the planned actions and any warnings on stderr
+/// (unless quiet), and on stdout the ports a live run would print, in the
+/// requested format.
+pub(crate) fn report_dry_run(
+    quiet: bool,
+    output_format: &OutputFormat,
+    config: &Config,
+    result: &ExecutionResult,
+) -> Result<(), CliError> {
+    let allocated_ports = result.allocated_ports.as_ref().ok_or_else(|| {
+        CliError::InvalidArguments("No ports were allocated - this is unexpected".to_string())
+    })?;
+    let formatted_output = format_allocations(output_format, allocated_ports, config)?;
+    if !quiet {
+        eprintln!("Dry run - would perform the following actions:");
+        for (index, action) in result.actions_taken.iter().enumerate() {
+            eprintln!("  {}. {action}", index + 1);
+        }
+        for warning in &result.warnings {
+            eprintln!("Warning: {warning}");
+        }
+        eprintln!(
+            "Dry run: would reserve {} ports; nothing was written.",
+            allocated_ports.len()
+        );
+    }
+    println!("{formatted_output}");
+    Ok(())
 }

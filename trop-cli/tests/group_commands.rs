@@ -1245,8 +1245,9 @@ fn test_reserve_group_stdout_stderr_separation() {
 /// Dry-run mode should:
 /// - Not create the database or make any changes
 /// - Show what would happen (on stderr)
-/// - Return success exit code
-/// - Not output actual allocations on stdout
+/// - Return success exit code (it runs from the config's directory, so the
+///   live run would succeed too)
+/// - Print the ports a live run would print on stdout
 #[test]
 fn test_reserve_group_dry_run() {
     let env = TestEnv::new();
@@ -1256,6 +1257,7 @@ fn test_reserve_group_dry_run() {
 
     let output = env
         .command()
+        .current_dir(&config_dir)
         .arg("reserve-group")
         .arg(&config_path)
         .arg("--dry-run")
@@ -1292,6 +1294,7 @@ fn test_reserve_group_dry_run_with_formats() {
     for format in &formats {
         let output = env
             .command()
+            .current_dir(&config_dir)
             .arg("reserve-group")
             .arg(&config_path)
             .arg("--format")
@@ -1326,6 +1329,7 @@ fn test_reserve_group_dry_run_quiet() {
 
     let output = env
         .command()
+        .current_dir(&config_dir)
         .arg("--quiet")
         .arg("reserve-group")
         .arg(&config_path)

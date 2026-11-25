@@ -3,20 +3,24 @@
 //! This module provides functionality for allocating groups of ports with specific
 //! offset patterns, useful for microservices or applications that need multiple ports.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::database::Database;
 use crate::error::Error;
+use crate::identifier::{identifier_error_message, IdentifierError};
 use crate::port::allocator::{PortAllocator, PortAvailability};
 use crate::port::occupancy::{OccupancyCheckConfig, PortOccupancyChecker};
+use crate::verified::allocation::Fallback;
 use crate::verified::group::{
     decide_group_reconciliation, derive_compatible_base, find_pattern_base, match_stored_tags,
     plan_fresh_group, validate_group_request, CompatClass, CompatError, FreshGroupError,
-    GroupDecision, IdentifierIssue, PreferredVerdict, RawService, ShapeError, StoredService,
+    FreshGroupPlan, GroupDecision, PreferredVerdict, RawService, ShapeError, StoredService,
     TagMatchError, ValidatedGroupShape,
 };
+use crate::verified::reserve::{allocate_with_cleanup_retry, Retry};
 use crate::verified::sticky::{
     plan_group_metadata, replacement_metadata, ReplacementSource, StickyField, StickyResolution,
     StoredMetadata,
@@ -78,28 +82,30 @@ impl GroupAllocationRequest {
     /// identity. `ReservationKey` trims tags before storage, so group matching
     /// and duplicate detection must use that same spelling before any write.
     ///
-    /// Tags, project, and task are trimmed here; every validation decision is
-    /// made by the verified kernel `verified::group::validate_group_request`.
+    /// The verified kernel `verified::group::validate_group_request` makes
+    /// every decision and trims the tags, project, and task with the shared
+    /// identifier rule; this glue only copies its normalized values back.
     pub(crate) fn normalized(&self) -> Result<Self> {
-        let mut normalized = self.clone();
-        normalized.project = normalized
-            .project
-            .as_deref()
-            .map(|value| value.trim().to_string());
-        normalized.task = normalized
-            .task
-            .as_deref()
-            .map(|value| value.trim().to_string());
-        for service in &mut normalized.services {
-            service.tag = service.tag.trim().to_string();
-        }
-
-        validated_shape(
-            normalized.services.iter(),
-            normalized.project.as_deref(),
-            normalized.task.as_deref(),
-        )?;
-        Ok(normalized)
+        let raw = raw_services(self.services.iter());
+        let validated = validate_group_request(&raw, self.project.as_deref(), self.task.as_deref())
+            .map_err(shape_error)?;
+        // The kernel keeps the services in order and changes only their tags.
+        let services = self
+            .services
+            .iter()
+            .zip(validated.shape.services())
+            .map(|(service, normalized)| ServiceAllocationRequest {
+                tag: normalized.tag.clone(),
+                offset: service.offset,
+                preferred: service.preferred,
+            })
+            .collect();
+        Ok(Self {
+            base_path: self.base_path.clone(),
+            project: validated.project.map(str::to_string),
+            task: validated.task.map(str::to_string),
+            services,
+        })
     }
 
     /// The services of a normalized request sorted by tag, with their
@@ -111,37 +117,25 @@ impl GroupAllocationRequest {
     fn sorted_shape(&self) -> Result<(Vec<&ServiceAllocationRequest>, ValidatedGroupShape)> {
         let mut services = self.services.iter().collect::<Vec<_>>();
         services.sort_unstable_by(|left, right| left.tag.cmp(&right.tag));
-        let shape = validated_shape(services.iter().copied(), None, None)?;
+        let raw = raw_services(services.iter().copied());
+        let shape = validate_group_request(&raw, None, None)
+            .map_err(shape_error)?
+            .shape;
         Ok((services, shape))
     }
 }
 
-/// Validate `services` (already trimmed) together with `project` and `task`,
-/// keeping the given service order.
-fn validated_shape<'a>(
+/// The kernel view of `services`, in the given order.
+fn raw_services<'a>(
     services: impl Iterator<Item = &'a ServiceAllocationRequest>,
-    project: Option<&str>,
-    task: Option<&str>,
-) -> Result<ValidatedGroupShape> {
-    let raw = services
+) -> Vec<RawService> {
+    services
         .map(|service| RawService {
-            tag: service.tag.as_bytes().to_vec(),
+            tag: service.tag.clone(),
             offset: service.offset,
             preferred: service.preferred.map(Port::value),
         })
-        .collect();
-    validate_group_request(raw, project.map(str::as_bytes), task.map(str::as_bytes))
-        .map_err(shape_error)
-}
-
-/// The validation message of an identifier rule (the same wording as the
-/// configuration validator).
-const fn identifier_message(issue: IdentifierIssue) -> &'static str {
-    match issue {
-        IdentifierIssue::Empty => "Cannot be empty or only whitespace",
-        IdentifierIssue::ContainsNul => "Cannot contain null bytes",
-        IdentifierIssue::TooLong => "Cannot exceed 255 bytes",
-    }
+        .collect()
 }
 
 /// Map a verified group-shape error to the public validation error.
@@ -151,14 +145,14 @@ fn shape_error(error: ShapeError) -> Error {
             "services",
             "Group allocation requires at least one service".to_string(),
         ),
-        ShapeError::Project(issue) => ("project", identifier_message(issue).to_string()),
-        ShapeError::Task(issue) => ("task", identifier_message(issue).to_string()),
+        ShapeError::Project(issue) => ("project", identifier_error_message(issue).to_string()),
+        ShapeError::Task(issue) => ("task", identifier_error_message(issue).to_string()),
         ShapeError::Tag { issue, .. } => (
             "services",
             match issue {
-                IdentifierIssue::Empty => "Service tags must not be empty or whitespace-only",
-                IdentifierIssue::ContainsNul => "Service tags cannot contain null bytes",
-                IdentifierIssue::TooLong => "Service tags cannot exceed 255 bytes",
+                IdentifierError::Blank => "Service tags must not be empty or whitespace-only",
+                IdentifierError::ContainsNul => "Service tags cannot contain null bytes",
+                IdentifierError::TooLong => "Service tags cannot exceed 255 bytes",
             }
             .to_string(),
         ),
@@ -373,6 +367,8 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     /// The existing exact-path tagged rows are classified before any write.
     /// The resulting refresh, fresh allocation, or forced replacement is then
     /// executed inside one savepoint.
+    ///
+    /// No automatic cleanup runs: an exhausted fresh allocation fails.
     pub(crate) fn allocate_group_with_policy(
         &self,
         conn: &rusqlite::Connection,
@@ -380,16 +376,55 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         occupancy_config: &OccupancyCheckConfig,
         policy: GroupReconciliationPolicy,
     ) -> Result<GroupAllocationResult> {
+        let outcome = self.allocate_group_with_cleanup(
+            conn,
+            request,
+            occupancy_config,
+            policy,
+            false,
+            |_| Ok(GroupCleanupCounts::default()),
+        )?;
+        Ok(outcome.result)
+    }
+
+    /// Allocate or reconcile a group under an explicit safety policy, with
+    /// one automatic cleanup and retry when a fresh allocation is exhausted.
+    ///
+    /// When a fresh allocation (of a new group, or after a forced
+    /// replacement deleted the stored one) finds no base for the fallback
+    /// pattern and `cleanup_possible` holds, `cleanup` runs once and the
+    /// allocation is retried once (the verified control
+    /// `verified::reserve::allocate_with_cleanup_retry`, shared with single
+    /// reservations). Everything runs inside one savepoint, so a failure
+    /// also rolls the cleanup back.
+    pub(crate) fn allocate_group_with_cleanup<K>(
+        &self,
+        conn: &rusqlite::Connection,
+        request: &GroupAllocationRequest,
+        occupancy_config: &OccupancyCheckConfig,
+        policy: GroupReconciliationPolicy,
+        cleanup_possible: bool,
+        cleanup: K,
+    ) -> Result<GroupAllocationOutcome>
+    where
+        K: FnOnce(&rusqlite::Connection) -> Result<GroupCleanupCounts>,
+    {
         let request = request.normalized()?;
 
         // The CLI opens an IMMEDIATE outer transaction before execution. This
         // savepoint keeps reconciliation/allocation atomic for library callers
-        // too, and rolls timestamp refreshes or inserts back as one unit.
+        // too, and rolls timestamp refreshes, cleanups, or inserts back as one
+        // unit.
         Database::with_savepoint(conn, "trop_allocate_group", |conn| {
             let existing =
                 Database::get_tagged_reservations_by_exact_path(conn, &request.base_path)?;
             let reconciliation = self.plan_reconciliation(&request, &existing, policy)?;
-            self.execute_reconciliation(conn, reconciliation, occupancy_config)
+            let fresh = FreshAllocation {
+                occupancy_config,
+                cleanup_possible,
+                cleanup,
+            };
+            self.execute_reconciliation(conn, reconciliation, fresh)
         })
     }
 
@@ -430,15 +465,18 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         }
     }
 
-    fn execute_reconciliation(
+    fn execute_reconciliation<K>(
         &self,
         conn: &rusqlite::Connection,
         reconciliation: GroupReconciliation,
-        occupancy_config: &OccupancyCheckConfig,
-    ) -> Result<GroupAllocationResult> {
+        fresh: FreshAllocation<'_, K>,
+    ) -> Result<GroupAllocationOutcome>
+    where
+        K: FnOnce(&rusqlite::Connection) -> Result<GroupCleanupCounts>,
+    {
         match reconciliation {
             GroupReconciliation::AllocateFresh(request) => {
-                self.allocate_fresh_group(conn, &request, occupancy_config)
+                self.allocate_fresh_group(conn, &request, fresh)
             }
             GroupReconciliation::Refresh { result, metadata } => {
                 let refreshed_at = SystemTime::now();
@@ -456,7 +494,10 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
                         ));
                     }
                 }
-                Ok(result)
+                Ok(GroupAllocationOutcome {
+                    result,
+                    warning: None,
+                })
             }
             GroupReconciliation::Replace {
                 request,
@@ -470,7 +511,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
                         ));
                     }
                 }
-                self.allocate_fresh_group(conn, &request, occupancy_config)
+                self.allocate_fresh_group(conn, &request, fresh)
             }
         }
     }
@@ -616,13 +657,7 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         let (services, shape) = request.sorted_shape()?;
         let stored_tags = existing
             .iter()
-            .map(|reservation| {
-                reservation
-                    .key()
-                    .tag
-                    .as_ref()
-                    .map(|tag| tag.as_bytes().to_vec())
-            })
+            .map(|reservation| reservation.key().tag.clone())
             .collect::<Vec<_>>();
         let rows = match_stored_tags(&shape, &stored_tags).map_err(|error| {
             Self::group_conflict(
@@ -713,14 +748,25 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
 
     /// Allocate a fresh group. The verified kernel
     /// `verified::group::plan_fresh_group` decides every port (pinning,
-    /// fallback classification, and the lowest-base pattern search); this
-    /// glue supplies the probes and performs the inserts.
-    fn allocate_fresh_group(
+    /// fallback classification, and the lowest-base pattern search), and the
+    /// verified control `verified::reserve::allocate_with_cleanup_retry`
+    /// decides whether an exhausted search is retried after one automatic
+    /// cleanup; this glue supplies the probes and the cleanup and performs
+    /// the inserts.
+    fn allocate_fresh_group<K>(
         &self,
         conn: &rusqlite::Connection,
         request: &GroupAllocationRequest,
-        occupancy_config: &OccupancyCheckConfig,
-    ) -> Result<GroupAllocationResult> {
+        fresh: FreshAllocation<'_, K>,
+    ) -> Result<GroupAllocationOutcome>
+    where
+        K: FnOnce(&rusqlite::Connection) -> Result<GroupCleanupCounts>,
+    {
+        let FreshAllocation {
+            occupancy_config,
+            cleanup_possible,
+            cleanup,
+        } = fresh;
         let (services, shape) = request.sorted_shape()?;
         let preferred_probe = |port: u16| -> Result<PreferredVerdict> {
             let availability =
@@ -734,30 +780,34 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         };
         let scan_probe = |port: u16| self.scan_probe(port, conn, occupancy_config);
 
-        let plan = match plan_fresh_group(&shape, self.range().span, &preferred_probe, &scan_probe)
-        {
-            Ok(plan) => plan,
-            Err(FreshGroupError::Probe(error)) => return Err(error),
-            Err(FreshGroupError::PreferredOnlyUnavailable { port, verdict }) => {
-                let reason = match verdict {
-                    PreferredVerdict::Available => PortAvailability::Available,
-                    PreferredVerdict::Reserved => PortAvailability::Reserved,
-                    PreferredVerdict::Excluded => PortAvailability::Excluded,
-                    PreferredVerdict::Occupied => PortAvailability::Occupied,
+        // The number of fallback services of the last exhausted attempt.
+        let exhausted_fallbacks = Cell::new(0);
+        // One planning attempt; the same attempt is the retry after cleanup.
+        let attempt = || -> Result<Fallback<FreshGroupPlan>> {
+            match plan_fresh_group(&shape, self.range().span, &preferred_probe, &scan_probe) {
+                Ok(plan) => Ok(Fallback::Allocated(plan)),
+                Err(FreshGroupError::PatternExhausted { fallback_count }) => {
+                    exhausted_fallbacks.set(fallback_count);
+                    Ok(Fallback::Exhausted)
                 }
-                .unavailable_reason()
-                .expect("verified: the reported preferred-port verdict is never Available");
-                return Err(Error::PreferredPortUnavailable {
-                    port: Port::try_from(port)?,
-                    reason,
-                });
+                Err(FreshGroupError::Probe(error)) => Err(error),
+                Err(FreshGroupError::PreferredOnlyUnavailable { port, verdict }) => {
+                    Err(preferred_only_unavailable(port, verdict)?)
+                }
             }
-            Err(FreshGroupError::PatternExhausted { fallback_count }) => {
-                return Err(Error::GroupAllocationFailed {
-                    attempted: fallback_count,
-                    reason: "No scanned base can satisfy the complete offset fallback pattern"
-                        .into(),
-                });
+        };
+        let (plan, cleaned) = match allocate_with_cleanup_retry(
+            cleanup_possible,
+            attempt,
+            || cleanup(conn),
+            attempt,
+        )? {
+            Retry::Allocated {
+                port: plan,
+                cleanup,
+            } => (plan, cleanup),
+            Retry::Exhausted { cleanup } => {
+                return Err(pattern_exhausted(exhausted_fallbacks.get(), cleanup));
             }
         };
 
@@ -789,9 +839,18 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
             Database::create_reservation_simple(conn, reservation)?;
         }
 
-        Ok(GroupAllocationResult {
-            allocations,
-            base_port: plan.base.map(Port::try_from).transpose()?,
+        Ok(GroupAllocationOutcome {
+            result: GroupAllocationResult {
+                allocations,
+                base_port: plan.base.map(Port::try_from).transpose()?,
+            },
+            warning: cleaned.map(|counts| {
+                format!(
+                    "Automatic cleanup after initial group pattern exhaustion pruned {} and \
+                     expired {} reservation(s); the group was allocated on the single retry.",
+                    counts.pruned, counts.expired
+                )
+            }),
         })
     }
 
@@ -836,6 +895,67 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         )?;
         // Infallible: the kernel returns a base >= the range minimum (>= 1).
         Ok(base.map(Port::try_from).transpose()?)
+    }
+}
+
+/// What one automatic cleanup removed before a group allocation was retried.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GroupCleanupCounts {
+    /// Reservations pruned (their paths no longer exist).
+    pub(crate) pruned: usize,
+    /// Reservations expired (unused for too long).
+    pub(crate) expired: usize,
+}
+
+/// A group allocation together with the warning to report, if any.
+#[derive(Debug, Clone)]
+pub(crate) struct GroupAllocationOutcome {
+    /// The group's ports.
+    pub(crate) result: GroupAllocationResult,
+    /// Set when automatic cleanup made room for a fresh group.
+    pub(crate) warning: Option<String>,
+}
+
+/// How a fresh group is allocated: the occupancy probes, and the single
+/// automatic cleanup allowed after an exhausted first attempt.
+struct FreshAllocation<'a, K> {
+    occupancy_config: &'a OccupancyCheckConfig,
+    cleanup_possible: bool,
+    cleanup: K,
+}
+
+/// The error for a preferred-only service whose preferred port is
+/// unavailable (`verdict` is never `Available`).
+fn preferred_only_unavailable(port: u16, verdict: PreferredVerdict) -> Result<Error> {
+    let reason = match verdict {
+        PreferredVerdict::Available => PortAvailability::Available,
+        PreferredVerdict::Reserved => PortAvailability::Reserved,
+        PreferredVerdict::Excluded => PortAvailability::Excluded,
+        PreferredVerdict::Occupied => PortAvailability::Occupied,
+    }
+    .unavailable_reason()
+    .expect("verified: the reported preferred-port verdict is never Available");
+    Ok(Error::PreferredPortUnavailable {
+        port: Port::try_from(port)?,
+        reason,
+    })
+}
+
+/// The error for a fallback pattern that no base satisfies, after the
+/// automatic cleanup and retry when one ran.
+fn pattern_exhausted(fallback_count: usize, cleaned: Option<GroupCleanupCounts>) -> Error {
+    let reason = match cleaned {
+        None => "No scanned base can satisfy the complete offset fallback pattern".to_string(),
+        Some(counts) => format!(
+            "No scanned base can satisfy the complete offset fallback pattern, even after \
+             automatic cleanup pruned {} and expired {} reservation(s) and the scan was \
+             retried once",
+            counts.pruned, counts.expired
+        ),
+    };
+    Error::GroupAllocationFailed {
+        attempted: fallback_count,
+        reason,
     }
 }
 
@@ -2315,5 +2435,287 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key().tag.as_deref(), Some("web"));
         assert_eq!(rows[0].project(), Some(legacy_project.as_str()));
+    }
+
+    // ------------------------------------------------------------------
+    // Glue boundaries of the verified validation, retry, and round trip
+    // ------------------------------------------------------------------
+
+    fn named_request(
+        project: Option<&str>,
+        task: Option<&str>,
+        services: Vec<ServiceAllocationRequest>,
+    ) -> GroupAllocationRequest {
+        GroupAllocationRequest {
+            base_path: PathBuf::from("/test/project"),
+            project: project.map(str::to_string),
+            task: task.map(str::to_string),
+            services,
+        }
+    }
+
+    /// Tags, project, and task are trimmed by the shared identifier rule
+    /// (Unicode `White_Space`, as `str::trim`), in place and in order.
+    #[test]
+    fn normalization_trims_unicode_whitespace_with_the_identifier_rule() {
+        let request = named_request(
+            Some(" proj\u{2003}"),
+            Some("\ttask\u{3000}"),
+            vec![
+                service("\u{3000}web\u{a0}", Some(0), None),
+                service("\u{2028}api\u{85}", Some(1), Some(8080)),
+            ],
+        );
+
+        let normalized = request.normalized().unwrap();
+
+        assert_eq!(normalized.project.as_deref(), Some("proj"));
+        assert_eq!(normalized.task.as_deref(), Some("task"));
+        let tags = normalized
+            .services
+            .iter()
+            .map(|service| service.tag.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tags, ["web", "api"]);
+        assert_eq!(normalized.services[1].offset, Some(1));
+        assert_eq!(
+            normalized.services[1].preferred,
+            Some(Port::try_from(8080).unwrap())
+        );
+        // Normalizing again changes nothing (verified idempotence).
+        assert_eq!(normalized.normalized().unwrap(), normalized);
+    }
+
+    /// The 255-byte limit counts UTF-8 bytes of the trimmed value.
+    #[test]
+    fn normalization_applies_the_identifier_byte_limit_after_trimming() {
+        let exactly = format!("  {}  ", "a".repeat(255));
+        let accepted = group_request(vec![service(&exactly, Some(0), None)])
+            .normalized()
+            .unwrap();
+        assert_eq!(accepted.services[0].tag, "a".repeat(255));
+
+        for tag in ["a".repeat(256), "é".repeat(128)] {
+            let (field, message) =
+                validation_message(group_request(vec![service(&tag, Some(0), None)]).normalized());
+            assert_eq!(field, "services");
+            assert_eq!(message, "Service tags cannot exceed 255 bytes");
+        }
+
+        let (field, message) = validation_message(
+            named_request(
+                Some(&"p".repeat(256)),
+                None,
+                vec![service("web", Some(0), None)],
+            )
+            .normalized(),
+        );
+        assert_eq!(
+            (field.as_str(), message.as_str()),
+            ("project", "Cannot exceed 255 bytes")
+        );
+    }
+
+    /// Errors follow the production precedence: project, then task, then the
+    /// first service, with the identifier rule's own order inside each.
+    #[test]
+    fn normalization_reports_errors_in_production_order() {
+        let bad_tag = service("\u{a0}", Some(0), None);
+        let (field, message) =
+            validation_message(named_request(Some(" "), Some("t\0"), vec![bad_tag]).normalized());
+        assert_eq!(
+            (field.as_str(), message.as_str()),
+            ("project", "Cannot be empty or only whitespace")
+        );
+
+        let (field, message) = validation_message(
+            named_request(Some("p"), Some("t\0"), vec![service(" ", Some(0), None)]).normalized(),
+        );
+        assert_eq!(
+            (field.as_str(), message.as_str()),
+            ("task", "Cannot contain null bytes")
+        );
+
+        let (field, message) = validation_message(
+            group_request(vec![
+                service("web", Some(0), None),
+                service("w\0b", Some(1), None),
+                service("", Some(2), None),
+            ])
+            .normalized(),
+        );
+        assert_eq!(
+            (field.as_str(), message.as_str()),
+            ("services", "Service tags cannot contain null bytes")
+        );
+
+        let (_, message) =
+            validation_message(group_request(vec![service("\u{a0}", Some(0), None)]).normalized());
+        assert_eq!(message, "Service tags must not be empty or whitespace-only");
+    }
+
+    /// `lemma_fresh_plan_is_compatible`, end to end: across range edges,
+    /// occupied bases, and mixed strategies, repeating a fresh allocation
+    /// refreshes it with the same ports and writes no new row.
+    #[test]
+    fn repeating_a_fresh_allocation_refreshes_it_unchanged() {
+        let shapes: [(u16, u16, Vec<ServiceAllocationRequest>, Vec<u16>); 5] = [
+            (
+                5000,
+                5010,
+                vec![service("web", Some(0), None), service("api", Some(2), None)],
+                vec![5000, 5001],
+            ),
+            (
+                65530,
+                65535,
+                vec![service("a", Some(0), None), service("b", Some(5), None)],
+                vec![],
+            ),
+            (
+                1,
+                20,
+                vec![
+                    service("pinned", Some(0), Some(15)),
+                    service("fallback", Some(1), Some(3)),
+                    service("plain", Some(3), None),
+                ],
+                vec![3],
+            ),
+            (
+                5000,
+                5100,
+                vec![
+                    service("only", None, Some(5050)),
+                    service("x", Some(0), None),
+                ],
+                vec![5000, 5002],
+            ),
+            (
+                5000,
+                5100,
+                vec![
+                    service("p", Some(1), Some(5000)),
+                    service("q", Some(0), Some(6000)),
+                ],
+                vec![],
+            ),
+        ];
+        for (min, max, services, occupied) in shapes {
+            let db = create_test_database();
+            let occupied = occupied
+                .into_iter()
+                .map(|port| Port::try_from(port).unwrap())
+                .collect();
+            let allocator = create_test_allocator(occupied, min, max);
+            let config = OccupancyCheckConfig::default();
+            let request = group_request(services);
+
+            let first = allocator
+                .allocate_group(db.connection(), &request, &config)
+                .unwrap_or_else(|error| panic!("{min}..{max}: {error}"));
+            let rows = Database::list_all_reservations(db.connection()).unwrap();
+            let second = allocator
+                .allocate_group(db.connection(), &request, &config)
+                .unwrap_or_else(|error| panic!("{min}..{max} repeat: {error}"));
+
+            assert_eq!(second.allocations, first.allocations, "{min}..{max}");
+            assert!(
+                second.base_port == first.base_port || second.base_port.is_none(),
+                "{min}..{max}: {:?} vs {:?}",
+                second.base_port,
+                first.base_port
+            );
+            let after = Database::list_all_reservations(db.connection()).unwrap();
+            assert_eq!(after.len(), rows.len(), "{min}..{max}: no new rows");
+            let mut ports = first.allocations.values().copied().collect::<Vec<_>>();
+            ports.sort_unstable();
+            ports.dedup();
+            assert_eq!(ports.len(), first.allocations.len(), "distinct ports");
+        }
+    }
+
+    /// The cleanup oracle runs only after an exhausted first attempt, at most
+    /// once, and only when a retry is possible.
+    #[test]
+    fn cleanup_runs_once_and_only_after_exhaustion_when_possible() {
+        let config = OccupancyCheckConfig::default();
+        let request = group_request(vec![
+            service("web", Some(0), None),
+            service("api", Some(1), None),
+        ]);
+        let blocker = Reservation::builder(
+            ReservationKey::new(PathBuf::from("/other"), None).unwrap(),
+            Port::try_from(5000).unwrap(),
+        )
+        .build()
+        .unwrap();
+
+        // Not exhausted: cleanup never runs.
+        let db = create_test_database();
+        let allocator = create_test_allocator(HashSet::new(), 5000, 5001);
+        let calls = Cell::new(0);
+        let outcome = allocator
+            .allocate_group_with_cleanup(
+                db.connection(),
+                &request,
+                &config,
+                GroupReconciliationPolicy::default(),
+                true,
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(GroupCleanupCounts::default())
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 0);
+        assert!(outcome.warning.is_none());
+
+        // Exhausted, cleanup impossible: it never runs.
+        let db = create_test_database();
+        Database::create_reservation_simple(db.connection(), &blocker).unwrap();
+        let error = allocator
+            .allocate_group_with_cleanup(
+                db.connection(),
+                &request,
+                &config,
+                GroupReconciliationPolicy::default(),
+                false,
+                |_| -> Result<GroupCleanupCounts> { panic!("cleanup must not run") },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::GroupAllocationFailed { attempted: 2, .. }
+        ));
+
+        // Exhausted, cleanup possible: it runs once; here it frees the port
+        // and the single retry succeeds.
+        let calls = Cell::new(0);
+        let outcome = allocator
+            .allocate_group_with_cleanup(
+                db.connection(),
+                &request,
+                &config,
+                GroupReconciliationPolicy::default(),
+                true,
+                |conn| {
+                    calls.set(calls.get() + 1);
+                    assert!(Database::delete_reservation_simple(conn, blocker.key())?);
+                    Ok(GroupCleanupCounts {
+                        pruned: 1,
+                        expired: 0,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            outcome.result.allocations["web"],
+            Port::try_from(5000).unwrap()
+        );
+        assert!(outcome
+            .warning
+            .is_some_and(|warning| warning.contains("pruned 1 and expired 0")));
     }
 }

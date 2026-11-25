@@ -3,13 +3,15 @@
 //! This module implements auto-discovery of configuration files and delegation
 //! to reserve group logic for batch port reservations.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::config::{Config, ConfigField, ConfigFileKind, ConfigLoader, EffectiveConfig};
 use crate::error::{Error, Result};
 use crate::verified::group::{first_present, select_highest_precedence};
 use rusqlite::Connection;
 
+use super::executor::ExecutionResult;
 use super::plan::OperationPlan;
 use super::reserve_group::{ReserveGroupOptions, ReserveGroupPlan};
 
@@ -235,6 +237,22 @@ impl AutoreservePlan {
     /// ```
     pub fn build_plan(&self, conn: &Connection) -> Result<OperationPlan> {
         self.reserve_group.build_plan(conn)
+    }
+
+    /// Runs this autoreserve request as a dry run against a private
+    /// in-memory copy of `database` (`None` when no database exists yet);
+    /// see [`ReserveGroupPlan::dry_run`].
+    ///
+    /// # Errors
+    ///
+    /// Returns every error a live run would return, and an error if the
+    /// database cannot be read.
+    pub fn dry_run(
+        &self,
+        database: Option<&Path>,
+        busy_timeout: Duration,
+    ) -> Result<ExecutionResult> {
+        self.reserve_group.dry_run(database, busy_timeout)
     }
 
     /// Returns the discovered configuration file path.
