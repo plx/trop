@@ -331,8 +331,11 @@ fn every_database_mutating_command_uses_the_timeout_exit_contract() {
         &env,
         "starting an immediate database transaction",
         |command| {
+            // The test runs from an unrelated working directory, so the
+            // unrelated-path guard must be waived to reach the lock.
             command
                 .arg("migrate")
+                .arg("--allow-unrelated-path")
                 .arg("--from")
                 .arg(&source)
                 .arg("--to")

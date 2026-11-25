@@ -4,17 +4,25 @@
 //! moving reservations from one path to another while preserving all
 //! metadata (ports, project, task, timestamps, tags).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use rusqlite::Connection;
 
 use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::path::normalize::normalize;
+use crate::verified::migrate::{
+    classify_conflicts, schedule_migration, MigAction, MigrationKeyError,
+};
+use crate::verified::release::check_affected;
 use crate::{Reservation, ReservationKey};
 
 use super::plan::{OperationPlan, PlanAction};
 
 /// Options for migration operation.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // one field per independent CLI flag
 pub struct MigrateOptions {
     /// Source path to migrate from.
     pub from_path: PathBuf,
@@ -22,10 +30,14 @@ pub struct MigrateOptions {
     pub to_path: PathBuf,
     /// Migrate all sub-paths recursively.
     pub recursive: bool,
-    /// Overwrite existing reservations at destination.
+    /// Overwrite existing reservations at destination, and allow migrating
+    /// reservations unrelated to the current directory.
     pub force: bool,
     /// Preview changes without applying them.
     pub dry_run: bool,
+    /// Allow migrating reservations whose source or destination path is
+    /// unrelated to the current working directory.
+    pub allow_unrelated_path: bool,
 }
 
 impl MigrateOptions {
@@ -35,6 +47,7 @@ impl MigrateOptions {
     /// - recursive: false
     /// - force: false
     /// - `dry_run`: false
+    /// - `allow_unrelated_path`: false
     ///
     /// # Examples
     ///
@@ -57,6 +70,7 @@ impl MigrateOptions {
             recursive: false,
             force: false,
             dry_run: false,
+            allow_unrelated_path: false,
         }
     }
 
@@ -80,6 +94,13 @@ impl MigrateOptions {
         self.dry_run = dry_run;
         self
     }
+
+    /// Sets the `allow_unrelated_path` flag.
+    #[must_use]
+    pub const fn with_allow_unrelated_path(mut self, allow: bool) -> Self {
+        self.allow_unrelated_path = allow;
+        self
+    }
 }
 
 /// Migration plan describing what will be moved.
@@ -89,7 +110,9 @@ pub struct MigratePlan {
     pub options: MigrateOptions,
     /// Items to migrate (`from_key` -> `to_key` with reservation data).
     pub migrations: Vec<MigrationItem>,
-    /// Reservation keys that would conflict at destination.
+    /// Destination keys whose existing reservation the migration would
+    /// overwrite (destinations that are themselves being moved away are not
+    /// conflicts).
     pub conflicts: Vec<ReservationKey>,
 }
 
@@ -147,14 +170,24 @@ impl MigratePlan {
     /// 1. Normalizes both paths
     /// 2. Finds all reservations at `from_path` (exact or recursive)
     /// 3. Calculates new paths by replacing the `from_path` prefix with `to_path`
-    /// 4. Checks for conflicts at destination paths
-    /// 5. Returns error if conflicts exist without `--force`
+    /// 4. Checks every source and destination path against the current
+    ///    directory (unless `force` or `allow_unrelated_path` is set)
+    /// 5. Checks for conflicts: destinations whose existing reservation would
+    ///    be overwritten (a destination that is itself being moved away is
+    ///    not a conflict)
+    /// 6. Returns error if conflicts exist without `--force`
+    ///
+    /// The plan is a snapshot: [`execute_migrate`] rebuilds it inside its
+    /// transaction and refuses to run if the database changed meanwhile.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - Paths cannot be normalized
     /// - No reservations found at `from_path` (non-recursive mode only)
+    /// - A source or destination path is unrelated to the current directory
+    ///   (without `force` or `allow_unrelated_path`)
+    /// - Two source reservations would migrate to the same destination
     /// - Conflicts exist at destination without `--force`
     ///
     /// # Examples
@@ -173,6 +206,14 @@ impl MigratePlan {
     /// plan.build(&db).unwrap();
     /// ```
     pub fn build(&mut self, db: &Database) -> Result<()> {
+        self.build_with_connection(db.connection())
+    }
+
+    /// Builds the plan from `conn` (for example inside a transaction).
+    fn build_with_connection(&mut self, conn: &Connection) -> Result<()> {
+        self.migrations.clear();
+        self.conflicts.clear();
+
         // Step 1: Normalize both paths
         let from_normalized = normalize(&self.options.from_path)?;
         let to_normalized = normalize(&self.options.to_path)?;
@@ -186,10 +227,10 @@ impl MigratePlan {
         // Step 2: Find all reservations at from_path
         let reservations = if self.options.recursive {
             // Get all descendants (including exact match)
-            Database::get_reservations_by_path_prefix(db.connection(), &from_normalized)?
+            Database::get_reservations_by_path_prefix(conn, &from_normalized)?
         } else {
             // Get exact matches only
-            Database::list_all_reservations(db.connection())?
+            Database::list_all_reservations(conn)?
                 .into_iter()
                 .filter(|r| normalize(&r.key().path).ok() == Some(from_normalized.clone()))
                 .collect()
@@ -208,30 +249,23 @@ impl MigratePlan {
             });
         }
 
-        // Step 3: For each reservation, calculate new path and check for conflicts
+        // Step 3: For each reservation, calculate the destination key
         for reservation in reservations {
             let from_key = reservation.key();
             let from_path_normalized = normalize(&from_key.path)?;
 
             // Calculate new path by replacing from_path prefix with to_path
-            let new_path_raw =
+            let new_path =
                 calculate_new_path(&from_path_normalized, &from_normalized, &to_normalized)?;
-
-            // Normalize the new path to ensure consistent format (no trailing slashes)
-            let new_path = normalize(&new_path_raw)?;
+            // The rebased path is already canonical (proved on Unix), so the
+            // normalization the previous implementation repeated here is a
+            // no-op.
+            #[cfg(unix)]
+            debug_assert!(crate::path::is_canonical_absolute(&new_path));
 
             // Create new reservation key with the new path but same tag
             let to_key = ReservationKey::new(new_path, from_key.tag.clone())?;
 
-            // Check if reservation already exists at destination
-            let has_conflict = Database::get_reservation(db.connection(), &to_key)?.is_some();
-            if has_conflict {
-                // Conflict detected - track it
-                self.conflicts.push(to_key.clone());
-                log::debug!("Conflict detected: {to_key} already exists");
-            }
-
-            // Always add to migration list - conflicts are resolved by force flag later
             self.migrations.push(MigrationItem {
                 from_key: from_key.clone(),
                 to_key,
@@ -239,7 +273,39 @@ impl MigratePlan {
             });
         }
 
-        // Step 4: If conflicts exist and not force, return error
+        // Step 4: The unrelated-path guard covers every reservation the
+        // migration deletes (sources) or writes (destinations).
+        let affected: Vec<&Path> = self
+            .migrations
+            .iter()
+            .map(|item| item.from_key.path.as_path())
+            .chain(
+                self.migrations
+                    .iter()
+                    .map(|item| item.to_key.path.as_path()),
+            )
+            .collect();
+        guard_affected_paths(
+            self.options.force,
+            self.options.allow_unrelated_path,
+            &affected,
+        )?;
+
+        // Step 5: Classify conflicts with the verified kernel.
+        let keys = KeyTable::intern(&self.migrations);
+        let mut dest_exists = Vec::with_capacity(self.migrations.len());
+        for item in &self.migrations {
+            dest_exists.push(Database::get_reservation(conn, &item.to_key)?.is_some());
+        }
+        let conflicts = classify_conflicts(keys.len(), &keys.sources, &keys.dests, &dest_exists)
+            .map_err(|error| key_error(&self.migrations, error))?;
+        for index in conflicts {
+            let to_key = self.migrations[index].to_key.clone();
+            log::debug!("Conflict detected: {to_key} already exists");
+            self.conflicts.push(to_key);
+        }
+
+        // Step 6: If conflicts exist and not force, return error
         if !self.conflicts.is_empty() && !self.options.force {
             return Err(Error::ReservationConflict {
                 details: format!(
@@ -263,9 +329,98 @@ impl MigratePlan {
     pub fn conflict_count(&self) -> usize {
         self.conflicts.len()
     }
+
+    /// Whether `other` selects the same moves and conflicts as this plan.
+    fn same_selection(&self, other: &Self) -> bool {
+        self.conflicts == other.conflicts
+            && self.migrations.len() == other.migrations.len()
+            && self
+                .migrations
+                .iter()
+                .zip(&other.migrations)
+                .all(|(a, b)| a.from_key == b.from_key && a.to_key == b.to_key)
+    }
+}
+
+/// Applies the unrelated-path guard (`verified::release::check_affected`) to
+/// `paths`, gating each one with the single-path check
+/// [`Database::validate_path_relationship`].
+pub(crate) fn guard_affected_paths(
+    force: bool,
+    allow_unrelated_path: bool,
+    paths: &[&Path],
+) -> Result<()> {
+    check_affected(force, allow_unrelated_path, paths.len(), &|index| {
+        Database::validate_path_relationship(paths[index], false).err()
+    })
+    .map_err(|failure| {
+        log::debug!(
+            "Unrelated-path guard refused {}",
+            paths[failure.index].display()
+        );
+        failure.error
+    })
+}
+
+/// Reservation keys interned to dense ids by their database identity (the
+/// stored path text and the stored tag text), so equal ids mean the same
+/// stored row.
+struct KeyTable {
+    /// The source id of each item.
+    sources: Vec<usize>,
+    /// The destination id of each item.
+    dests: Vec<usize>,
+    /// The key of each id.
+    keys: Vec<ReservationKey>,
+}
+
+impl KeyTable {
+    fn intern(items: &[MigrationItem]) -> Self {
+        let mut ids: BTreeMap<(String, String), usize> = BTreeMap::new();
+        let mut keys = Vec::new();
+        let mut id_of = |key: &ReservationKey| {
+            let identity = (key.path_as_string(), key.tag.clone().unwrap_or_default());
+            *ids.entry(identity).or_insert_with(|| {
+                keys.push(key.clone());
+                keys.len() - 1
+            })
+        };
+        let sources = items.iter().map(|item| id_of(&item.from_key)).collect();
+        let dests = items.iter().map(|item| id_of(&item.to_key)).collect();
+        Self {
+            sources,
+            dests,
+            keys,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+}
+
+/// Maps a key-list error from the kernel to a user-facing error.
+fn key_error(items: &[MigrationItem], error: MigrationKeyError) -> Error {
+    match error {
+        MigrationKeyError::DuplicateDest { first, second } => Error::ReservationConflict {
+            details: format!(
+                "Reservations {} and {} would both migrate to {}",
+                items[first].from_key, items[second].from_key, items[first].to_key
+            ),
+        },
+        other => Error::Validation {
+            field: "migration".to_string(),
+            message: format!("inconsistent migration plan: {other:?}"),
+        },
+    }
 }
 
 /// Calculates the new path for a reservation by replacing the `from_path` prefix with `to_path`.
+///
+/// On Unix the three paths are normalized (canonical) byte strings, and the
+/// verified kernel `verified::migrate::rebase_canonical` computes the
+/// result: `to` followed by the components of `original_path` below
+/// `from_prefix`, itself canonical (so normalizing it again is a no-op).
 ///
 /// # Arguments
 ///
@@ -279,32 +434,66 @@ impl MigratePlan {
 ///
 /// # Errors
 ///
-/// Returns an error if the path transformation fails
+/// Returns an error if `from_prefix` is not a component prefix of
+/// `original_path` (or, on Unix, if a path is not in canonical form).
+#[cfg(unix)]
 fn calculate_new_path(
     original_path: &Path,
     from_prefix: &Path,
     to_prefix: &Path,
 ) -> Result<PathBuf> {
-    // Get the relative path from from_prefix to original_path
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    crate::verified::migrate::rebase_canonical(
+        original_path.as_os_str().as_bytes(),
+        from_prefix.as_os_str().as_bytes(),
+        to_prefix.as_os_str().as_bytes(),
+    )
+    .map(|bytes| PathBuf::from(OsString::from_vec(bytes)))
+    .ok_or_else(|| not_under_prefix(original_path, from_prefix))
+}
+
+/// Calculates the new path for a reservation by replacing the `from_path` prefix with `to_path`.
+///
+/// Outside Unix this uses `Path::strip_prefix` and `Path::join`, then
+/// normalizes the result (joining an empty remainder adds a separator).
+///
+/// # Errors
+///
+/// Returns an error if `from_prefix` is not a component prefix of
+/// `original_path`.
+#[cfg(not(unix))]
+fn calculate_new_path(
+    original_path: &Path,
+    from_prefix: &Path,
+    to_prefix: &Path,
+) -> Result<PathBuf> {
     let relative = original_path
         .strip_prefix(from_prefix)
-        .map_err(|_| Error::InvalidPath {
-            path: original_path.to_path_buf(),
-            reason: format!(
-                "Path {} does not start with prefix {}",
-                original_path.display(),
-                from_prefix.display()
-            ),
-        })?;
+        .map_err(|_| not_under_prefix(original_path, from_prefix))?;
+    normalize(&to_prefix.join(relative))
+}
 
-    // Join to_prefix with the relative path
-    Ok(to_prefix.join(relative))
+fn not_under_prefix(original_path: &Path, from_prefix: &Path) -> Error {
+    Error::InvalidPath {
+        path: original_path.to_path_buf(),
+        reason: format!(
+            "Path {} does not start with prefix {}",
+            original_path.display(),
+            from_prefix.display()
+        ),
+    }
 }
 
 /// Converts a migration plan to an operation plan.
 ///
-/// This creates the plan actions that will be executed, including
-/// deleting old reservations and creating new ones at the destination.
+/// The actions come from the verified schedule
+/// (`verified::migrate::schedule_migration`): every source reservation is
+/// deleted, then every destination that is not itself a source (overwritten
+/// conflicts, or absent keys), and only then is every destination created.
+/// No create can be undone by a later delete, so every migrated reservation
+/// survives even when the destination tree overlaps the source tree.
 ///
 /// # Arguments
 ///
@@ -314,11 +503,12 @@ fn calculate_new_path(
 ///
 /// An operation plan with all the necessary actions
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if building a reservation from valid existing data fails,
-/// which should never happen in practice.
-pub fn to_operation_plan(migrate_plan: &MigratePlan) -> OperationPlan {
+/// Returns an error if two items share a source or a destination key (which
+/// [`MigratePlan::build`] never produces), or if a preserved reservation
+/// cannot be rebuilt at its destination.
+pub fn to_operation_plan(migrate_plan: &MigratePlan) -> Result<OperationPlan> {
     let mut plan = OperationPlan::new(format!(
         "Migrate reservations from {} to {}",
         migrate_plan.options.from_path.display(),
@@ -328,40 +518,45 @@ pub fn to_operation_plan(migrate_plan: &MigratePlan) -> OperationPlan {
     // Add warnings if there are no migrations
     if migrate_plan.migrations.is_empty() && migrate_plan.conflicts.is_empty() {
         plan = plan.add_warning("No reservations to migrate".to_string());
-        return plan;
+        return Ok(plan);
     }
 
-    // If force mode, delete conflicts first
-    if migrate_plan.options.force {
-        for conflict_key in &migrate_plan.conflicts {
-            plan = plan.add_action(PlanAction::DeleteReservation(conflict_key.clone()));
+    let keys = KeyTable::intern(&migrate_plan.migrations);
+    let actions = schedule_migration(keys.len(), &keys.sources, &keys.dests)
+        .map_err(|error| key_error(&migrate_plan.migrations, error))?;
+
+    for action in actions {
+        match action {
+            MigAction::DeleteKey(id) => {
+                plan = plan.add_action(PlanAction::DeleteReservation(keys.keys[id].clone()));
+            }
+            MigAction::Create(index) => {
+                // Create the new reservation with preserved metadata
+                let item = &migrate_plan.migrations[index];
+                let new_reservation =
+                    Reservation::builder(item.to_key.clone(), item.reservation.port())
+                        .project(item.reservation.project().map(String::from))
+                        .task(item.reservation.task().map(String::from))
+                        .created_at(item.reservation.created_at())
+                        .last_used_at(item.reservation.last_used_at())
+                        .build()?;
+                plan = plan.add_action(PlanAction::CreateReservation(new_reservation));
+            }
         }
     }
 
-    // For each migration: delete old, create new
-    for item in &migrate_plan.migrations {
-        // Delete old reservation
-        plan = plan.add_action(PlanAction::DeleteReservation(item.from_key.clone()));
-
-        // Create new reservation with preserved metadata
-        let new_reservation = Reservation::builder(item.to_key.clone(), item.reservation.port())
-            .project(item.reservation.project().map(String::from))
-            .task(item.reservation.task().map(String::from))
-            .created_at(item.reservation.created_at())
-            .last_used_at(item.reservation.last_used_at())
-            .build()
-            .expect("Building reservation from valid data should succeed");
-
-        plan = plan.add_action(PlanAction::CreateReservation(new_reservation));
-    }
-
-    plan
+    Ok(plan)
 }
 
 /// Executes a migration plan.
 ///
-/// This is a convenience function that converts the migration plan to an operation plan
-/// and executes it using the plan executor.
+/// The migration runs in one `IMMEDIATE` transaction. Inside it, the plan is
+/// rebuilt from `plan.options` against the locked database, and the
+/// migration is refused (with no changes) unless the rebuilt plan selects
+/// the same moves and conflicts as `plan`. So the plan that runs is exactly
+/// the plan that was shown, and it is a snapshot of the state it modifies:
+/// a destination reserved after planning is never overwritten without
+/// `--force`, and a source released after planning is never resurrected.
 ///
 /// # Arguments
 ///
@@ -376,6 +571,7 @@ pub fn to_operation_plan(migrate_plan: &MigratePlan) -> OperationPlan {
 ///
 /// Returns an error if:
 /// - The migration plan contains conflicts without force
+/// - The reservations changed since the plan was built
 /// - Database operations fail
 ///
 /// # Examples
@@ -404,11 +600,23 @@ pub fn execute_migrate(plan: &MigratePlan, db: &mut Database) -> Result<MigrateR
 fn execute_migrate_inner(plan: &MigratePlan, db: &mut Database) -> Result<MigrateResult> {
     use super::executor::PlanExecutor;
 
-    // Convert to operation plan
-    let op_plan = to_operation_plan(plan);
-
     // Begin transaction for atomic migration
     let tx = db.begin_transaction()?;
+
+    // Rebuild the plan against the locked database: the executed schedule is
+    // derived from this snapshot, which must match the plan the caller saw.
+    let mut current = MigratePlan::new(plan.options.clone());
+    current.build_with_connection(&tx)?;
+    if !current.same_selection(plan) {
+        return Err(Error::ReservationConflict {
+            details: "Reservations changed while the migration was being planned; \
+                      no changes were made. Re-run the migration."
+                .to_string(),
+        });
+    }
+
+    // Convert to operation plan
+    let op_plan = to_operation_plan(&current)?;
 
     // Execute the plan inside transaction
     let mut executor = PlanExecutor::new(&tx);
@@ -419,14 +627,14 @@ fn execute_migrate_inner(plan: &MigratePlan, db: &mut Database) -> Result<Migrat
 
     // Build result
     Ok(MigrateResult {
-        migrated_count: plan.migrations.len(),
-        conflicts_resolved: if plan.options.force {
-            plan.conflicts.len()
+        migrated_count: current.migrations.len(),
+        conflicts_resolved: if current.options.force {
+            current.conflicts.len()
         } else {
             0
         },
-        from_path: plan.options.from_path.clone(),
-        to_path: plan.options.to_path.clone(),
+        from_path: current.options.from_path.clone(),
+        to_path: current.options.to_path.clone(),
     })
 }
 
@@ -526,7 +734,8 @@ mod tests {
         db.create_reservation(&reservation).unwrap();
 
         // Build migration plan
-        let options = MigrateOptions::new(PathBuf::from("/old/path"), PathBuf::from("/new/path"));
+        let options = MigrateOptions::new(PathBuf::from("/old/path"), PathBuf::from("/new/path"))
+            .with_allow_unrelated_path(true);
         let mut plan = MigratePlan::new(options);
         plan.build(&db).unwrap();
 
@@ -560,7 +769,8 @@ mod tests {
         db.create_reservation(&r2).unwrap();
 
         // Build migration plan without force - should error
-        let options = MigrateOptions::new(PathBuf::from("/old/path"), PathBuf::from("/new/path"));
+        let options = MigrateOptions::new(PathBuf::from("/old/path"), PathBuf::from("/new/path"))
+            .with_allow_unrelated_path(true);
         let mut plan = MigratePlan::new(options);
         let result = plan.build(&db);
 
@@ -620,7 +830,8 @@ mod tests {
 
         // Build recursive migration plan
         let options = MigrateOptions::new(PathBuf::from("/old/path"), PathBuf::from("/new/path"))
-            .with_recursive(true);
+            .with_recursive(true)
+            .with_allow_unrelated_path(true);
         let mut plan = MigratePlan::new(options);
         plan.build(&db).unwrap();
 
@@ -637,5 +848,363 @@ mod tests {
         assert!(new_paths.contains(&PathBuf::from("/new/path")));
         assert!(new_paths.contains(&PathBuf::from("/new/path/sub1")));
         assert!(new_paths.contains(&PathBuf::from("/new/path/sub2")));
+    }
+
+    // ------------------------------------------------------------------
+    // Verified schedule, conflict classification, and snapshot glue
+    // ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    fn reserve(db: &mut Database, path: &str, port: u16) {
+        let key = ReservationKey::new(PathBuf::from(path), None).unwrap();
+        let reservation = Reservation::builder(key, Port::try_from(port).unwrap())
+            .build()
+            .unwrap();
+        db.create_reservation(&reservation).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn port_at(db: &Database, path: &str) -> Option<u16> {
+        let key = ReservationKey::new(PathBuf::from(path), None).unwrap();
+        Database::get_reservation(db.connection(), &key)
+            .unwrap()
+            .map(|reservation| reservation.port().value())
+    }
+
+    #[cfg(unix)]
+    fn migrate(db: &mut Database, options: MigrateOptions) -> Result<MigrateResult> {
+        let mut plan = MigratePlan::new(options);
+        plan.build(db)?;
+        execute_migrate(&plan, db)
+    }
+
+    #[cfg(unix)]
+    fn options(from: &str, to: &str) -> MigrateOptions {
+        MigrateOptions::new(PathBuf::from(from), PathBuf::from(to)).with_allow_unrelated_path(true)
+    }
+
+    /// Regression: with `/w/a` and `/w/a/b` reserved, moving `/w/a` onto
+    /// `/w/a/b` with `--force` used to delete the row it had just created
+    /// at `/w/a/b`, leaving only `/w/a/b/b`.
+    #[test]
+    #[cfg(unix)]
+    fn test_destination_inside_source_tree_keeps_every_reservation() {
+        let mut db = create_test_database();
+        reserve(&mut db, "/w/a", 5000);
+        reserve(&mut db, "/w/a/b", 5001);
+
+        let result = migrate(
+            &mut db,
+            options("/w/a", "/w/a/b")
+                .with_recursive(true)
+                .with_force(true),
+        )
+        .unwrap();
+
+        assert_eq!(result.migrated_count, 2);
+        // `/w/a/b` is itself moved away, so nothing was overwritten.
+        assert_eq!(result.conflicts_resolved, 0);
+        assert_eq!(port_at(&db, "/w/a"), None);
+        assert_eq!(port_at(&db, "/w/a/b"), Some(5000));
+        assert_eq!(port_at(&db, "/w/a/b/b"), Some(5001));
+        assert_eq!(
+            Database::list_all_reservations(db.connection())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// Regression: a destination that is itself a migration source is not a
+    /// conflict, so `migrate --from P --to P` is a no-op without `--force`.
+    #[test]
+    #[cfg(unix)]
+    fn test_self_migration_is_a_noop_without_force() {
+        let mut db = create_test_database();
+        reserve(&mut db, "/w/p", 5000);
+
+        let mut plan = MigratePlan::new(options("/w/p", "/w/p"));
+        plan.build(&db).unwrap();
+        assert_eq!(plan.conflict_count(), 0);
+        let result = execute_migrate(&plan, &mut db).unwrap();
+
+        assert_eq!(result.migrated_count, 1);
+        assert_eq!(port_at(&db, "/w/p"), Some(5000));
+        assert_eq!(
+            Database::list_all_reservations(db.connection())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Regression: re-rooting a subtree onto its parent overwrites nothing
+    /// (the only existing destination is itself moved away), so it succeeds
+    /// without `--force`.
+    #[test]
+    #[cfg(unix)]
+    fn test_migrate_to_ancestor_without_force() {
+        let mut db = create_test_database();
+        reserve(&mut db, "/w/a/b", 5000);
+        reserve(&mut db, "/w/a/b/b", 5001);
+
+        let result = migrate(&mut db, options("/w/a/b", "/w/a").with_recursive(true)).unwrap();
+
+        assert_eq!(result.migrated_count, 2);
+        assert_eq!(port_at(&db, "/w/a"), Some(5000));
+        assert_eq!(port_at(&db, "/w/a/b"), Some(5001));
+        assert_eq!(port_at(&db, "/w/a/b/b"), None);
+    }
+
+    /// A real overwrite is still a conflict (and `--force` resolves it).
+    #[test]
+    #[cfg(unix)]
+    fn test_overlapping_migration_with_a_real_conflict() {
+        let mut db = create_test_database();
+        reserve(&mut db, "/w/a", 5000);
+        reserve(&mut db, "/w/a/b", 5001);
+        reserve(&mut db, "/w/a/b/b", 5002);
+        reserve(&mut db, "/w/a/b/b/b", 5003);
+
+        // Moving only `/w/a/b` (non-recursive) onto `/w/a/b/b` overwrites the
+        // reservation there, which is not moved.
+        let mut plan = MigratePlan::new(options("/w/a/b", "/w/a/b/b"));
+        assert!(matches!(
+            plan.build(&db),
+            Err(Error::ReservationConflict { .. })
+        ));
+
+        let result = migrate(&mut db, options("/w/a/b", "/w/a/b/b").with_force(true)).unwrap();
+        assert_eq!(result.conflicts_resolved, 1);
+        assert_eq!(port_at(&db, "/w/a/b"), None);
+        assert_eq!(port_at(&db, "/w/a/b/b"), Some(5001));
+        assert_eq!(port_at(&db, "/w/a/b/b/b"), Some(5003));
+        assert_eq!(port_at(&db, "/w/a"), Some(5000));
+    }
+
+    /// The operation plan deletes every source and non-source destination
+    /// before it creates anything, and creates each item exactly once.
+    #[test]
+    #[cfg(unix)]
+    fn test_operation_plan_deletes_before_creates() {
+        let mut db = create_test_database();
+        reserve(&mut db, "/w/a", 5000);
+        reserve(&mut db, "/w/a/b", 5001);
+        reserve(&mut db, "/w/x", 5002);
+
+        let mut plan = MigratePlan::new(options("/w/a", "/w/a/b").with_recursive(true));
+        plan.build(&db).unwrap();
+        let op_plan = to_operation_plan(&plan).unwrap();
+
+        let first_create = op_plan
+            .actions
+            .iter()
+            .position(|action| matches!(action, PlanAction::CreateReservation(_)))
+            .unwrap();
+        assert!(op_plan.actions[..first_create]
+            .iter()
+            .all(|action| matches!(action, PlanAction::DeleteReservation(_))));
+        let created: Vec<PathBuf> = op_plan.actions[first_create..]
+            .iter()
+            .map(|action| match action {
+                PlanAction::CreateReservation(reservation) => reservation.key().path.clone(),
+                other => panic!("unexpected action after the first create: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            created,
+            vec![PathBuf::from("/w/a/b"), PathBuf::from("/w/a/b/b")]
+        );
+        let deleted: Vec<PathBuf> = op_plan.actions[..first_create]
+            .iter()
+            .map(|action| match action {
+                PlanAction::DeleteReservation(key) => key.path.clone(),
+                other => panic!("unexpected action: {other:?}"),
+            })
+            .collect();
+        // Sources, then the destination that is not a source.
+        assert_eq!(
+            deleted,
+            vec![
+                PathBuf::from("/w/a"),
+                PathBuf::from("/w/a/b"),
+                PathBuf::from("/w/a/b/b")
+            ]
+        );
+    }
+
+    /// Two stored rows whose paths normalize to the same path would both
+    /// migrate to one destination; the kernel refuses instead of silently
+    /// keeping only one of them.
+    #[test]
+    #[cfg(unix)]
+    fn test_colliding_destinations_are_refused() {
+        let db = create_test_database();
+        for (path, port) in [("/w/a", 5000), ("/w/a/", 5001)] {
+            db.connection()
+                .execute(
+                    "INSERT INTO reservations (path, tag, port, project, task, created_at, last_used_at) \
+                     VALUES (?1, '', ?2, NULL, NULL, 0, 0)",
+                    rusqlite::params![path, port],
+                )
+                .unwrap();
+        }
+
+        let mut plan = MigratePlan::new(options("/w/a", "/w/b"));
+        assert!(plan.build(&db).is_err());
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM reservations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    fn two_connections() -> (tempfile::TempDir, Database, Database) {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::DatabaseConfig::new(directory.path().join("race.db"));
+        let first = Database::open(config.clone()).unwrap();
+        let second = Database::open(config).unwrap();
+        (directory, first, second)
+    }
+
+    /// Regression: a destination reserved after the plan was built is not
+    /// silently overwritten (the plan is rebuilt inside the transaction).
+    #[test]
+    #[cfg(unix)]
+    fn test_execute_refuses_destination_reserved_after_planning() {
+        let (_directory, mut db, mut other) = two_connections();
+        reserve(&mut db, "/w/src", 5000);
+
+        let mut plan = MigratePlan::new(options("/w/src", "/w/dst"));
+        plan.build(&db).unwrap();
+        assert_eq!(plan.conflict_count(), 0);
+
+        // A concurrent writer reserves the destination after planning.
+        reserve(&mut other, "/w/dst", 5001);
+
+        assert!(execute_migrate(&plan, &mut db).is_err());
+        assert_eq!(port_at(&db, "/w/dst"), Some(5001));
+        assert_eq!(port_at(&db, "/w/src"), Some(5000));
+    }
+
+    /// Regression: a source released after the plan was built is not
+    /// resurrected at the destination.
+    #[test]
+    #[cfg(unix)]
+    fn test_execute_refuses_source_released_after_planning() {
+        let (_directory, mut db, mut other) = two_connections();
+        reserve(&mut db, "/w/src", 5000);
+
+        let mut plan = MigratePlan::new(options("/w/src", "/w/dst"));
+        plan.build(&db).unwrap();
+
+        let key = ReservationKey::new(PathBuf::from("/w/src"), None).unwrap();
+        assert!(other.delete_reservation(&key).unwrap());
+
+        assert!(execute_migrate(&plan, &mut db).is_err());
+        assert_eq!(port_at(&db, "/w/dst"), None);
+        assert_eq!(port_at(&db, "/w/src"), None);
+    }
+
+    /// The plan executed is rebuilt against the locked database; an
+    /// unchanged database executes exactly the plan that was built.
+    #[test]
+    #[cfg(unix)]
+    fn test_execute_runs_the_planned_moves() {
+        let (_directory, mut db, _other) = two_connections();
+        reserve(&mut db, "/w/src", 5000);
+        reserve(&mut db, "/w/src/child", 5001);
+
+        let mut plan = MigratePlan::new(options("/w/src", "/w/dst").with_recursive(true));
+        plan.build(&db).unwrap();
+        let result = execute_migrate(&plan, &mut db).unwrap();
+
+        assert_eq!(result.migrated_count, 2);
+        assert_eq!(port_at(&db, "/w/dst"), Some(5000));
+        assert_eq!(port_at(&db, "/w/dst/child"), Some(5001));
+    }
+
+    /// The unrelated-path guard covers sources and destinations; force or
+    /// `allow_unrelated_path` bypass it.
+    #[test]
+    #[cfg(unix)]
+    fn test_migrate_guard_checks_sources_and_destinations() {
+        let mut db = create_test_database();
+        let cwd = std::env::current_dir().unwrap();
+        let related = cwd.join("trop-migrate-guard-source");
+        let related_str = related.to_str().unwrap();
+        reserve(&mut db, related_str, 5000);
+        let unrelated = "/trop-migrate-guard-unrelated/destination";
+
+        let guarded = MigrateOptions::new(related.clone(), PathBuf::from(unrelated));
+        let mut plan = MigratePlan::new(guarded.clone());
+        assert!(matches!(
+            plan.build(&db),
+            Err(Error::PathRelationshipViolation { .. })
+        ));
+
+        reserve(&mut db, unrelated, 5001);
+        let back = MigrateOptions::new(PathBuf::from(unrelated), cwd.join("trop-migrate-guard-b"));
+        let mut plan = MigratePlan::new(back);
+        assert!(matches!(
+            plan.build(&db),
+            Err(Error::PathRelationshipViolation { .. })
+        ));
+
+        let mut plan = MigratePlan::new(guarded.clone().with_allow_unrelated_path(true));
+        assert!(matches!(
+            plan.build(&db),
+            Err(Error::ReservationConflict { .. })
+        ));
+        let mut plan = MigratePlan::new(guarded.with_force(true));
+        plan.build(&db).unwrap();
+        assert_eq!(plan.conflict_count(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_calculate_new_path_root_and_boundaries() {
+        let cases = [
+            ("/", "/", "/", Some("/")),
+            ("/", "/", "/x", Some("/x")),
+            ("/a", "/", "/", Some("/a")),
+            ("/a/b", "/", "/x", Some("/x/a/b")),
+            ("/a/b", "/a", "/", Some("/b")),
+            ("/a", "/a", "/", Some("/")),
+            ("/a/b", "/a/b", "/c", Some("/c")),
+            ("/a/bc", "/a/b", "/c", None),
+            ("/a", "/a/b", "/c", None),
+        ];
+        for (original, from, to, expected) in cases {
+            let result = calculate_new_path(Path::new(original), Path::new(from), Path::new(to));
+            match expected {
+                Some(path) => assert_eq!(result.unwrap(), PathBuf::from(path), "{original}"),
+                None => assert!(result.is_err(), "{original} under {from}"),
+            }
+        }
+    }
+
+    /// The rebased path agrees with `strip_prefix` + `join` + `normalize`
+    /// (the previous implementation) on canonical inputs.
+    #[test]
+    #[cfg(unix)]
+    fn test_calculate_new_path_matches_std() {
+        let paths = [
+            "/", "/a", "/a/b", "/a/bc", "/a/b/c", "/x", "/x/y", "/a/b/c/d",
+        ];
+        for original in paths {
+            for from in paths {
+                for to in paths {
+                    let expected = Path::new(original)
+                        .strip_prefix(from)
+                        .ok()
+                        .map(|relative| normalize(&Path::new(to).join(relative)).unwrap());
+                    let actual =
+                        calculate_new_path(Path::new(original), Path::new(from), Path::new(to))
+                            .ok();
+                    assert_eq!(actual, expected, "{original} from {from} to {to}");
+                }
+            }
+        }
     }
 }
