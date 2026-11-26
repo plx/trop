@@ -570,7 +570,7 @@ fn test_init_dry_run_shows_error_for_existing_db() {
         .assert()
         .success();
 
-    // Dry-run without --overwrite (should show error)
+    // Dry-run without --overwrite fails exactly as the live run would.
     let output = env
         .command_bare()
         .arg("init")
@@ -580,14 +580,18 @@ fn test_init_dry_run_shows_error_for_existing_db() {
         .output()
         .expect("Failed to run init");
 
-    assert!(output.status.success(), "Dry-run should succeed");
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "Dry-run must fail like the live run: {output:?}"
+    );
 
-    let stdout = String::from_utf8(output.stdout).expect("Invalid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("Invalid UTF-8");
 
-    // Should mention an error would occur
+    // Should report the error the live run reports
     assert!(
-        stdout.contains("ERROR") || stdout.contains("already exists"),
-        "Should show error would occur: {stdout}"
+        stderr.contains("already exists") && stderr.contains("--overwrite"),
+        "Should show the error: {stderr}"
     );
 }
 

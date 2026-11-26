@@ -1,12 +1,16 @@
 //! Read-only physical, schema, and logical database validation.
 
-use std::fmt::Write as _;
-
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{Error, Result};
+use crate::verified::schema_version::{
+    classify_for_validation, ColumnFacts, MetadataState, ValidateDisposition,
+};
+use crate::verified::sql_schema::{normalize_schema_sql, token_run_contains, tokenize_schema_sql};
+use crate::verified::storage::Cell;
 
+use super::migrations::{observe_metadata, unsupported_version, version_corruption};
 use super::operations::row_to_reservation;
 use super::schema::{CREATE_METADATA_TABLE, CREATE_RESERVATIONS_TABLE, CURRENT_SCHEMA_VERSION};
 
@@ -53,6 +57,17 @@ impl ColumnSpec {
             primary_key_position,
         }
     }
+
+    /// The expected column as the verified layout check sees it.
+    const fn facts(&self) -> ColumnFacts<'static> {
+        ColumnFacts {
+            name: self.name,
+            declared_type: self.declared_type,
+            not_null: self.not_null,
+            primary_key_position: self.primary_key_position,
+            hidden: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +77,19 @@ struct ActualColumn {
     not_null: bool,
     primary_key_position: i64,
     hidden: i64,
+}
+
+impl ActualColumn {
+    /// The column as the verified layout check sees it.
+    fn facts(&self) -> ColumnFacts<'_> {
+        ColumnFacts {
+            name: &self.name,
+            declared_type: &self.declared_type,
+            not_null: self.not_null,
+            primary_key_position: self.primary_key_position,
+            hidden: self.hidden,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,60 +171,32 @@ fn validate_current_database_inner(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Checks the stored schema version (verified kernel
+/// `classify_for_validation`, which agrees with opening: a database opens as
+/// current exactly when it validates).
 fn validate_schema_version(conn: &Connection) -> Result<()> {
-    let mut statement = conn.prepare(
-        "SELECT value FROM metadata
-         WHERE key = 'schema_version'",
-    )?;
-    let mut rows = statement.query([])?;
-    let Some(row) = rows.next()? else {
-        return Err(Error::corrupt_stored_value(
-            "metadata",
-            "value",
-            "key=\"schema_version\"",
-            "exactly one schema_version row is required",
-        ));
-    };
-    let value = text_value(
-        row.get_ref(0)?,
-        "metadata",
-        "value",
-        "key=\"schema_version\"",
-    )?;
-    let version = value.parse::<i32>().map_err(|_| {
-        Error::corrupt_stored_value(
-            "metadata",
-            "value",
-            "key=\"schema_version\"",
-            "schema_version must be a base-10 signed integer",
-        )
-    })?;
-    if rows.next()?.is_some() {
-        return Err(Error::corrupt_stored_value(
-            "metadata",
-            "value",
-            "key=\"schema_version\"",
-            "exactly one schema_version row is required",
-        ));
-    }
+    let observed = observe_metadata(conn)?;
+    schema_version_verdict(observed.state())
+}
 
-    if version > CURRENT_SCHEMA_VERSION {
-        return Err(Error::UnsupportedSchemaVersion {
-            expected: u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or_default(),
-            found: u32::try_from(version).unwrap_or(u32::MAX),
-        });
-    }
-    if version < CURRENT_SCHEMA_VERSION {
-        return Err(Error::MigrationRequired {
+/// Validation's verdict on observed schema metadata (verified kernel
+/// `classify_for_validation`), as an error for anything but a current,
+/// well-formed version. A newer or corrupt version is reported through the
+/// one message table opening uses (`migrations::unsupported_version` and
+/// `migrations::version_corruption`).
+fn schema_version_verdict(state: MetadataState<'_>) -> Result<()> {
+    match classify_for_validation(state) {
+        ValidateDisposition::Valid => Ok(()),
+        ValidateDisposition::Future(version) => Err(unsupported_version(version)),
+        ValidateDisposition::MigrationRequired(version) => Err(Error::MigrationRequired {
             found: version,
             target: CURRENT_SCHEMA_VERSION,
             action: "validation is read-only; reopen the database writable to apply the ordered \
                      migration, or validate a writable migrated copy"
                 .into(),
-        });
+        }),
+        ValidateDisposition::Corrupt(corruption) => Err(version_corruption(corruption)),
     }
-
-    Ok(())
 }
 
 fn validate_metadata_rows(conn: &Connection) -> Result<()> {
@@ -215,25 +215,17 @@ fn validate_metadata_rows(conn: &Connection) -> Result<()> {
         }
     }
 
-    if schema_versions.len() != 1 {
-        return Err(Error::corrupt_stored_value(
-            "metadata",
-            "value",
-            "key=\"schema_version\"",
-            "exactly one schema_version row is required",
-        ));
-    }
-
-    if schema_versions[0].parse::<i32>().is_err() {
-        return Err(Error::corrupt_stored_value(
-            "metadata",
-            "value",
-            "key=\"schema_version\"",
-            "schema_version must be a base-10 signed integer",
-        ));
-    }
-
-    Ok(())
+    // This scan is a separate read from `validate_schema_version`'s, so the
+    // `schema_version` rows it saw are classified again by the same verified
+    // kernel instead of being re-checked by hand.
+    let state = match schema_versions.as_slice() {
+        [] => MetadataState::NoVersionRow,
+        [first, rest @ ..] => MetadataState::VersionRow {
+            value: Cell::Text(first),
+            more_rows: !rest.is_empty(),
+        },
+    };
+    schema_version_verdict(state)
 }
 
 fn validate_reservation_rows(conn: &Connection) -> Result<()> {
@@ -297,15 +289,19 @@ fn validate_required_constraints(conn: &Connection) -> Result<()> {
         .ok_or_else(|| Error::DatabaseCorruption {
             details: "schema v2 reservations table is missing".into(),
         })?;
-    let normalized = normalize_schema_sql(&sql, None);
+    // Verified kernel `token_run_contains`: the constraint's tokens must
+    // occur as a contiguous run of the table's tokens. Text inside a comment
+    // or a quoted literal is part of one token, so it never matches.
+    let tokens = tokenize_schema_sql(sql.as_bytes(), None);
 
     for (name, expression) in [
         ("valid_port", "CHECK (port BETWEEN 1 AND 65535)"),
         ("valid_created_at", "CHECK (created_at >= 0)"),
         ("valid_last_used_at", "CHECK (last_used_at >= 0)"),
     ] {
-        let required = normalize_schema_sql(&format!("CONSTRAINT {name} {expression}"), None);
-        if !normalized.contains(&required) {
+        let required =
+            tokenize_schema_sql(format!("CONSTRAINT {name} {expression}").as_bytes(), None);
+        if !token_run_contains(&tokens, &required) {
             return Err(Error::DatabaseCorruption {
                 details: format!(
                     "schema v2 reservations table is missing required constraint {name}; \
@@ -331,8 +327,12 @@ fn validate_exact_table_definitions(conn: &Connection) -> Result<()> {
             |row| row.get(0),
         )?;
         let expected_sql = create_sql.replacen("IF NOT EXISTS", "", 1);
-        let expected = normalize_schema_sql(&expected_sql, Some(table));
-        if normalize_schema_sql(&actual, Some(table)) != expected {
+        // Verified kernel `normalize_schema_sql`: its encoding is injective,
+        // so the normalized texts are equal exactly when the token streams
+        // are (whitespace between tokens and the case of bare words aside).
+        let allowed = Some(table.as_bytes());
+        let expected = normalize_schema_sql(expected_sql.as_bytes(), allowed);
+        if normalize_schema_sql(actual.as_bytes(), allowed) != expected {
             return Err(Error::DatabaseCorruption {
                 details: format!(
                     "schema v2 table {table} does not exactly match the required definition; \
@@ -487,24 +487,22 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<ActualColumn>> {
     Ok(columns)
 }
 
+/// The column layout check (verified kernel `columns_match`): equal lengths,
+/// and position by position the same name, the same declared type ignoring
+/// ASCII case, the same `NOT NULL`, no hidden column, and (with `check_pk`)
+/// the same primary-key position.
+fn layout_matches(actual: &[ActualColumn], expected: &[ColumnSpec], check_pk: bool) -> bool {
+    let actual = actual.iter().map(ActualColumn::facts).collect::<Vec<_>>();
+    let expected = expected.iter().map(ColumnSpec::facts).collect::<Vec<_>>();
+    crate::verified::schema_version::columns_match(&actual, &expected, check_pk, true)
+}
+
 fn column_shapes_match(actual: &[ActualColumn], expected: &[ColumnSpec]) -> bool {
-    actual.len() == expected.len()
-        && actual.iter().zip(expected).all(|(actual, expected)| {
-            actual.name == expected.name
-                && actual
-                    .declared_type
-                    .eq_ignore_ascii_case(expected.declared_type)
-                && actual.not_null == expected.not_null
-                && actual.hidden == 0
-        })
+    layout_matches(actual, expected, false)
 }
 
 fn columns_match(actual: &[ActualColumn], expected: &[ColumnSpec]) -> bool {
-    column_shapes_match(actual, expected)
-        && actual
-            .iter()
-            .zip(expected)
-            .all(|(actual, expected)| actual.primary_key_position == expected.primary_key_position)
+    layout_matches(actual, expected, true)
 }
 
 fn table_is_strict(conn: &Connection, table: &str) -> Result<bool> {
@@ -536,18 +534,23 @@ fn text_value<'a>(value: ValueRef<'a>, table: &str, field: &str, key: &str) -> R
     })
 }
 
+/// How a metadata row's key is named in a diagnostic. `corrupt_stored_value`
+/// adds the `key=` label, so this is only the key's text (as the schema
+/// version table in `migrations::version_corruption` names it).
 fn metadata_key_context(value: ValueRef<'_>) -> String {
     match value {
         ValueRef::Text(bytes) => std::str::from_utf8(bytes).map_or_else(
-            |_| "key=<invalid UTF-8>".to_string(),
-            |key| format!("key=\"{}\"", escape_text(key)),
+            |_| "<invalid UTF-8>".to_string(),
+            |key| format!("\"{}\"", escape_text(key)),
         ),
-        other => format!("key=<{}>", value_kind(other)),
+        other => format!("<{}>", value_kind(other)),
     }
 }
 
+/// `char::escape_default` of every char (verified kernel `escape_default`:
+/// printable ASCII only, no unescaped `"`, injective).
 fn escape_text(value: &str) -> String {
-    value.chars().flat_map(char::escape_default).collect()
+    crate::verified::escape::escape_default(value)
 }
 
 fn value_kind(value: ValueRef<'_>) -> &'static str {
@@ -560,133 +563,6 @@ fn value_kind(value: ValueRef<'_>) -> &'static str {
     }
 }
 
-fn normalize_schema_sql(sql: &str, allowed_quoted_identifier: Option<&str>) -> String {
-    let mut normalized = String::with_capacity(sql.len());
-    let mut characters = sql.chars().peekable();
-
-    while let Some(character) = characters.next() {
-        if character.is_ascii_whitespace() {
-            continue;
-        }
-
-        if is_schema_word_character(character) {
-            let mut word = String::from(character);
-            while characters
-                .peek()
-                .is_some_and(|next| is_schema_word_character(*next))
-            {
-                word.push(characters.next().expect("peeked word character"));
-            }
-            push_schema_token(&mut normalized, 'w', &word.to_ascii_lowercase());
-            continue;
-        }
-
-        match character {
-            '"' => {
-                let (raw, decoded, closed) = read_quoted_schema_token(&mut characters, '"', true);
-                if closed && allowed_quoted_identifier == Some(decoded.as_str()) {
-                    push_schema_token(&mut normalized, 'w', &decoded.to_ascii_lowercase());
-                } else {
-                    push_schema_token(&mut normalized, 'q', &raw);
-                }
-            }
-            '\'' | '`' => {
-                let (raw, _, _) = read_quoted_schema_token(&mut characters, character, true);
-                push_schema_token(&mut normalized, character, &raw);
-            }
-            '[' => {
-                let mut raw = String::from(character);
-                for quoted in characters.by_ref() {
-                    raw.push(quoted);
-                    if quoted == ']' {
-                        break;
-                    }
-                }
-                push_schema_token(&mut normalized, '[', &raw);
-            }
-            '-' if characters.peek() == Some(&'-') => {
-                let mut comment = String::from(character);
-                comment.push(characters.next().expect("peeked comment delimiter"));
-                for content in characters.by_ref() {
-                    comment.push(content);
-                    if content == '\n' {
-                        break;
-                    }
-                }
-                push_schema_token(&mut normalized, 'c', &comment);
-            }
-            '/' if characters.peek() == Some(&'*') => {
-                let mut comment = String::from(character);
-                comment.push(characters.next().expect("peeked comment delimiter"));
-                while let Some(content) = characters.next() {
-                    comment.push(content);
-                    if content == '*' && characters.peek() == Some(&'/') {
-                        comment.push(characters.next().expect("peeked comment delimiter"));
-                        break;
-                    }
-                }
-                push_schema_token(&mut normalized, 'c', &comment);
-            }
-            _ => {
-                let mut operator = String::from(character);
-                if characters
-                    .peek()
-                    .is_some_and(|next| is_two_character_sql_operator(character, *next))
-                {
-                    operator.push(characters.next().expect("peeked operator"));
-                    if operator == "->" && characters.peek() == Some(&'>') {
-                        operator.push(characters.next().expect("peeked operator"));
-                    }
-                }
-                push_schema_token(&mut normalized, 's', &operator);
-            }
-        }
-    }
-
-    normalized
-}
-
-fn is_schema_word_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '_' | '$') || !character.is_ascii()
-}
-
-fn is_two_character_sql_operator(first: char, second: char) -> bool {
-    matches!(
-        (first, second),
-        ('<' | '>' | '!' | '=', '=') | ('<' | '-', '>') | ('|', '|')
-    )
-}
-
-fn read_quoted_schema_token<I>(
-    characters: &mut std::iter::Peekable<I>,
-    delimiter: char,
-    doubled_delimiter_escape: bool,
-) -> (String, String, bool)
-where
-    I: Iterator<Item = char>,
-{
-    let mut raw = String::from(delimiter);
-    let mut decoded = String::new();
-    while let Some(character) = characters.next() {
-        raw.push(character);
-        if character == delimiter {
-            if doubled_delimiter_escape && characters.peek() == Some(&delimiter) {
-                raw.push(characters.next().expect("peeked delimiter"));
-                decoded.push(delimiter);
-            } else {
-                return (raw, decoded, true);
-            }
-        } else {
-            decoded.push(character);
-        }
-    }
-    (raw, decoded, false)
-}
-
-fn push_schema_token(normalized: &mut String, kind: char, value: &str) {
-    write!(normalized, "{kind}{}:{value};", value.len()).expect("writing to String cannot fail");
-}
-
 fn is_physical_corruption(error: &rusqlite::Error) -> bool {
     matches!(
         error,
@@ -697,4 +573,346 @@ fn is_physical_corruption(error: &rusqlite::Error) -> bool {
                     | rusqlite::ErrorCode::NotADatabase
             )
     )
+}
+
+#[cfg(test)]
+mod tests {
+    //! Glue tests for the verified schema-SQL kernel: the byte-level
+    //! tokenizer is differential-tested against the historical `char`-level
+    //! implementation (kept here verbatim as the oracle), and the token-run
+    //! containment check is pinned at its boundaries.
+
+    use std::fmt::Write as _;
+
+    use super::{normalize_schema_sql, token_run_contains, tokenize_schema_sql};
+
+    // ---- The historical char-level normalizer (differential oracle) ----
+
+    fn legacy_normalize_schema_sql(sql: &str, allowed_quoted_identifier: Option<&str>) -> String {
+        let mut normalized = String::with_capacity(sql.len());
+        let mut characters = sql.chars().peekable();
+
+        while let Some(character) = characters.next() {
+            if character.is_ascii_whitespace() {
+                continue;
+            }
+
+            if is_schema_word_character(character) {
+                let mut word = String::from(character);
+                while characters
+                    .peek()
+                    .is_some_and(|next| is_schema_word_character(*next))
+                {
+                    word.push(characters.next().expect("peeked word character"));
+                }
+                push_schema_token(&mut normalized, 'w', &word.to_ascii_lowercase());
+                continue;
+            }
+
+            match character {
+                '"' => {
+                    let (raw, decoded, closed) =
+                        read_quoted_schema_token(&mut characters, '"', true);
+                    if closed && allowed_quoted_identifier == Some(decoded.as_str()) {
+                        push_schema_token(&mut normalized, 'w', &decoded.to_ascii_lowercase());
+                    } else {
+                        push_schema_token(&mut normalized, 'q', &raw);
+                    }
+                }
+                '\'' | '`' => {
+                    let (raw, _, _) = read_quoted_schema_token(&mut characters, character, true);
+                    push_schema_token(&mut normalized, character, &raw);
+                }
+                '[' => {
+                    let mut raw = String::from(character);
+                    for quoted in characters.by_ref() {
+                        raw.push(quoted);
+                        if quoted == ']' {
+                            break;
+                        }
+                    }
+                    push_schema_token(&mut normalized, '[', &raw);
+                }
+                '-' if characters.peek() == Some(&'-') => {
+                    let mut comment = String::from(character);
+                    comment.push(characters.next().expect("peeked comment delimiter"));
+                    for content in characters.by_ref() {
+                        comment.push(content);
+                        if content == '\n' {
+                            break;
+                        }
+                    }
+                    push_schema_token(&mut normalized, 'c', &comment);
+                }
+                '/' if characters.peek() == Some(&'*') => {
+                    let mut comment = String::from(character);
+                    comment.push(characters.next().expect("peeked comment delimiter"));
+                    while let Some(content) = characters.next() {
+                        comment.push(content);
+                        if content == '*' && characters.peek() == Some(&'/') {
+                            comment.push(characters.next().expect("peeked comment delimiter"));
+                            break;
+                        }
+                    }
+                    push_schema_token(&mut normalized, 'c', &comment);
+                }
+                _ => {
+                    let mut operator = String::from(character);
+                    if characters
+                        .peek()
+                        .is_some_and(|next| is_two_character_sql_operator(character, *next))
+                    {
+                        operator.push(characters.next().expect("peeked operator"));
+                        if operator == "->" && characters.peek() == Some(&'>') {
+                            operator.push(characters.next().expect("peeked operator"));
+                        }
+                    }
+                    push_schema_token(&mut normalized, 's', &operator);
+                }
+            }
+        }
+
+        normalized
+    }
+
+    fn is_schema_word_character(character: char) -> bool {
+        character.is_ascii_alphanumeric() || matches!(character, '_' | '$') || !character.is_ascii()
+    }
+
+    fn is_two_character_sql_operator(first: char, second: char) -> bool {
+        matches!(
+            (first, second),
+            ('<' | '>' | '!' | '=', '=') | ('<' | '-', '>') | ('|', '|')
+        )
+    }
+
+    fn read_quoted_schema_token<I>(
+        characters: &mut std::iter::Peekable<I>,
+        delimiter: char,
+        doubled_delimiter_escape: bool,
+    ) -> (String, String, bool)
+    where
+        I: Iterator<Item = char>,
+    {
+        let mut raw = String::from(delimiter);
+        let mut decoded = String::new();
+        while let Some(character) = characters.next() {
+            raw.push(character);
+            if character == delimiter {
+                if doubled_delimiter_escape && characters.peek() == Some(&delimiter) {
+                    raw.push(characters.next().expect("peeked delimiter"));
+                    decoded.push(delimiter);
+                } else {
+                    return (raw, decoded, true);
+                }
+            } else {
+                decoded.push(character);
+            }
+        }
+        (raw, decoded, false)
+    }
+
+    fn push_schema_token(normalized: &mut String, kind: char, value: &str) {
+        write!(normalized, "{kind}{}:{value};", value.len())
+            .expect("writing to String cannot fail");
+    }
+
+    // ---- Helpers ----
+
+    fn normalized(sql: &str, allowed: Option<&str>) -> String {
+        String::from_utf8(normalize_schema_sql(
+            sql.as_bytes(),
+            allowed.map(str::as_bytes),
+        ))
+        .expect("the normalized form of UTF-8 text is UTF-8")
+    }
+
+    fn contains(hay: &str, needle: &str) -> bool {
+        token_run_contains(
+            &tokenize_schema_sql(hay.as_bytes(), None),
+            &tokenize_schema_sql(needle.as_bytes(), None),
+        )
+    }
+
+    /// A small deterministic xorshift generator (no test-only dependency).
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            usize::try_from(self.next_u64() % (n as u64)).expect("below n")
+        }
+    }
+
+    /// Characters that exercise every tokenizer branch, including non-ASCII
+    /// text (2-, 3- and 4-byte UTF-8), control characters, vertical tab
+    /// (not ASCII whitespace), and every delimiter and operator byte.
+    const ALPHABET: &[char] = &[
+        'a', 'Z', 'q', '0', '9', '_', '$', ' ', '\t', '\n', '\r', '\x0B', '\x0C', '\0', '"', '\'',
+        '`', '[', ']', '-', '/', '*', '<', '>', '!', '=', '|', '(', ')', ',', ';', ':', '.', '+',
+        '%', 'é', 'É', '€', '😀', '\u{85}', '\u{a0}',
+    ];
+
+    fn random_sql(rng: &mut Rng) -> String {
+        let len = rng.below(24);
+        (0..len)
+            .map(|_| ALPHABET[rng.below(ALPHABET.len())])
+            .collect()
+    }
+
+    // ---- Differential tests ----
+
+    #[test]
+    fn kernel_normalizer_matches_the_char_level_normalizer_on_random_text() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..200_000 {
+            let sql = random_sql(&mut rng);
+            let allowed_text = random_sql(&mut rng);
+            for allowed in [
+                None,
+                Some("metadata"),
+                Some("reservations"),
+                Some(allowed_text.as_str()),
+                Some(""),
+            ] {
+                assert_eq!(
+                    normalized(&sql, allowed),
+                    legacy_normalize_schema_sql(&sql, allowed),
+                    "sql={sql:?} allowed={allowed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kernel_normalizer_matches_the_char_level_normalizer_on_edge_cases() {
+        let cases = [
+            "",
+            " \t\r\n\x0C",
+            "\x0B",
+            "\"",
+            "\"\"",
+            "\"\"\"\"",
+            "\"a\"\"b\"",
+            "\"metadata\"",
+            "\"Metadata\"",
+            "\"metadata",
+            "'it''s'",
+            "'unterminated",
+            "`a``b`",
+            "[a]]b",
+            "[unterminated",
+            "-",
+            "--",
+            "-- comment\nnext",
+            "-->",
+            "->",
+            "->>",
+            "->>>",
+            "<=>",
+            "<>=",
+            "!==",
+            "||||",
+            "/",
+            "/*",
+            "/*/",
+            "/**/",
+            "/* a */ b",
+            "/* never closed *",
+            "CamelCase_Word$1 éÉ€😀",
+            "a\u{85}b\u{a0}c",
+            "CREATE TABLE \"reservations\" (port INTEGER NOT NULL)",
+        ];
+        for sql in cases {
+            for allowed in [None, Some("metadata"), Some("a\"b"), Some("")] {
+                assert_eq!(
+                    normalized(sql, allowed),
+                    legacy_normalize_schema_sql(sql, allowed),
+                    "sql={sql:?} allowed={allowed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kernel_normalizer_matches_the_schema_definitions() {
+        for (table, sql) in [
+            ("metadata", super::CREATE_METADATA_TABLE),
+            ("reservations", super::CREATE_RESERVATIONS_TABLE),
+        ] {
+            assert_eq!(
+                normalized(sql, Some(table)),
+                legacy_normalize_schema_sql(sql, Some(table))
+            );
+        }
+    }
+
+    #[test]
+    fn normalizer_encodes_each_token_with_its_byte_length() {
+        assert_eq!(normalized("", None), "");
+        assert_eq!(normalized("  ", None), "");
+        assert_eq!(normalized("Port", None), "w4:port;");
+        assert_eq!(normalized("é", None), "w2:é;");
+        assert_eq!(normalized("->>", None), "s3:->>;");
+        assert_eq!(normalized("\"a\"\"b\"", Some("a\"b")), "w3:a\"b;");
+        assert_eq!(normalized("\"a\"\"b\"", None), "q6:\"a\"\"b\";");
+        // Length prefixes keep the encoding injective: these two inputs
+        // differ in token boundaries, so their normalized forms differ.
+        assert_ne!(normalized("'a;w1:b'", None), normalized("'a' b", None));
+        let long = "x".repeat(1234);
+        assert_eq!(normalized(&long, None), format!("w1234:{long};"));
+    }
+
+    // ---- Token-run containment ----
+
+    #[test]
+    fn token_run_containment_is_aligned_to_token_boundaries() {
+        let constraint = "CONSTRAINT valid_port CHECK (port BETWEEN 1 AND 65535)";
+        assert!(contains(constraint, constraint));
+        assert!(contains(
+            &format!("port INTEGER NOT NULL {constraint}, project TEXT"),
+            constraint
+        ));
+        assert!(contains(
+            "constraint   VALID_PORT check(port between 1 and 65535)",
+            constraint
+        ));
+        // The constraint text inside a comment or a quoted literal is one
+        // token there, so it does not occur as a run of tokens.
+        assert!(!contains(&format!("/* {constraint} */"), constraint));
+        assert!(!contains(&format!("-- {constraint}\n"), constraint));
+        assert!(!contains(&format!("'{constraint}'"), constraint));
+        // Nor does the encoded token stream of the constraint, which the old
+        // substring search over normalized text accepted.
+        let encoded = normalized(constraint, None);
+        assert!(!contains(&format!("/* {encoded} */"), constraint));
+        assert!(!contains(&format!("'{encoded}'"), constraint));
+        // A run must be contiguous and complete.
+        assert!(!contains(
+            "CONSTRAINT valid_port /* x */ CHECK (port BETWEEN 1 AND 65535)",
+            constraint
+        ));
+        assert!(!contains(
+            "CONSTRAINT valid_port CHECK (port BETWEEN 1 AND 6553)",
+            constraint
+        ));
+        assert!(!contains("CONSTRAINT valid_port", constraint));
+        // A bare word does not match inside a longer word.
+        assert!(!contains("valid_ports", "valid_port"));
+        // Boundaries: the empty needle occurs everywhere, including in empty
+        // text; nothing non-empty occurs in empty text.
+        assert!(contains("", ""));
+        assert!(contains("a", ""));
+        assert!(!contains("", "a"));
+        assert!(contains("a b", "b"));
+        assert!(contains("a b", "a"));
+    }
 }

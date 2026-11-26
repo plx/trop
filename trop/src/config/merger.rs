@@ -6,6 +6,8 @@
 use crate::config::loader::ConfigSource;
 use crate::config::schema::{CleanupConfig, Config, OccupancyConfig, PortConfig};
 use crate::config::ConfigField;
+use crate::verified::config::overlay_leaf;
+use crate::verified::port_bounds::{overlay_port_bounds, LayerLeaves, PortBounds, PortLayer};
 
 /// Merges configuration sources according to precedence rules.
 ///
@@ -65,59 +67,38 @@ impl ConfigMerger {
             on_field(ConfigField::Project);
         }
 
-        if source.disable_autoinit.is_some() {
-            target.disable_autoinit = source.disable_autoinit;
-            on_field(ConfigField::DisableAutoinit);
+        // Scalar leaves: the verified kernel's `overlay_leaf` returns the
+        // source's value when it sets one (and reports it as set), otherwise
+        // the target's. Folded over the layers, each leaf ends up with the
+        // value of the highest-precedence layer that sets it
+        // (`lemma_fold_overlay_precedence`).
+        macro_rules! leaf {
+            ($leaf:ident, $field:ident) => {{
+                let (value, set) = overlay_leaf(target.$leaf, source.$leaf);
+                target.$leaf = value;
+                if set {
+                    on_field(ConfigField::$field);
+                }
+            }};
         }
-
-        if source.disable_autoprune.is_some() {
-            target.disable_autoprune = source.disable_autoprune;
-            on_field(ConfigField::DisableAutoprune);
-        }
-
-        if source.disable_autoexpire.is_some() {
-            target.disable_autoexpire = source.disable_autoexpire;
-            on_field(ConfigField::DisableAutoexpire);
-        }
-
-        if source.allow_unrelated_path.is_some() {
-            target.allow_unrelated_path = source.allow_unrelated_path;
-            on_field(ConfigField::AllowUnrelatedPath);
-        }
-
-        if source.allow_change_project.is_some() {
-            target.allow_change_project = source.allow_change_project;
-            on_field(ConfigField::AllowChangeProject);
-        }
-
-        if source.allow_change_task.is_some() {
-            target.allow_change_task = source.allow_change_task;
-            on_field(ConfigField::AllowChangeTask);
-        }
-
-        if source.allow_change.is_some() {
-            target.allow_change = source.allow_change;
-            on_field(ConfigField::AllowChange);
-        }
-
-        if source.maximum_lock_wait_seconds.is_some() {
-            target.maximum_lock_wait_seconds = source.maximum_lock_wait_seconds;
-            on_field(ConfigField::MaximumLockWaitSeconds);
-        }
-
-        if source.output_format.is_some() {
-            target.output_format = source.output_format;
-            on_field(ConfigField::OutputFormat);
-        }
+        leaf!(disable_autoinit, DisableAutoinit);
+        leaf!(disable_autoprune, DisableAutoprune);
+        leaf!(disable_autoexpire, DisableAutoexpire);
+        leaf!(allow_unrelated_path, AllowUnrelatedPath);
+        leaf!(allow_change_project, AllowChangeProject);
+        leaf!(allow_change_task, AllowChangeTask);
+        leaf!(allow_change, AllowChange);
+        leaf!(maximum_lock_wait_seconds, MaximumLockWaitSeconds);
+        leaf!(output_format, OutputFormat);
 
         // Merge ports config
         if let Some(ref source_ports) = source.ports {
-            target.ports = Some(match &target.ports {
-                Some(target_ports) => Self::merge_port_config(target_ports, source_ports),
-                None => source_ports.clone(),
-            });
-            on_field(ConfigField::PortsMin);
-            if source_ports.max.is_some() || source_ports.max_offset.is_some() {
+            let (ports, leaves) = Self::merge_port_config(target.ports.as_ref(), source_ports);
+            target.ports = Some(ports);
+            if leaves.min {
+                on_field(ConfigField::PortsMin);
+            }
+            if leaves.upper {
                 // Selecting either upper-bound representation also clears the
                 // mutually exclusive representation.
                 on_field(ConfigField::PortsMax);
@@ -138,13 +119,16 @@ impl ConfigMerger {
             on_field(ConfigField::ExcludedPorts);
         }
 
-        // Merge cleanup config
+        // Merge cleanup config: a source section (even an empty one) makes
+        // the target section present; its leaf is overlaid.
         if let Some(ref source_cleanup) = source.cleanup {
-            target.cleanup = Some(match &target.cleanup {
-                Some(target_cleanup) => Self::merge_cleanup(target_cleanup, source_cleanup),
-                None => source_cleanup.clone(),
-            });
-            if source_cleanup.expire_after_days.is_some() {
+            let lower = target
+                .cleanup
+                .as_ref()
+                .and_then(|cleanup| cleanup.expire_after_days);
+            let (expire_after_days, set) = overlay_leaf(lower, source_cleanup.expire_after_days);
+            target.cleanup = Some(CleanupConfig { expire_after_days });
+            if set {
                 on_field(ConfigField::CleanupExpireAfterDays);
             }
         }
@@ -167,32 +151,37 @@ impl ConfigMerger {
 
     /// Merge port configuration.
     ///
-    /// Source values take precedence over target values.
-    fn merge_port_config(target: &PortConfig, source: &PortConfig) -> PortConfig {
-        let (max, max_offset) = if source.max.is_some() && source.max_offset.is_some() {
-            (source.max, source.max_offset)
-        } else if source.max_offset.is_some() {
-            (None, source.max_offset)
-        } else if source.max.is_some() {
-            (source.max, None)
-        } else {
-            (target.max, target.max_offset)
+    /// Source values take precedence over target values: the source's `min`
+    /// always wins, and an upper bound in the source replaces the target's.
+    /// The source's `max_offset` is resolved against the source's own `min`
+    /// into an absolute `max`, and a target upper bound the source keeps
+    /// stays where it is, so a later `min` never moves an earlier offset that
+    /// resolved. (An offset that does not resolve -- 0, or past 65535 -- is
+    /// kept as written for validation to report; this merge validates
+    /// nothing.) The decision is made by the verified port-bounds kernel
+    /// (`overlay_port_bounds`); this returns the merged section and the
+    /// leaves the source set.
+    fn merge_port_config(
+        target: Option<&PortConfig>,
+        source: &PortConfig,
+    ) -> (PortConfig, LayerLeaves) {
+        // An absent target section has no upper bound; its `min` is
+        // irrelevant because every source section sets `min`.
+        let lower = target.map_or(
+            PortBounds {
+                min: source.min,
+                max: None,
+                max_offset: None,
+            },
+            PortConfig::bounds,
+        );
+        let layer = PortLayer {
+            min: Some(source.min),
+            max: source.max,
+            max_offset: source.max_offset,
         };
-
-        PortConfig {
-            min: source.min, // Always use source
-            max,
-            max_offset,
-        }
-    }
-
-    /// Merge cleanup configuration.
-    ///
-    /// Source values take precedence over target values.
-    fn merge_cleanup(target: &CleanupConfig, source: &CleanupConfig) -> CleanupConfig {
-        CleanupConfig {
-            expire_after_days: source.expire_after_days.or(target.expire_after_days),
-        }
+        let (bounds, leaves) = overlay_port_bounds(lower, layer);
+        (PortConfig::from_bounds(bounds), leaves)
     }
 
     fn merge_occupancy(
@@ -228,8 +217,9 @@ impl ConfigMerger {
                 ConfigField::OccupancyCheckAllInterfaces,
             ),
         ] {
-            if let Some(value) = source_value {
-                *target_value = Some(value);
+            let (value, set) = overlay_leaf(*target_value, source_value);
+            *target_value = value;
+            if set {
                 on_field(field);
             }
         }
@@ -316,8 +306,8 @@ mod tests {
         ConfigMerger::merge_into(&mut target, &source);
         let ports = target.ports.unwrap();
         assert_eq!(ports.min, 7000); // Always use source
-        assert_eq!(ports.max, None); // max_offset clears max
-        assert_eq!(ports.max_offset, Some(100)); // Use source
+        assert_eq!(ports.max, Some(7100)); // Source offset, resolved at source min
+        assert_eq!(ports.max_offset, None); // Stored as the absolute max
     }
 
     #[test]
@@ -342,8 +332,8 @@ mod tests {
         ConfigMerger::merge_into(&mut target, &source);
         let ports = target.ports.unwrap();
         assert_eq!(ports.min, 8000);
-        assert_eq!(ports.max, None);
-        assert_eq!(ports.max_offset, Some(25));
+        assert_eq!(ports.max, Some(8025));
+        assert_eq!(ports.max_offset, None);
     }
 
     #[test]
@@ -476,6 +466,64 @@ mod tests {
         ConfigMerger::merge_into(&mut target, &source);
         assert_eq!(target.project, Some("existing".to_string()));
         assert_eq!(target.disable_autoinit, Some(true));
+    }
+
+    /// The leaf overlay reports exactly the leaves the source sets, and keeps
+    /// the historical section semantics: a source section, even one with no
+    /// leaves, makes the target section present.
+    #[test]
+    fn test_merge_reports_exactly_the_set_leaves_and_keeps_section_presence() {
+        let mut target = Config::default();
+        let source = Config {
+            cleanup: Some(CleanupConfig::default()),
+            occupancy_check: Some(OccupancyConfig::default()),
+            output_format: Some(crate::config::OutputFormat::Csv),
+            maximum_lock_wait_seconds: Some(0),
+            ..Default::default()
+        };
+        let mut fields = Vec::new();
+        ConfigMerger::merge_into_observed(&mut target, &source, |field| fields.push(field));
+        assert_eq!(target.cleanup, Some(CleanupConfig::default()));
+        assert_eq!(target.occupancy_check, Some(OccupancyConfig::default()));
+        assert_eq!(
+            fields,
+            [
+                ConfigField::MaximumLockWaitSeconds,
+                ConfigField::OutputFormat
+            ]
+        );
+
+        // A later layer that sets a leaf wins; one that leaves it unset keeps it.
+        let higher = Config {
+            cleanup: Some(CleanupConfig {
+                expire_after_days: Some(7),
+            }),
+            occupancy_check: Some(OccupancyConfig {
+                skip_udp: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut fields = Vec::new();
+        ConfigMerger::merge_into_observed(&mut target, &higher, |field| fields.push(field));
+        let empty_sections = Config {
+            cleanup: Some(CleanupConfig::default()),
+            occupancy_check: Some(OccupancyConfig::default()),
+            ..Default::default()
+        };
+        ConfigMerger::merge_into_observed(&mut target, &empty_sections, |field| {
+            fields.push(field);
+        });
+        assert_eq!(target.cleanup.unwrap().expire_after_days, Some(7));
+        assert_eq!(target.occupancy_check.unwrap().skip_udp, Some(true));
+        assert_eq!(target.output_format, Some(crate::config::OutputFormat::Csv));
+        assert_eq!(
+            fields,
+            [
+                ConfigField::CleanupExpireAfterDays,
+                ConfigField::OccupancySkipUdp
+            ]
+        );
     }
 }
 

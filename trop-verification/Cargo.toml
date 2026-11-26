@@ -1,0 +1,18 @@
+[package]
+name = "trop-verification"
+version = "0.0.0"
+edition = "2021"
+authors = ["trop contributors"]
+license = "Apache-2.0 OR MIT"
+description = "Verus verification harness for trop's verified kernels (not published)"
+repository = "https://github.com/plx/trop"
+publish = false
+
+[dependencies]
+vstd = { workspace = true }
+
+# `cargo verus verify` (run from this directory, or `just verify`) verifies
+# this crate. Its only module is trop's `src/verified` tree, mounted below, so
+# the code that Verus proves is byte-for-byte the code `trop` compiles.
+[package.metadata.verus]
+verify = true

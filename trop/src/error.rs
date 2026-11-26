@@ -362,14 +362,16 @@ impl Error {
     }
 }
 
+/// Whether an `SQLite` failure is lock contention: its (extended) result code
+/// is in the `SQLITE_BUSY` or `SQLITE_LOCKED` family. The formally verified
+/// kernel `verified::cli::is_lock_contention_code` decides from the extended
+/// code (its low byte is 5 or 6), which is how rusqlite derives the
+/// `DatabaseBusy` and `DatabaseLocked` codes.
 pub(crate) fn sqlite_error_is_lock_contention(error: &rusqlite::Error) -> bool {
     matches!(
         error,
         rusqlite::Error::SqliteFailure(sqlite, _)
-            if matches!(
-                sqlite.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            )
+            if crate::verified::cli::is_lock_contention_code(sqlite.extended_code)
     )
 }
 
@@ -498,6 +500,47 @@ mod tests {
         let error = Error::Database(source)
             .classify_sqlite_lock(std::time::Duration::ZERO, "reading schema");
         assert!(matches!(error, Error::Database(_)));
+    }
+
+    /// The kernel's extended-code rule agrees with rusqlite's own
+    /// classification (`DatabaseBusy`/`DatabaseLocked`) for every result code
+    /// rusqlite can construct from the low 16 bits, and for the extremes.
+    #[test]
+    fn sqlite_lock_classification_matches_rusqlite_error_codes() {
+        let codes = (0..=0xFFFF).chain([i32::MIN, -1, -251, i32::MAX, 0x0001_0005, 0x7FFF_FF06]);
+        for code in codes {
+            let ffi = rusqlite::ffi::Error::new(code);
+            let rusqlite_says = matches!(
+                ffi.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            );
+            let error = rusqlite::Error::SqliteFailure(ffi, None);
+            assert_eq!(
+                sqlite_error_is_lock_contention(&error),
+                rusqlite_says,
+                "{code}"
+            );
+        }
+        for (code, contention) in [
+            (rusqlite::ffi::SQLITE_BUSY, true),
+            (rusqlite::ffi::SQLITE_LOCKED, true),
+            (rusqlite::ffi::SQLITE_BUSY_SNAPSHOT, true),
+            (rusqlite::ffi::SQLITE_BUSY_RECOVERY, true),
+            (rusqlite::ffi::SQLITE_LOCKED_SHAREDCACHE, true),
+            (rusqlite::ffi::SQLITE_CORRUPT, false),
+            (rusqlite::ffi::SQLITE_CANTOPEN, false),
+            (rusqlite::ffi::SQLITE_IOERR_LOCK, false),
+        ] {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            assert_eq!(
+                sqlite_error_is_lock_contention(&error),
+                contention,
+                "{code}"
+            );
+        }
+        assert!(!sqlite_error_is_lock_contention(
+            &rusqlite::Error::QueryReturnedNoRows
+        ));
     }
 
     #[test]

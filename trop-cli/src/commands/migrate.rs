@@ -11,6 +11,7 @@ use trop::{execute_migrate, MigrateOptions, MigratePlan};
 
 /// Migrate reservations between paths.
 #[derive(Args)]
+#[allow(clippy::struct_excessive_bools)] // one field per independent CLI flag
 pub struct MigrateCommand {
     /// Source path to migrate from
     #[arg(long, value_name = "PATH")]
@@ -24,9 +25,15 @@ pub struct MigrateCommand {
     #[arg(long)]
     pub recursive: bool,
 
-    /// Overwrite existing reservations at destination
+    /// Overwrite existing reservations at destination (also allows paths
+    /// unrelated to the current directory)
     #[arg(long)]
     pub force: bool,
+
+    /// Allow migrating reservations whose source or destination path is
+    /// unrelated to the current directory
+    #[arg(long)]
+    pub allow_unrelated_path: bool,
 
     /// Preview changes without applying them
     #[arg(long)]
@@ -45,15 +52,19 @@ impl MigrateCommand {
         let from = context.resolve_explicit_path(&self.from)?;
         let to = context.resolve_explicit_path(&self.to)?;
 
-        // 3. Build migrate options
+        // 3. Build migrate options. The unrelated-path permission comes from
+        // the flag or from the effective configuration (`allow_unrelated_path`).
+        let allow_unrelated_path =
+            self.allow_unrelated_path || context.effective()?.allow_unrelated_path();
         let options = MigrateOptions::new(from.clone(), to.clone())
             .with_recursive(self.recursive)
             .with_force(self.force)
-            .with_dry_run(self.dry_run);
+            .with_dry_run(self.dry_run)
+            .with_allow_unrelated_path(allow_unrelated_path);
 
         // 4. Create and build migration plan
         let mut plan = MigratePlan::new(options);
-        plan.build(&db).map_err(CliError::from)?;
+        plan.build(&db).map_err(with_override_hint)?;
 
         // 5. Display migration plan
         if !global.quiet {
@@ -113,23 +124,18 @@ impl MigrateCommand {
                     }
                 }
                 eprintln!();
-
-                if !self.force {
-                    eprintln!("Use --force to overwrite conflicting reservations.");
-                    return Err(CliError::InvalidArguments(
-                        "Migration would conflict with existing reservations".to_string(),
-                    ));
-                }
             }
         }
 
-        // 6. Execute migration if not dry-run
+        // 6. Execute migration if not dry-run. `execute_migrate` rebuilds the
+        // plan inside its immediate transaction and refuses to run if the
+        // reservations changed since the plan above was shown.
         if self.dry_run {
             if !global.quiet {
                 eprintln!("Dry run - no changes made.");
             }
         } else {
-            let result = execute_migrate(&plan, &mut db).map_err(CliError::from)?;
+            let result = execute_migrate(&plan, &mut db).map_err(with_override_hint)?;
 
             if !global.quiet {
                 eprintln!("Migration complete:");
@@ -146,5 +152,25 @@ impl MigrateCommand {
         }
 
         Ok(())
+    }
+}
+
+/// Names the overrides when the unrelated-path guard refuses a migration.
+///
+/// The guard checks every source and destination reservation against the
+/// current directory, so migrating after moving a directory (run from the
+/// new location) needs `--allow-unrelated-path` (or `--force`, or
+/// `allow_unrelated_path: true` in the configuration).
+fn with_override_hint(error: trop::Error) -> CliError {
+    match error {
+        trop::Error::PathRelationshipViolation { details } => {
+            CliError::from(trop::Error::PathRelationshipViolation {
+                details: format!(
+                    "{details} (migrate checks every source and destination reservation; \
+                     use --allow-unrelated-path or --force to migrate it anyway)"
+                ),
+            })
+        }
+        other => CliError::from(other),
     }
 }

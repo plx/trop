@@ -6,18 +6,33 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use crate::config::{Config, ConfigField, ConfigLoader, ConfigValidator, EffectiveConfig};
-use crate::database::Database;
+use crate::config::{
+    CleanupConfig, Config, ConfigField, ConfigLoader, ConfigValidator, EffectiveConfig, PortConfig,
+};
+use crate::database::{check_schema_compatibility, Database, DatabaseConfig};
 use crate::error::{Error, Result};
+use crate::output::{OutputFormat, ShellType};
+use crate::path::relationship::path_tokens;
+use crate::port::allocator::{allocator_from_config, port_span_from_config};
 use crate::port::group::{
-    GroupAllocationRequest, GroupReconciliationPolicy, ServiceAllocationRequest,
+    GroupAllocationOutcome, GroupAllocationRequest, GroupCleanupCounts, GroupReconciliationPolicy,
+    ServiceAllocationRequest,
 };
 use crate::port::occupancy::OccupancyCheckConfig;
+use crate::verified::group::{self as group_kernel, config_service_offset, FormatArg, GroupOutput};
+use crate::verified::port_bounds::group_scan_span;
+use crate::verified::release::guard_paths;
+use crate::verified::reserve::{cleanup_policy, CleanupSwitches};
 use crate::{PathResolver, Port};
-use rusqlite::Connection;
+use rusqlite::types::Value;
+use rusqlite::{params_from_iter, Connection, OpenFlags};
 
+use super::cleanup::CleanupOperations;
+use super::executor::{ExecutionResult, PlanExecutor};
 use super::plan::{OperationPlan, PlanAction};
+use super::release::path_guard;
 
 /// Options for a reserve group operation.
 ///
@@ -308,12 +323,19 @@ impl ReserveGroupPlan {
             });
         }
 
-        // Apply the same invocation-path guard as a single reservation. Force
-        // is the broad override; the narrow path flag authorizes only this
-        // relationship check.
-        if !self.options.force && !self.options.allow_unrelated_path {
-            Database::validate_path_relationship(&self.reservation_path, false)?;
-        }
+        // Apply the same invocation-path guard as a single reservation and a
+        // release. Force is the broad override; the narrow path flag
+        // authorizes only this relationship check. The verified guard
+        // decides whether it applies (neither override) and the lexical
+        // relation to the current directory; the database's single-path
+        // check is the physical fallback for a lexically unrelated path, and
+        // its error is the refusal.
+        let path = &self.reservation_path;
+        let guard = path_guard(self.options.force, self.options.allow_unrelated_path, true)?;
+        guard_paths(&guard, &[path_tokens(path)], &|_index| {
+            Database::validate_path_relationship(path, false).err()
+        })
+        .map_err(|failure| failure.error)?;
 
         // Convert the reservation group to a GroupAllocationRequest
         let request = self.build_group_request(reservation_group)?;
@@ -342,19 +364,59 @@ impl ReserveGroupPlan {
         Ok(plan)
     }
 
+    /// Runs this group reservation as a dry run.
+    ///
+    /// The plan is built and executed exactly as a live run builds and
+    /// executes it -- reconciliation, the fresh allocation, the automatic
+    /// cleanup and, if it freed anything, the single retry -- but inside a
+    /// transaction on a private in-memory copy of the database
+    /// (`open_dry_run_snapshot`), which is then discarded. The result
+    /// therefore reports the ports a live run on the same snapshot would
+    /// reserve or refresh, with its warnings, and the dry run fails with
+    /// exactly the error such a live run would report.
+    /// `database` is the database file, or `None` when none exists yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns every error a live run would return, and an error if the
+    /// database cannot be read.
+    pub fn dry_run(
+        &self,
+        database: Option<&Path>,
+        busy_timeout: Duration,
+    ) -> Result<ExecutionResult> {
+        let snapshot = open_dry_run_snapshot(database, busy_timeout)?;
+        let transaction = snapshot.unchecked_transaction()?;
+        let plan = self.build_plan(&transaction)?;
+        let mut result = PlanExecutor::new(&transaction).execute(&plan)?;
+        // Dropping the transaction rolls the copy back; the copy itself is
+        // discarded with `snapshot`.
+        drop(transaction);
+        result.dry_run = true;
+        Ok(result)
+    }
+
     /// Builds a `GroupAllocationRequest` from the reservation group.
+    ///
+    /// Services are taken in tag order (the configuration stores them in a
+    /// `HashMap`), so the request and any validation error it produces are
+    /// deterministic. The request's project, task, and tags are validated by
+    /// `GroupAllocationRequest::normalized` with the same identifier rules
+    /// as a single reservation.
     fn build_group_request(
         &self,
         group: &crate::config::ReservationGroup,
     ) -> Result<GroupAllocationRequest> {
-        let mut services = Vec::new();
+        let mut definitions = group.services.iter().collect::<Vec<_>>();
+        definitions.sort_unstable_by_key(|(tag, _)| *tag);
 
-        for (tag, service_def) in &group.services {
+        let mut services = Vec::with_capacity(definitions.len());
+        for (tag, service_def) in definitions {
             let preferred = service_def.preferred.map(Port::try_from).transpose()?;
 
             services.push(ServiceAllocationRequest {
                 tag: tag.clone(),
-                offset: Some(service_def.offset.unwrap_or(0)),
+                offset: Some(config_service_offset(service_def.offset)),
                 preferred,
             });
         }
@@ -369,56 +431,300 @@ impl ReserveGroupPlan {
     }
 
     /// Returns configuration adjusted so `reservations.base` is the group scan start.
+    ///
+    /// The configured range is resolved exactly as the allocator resolves it
+    /// (`port_range_from_config`), and the verified kernel
+    /// `verified::port_bounds::group_scan_span` narrows it: the scan runs from
+    /// the base to the configured maximum, and the base must lie inside the
+    /// configured range. Without a base the configuration is unchanged.
     fn config_with_group_base_as_scan_start(
         &self,
         group: &crate::config::ReservationGroup,
     ) -> Result<Config> {
-        let Some(base) = group.base else {
+        if group.base.is_none() {
             return Ok(self.config.clone());
-        };
-
-        let mut config = self.config.clone();
-        let ports = config.ports.as_mut().ok_or_else(|| Error::Validation {
-            field: "ports".to_string(),
-            message: "Port configuration is required when reservations.base is set".to_string(),
+        }
+        let ports = self
+            .config
+            .ports
+            .as_ref()
+            .ok_or_else(|| Error::Validation {
+                field: "ports".to_string(),
+                message: "Port configuration is required when reservations.base is set".to_string(),
+            })?;
+        let configured = port_span_from_config(ports)?;
+        let scan = group_scan_span(group.base, configured).ok_or_else(|| Error::Validation {
+            field: "reservations.base".to_string(),
+            message: format!(
+                "Base port {} must be within port range {}..{}",
+                group.base.unwrap_or_default(),
+                configured.min(),
+                configured.max()
+            ),
         })?;
 
-        let max = if let Some(max) = ports.max {
-            max
-        } else if let Some(max_offset) = ports.max_offset {
-            ports
-                .min
-                .checked_add(max_offset)
-                .ok_or_else(|| Error::Validation {
-                    field: "ports.max_offset".to_string(),
-                    message: format!(
-                        "Offset {max_offset} would overflow when added to min port {}",
-                        ports.min
-                    ),
-                })?
-        } else {
-            return Err(Error::Validation {
-                field: "ports".to_string(),
-                message: "Either max or max_offset must be specified".to_string(),
-            });
-        };
-
-        if base < ports.min || base > max {
-            return Err(Error::Validation {
-                field: "reservations.base".to_string(),
-                message: format!(
-                    "Base port {base} must be within port range {}..{max}",
-                    ports.min
-                ),
-            });
-        }
-
-        ports.min = base;
-        ports.max = Some(max);
-        ports.max_offset = None;
-
+        let mut config = self.config.clone();
+        config.ports = Some(PortConfig {
+            min: scan.min(),
+            max: Some(scan.max()),
+            max_offset: None,
+        });
         Ok(config)
     }
+}
+
+/// Runs a planned group allocation: reconciliation and, for a fresh group,
+/// the allocation with one automatic cleanup when the fallback pattern is
+/// exhausted, and one retry when that cleanup freed something -- the same
+/// step single reservations take.
+///
+/// The cleanup policy is the verified `verified::reserve::cleanup_policy` of
+/// the configuration's `disable_autoprune`/`disable_autoexpire` switches, so
+/// a cleanup is possible unless both are disabled. Enabled expiry uses the
+/// configured `expire_after_days`, or the built-in 30-day default when it is
+/// unset (no `cleanup` section, or one without `expire_after_days`; verified
+/// `verified::cleanup::automatic_selection`), as for single reservations.
+pub(crate) fn execute_group_allocation(
+    conn: &Connection,
+    request: &GroupAllocationRequest,
+    policy: GroupReconciliationPolicy,
+    full_config: &Config,
+    occupancy_config: &OccupancyCheckConfig,
+) -> Result<GroupAllocationOutcome> {
+    let allocator = allocator_from_config(full_config)?;
+    let cleanup = cleanup_policy(CleanupSwitches {
+        disable_autoprune: full_config.disable_autoprune.unwrap_or(false),
+        disable_autoexpire: full_config.disable_autoexpire.unwrap_or(false),
+    });
+    allocator.allocate_group_with_cleanup(
+        conn,
+        request,
+        occupancy_config,
+        policy,
+        cleanup.retry_possible(),
+        |conn| {
+            // The 30-day default is applied by the verified selection, not
+            // here: an unset threshold is passed through unchanged.
+            let unconfigured = CleanupConfig::default();
+            let cleanup_config = full_config.cleanup.as_ref().unwrap_or(&unconfigured);
+            let result = CleanupOperations::automatic_cleanup_in_connection(
+                conn,
+                cleanup_config,
+                cleanup.prune,
+                cleanup.expire,
+                || {},
+            )?;
+            Ok(GroupCleanupCounts {
+                pruned: result.pruned_count,
+                expired: result.expired_count,
+            })
+        },
+    )
+}
+
+/// Opens a private, in-memory copy of a database for a dry run.
+///
+/// - With `database` (an existing database file), the file is opened
+///   read-only and copied -- every table with its rows, then its indexes,
+///   triggers, and views -- inside one read transaction, so the copy is one
+///   consistent snapshot.
+/// - Without one, the copy starts empty, as the database a live run would
+///   create.
+///
+/// The copy is then initialized or migrated in memory by the same schema
+/// check `Database::open` runs, so it is the database a live run would plan
+/// against, and an unsupported schema fails as a live run fails. The file is
+/// never written, created, initialized, or migrated. Opening an existing
+/// WAL-mode database read-only can leave its `-wal`/`-shm` files beside it;
+/// the contents never change.
+///
+/// Like `Database::open`, it first rejects a `busy_timeout` `SQLite` cannot
+/// store (more than `i32::MAX` milliseconds) through the same
+/// `DatabaseConfig::check_busy_timeout`, so with the same validation error,
+/// whether or not a database file exists. Without this check, rusqlite's
+/// `busy_timeout` panics on such a value.
+///
+/// # Errors
+///
+/// Returns an error if the busy timeout is too large, if the file cannot be
+/// opened or read, or if its schema is not supported.
+#[doc(hidden)]
+pub fn open_dry_run_snapshot(
+    database: Option<&Path>,
+    busy_timeout: Duration,
+) -> Result<Connection> {
+    DatabaseConfig::check_busy_timeout(busy_timeout)?;
+    let snapshot = Connection::open_in_memory()?;
+    if let Some(path) = database {
+        let source = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        source.busy_timeout(busy_timeout)?;
+        let read = source.unchecked_transaction()?;
+        copy_database(&read, &snapshot)?;
+        drop(read);
+    }
+    check_schema_compatibility(&snapshot)?;
+    Ok(snapshot)
+}
+
+/// Checks, without creating anything, that a live run could create the
+/// directory that will hold the database at `db_path`, which does not exist
+/// yet.
+///
+/// A live run's `Database::open` creates the missing parent directories with
+/// `create_dir_all`, which fails when the deepest existing ancestor of the
+/// database's directory is not a directory (for example a regular file used
+/// as `--data-dir` or one of its ancestors). A dry run with no database plans
+/// against an empty copy and creates nothing, so it checks that ancestor
+/// instead and fails with an I/O error -- the error class, and so the exit
+/// code, of the live failure; the message describes the obstruction rather
+/// than repeating the operating system's text. Permissions are not checked:
+/// a directory the live run cannot write to is not detected.
+///
+/// # Errors
+///
+/// Returns `Error::Io` when an existing ancestor is not a directory, or when
+/// an ancestor cannot be inspected.
+#[doc(hidden)]
+pub fn check_database_directory_creatable(db_path: &Path) -> Result<()> {
+    let Some(directory) = db_path.parent() else {
+        return Ok(());
+    };
+    // The first failure to inspect a component other than "not found" (for
+    // example "not a directory", reported below a regular file). It is
+    // reported only if no ancestor turns out to be the obstruction.
+    let mut inspection_error: Option<std::io::Error> = None;
+    let mut ancestor = directory;
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) if ancestor.is_dir() => {
+                return inspection_error.map_or(Ok(()), |error| Err(Error::Io(error)));
+            }
+            Ok(_) => {
+                let kind = if ancestor == directory {
+                    ErrorKind::AlreadyExists
+                } else {
+                    ErrorKind::Other
+                };
+                return Err(Error::Io(std::io::Error::new(
+                    kind,
+                    format!(
+                        "cannot create the database directory {}: {} exists and is not a \
+                         directory",
+                        directory.display(),
+                        ancestor.display()
+                    ),
+                )));
+            }
+            Err(error) => {
+                if error.kind() != ErrorKind::NotFound && inspection_error.is_none() {
+                    inspection_error = Some(error);
+                }
+                match ancestor.parent() {
+                    Some(parent) => ancestor = parent,
+                    None => {
+                        return inspection_error.map_or(Ok(()), |error| Err(Error::Io(error)));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Copies every table (with its rows), index, trigger, and view of `source`
+/// into the empty database `target`.
+fn copy_database(source: &Connection, target: &Connection) -> Result<()> {
+    let objects = {
+        let mut statement = source.prepare(
+            "SELECT type, name, sql FROM sqlite_master \
+             WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+             ORDER BY rowid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    // Tables and their rows first, then the objects that refer to them.
+    for (kind, name, sql) in &objects {
+        if kind == "table" {
+            target.execute_batch(sql)?;
+            copy_rows(source, target, name)?;
+        }
+    }
+    for (kind, _, sql) in &objects {
+        if kind != "table" {
+            target.execute_batch(sql)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copies every row of `table` from `source` into the same (empty) table of
+/// `target`.
+fn copy_rows(source: &Connection, target: &Connection, table: &str) -> Result<()> {
+    let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+    let mut select = source.prepare(&format!("SELECT * FROM {quoted}"))?;
+    let columns = select.column_count();
+    let placeholders = vec!["?"; columns].join(", ");
+    let mut insert = target.prepare(&format!("INSERT INTO {quoted} VALUES ({placeholders})"))?;
+    let mut rows = select.query([])?;
+    while let Some(row) = rows.next()? {
+        let values = (0..columns)
+            .map(|index| row.get::<_, Value>(index))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        insert.execute(params_from_iter(values))?;
+    }
+    Ok(())
+}
+
+/// The `--format` of `reserve-group` and `autoreserve`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupOutputFormat {
+    /// Shell export statements.
+    Export,
+    /// JSON.
+    Json,
+    /// Dotenv (`.env`) lines.
+    Dotenv,
+    /// Human-readable text.
+    Human,
+}
+
+/// Selects the output of `reserve-group` and `autoreserve`.
+///
+/// JSON, dotenv, and human output need no shell, so `shell` is ignored for
+/// them. Export output uses `shell` when it is given -- an unknown name is an
+/// error, never replaced by detection -- and otherwise the detected shell.
+/// The verified kernel `verified::group::select_group_output` decides, and it
+/// parses `shell` or detects the shell only in those cases.
+///
+/// # Errors
+///
+/// Returns an error for the export format when `shell` names no supported
+/// shell, or when no shell is given and detection fails.
+pub fn select_group_output(format: GroupOutputFormat, shell: Option<&str>) -> Result<OutputFormat> {
+    let format = match format {
+        GroupOutputFormat::Export => FormatArg::Export,
+        GroupOutputFormat::Json => FormatArg::Json,
+        GroupOutputFormat::Dotenv => FormatArg::Dotenv,
+        GroupOutputFormat::Human => FormatArg::Human,
+    };
+    let parse = shell.map(|name| move || ShellType::from_string(name));
+    Ok(
+        match group_kernel::select_group_output(format, parse, ShellType::detect)? {
+            GroupOutput::Export(shell) => OutputFormat::Export(shell),
+            GroupOutput::Json => OutputFormat::Json,
+            GroupOutput::Dotenv => OutputFormat::Dotenv,
+            GroupOutput::Human => OutputFormat::Human,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -579,6 +885,49 @@ reservations:
                 assert_eq!(request.project, Some("test-project".to_string()));
             }
             _ => panic!("Expected AllocateGroup action"),
+        }
+    }
+
+    /// The unrelated-path guard applies exactly when neither `--force` nor
+    /// `--allow-unrelated-path` is given (the verified guard's flag rule).
+    #[test]
+    fn test_reserve_group_path_guard_applies_exactly_without_an_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r"
+ports:
+  min: 5000
+  max: 7000
+reservations:
+  services:
+    web:
+      offset: 0
+";
+        // The temporary directory is unrelated to the test's working
+        // directory.
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let db = create_test_database();
+        for (force, allow_unrelated_path) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let options = ReserveGroupOptions::new(config_path.clone())
+                .with_force(force)
+                .with_allow_unrelated_path(allow_unrelated_path);
+            let result = ReserveGroupPlan::new(options)
+                .unwrap()
+                .build_plan(db.connection());
+            if force || allow_unrelated_path {
+                assert!(
+                    result.is_ok(),
+                    "force={force} allow={allow_unrelated_path}: {:?}",
+                    result.err()
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(Error::PathRelationshipViolation { .. })),
+                    "{:?}",
+                    result.err()
+                );
+            }
         }
     }
 
@@ -771,14 +1120,317 @@ reservations:
       offset: 0
 ";
         let config_path = create_test_config_file(&temp_dir, config_content);
-        let options = ReserveGroupOptions::new(config_path);
-        let planner = ReserveGroupPlan::new(options).unwrap();
-        let group = planner.config.reservations.as_ref().unwrap();
+
+        // Validation of the document now rejects the base (it used to be
+        // accepted until the plan was built) ...
+        let err = ReserveGroupPlan::new(ReserveGroupOptions::new(config_path))
+            .err()
+            .expect("an out-of-range base is a validation error");
+        assert!(
+            matches!(&err, Error::Validation { field, message }
+                if field == "reservations.base"
+                    && message == "Base port 6500 must be within port range 5000..6000"),
+            "{err:?}"
+        );
+
+        // ... and the scan-start narrowing still refuses it on its own.
+        let planner = planner_with_ports(&temp_dir, "  min: 5000\n  max: 6000");
+        let err = planner
+            .config_with_group_base_as_scan_start(&group_with_base(Some(6500)))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Validation { field, message }
+                if field == "reservations.base"
+                    && message == "Base port 6500 must be within port range 5000..6000"),
+            "{err:?}"
+        );
+    }
+
+    fn planner_with_ports(dir: &TempDir, ports: &str) -> ReserveGroupPlan {
+        let config_content = format!("project: test\nports:\n{ports}\n");
+        let config_path = create_test_config_file(dir, &config_content);
+        ReserveGroupPlan::new(ReserveGroupOptions::new(config_path)).unwrap()
+    }
+
+    fn group_with_base(base: Option<u16>) -> ReservationGroup {
+        let mut services = HashMap::new();
+        services.insert(
+            "web".to_string(),
+            ServiceDefinition {
+                offset: Some(0),
+                preferred: None,
+                env: None,
+            },
+        );
+        ReservationGroup { base, services }
+    }
+
+    /// Regression: the group task follows the same identifier rules as a
+    /// single reservation's task (no NUL bytes, at most 255 bytes).
+    #[test]
+    fn test_reserve_group_validates_task_like_reserve() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r"
+project: test-project
+ports:
+  min: 5000
+  max: 7000
+reservations:
+  services:
+    web:
+      offset: 0
+";
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let db = create_test_database();
+
+        for (task, message) in [
+            ("x".repeat(300), "Cannot exceed 255 bytes"),
+            ("dev\0task".to_string(), "Cannot contain null bytes"),
+        ] {
+            let options = ReserveGroupOptions::new(config_path.clone())
+                .with_allow_unrelated_path(true)
+                .with_task(Some(task.clone()));
+            let planner = ReserveGroupPlan::new(options).unwrap();
+            let single = ConfigValidator::validate_runtime_identifier("task", &task)
+                .expect_err("single reserve rejects this task");
+
+            match planner.build_plan(db.connection()) {
+                Err(Error::Validation {
+                    field,
+                    message: actual,
+                }) => {
+                    assert_eq!(field, "task");
+                    assert_eq!(actual, message);
+                    assert!(
+                        matches!(&single, Error::Validation { message, .. } if *message == actual),
+                        "group and single-reservation task errors differ: {single:?}"
+                    );
+                }
+                other => panic!("expected a task validation error, got {other:?}"),
+            }
+        }
+
+        // A 255-byte task (after trimming) is accepted, trimmed.
+        let task = "t".repeat(255);
+        let options = ReserveGroupOptions::new(config_path)
+            .with_allow_unrelated_path(true)
+            .with_task(Some(format!(" {task} ")));
+        let plan = ReserveGroupPlan::new(options)
+            .unwrap()
+            .build_plan(db.connection())
+            .unwrap();
+        match &plan.actions[0] {
+            PlanAction::AllocateGroup { request, .. } => {
+                assert_eq!(request.task.as_deref(), Some(task.as_str()));
+            }
+            _ => panic!("Expected AllocateGroup action"),
+        }
+    }
+
+    /// Regression: services are built in tag order, not `HashMap` order, so
+    /// the request (and the first validation error) is deterministic.
+    #[test]
+    fn test_build_group_request_orders_services_by_tag() {
+        let tags = [
+            "kappa", "alpha", "zeta", "delta", "beta", "theta", "eta", "gamma", "iota", "epsilon",
+        ];
+        let mut services = HashMap::new();
+        for (offset, tag) in (0u16..).zip(tags) {
+            services.insert(
+                tag.to_string(),
+                ServiceDefinition {
+                    offset: Some(offset),
+                    preferred: None,
+                    env: None,
+                },
+            );
+        }
+        let group = ReservationGroup {
+            base: None,
+            services,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let planner = planner_with_ports(&temp_dir, "  min: 5000\n  max: 7000");
+        let request = planner.build_group_request(&group).unwrap();
+
+        let mut expected = tags.map(str::to_string).to_vec();
+        expected.sort();
+        let actual = request
+            .services
+            .iter()
+            .map(|service| service.tag.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_group_scan_bounds_at_range_edges() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // No base: the configuration is unchanged (max_offset kept).
+        let planner = planner_with_ports(&temp_dir, "  min: 5000\n  max_offset: 100");
+        let config = planner
+            .config_with_group_base_as_scan_start(&group_with_base(None))
+            .unwrap();
+        let ports = config.ports.unwrap();
+        assert_eq!(
+            (ports.min, ports.max, ports.max_offset),
+            (5000, None, Some(100))
+        );
+
+        // Base at either edge of a max_offset range: max comes from the
+        // configured min, never from the base.
+        for base in [5000, 5100] {
+            let config = planner
+                .config_with_group_base_as_scan_start(&group_with_base(Some(base)))
+                .unwrap();
+            let ports = config.ports.unwrap();
+            assert_eq!(
+                (ports.min, ports.max, ports.max_offset),
+                (base, Some(5100), None)
+            );
+        }
+
+        // One past either edge is rejected.
+        for base in [4999, 5101] {
+            let err = planner
+                .config_with_group_base_as_scan_start(&group_with_base(Some(base)))
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::Validation { field, message }
+                    if field == "reservations.base"
+                        && *message == format!("Base port {base} must be within port range 5000..5100")),
+                "unexpected error: {err:?}"
+            );
+        }
+
+        // The whole port domain.
+        let planner = planner_with_ports(&temp_dir, "  min: 1\n  max: 65535");
+        let config = planner
+            .config_with_group_base_as_scan_start(&group_with_base(Some(65535)))
+            .unwrap();
+        let ports = config.ports.unwrap();
+        assert_eq!((ports.min, ports.max), (65535, Some(65535)));
+    }
+
+    #[test]
+    fn test_group_scan_bounds_reports_missing_ports() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = create_test_config_file(&temp_dir, "project: test\n");
+        let planner = ReserveGroupPlan::new(ReserveGroupOptions::new(config_path)).unwrap();
 
         let err = planner
-            .config_with_group_base_as_scan_start(group)
+            .config_with_group_base_as_scan_start(&group_with_base(Some(5000)))
             .unwrap_err();
+        assert!(matches!(err, Error::Validation { field, .. } if field == "ports"));
+    }
 
-        assert!(matches!(err, Error::Validation { field, .. } if field == "reservations.base"));
+    /// Non-export formats never consult the shell, so an unknown `--shell`
+    /// is ignored for them; export parses an explicit shell (and never falls
+    /// back to detection when it is unknown).
+    #[test]
+    fn group_output_selection_consults_the_shell_only_for_export() {
+        for (format, expected) in [
+            (GroupOutputFormat::Json, OutputFormat::Json),
+            (GroupOutputFormat::Dotenv, OutputFormat::Dotenv),
+            (GroupOutputFormat::Human, OutputFormat::Human),
+        ] {
+            assert_eq!(select_group_output(format, Some("csh")).unwrap(), expected);
+            assert_eq!(select_group_output(format, None).unwrap(), expected);
+        }
+
+        assert_eq!(
+            select_group_output(GroupOutputFormat::Export, Some("ZSH")).unwrap(),
+            OutputFormat::Export(ShellType::Zsh)
+        );
+        assert_eq!(
+            select_group_output(GroupOutputFormat::Export, Some("pwsh")).unwrap(),
+            OutputFormat::Export(ShellType::PowerShell)
+        );
+        let error = select_group_output(GroupOutputFormat::Export, Some("csh")).unwrap_err();
+        assert!(matches!(error, Error::Validation { ref field, .. } if field == "shell"));
+
+        // Without an explicit shell, export uses exactly what detection says.
+        let detected = ShellType::detect().map(OutputFormat::Export);
+        let selected = select_group_output(GroupOutputFormat::Export, None);
+        assert_eq!(selected.ok(), detected.ok());
+    }
+
+    /// A dry-run snapshot holds every row of the source and keeps its
+    /// constraints and indexes; writing to it never reaches the file.
+    #[test]
+    fn dry_run_snapshot_copies_rows_constraints_and_indexes() {
+        use crate::{Reservation, ReservationKey};
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("trop.db");
+        {
+            let mut db = Database::open(crate::DatabaseConfig::new(&db_path)).unwrap();
+            for (index, port) in [5000_u16, 5001, 65535].into_iter().enumerate() {
+                let key = ReservationKey::new(
+                    PathBuf::from(format!("/snapshot/{index}")),
+                    (index > 0).then(|| format!("tag{index}")),
+                )
+                .unwrap();
+                let reservation = Reservation::builder(key, Port::try_from(port).unwrap())
+                    .project(Some("p".to_string()))
+                    .build()
+                    .unwrap();
+                db.create_reservation(&reservation).unwrap();
+            }
+        }
+        let original = Database::list_all_reservations(
+            Database::open(crate::DatabaseConfig::new(&db_path).read_only())
+                .unwrap()
+                .connection(),
+        )
+        .unwrap();
+
+        let snapshot =
+            open_dry_run_snapshot(Some(&db_path), std::time::Duration::from_secs(1)).unwrap();
+
+        assert_eq!(
+            Database::list_all_reservations(&snapshot).unwrap(),
+            original
+        );
+        let indexes: i64 = snapshot
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 3);
+        // The UNIQUE port constraint survives the copy.
+        let duplicate = snapshot.execute(
+            "INSERT INTO reservations (path, tag, port, created_at, last_used_at)
+             VALUES ('/other', '', 5000, 0, 0)",
+            [],
+        );
+        assert!(duplicate.is_err());
+        snapshot.execute("DELETE FROM reservations", []).unwrap();
+        drop(snapshot);
+        let after = Database::list_all_reservations(
+            Database::open(crate::DatabaseConfig::new(&db_path).read_only())
+                .unwrap()
+                .connection(),
+        )
+        .unwrap();
+        assert_eq!(after, original, "the file never changes");
+    }
+
+    /// Without a database file the snapshot is a freshly initialized empty
+    /// database, and nothing is created on disk.
+    #[test]
+    fn dry_run_snapshot_without_a_database_is_empty_and_initialized() {
+        let dir = TempDir::new().unwrap();
+        let snapshot = open_dry_run_snapshot(None, std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(Database::list_all_reservations(&snapshot).unwrap(), []);
+        assert_eq!(
+            crate::database::get_schema_version(&snapshot).unwrap(),
+            crate::database::get_schema_version(create_test_database().connection()).unwrap()
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

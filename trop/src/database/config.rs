@@ -8,8 +8,13 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 
-pub(crate) const MAX_BUSY_TIMEOUT_MILLISECONDS: u128 = i32::MAX as u128;
-pub(crate) const MAX_BUSY_TIMEOUT_SECONDS: u64 = (i32::MAX as u64) / 1000;
+/// `SQLite`'s busy-timeout limit (`i32::MAX` milliseconds), from the verified
+/// configuration kernel.
+pub(crate) const MAX_BUSY_TIMEOUT_MILLISECONDS: u64 =
+    crate::verified::config::MAX_BUSY_TIMEOUT_MILLIS;
+/// The largest whole number of seconds within the limit (derived from it in
+/// the verified kernel, which proves it tight).
+pub(crate) const MAX_BUSY_TIMEOUT_SECONDS: u64 = crate::verified::config::MAX_LOCK_WAIT_SECONDS;
 
 /// Configuration for database connections.
 ///
@@ -96,8 +101,23 @@ impl DatabaseConfig {
         self
     }
 
+    /// Reject a busy timeout `SQLite` cannot store (more than `i32::MAX`
+    /// milliseconds, as `Duration::as_millis` counts them). See
+    /// [`Self::check_busy_timeout`].
     pub(super) fn validate_busy_timeout(&self) -> Result<()> {
-        if self.busy_timeout.as_millis() > MAX_BUSY_TIMEOUT_MILLISECONDS {
+        Self::check_busy_timeout(self.busy_timeout)
+    }
+
+    /// Reject a busy timeout `SQLite` cannot store (more than `i32::MAX`
+    /// milliseconds, as `Duration::as_millis` counts them), with the
+    /// validation error `Database::open` reports. Decided by the verified
+    /// kernel's `busy_timeout_ok` over the duration's parts, which also proves
+    /// every configuration-validated `maximum_lock_wait_seconds` passes.
+    ///
+    /// The group dry run's snapshot opener calls this too, so it rejects
+    /// exactly the timeouts, with exactly the error, a live open does.
+    pub(crate) fn check_busy_timeout(timeout: Duration) -> Result<()> {
+        if !crate::verified::config::busy_timeout_ok(timeout.as_secs(), timeout.subsec_nanos()) {
             return Err(Error::Validation {
                 field: "maximum_lock_wait_seconds".into(),
                 message: format!(
@@ -132,16 +152,24 @@ impl DatabaseConfig {
 /// Returns the default data directory for trop.
 ///
 /// Resolution order:
-/// 1. `$TROP_DATA_DIR` if set
-/// 2. `~/.trop` on Unix-like systems or `%USERPROFILE%\.trop` on Windows
+/// 1. `$TROP_DATA_DIR`, used as given, if set
+/// 2. `$HOME/.trop`, if `HOME` is set to a non-empty absolute path
+/// 3. `%USERPROFILE%\.trop`, if `USERPROFILE` is set to a non-empty absolute
+///    path
+///
+/// An empty or relative `HOME` or `USERPROFILE` is skipped rather than used:
+/// it would place the data directory under the current working directory,
+/// so commands run from different directories would silently use different
+/// databases. The choice is made by the formally verified kernel
+/// `verified::cli::select_data_dir` (see `docs/verification.md`).
 ///
 /// This directory contains the database file, config file, and other
 /// persistent data.
 ///
 /// # Errors
 ///
-/// Returns an error if the home directory cannot be determined and
-/// `TROP_DATA_DIR` is not set.
+/// Returns an error if `TROP_DATA_DIR` is not set and neither `HOME` nor
+/// `USERPROFILE` is a non-empty absolute path.
 ///
 /// # Examples
 ///
@@ -152,31 +180,58 @@ impl DatabaseConfig {
 /// println!("Data directory: {}", data_dir.display());
 /// ```
 pub fn default_data_dir() -> Result<PathBuf> {
-    // Check TROP_DATA_DIR first
-    if let Ok(data_dir) = std::env::var("TROP_DATA_DIR") {
-        return Ok(PathBuf::from(data_dir));
-    }
+    data_dir_from(
+        std::env::var_os("TROP_DATA_DIR"),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+    )
+}
 
-    // Fall back to ~/.trop
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| Error::Validation {
-            field: "home_directory".into(),
-            message: "Cannot determine home directory".into(),
-        })?;
-    Ok(PathBuf::from(home).join(".trop"))
+/// [`default_data_dir`] for the given values of `TROP_DATA_DIR`, `HOME` and
+/// `USERPROFILE` (`None` when unset).
+fn data_dir_from(
+    trop_data_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    use crate::verified::cli::{select_data_dir, DataDirSource, HomeFacts};
+
+    let facts = |value: &Option<std::ffi::OsString>| {
+        value.as_ref().map(|value| HomeFacts {
+            nonempty: !value.is_empty(),
+            absolute: Path::new(value).is_absolute(),
+        })
+    };
+    let selected = match select_data_dir(trop_data_dir.is_some(), facts(&home), facts(&userprofile))
+    {
+        Some(DataDirSource::TropDataDir) => trop_data_dir.map(PathBuf::from),
+        Some(DataDirSource::Home) => home.map(|home| PathBuf::from(home).join(".trop")),
+        Some(DataDirSource::UserProfile) => {
+            userprofile.map(|userprofile| PathBuf::from(userprofile).join(".trop"))
+        }
+        None => None,
+    };
+    // The kernel selects only a source that is set, so `selected` is `None`
+    // exactly when it found no usable source.
+    selected.ok_or_else(|| Error::Validation {
+        field: "home_directory".into(),
+        message: "Cannot determine home directory: HOME and USERPROFILE are unset, empty, \
+                  or not absolute paths; set TROP_DATA_DIR or pass --data-dir"
+            .into(),
+    })
 }
 
 /// Resolves the database path using environment variables or defaults.
 ///
-/// The resolution order is:
+/// The database is `trop.db` in [`default_data_dir`]:
 /// 1. `$TROP_DATA_DIR/trop.db` if the `TROP_DATA_DIR` environment variable is set
-/// 2. `~/.trop/trop.db` otherwise
+/// 2. `~/.trop/trop.db` otherwise (see [`default_data_dir`] for the home
+///    directory rules)
 ///
 /// # Errors
 ///
-/// Returns an error if the home directory cannot be determined and
-/// `TROP_DATA_DIR` is not set.
+/// Returns an error if [`default_data_dir`] cannot determine the data
+/// directory.
 ///
 /// # Examples
 ///
@@ -187,11 +242,7 @@ pub fn default_data_dir() -> Result<PathBuf> {
 /// println!("Database path: {}", db_path.display());
 /// ```
 pub fn resolve_database_path() -> Result<PathBuf> {
-    if let Ok(data_dir) = std::env::var("TROP_DATA_DIR") {
-        Ok(PathBuf::from(data_dir).join("trop.db"))
-    } else {
-        Ok(default_data_dir()?.join("trop.db"))
-    }
+    Ok(default_data_dir()?.join("trop.db"))
 }
 
 #[cfg(test)]
@@ -222,9 +273,8 @@ mod tests {
 
     #[test]
     fn test_config_rejects_busy_timeout_larger_than_sqlite_limit() {
-        let config = DatabaseConfig::new("/tmp/test.db").with_busy_timeout(Duration::from_millis(
-            u64::try_from(MAX_BUSY_TIMEOUT_MILLISECONDS).unwrap() + 1,
-        ));
+        let config = DatabaseConfig::new("/tmp/test.db")
+            .with_busy_timeout(Duration::from_millis(MAX_BUSY_TIMEOUT_MILLISECONDS + 1));
         let error = config.validate_busy_timeout().unwrap_err();
         assert!(matches!(
             error,
@@ -234,6 +284,36 @@ mod tests {
             } if field == "maximum_lock_wait_seconds"
                 && message.contains(&MAX_BUSY_TIMEOUT_MILLISECONDS.to_string())
         ));
+    }
+
+    #[test]
+    fn test_busy_timeout_limit_is_exact_at_millisecond_resolution() {
+        let accepts = |timeout: Duration| {
+            DatabaseConfig::new("/tmp/test.db")
+                .with_busy_timeout(timeout)
+                .validate_busy_timeout()
+                .is_ok()
+        };
+        assert_eq!(MAX_BUSY_TIMEOUT_MILLISECONDS, 2_147_483_647);
+        assert_eq!(MAX_BUSY_TIMEOUT_SECONDS, 2_147_483);
+        assert!(accepts(Duration::from_millis(
+            MAX_BUSY_TIMEOUT_MILLISECONDS
+        )));
+        // Sub-millisecond remainders do not count (`as_millis` truncates).
+        assert!(accepts(
+            Duration::from_millis(MAX_BUSY_TIMEOUT_MILLISECONDS) + Duration::from_nanos(999_999)
+        ));
+        assert!(!accepts(Duration::from_millis(
+            MAX_BUSY_TIMEOUT_MILLISECONDS + 1
+        )));
+        assert!(!accepts(Duration::MAX));
+        assert!(!accepts(Duration::from_secs(u64::MAX / 1000 + 1)));
+        // Every whole-second lock wait the configuration accepts is accepted
+        // here, and the next second is not.
+        assert!(accepts(Duration::from_secs(MAX_BUSY_TIMEOUT_SECONDS)));
+        assert!(!accepts(Duration::from_secs(MAX_BUSY_TIMEOUT_SECONDS + 1)));
+        assert!(accepts(Duration::ZERO));
+        assert!(accepts(Duration::from_nanos(1)));
     }
 
     #[test]
@@ -273,6 +353,55 @@ mod tests {
 
         // Clean up
         std::env::remove_var("TROP_DATA_DIR");
+    }
+
+    /// Regression: an empty or relative `HOME` used to give a data directory
+    /// relative to the current directory (`.trop`, `relhome/.trop`), and with
+    /// `HOME` and `USERPROFILE` unset the CLI panicked. Unusable home
+    /// variables are now skipped, and with none left the error is reported.
+    #[cfg(unix)]
+    #[test]
+    fn test_data_dir_skips_unusable_home_variables() {
+        let os = |value: Option<&str>| value.map(std::ffi::OsString::from);
+        for (home, userprofile, expected) in [
+            (Some("/home/u"), None, Some("/home/u/.trop")),
+            (Some("/home/u"), Some("/profile"), Some("/home/u/.trop")),
+            (Some(""), Some("/profile"), Some("/profile/.trop")),
+            (Some("relhome"), Some("/profile"), Some("/profile/.trop")),
+            (None, Some("/profile"), Some("/profile/.trop")),
+            (Some(""), None, None),
+            (Some("relhome"), None, None),
+            (Some("relhome"), Some(""), None),
+            (Some("."), Some("profile"), None),
+            (None, None, None),
+        ] {
+            let result = data_dir_from(None, os(home), os(userprofile));
+            if let Some(dir) = expected {
+                assert_eq!(
+                    result.unwrap(),
+                    PathBuf::from(dir),
+                    "{home:?} {userprofile:?}"
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(&error, Error::Validation { field, .. } if field == "home_directory"),
+                    "{error:?}"
+                );
+            }
+        }
+        // TROP_DATA_DIR is explicit and used as given, whatever the home
+        // variables are (including an empty or relative value).
+        for value in ["custom", "/data", ""] {
+            assert_eq!(
+                data_dir_from(os(Some(value)), os(Some("")), os(Some("rel"))).unwrap(),
+                PathBuf::from(value)
+            );
+            assert_eq!(
+                data_dir_from(os(Some(value)), None, None).unwrap(),
+                PathBuf::from(value)
+            );
+        }
     }
 
     #[test]

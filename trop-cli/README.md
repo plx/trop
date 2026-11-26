@@ -126,8 +126,11 @@ port actually stored after reconciliation.
 
 When the configured range is initially exhausted, `reserve` runs the enabled
 automatic cleanup phases under the same database transaction as allocation:
-stale-path pruning first, then configured age-based expiration. It then retries
-the complete allocation scan exactly once. `--disable-autoprune`,
+stale-path pruning first, then configured age-based expiration. When that
+cleanup removed at least one reservation, it then retries the complete
+allocation scan exactly once; when it removed nothing, the range is reported
+exhausted without a second scan. `reserve-group` and `autoreserve` do the same
+for an exhausted group. `--disable-autoprune`,
 `--disable-autoexpire`, and `--disable-autoclean` override the corresponding
 effective config/environment settings; `--force` does not re-enable a disabled
 phase. Normal mode reports only aggregate prune/expire counts on stderr, while
@@ -384,6 +387,18 @@ Other key environment variables:
 - `trop expire` - Remove stale reservations
 - `trop autoclean` - Combined prune and expire
 - `trop migrate` - Move reservations between paths
+
+`migrate --from <old> --to <new>` moves the reservation at `<old>` (with
+`--recursive`, every reservation at or below `<old>`) to the same place under
+`<new>`, keeping ports, tags, and metadata, in one transaction. It refuses to
+overwrite an existing reservation that is not itself being moved unless
+`--force` is given; moving a path onto itself or re-rooting a subtree onto its
+parent is not an overwrite. Like `release`, it refuses to delete or write a
+reservation whose path is unrelated to the current directory (neither an
+ancestor nor a descendant of it) unless `--allow-unrelated-path`, `--force`, or
+`allow_unrelated_path: true` in the configuration allows it. So after
+`mv old new`, run `trop migrate --from ../old --to . --allow-unrelated-path`
+from inside `new`, or run the migration from a common parent directory.
 
 `prune` treats a reservation target as live only while it resolves to a
 directory. Missing targets, dangling symlinks, paths replaced by files, and

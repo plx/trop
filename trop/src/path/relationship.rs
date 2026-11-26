@@ -2,8 +2,21 @@
 //!
 //! This module provides functionality to determine the relationship between
 //! two paths, such as whether one is an ancestor or descendant of the other.
+//!
+//! The relationship is decided by the verified kernel
+//! `verified::path_relation` (`path_relationship`, `path_is_within`,
+//! `path_contains`). It proves the relation is reflexive and flip-symmetric,
+//! that `Ancestor` is transitive, that `is_within`/`contains` form a partial
+//! order, and that an ancestor's descendants extend it by named components
+//! only.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::path::{Component, Path};
+
+use crate::path::component_kind;
+use crate::verified::path_relation::{
+    path_contains, path_is_within, path_relationship, PathToken, Rel,
+};
 
 /// Relationship between two paths.
 ///
@@ -53,8 +66,24 @@ pub enum PathRelationship {
 impl PathRelationship {
     /// Determine the relationship between two paths.
     ///
-    /// This function normalizes both paths for comparison by removing trailing
-    /// separators and then checks their prefix relationships.
+    /// Both paths are compared component by component after lexical
+    /// resolution: repeated and trailing separators and `.` components are
+    /// ignored, and a `..` cancels the preceding named component (`/a/b/..`
+    /// is the same as `/a`).
+    ///
+    /// A `..` with no named component to cancel (at the root, at the start
+    /// of a relative path, or after a drive prefix: exactly where
+    /// [`resolve_components`](crate::path::normalize::resolve_components)
+    /// fails) is kept as part of the path's *head*, together with its root or
+    /// prefix. Two paths are related only when their heads agree, so a
+    /// relative path (including the empty path) is `Unrelated` to a rooted
+    /// one, `/..` is `Unrelated` to `/`, and `../..` is `Unrelated` to `..`.
+    /// With equal heads, the named components decide.
+    ///
+    /// The relation is reflexive (`between(p, p)` is `Same`), flip-symmetric
+    /// (`between(a, b)` is `Ancestor` exactly when `between(b, a)` is
+    /// `Descendant`), and `Ancestor` is transitive. `Ancestor` means the
+    /// second path is the first followed by one or more named components.
     ///
     /// # Examples
     ///
@@ -88,25 +117,12 @@ impl PathRelationship {
     /// ```
     #[must_use]
     pub fn between(path1: &Path, path2: &Path) -> Self {
-        // Normalize for comparison
-        let p1 = normalize_for_comparison(path1);
-        let p2 = normalize_for_comparison(path2);
-
-        if p1 == p2 {
-            return Self::Same;
+        match path_relationship(&path_tokens(path1), &path_tokens(path2)) {
+            Rel::Ancestor => Self::Ancestor,
+            Rel::Descendant => Self::Descendant,
+            Rel::Same => Self::Same,
+            Rel::Unrelated => Self::Unrelated,
         }
-
-        // Check if path1 is ancestor of path2
-        if p2.starts_with(&p1) {
-            return Self::Ancestor;
-        }
-
-        // Check if path1 is descendant of path2
-        if p1.starts_with(&p2) {
-            return Self::Descendant;
-        }
-
-        Self::Unrelated
     }
 
     /// Check if the relationship is hierarchical (not unrelated).
@@ -165,8 +181,7 @@ impl PathRelationship {
     /// ```
     #[must_use]
     pub fn is_within(path: &Path, directory: &Path) -> bool {
-        let rel = Self::between(path, directory);
-        matches!(rel, Self::Descendant | Self::Same)
+        path_is_within(&path_tokens(path), &path_tokens(directory))
     }
 
     /// Check if a path contains another path (ancestor or same).
@@ -185,8 +200,7 @@ impl PathRelationship {
     /// ```
     #[must_use]
     pub fn contains(path: &Path, other: &Path) -> bool {
-        let rel = Self::between(path, other);
-        matches!(rel, Self::Ancestor | Self::Same)
+        path_contains(&path_tokens(path), &path_tokens(other))
     }
 
     /// Get a human-readable description of the relationship.
@@ -235,13 +249,54 @@ impl PathRelationship {
     }
 }
 
-/// Normalize a path for comparison purposes.
+/// A path's components as kernel tokens: each component's kind and an
+/// equality key.
 ///
-/// This function removes trailing slashes and normalizes separators to ensure
-/// consistent comparison results.
-fn normalize_for_comparison(path: &Path) -> PathBuf {
-    // Components iterator automatically normalizes trailing separators
-    path.components().collect()
+/// `std` compares named components by their `OsStr` encoding and Windows
+/// prefixes by their parsed form (so `c:` equals `C:`), so a prefix is keyed
+/// by its parsed `Prefix` value and every other component by its encoded
+/// bytes.
+pub(crate) fn path_tokens(path: &Path) -> Vec<PathToken> {
+    path.components()
+        .map(|component| PathToken {
+            kind: component_kind(component),
+            name: component_key(component),
+        })
+        .collect()
+}
+
+fn component_key(component: Component<'_>) -> Vec<u8> {
+    match component {
+        Component::Prefix(prefix) => format!("{:?}", prefix.kind()).into_bytes(),
+        other => os_str_key(other.as_os_str()),
+    }
+}
+
+// Each `os_str_key` is an injective encoding of the `OsStr`, so key equality
+// is `OsStr` equality. (`OsStr::as_encoded_bytes` would serve every platform
+// at once, but it is newer than the crate's minimum supported Rust version.)
+
+/// The bytes of a Unix `OsStr`.
+#[cfg(unix)]
+fn os_str_key(value: &OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    value.as_bytes().to_vec()
+}
+
+/// The UTF-16 code units of a Windows `OsStr`, as little-endian bytes
+/// (fixed-width, so injective).
+#[cfg(windows)]
+fn os_str_key(value: &OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    value.encode_wide().flat_map(u16::to_le_bytes).collect()
+}
+
+/// Other platforms: the `Debug` spelling, which quotes the string and escapes
+/// backslashes and every byte or code unit that is not valid Unicode, so
+/// distinct values never share a spelling.
+#[cfg(not(any(unix, windows)))]
+fn os_str_key(value: &OsStr) -> Vec<u8> {
+    format!("{value:?}").into_bytes()
 }
 
 #[cfg(test)]
@@ -390,16 +445,150 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_for_comparison() {
+    fn test_separators_and_dots_do_not_matter() {
+        for (left, right) in [
+            ("/a/", "/a"),
+            ("/a//b", "/a/b"),
+            ("/a/./b", "/a/b"),
+            ("/", "/"),
+            ("//", "/"),
+        ] {
+            assert_eq!(
+                PathRelationship::between(Path::new(left), Path::new(right)),
+                PathRelationship::Same,
+                "{left} vs {right}"
+            );
+        }
+    }
+
+    // Regression: `..` used to be compared as a literal component, so
+    // `/a/b/..` was reported as a descendant of `/a`.
+    #[test]
+    fn test_parent_components_are_resolved_before_comparing() {
+        let cases = [
+            ("/a/b/..", "/a", PathRelationship::Same),
+            ("/a/b/../c", "/a/c", PathRelationship::Same),
+            ("/a/b/../c", "/a", PathRelationship::Descendant),
+            ("/a/b/..", "/a/b", PathRelationship::Ancestor),
+            ("/a/../b", "/a", PathRelationship::Unrelated),
+            ("a/..", "", PathRelationship::Same),
+            ("../a", "../a/b", PathRelationship::Ancestor),
+            ("../a/..", "..", PathRelationship::Same),
+            ("a/../..", "..", PathRelationship::Same),
+            ("../a", "a", PathRelationship::Unrelated),
+            ("./a", "a", PathRelationship::Same),
+        ];
+        for (left, right, expected) in cases {
+            assert_eq!(
+                PathRelationship::between(Path::new(left), Path::new(right)),
+                expected,
+                "{left} vs {right}"
+            );
+        }
+    }
+
+    // A `..` that cannot be resolved belongs to the path's head: it is never
+    // compared as if it were a named child component. (It used to be, so
+    // `../..` was reported as a descendant of `..`, and `/..` of `/`.)
+    #[test]
+    fn test_unresolvable_parent_components_are_part_of_the_head() {
+        let cases = [
+            ("..", ".", PathRelationship::Unrelated),
+            ("..", "", PathRelationship::Unrelated),
+            ("../..", "..", PathRelationship::Unrelated),
+            ("../../a", "../a", PathRelationship::Unrelated),
+            ("/..", "/", PathRelationship::Unrelated),
+            ("/../a", "/a", PathRelationship::Unrelated),
+            ("/..", "/..", PathRelationship::Same),
+            ("/../a", "/../a/b", PathRelationship::Ancestor),
+            ("../..", "../../a", PathRelationship::Ancestor),
+            ("..", "../a", PathRelationship::Ancestor),
+        ];
+        for (left, right, expected) in cases {
+            assert_eq!(
+                PathRelationship::between(Path::new(left), Path::new(right)),
+                expected,
+                "{left} vs {right}"
+            );
+        }
+        assert!(!PathRelationship::is_within(
+            Path::new(".."),
+            Path::new(".")
+        ));
+        assert!(!PathRelationship::is_within(Path::new(".."), Path::new("")));
+        assert!(!PathRelationship::is_within(
+            Path::new("../.."),
+            Path::new("..")
+        ));
+        assert!(!PathRelationship::contains(
+            Path::new("/"),
+            Path::new("/..")
+        ));
+        assert!(PathRelationship::is_within(
+            Path::new("../a"),
+            Path::new("..")
+        ));
+    }
+
+    // Windows prefixes are compared in their parsed form, and a `..` right
+    // after a drive-relative prefix belongs to the head.
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_prefixes() {
+        let cases = [
+            (r"C:\a", r"c:\a\b", PathRelationship::Ancestor),
+            (r"C:\a", r"D:\a", PathRelationship::Unrelated),
+            (r"C:\a", r"\a", PathRelationship::Unrelated),
+            ("C:..", "C:", PathRelationship::Unrelated),
+            (r"C:..\a", "C:..", PathRelationship::Descendant),
+        ];
+        for (left, right, expected) in cases {
+            assert_eq!(
+                PathRelationship::between(Path::new(left), Path::new(right)),
+                expected,
+                "{left} vs {right}"
+            );
+        }
+    }
+
+    // Regression: the empty path used to be an ancestor of every absolute
+    // path. A relative path and a rooted path are never hierarchically
+    // related.
+    #[test]
+    fn test_relative_paths_are_unrelated_to_rooted_paths() {
+        for relative in ["", ".", "a", "a/b", ".."] {
+            for rooted in ["/", "/a", "/a/b"] {
+                assert_eq!(
+                    PathRelationship::between(Path::new(relative), Path::new(rooted)),
+                    PathRelationship::Unrelated,
+                    "{relative:?} vs {rooted:?}"
+                );
+                assert_eq!(
+                    PathRelationship::between(Path::new(rooted), Path::new(relative)),
+                    PathRelationship::Unrelated,
+                    "{rooted:?} vs {relative:?}"
+                );
+            }
+        }
+        assert!(!PathRelationship::contains(Path::new(""), Path::new("/a")));
+        assert!(!PathRelationship::is_within(Path::new("/a"), Path::new("")));
+        // Relative paths still relate to each other.
         assert_eq!(
-            normalize_for_comparison(Path::new("/a/")),
-            PathBuf::from("/a")
+            PathRelationship::between(Path::new(""), Path::new("a")),
+            PathRelationship::Ancestor
+        );
+    }
+
+    #[test]
+    fn test_component_boundaries() {
+        assert_eq!(
+            PathRelationship::between(Path::new("/a/b"), Path::new("/a/bc")),
+            PathRelationship::Unrelated
         );
         assert_eq!(
-            normalize_for_comparison(Path::new("/a")),
-            PathBuf::from("/a")
+            PathRelationship::between(Path::new("/"), Path::new("/a/b")),
+            PathRelationship::Ancestor
         );
-        assert_eq!(normalize_for_comparison(Path::new("/")), PathBuf::from("/"));
     }
 
     // Property-based tests
@@ -407,6 +596,7 @@ mod tests {
     mod property_tests {
         use super::*;
         use proptest::prelude::*;
+        use std::path::PathBuf;
 
         // Strategy to generate valid path strings
         fn path_strategy() -> impl Strategy<Value = String> {

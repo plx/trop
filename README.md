@@ -57,8 +57,11 @@ make an IPv6 probe also claim IPv4. Windows wildcard probes also request
 exclusive address use so its permissive default binding rules cannot hide a
 listener on a specific interface. A bind conflict marks the port occupied.
 Unsupported families, permission failures, and other unexpected socket errors
-are reported with the failed protocol, family, scope, and address; allocation
-treats those failures conservatively as possibly occupied.
+are reported with the failed protocol, family, scope, and address. A failed
+probe stops allocation with that error: trop never hands out a port whose
+check did not complete, and it does not skip to the next port. On hosts
+without a protocol or address family, skip its probes (for example
+`--skip-ipv6`).
 
 `reserve`, `reserve-group`, `autoreserve`, `scan`, and
 `port-info --include-occupancy` all derive this policy from the same effective
@@ -380,6 +383,24 @@ The project includes comprehensive test coverage:
 
 This release should be considered a "preview" release: the core functionality is implemented, heavily-tested, and appears to work, but has not *yet* been heavily used in real-world scenarios. 
 As such, expect potential bugs and breaking changes—appreciate all early adopters and welcome any feedback!
+
+### Unreleased changes to the `trop` library API
+
+The next release of the `trop` library crate includes at least these
+changes to public API and behavior relative to 0.2.0, so it needs a new
+minor version (0.3.0: Cargo treats a 0.x minor bump as breaking) rather than
+a 0.2.x patch:
+
+- `operations::MigrateOptions` has a new public field,
+  `allow_unrelated_path`. Code that builds `MigrateOptions` with a struct
+  literal must set it; `MigrateOptions::new` sets it to `false`, and the new
+  builder `MigrateOptions::with_allow_unrelated_path` sets it.
+- `operations::migrate::to_operation_plan` now returns
+  `Result<OperationPlan>` instead of `OperationPlan`.
+- Migration now applies the unrelated-path guard. With neither `force` nor
+  `allow_unrelated_path`, a migration whose source or destination keys are
+  unrelated to the process's working directory fails with
+  `Error::PathRelationshipViolation`.
 
 ## License
 

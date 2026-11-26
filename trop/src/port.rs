@@ -20,6 +20,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::verified::port::{
+    port_checked_add, port_checked_sub, port_is_privileged, port_is_valid, PortCursor, PortSpan,
+};
+
 /// A valid network port number (1-65535).
 ///
 /// Port 0 is considered invalid as it has special meaning in networking contexts.
@@ -35,9 +39,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// // Invalid port (0)
 /// assert!(Port::try_from(0).is_err());
+///
+/// // Deserialization enforces the same rule.
+/// assert!(serde_json::from_str::<Port>("0").is_err());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "u16", into = "u16")]
 pub struct Port(u16);
 
 impl Port {
@@ -79,7 +86,7 @@ impl Port {
     /// ```
     #[must_use]
     pub const fn is_privileged(self) -> bool {
-        self.0 < 1024
+        port_is_privileged(self.0)
     }
 
     /// Add an offset to a port, returning a new port if the result is valid.
@@ -100,9 +107,9 @@ impl Port {
     /// ```
     #[must_use]
     pub const fn checked_add(self, offset: u16) -> Option<Self> {
-        match self.0.checked_add(offset) {
-            Some(result) if result > 0 => Some(Self(result)),
-            _ => None,
+        match port_checked_add(self.0, offset) {
+            Some(result) => Some(Self(result)),
+            None => None,
         }
     }
 
@@ -124,9 +131,9 @@ impl Port {
     /// ```
     #[must_use]
     pub const fn checked_sub(self, offset: u16) -> Option<Self> {
-        match self.0.checked_sub(offset) {
-            Some(result) if result > 0 => Some(Self(result)),
-            _ => None,
+        match port_checked_sub(self.0, offset) {
+            Some(result) => Some(Self(result)),
+            None => None,
         }
     }
 }
@@ -135,14 +142,20 @@ impl TryFrom<u16> for Port {
     type Error = InvalidPortError;
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        if value == 0 {
+        if port_is_valid(value) {
+            Ok(Self(value))
+        } else {
             Err(InvalidPortError {
                 value,
                 reason: "port 0 is invalid".into(),
             })
-        } else {
-            Ok(Self(value))
         }
+    }
+}
+
+impl From<Port> for u16 {
+    fn from(port: Port) -> Self {
+        port.0
     }
 }
 
@@ -174,23 +187,35 @@ impl std::error::Error for InvalidPortError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AutomaticCleanupStatus {
-    attempted: bool,
+    run: CleanupRun,
     prune_enabled: bool,
     expire_enabled: bool,
     pruned: usize,
     expired: usize,
 }
 
+/// Whether the automatic cleanup ran, and whether the allocation was retried
+/// after it (only after a cleanup that freed something).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CleanupRun {
+    /// No cleanup ran.
+    Skipped,
+    /// A cleanup ran and freed nothing, so the allocation was not retried.
+    NotRetried,
+    /// A cleanup ran, freed something, and the allocation was retried.
+    Retried,
+}
+
 impl AutomaticCleanupStatus {
     pub(crate) const fn new(
-        attempted: bool,
+        run: CleanupRun,
         prune_enabled: bool,
         expire_enabled: bool,
         pruned: usize,
         expired: usize,
     ) -> Self {
         Self {
-            attempted,
+            run,
             prune_enabled,
             expire_enabled,
             pruned,
@@ -201,7 +226,16 @@ impl AutomaticCleanupStatus {
     /// Whether automatic cleanup ran.
     #[must_use]
     pub const fn attempted(self) -> bool {
-        self.attempted
+        !matches!(self.run, CleanupRun::Skipped)
+    }
+
+    /// Whether the allocation was retried after the cleanup. The verified
+    /// cleanup-and-retry control retries exactly when the cleanup removed at
+    /// least one reservation, so this is `false` when cleanup did not run or
+    /// freed nothing.
+    #[must_use]
+    pub const fn retried(self) -> bool {
+        matches!(self.run, CleanupRun::Retried)
     }
 
     /// Whether stale-path pruning was enabled.
@@ -328,7 +362,7 @@ impl PortExhaustionDetails {
 
 impl fmt::Display for PortExhaustionDetails {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.cleanup.attempted {
+        if self.cleanup.retried() {
             write!(
                 f,
                 ": remaining blockers after the single retry: {}; automatic cleanup pruned {} \
@@ -336,6 +370,16 @@ impl fmt::Display for PortExhaustionDetails {
                 self.blockers,
                 self.cleanup.pruned,
                 self.cleanup.expired,
+                self.cleanup.policy_description()
+            )
+        } else if self.cleanup.attempted() {
+            write!(
+                f,
+                ": automatic cleanup pruned {} and expired {} reservation(s), so the scan was \
+                 not retried; remaining blockers: {}; {}",
+                self.cleanup.pruned,
+                self.cleanup.expired,
+                self.blockers,
                 self.cleanup.policy_description()
             )
         } else {
@@ -366,8 +410,8 @@ impl fmt::Display for PortExhaustionDetails {
 /// ```
 #[derive(Clone, Copy)]
 pub struct PortRange {
-    min: Port,
-    max: Port,
+    /// Verified bounds: the type invariant guarantees `1 <= min <= max`.
+    span: PortSpan,
     exhaustion_details: Option<PortExhaustionDetails>,
 }
 
@@ -391,18 +435,16 @@ impl PortRange {
     /// assert_eq!(range.len(), 11);
     /// ```
     pub fn new(min: Port, max: Port) -> Result<Self, InvalidPortRangeError> {
-        if max < min {
-            Err(InvalidPortRangeError {
+        match PortSpan::new(min.value(), max.value()) {
+            Some(span) => Ok(Self {
+                span,
+                exhaustion_details: None,
+            }),
+            None => Err(InvalidPortRangeError {
                 min,
                 max,
                 reason: "max must be greater than or equal to min".into(),
-            })
-        } else {
-            Ok(Self {
-                min,
-                max,
-                exhaustion_details: None,
-            })
+            }),
         }
     }
 
@@ -418,13 +460,13 @@ impl PortRange {
     /// Returns the minimum port in the range.
     #[must_use]
     pub const fn min(&self) -> Port {
-        self.min
+        Port(self.span.min())
     }
 
     /// Returns the maximum port in the range.
     #[must_use]
     pub const fn max(&self) -> Port {
-        self.max
+        Port(self.span.max())
     }
 
     /// Returns `true` if the range contains the given port.
@@ -446,7 +488,7 @@ impl PortRange {
     /// ```
     #[must_use]
     pub const fn contains(&self, port: Port) -> bool {
-        port.value() >= self.min.value() && port.value() <= self.max.value()
+        self.span.contains(port.value())
     }
 
     /// Returns the number of ports in the range (inclusive).
@@ -463,7 +505,7 @@ impl PortRange {
     /// ```
     #[must_use]
     pub const fn len(&self) -> u16 {
-        self.max.value() - self.min.value() + 1
+        self.span.len()
     }
 
     /// Returns `true` if the range contains no ports.
@@ -472,7 +514,7 @@ impl PortRange {
     /// that max >= min, but the method is provided for completeness.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        false
+        self.span.is_empty()
     }
 
     /// Returns an iterator over all ports in this range.
@@ -495,8 +537,7 @@ impl PortRange {
     #[must_use]
     pub fn iter(self) -> PortRangeIter {
         PortRangeIter {
-            range: self,
-            current: u32::from(self.min.value()),
+            cursor: PortCursor::new(self.span),
         }
     }
 }
@@ -507,15 +548,15 @@ impl PortRange {
 impl fmt::Debug for PortRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PortRange")
-            .field("min", &self.min)
-            .field("max", &self.max)
+            .field("min", &self.min())
+            .field("max", &self.max())
             .finish()
     }
 }
 
 impl PartialEq for PortRange {
     fn eq(&self, other: &Self) -> bool {
-        self.min == other.min && self.max == other.max
+        self.span == other.span
     }
 }
 
@@ -523,7 +564,7 @@ impl Eq for PortRange {}
 
 impl fmt::Display for PortRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-{}", self.min, self.max)
+        write!(f, "{}-{}", self.min(), self.max())
     }
 }
 
@@ -537,33 +578,24 @@ impl IntoIterator for PortRange {
 }
 
 /// Iterator over ports in a `PortRange`.
+///
+/// Yields every port of the range exactly once, in ascending order (verified
+/// by the `verified::port::PortCursor` kernel).
 #[derive(Debug)]
 pub struct PortRangeIter {
-    range: PortRange,
-    current: u32,
+    cursor: PortCursor,
 }
 
 impl Iterator for PortRangeIter {
     type Item = Port;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current <= u32::from(self.range.max.value()) {
-            let port =
-                Port(u16::try_from(self.current).expect("iterator current cannot exceed u16::MAX"));
-            self.current += 1;
-            Some(port)
-        } else {
-            None
-        }
+        self.cursor.advance().map(Port)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        if self.current <= u32::from(self.range.max.value()) {
-            let remaining = (u32::from(self.range.max.value()) - self.current + 1) as usize;
-            (remaining, Some(remaining))
-        } else {
-            (0, Some(0))
-        }
+        let remaining = self.cursor.remaining_len();
+        (remaining, Some(remaining))
     }
 }
 
@@ -817,5 +849,56 @@ mod tests {
         let near_min = Port::try_from(2).unwrap();
         assert_eq!(near_min.checked_sub(1).unwrap().value(), 1);
         assert!(near_min.checked_sub(2).is_none());
+    }
+
+    #[test]
+    fn test_port_serde_round_trip_is_a_bare_number() {
+        let port = Port::try_from(8080).unwrap();
+        assert_eq!(serde_json::to_string(&port).unwrap(), "8080");
+        assert_eq!(serde_json::from_str::<Port>("8080").unwrap(), port);
+        assert_eq!(
+            serde_json::from_str::<Port>("65535").unwrap().value(),
+            65535
+        );
+    }
+
+    #[test]
+    fn test_port_deserialize_rejects_zero() {
+        // Deserialization goes through `TryFrom<u16>`, so it cannot produce a
+        // `Port` that violates the documented 1..=65535 invariant.
+        let err = serde_json::from_str::<Port>("0").unwrap_err();
+        assert!(err.to_string().contains("port 0 is invalid"), "{err}");
+        assert!(serde_json::from_str::<Port>("65536").is_err());
+        assert!(serde_json::from_str::<Option<Port>>("0").is_err());
+    }
+
+    #[test]
+    fn test_full_domain_range_iterates_every_port_once() {
+        let range = PortRange::new(
+            Port::try_from(Port::MIN).unwrap(),
+            Port::try_from(Port::MAX).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(range.len(), u16::MAX);
+        let mut iter = range.iter();
+        assert_eq!(iter.len(), usize::from(u16::MAX));
+        let mut expected = Port::MIN;
+        for port in iter.by_ref() {
+            assert_eq!(port.value(), expected);
+            expected = expected.wrapping_add(1);
+        }
+        assert_eq!(expected, 0, "iteration must end exactly after 65535");
+        assert_eq!(iter.len(), 0);
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn test_single_port_range_at_domain_maximum() {
+        let max = Port::try_from(Port::MAX).unwrap();
+        let range = PortRange::new(max, max).unwrap();
+        assert_eq!(range.len(), 1);
+        assert!(!range.is_empty());
+        assert_eq!(range.iter().collect::<Vec<_>>(), vec![max]);
     }
 }

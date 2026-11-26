@@ -17,10 +17,8 @@ use crate::invocation::{
 use crate::utils::GlobalOptions;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use trop::config::{
-    CleanupConfig, ConfigField, OccupancyConfig, OutputFormat as ConfigOutputFormat, PortConfig,
-    DEFAULT_MAX_PORT, DEFAULT_MIN_PORT,
-};
+use trop::cli_support::{cleanup_switches, occupancy_layer, OccupancySwitches};
+use trop::config::{CleanupConfig, ConfigField, OutputFormat as ConfigOutputFormat, PortConfig};
 
 /// Command-line tool for managing ephemeral port reservations.
 #[derive(Parser)]
@@ -177,30 +175,9 @@ impl Command {
                     clear_task: command.clear_task,
                 });
 
-                let min = command
-                    .min
-                    .as_deref()
-                    .map(crate::commands::reserve::parse_port_string)
-                    .transpose()
-                    .map_err(|error| {
-                        CliError::InvalidArguments(format!("invalid --min value: {error}"))
-                    })?;
-                let max = command
-                    .max
-                    .as_deref()
-                    .map(crate::commands::reserve::parse_port_string)
-                    .transpose()
-                    .map_err(|error| {
-                        CliError::InvalidArguments(format!("invalid --max value: {error}"))
-                    })?;
-                if let (Some(min), Some(max)) = (min, max) {
-                    if min > max {
-                        return Err(CliError::InvalidArguments(format!(
-                            "Invalid port range: min ({min}) must be less than or equal to max ({max})"
-                        )));
-                    }
-                }
-                set_port_overrides(&mut command_line, min, max);
+                let min = parse_port_flag("--min", command.min.as_deref())?;
+                let max = parse_port_flag("--max", command.max.as_deref())?;
+                set_port_overrides(&mut command_line, min, max)?;
 
                 set_true(
                     &mut command_line,
@@ -222,14 +199,20 @@ impl Command {
                     command.allow_change,
                     ConfigField::AllowChange,
                 );
+                // `--disable-autoclean` turns off both cleanups (verified).
+                let (disable_autoprune, disable_autoexpire) = cleanup_switches(
+                    command.disable_autoprune,
+                    command.disable_autoexpire,
+                    command.disable_autoclean,
+                );
                 set_true(
                     &mut command_line,
-                    command.disable_autoprune || command.disable_autoclean,
+                    disable_autoprune,
                     ConfigField::DisableAutoprune,
                 );
                 set_true(
                     &mut command_line,
-                    command.disable_autoexpire || command.disable_autoclean,
+                    disable_autoexpire,
                     ConfigField::DisableAutoexpire,
                 );
                 set_occupancy_overrides(
@@ -272,9 +255,11 @@ impl Command {
                     command.skip_udp,
                     command.check_all_interfaces,
                 );
+                validate_task_like_reserve(&mut command_line, command.task.as_ref());
                 ConfigScope::ExplicitProject(command.config_path.clone())
             }
             Self::Autoreserve(command) => {
+                validate_task_like_reserve(&mut command_line, command.task.as_ref());
                 set_permissions(
                     &mut command_line,
                     command.allow_unrelated_path,
@@ -314,7 +299,10 @@ impl Command {
                 ConfigScope::Discover
             }
             Self::Scan(command) => {
-                set_port_overrides(&mut command_line, command.min, command.max);
+                // Parsed exactly like `reserve`'s bounds (same messages, exit 4).
+                let min = parse_port_flag("--min", command.min.as_deref())?;
+                let max = parse_port_flag("--max", command.max.as_deref())?;
+                set_port_overrides(&mut command_line, min, max)?;
                 set_occupancy_overrides(
                     &mut command_line,
                     false,
@@ -403,14 +391,58 @@ impl Command {
     }
 }
 
-fn set_port_overrides(command_line: &mut CommandLineConfig, min: Option<u16>, max: Option<u16>) {
+/// Route a `reserve-group`/`autoreserve` `--task` through the configuration
+/// layer `reserve` uses for its own `--task`. The group commands then take
+/// their task from the effective configuration (`--task`, else `TROP_TASK`),
+/// exactly as `reserve` does, so the same invalid value is rejected the same
+/// way by all three commands (a configuration error naming its source, the
+/// command line or `TROP_TASK`, exit 7).
+fn validate_task_like_reserve(command_line: &mut CommandLineConfig, task: Option<&String>) {
+    if let Some(task) = task {
+        command_line.reservation_metadata = Some(ReservationMetadataRequest {
+            clear_project: false,
+            task: Some(task.clone()),
+            clear_task: false,
+        });
+    }
+}
+
+/// Parse a `trop reserve` port flag, reporting a bad value once (not wrapped
+/// twice in "Invalid arguments").
+fn parse_port_flag(flag: &str, value: Option<&str>) -> Result<Option<u16>, CliError> {
+    value
+        .map(crate::commands::reserve::parse_port_string)
+        .transpose()
+        .map_err(|error| match error {
+            CliError::InvalidArguments(message) => {
+                CliError::InvalidArguments(format!("invalid {flag} value: {message}"))
+            }
+            other => other,
+        })
+}
+
+/// Lay `--min` / `--max` over the configuration as exactly the leaves the
+/// user typed, after checking them (each a valid port, `min <= max`) with the
+/// library's verified rule. `reserve` and `scan` share this, so both reject a
+/// bad pair as invalid arguments (exit 4).
+fn set_port_overrides(
+    command_line: &mut CommandLineConfig,
+    min: Option<u16>,
+    max: Option<u16>,
+) -> Result<(), CliError> {
+    PortConfig::check_command_line_bounds(min, max).map_err(|error| match error {
+        trop::Error::Validation { message, .. } => CliError::InvalidArguments(message),
+        other => CliError::Library(other),
+    })?;
     if min.is_none() && max.is_none() {
-        return;
+        return Ok(());
     }
 
+    // Only the recorded leaves are applied; the others are placeholders.
+    let placeholder = PortConfig::default();
     command_line.config.ports = Some(PortConfig {
-        min: min.unwrap_or(DEFAULT_MIN_PORT),
-        max: max.or(Some(DEFAULT_MAX_PORT)),
+        min: min.unwrap_or(placeholder.min),
+        max: max.or(placeholder.max),
         max_offset: None,
     });
     if min.is_some() {
@@ -420,6 +452,7 @@ fn set_port_overrides(command_line: &mut CommandLineConfig, min: Option<u16>, ma
         command_line.record(ConfigField::PortsMax);
         command_line.record(ConfigField::PortsMaxOffset);
     }
+    Ok(())
 }
 
 fn set_permissions(
@@ -457,34 +490,35 @@ fn set_occupancy_overrides(
     skip_udp: bool,
     check_all_interfaces: bool,
 ) {
-    if !(skip || skip_ip4 || skip_ip6 || skip_tcp || skip_udp || check_all_interfaces) {
+    // The verified layer: no layer without a switch, and `Some(true)` exactly
+    // for the given switches (the command line never re-enables a probe).
+    let Some(layer) = occupancy_layer(OccupancySwitches {
+        skip,
+        skip_ipv4: skip_ip4,
+        skip_ipv6: skip_ip6,
+        skip_tcp,
+        skip_udp,
+        check_all_interfaces,
+    }) else {
         return;
-    }
+    };
 
-    command_line.config.occupancy_check = Some(OccupancyConfig {
-        skip: skip.then_some(true),
-        skip_ip4: skip_ip4.then_some(true),
-        skip_ip6: skip_ip6.then_some(true),
-        skip_tcp: skip_tcp.then_some(true),
-        skip_udp: skip_udp.then_some(true),
-        check_all_interfaces: check_all_interfaces.then_some(true),
-    });
-
-    for (enabled, field) in [
-        (skip, ConfigField::OccupancySkip),
-        (skip_ip4, ConfigField::OccupancySkipIp4),
-        (skip_ip6, ConfigField::OccupancySkipIp6),
-        (skip_tcp, ConfigField::OccupancySkipTcp),
-        (skip_udp, ConfigField::OccupancySkipUdp),
+    for (leaf, field) in [
+        (layer.skip, ConfigField::OccupancySkip),
+        (layer.skip_ip4, ConfigField::OccupancySkipIp4),
+        (layer.skip_ip6, ConfigField::OccupancySkipIp6),
+        (layer.skip_tcp, ConfigField::OccupancySkipTcp),
+        (layer.skip_udp, ConfigField::OccupancySkipUdp),
         (
-            check_all_interfaces,
+            layer.check_all_interfaces,
             ConfigField::OccupancyCheckAllInterfaces,
         ),
     ] {
-        if enabled {
+        if leaf.is_some() {
             command_line.record(field);
         }
     }
+    command_line.config.occupancy_check = Some(layer);
 }
 
 fn set_cleanup_days(command_line: &mut CommandLineConfig, days: Option<u32>) {
@@ -516,6 +550,7 @@ fn set_true(command_line: &mut CommandLineConfig, enabled: bool, field: ConfigFi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trop::config::OccupancyConfig;
 
     fn globals() -> GlobalOptions {
         GlobalOptions {
@@ -631,5 +666,80 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    fn port_request(args: &[&str]) -> Result<(Option<PortConfig>, Vec<ConfigField>), CliError> {
+        let cli = Cli::try_parse_from(args).expect("port arguments should parse");
+        let request = cli.command.config_request(&globals())?;
+        let port_fields = [
+            ConfigField::PortsMin,
+            ConfigField::PortsMax,
+            ConfigField::PortsMaxOffset,
+        ];
+        let fields = request
+            .command_line
+            .fields
+            .iter()
+            .copied()
+            .filter(|field| port_fields.contains(field))
+            .collect();
+        Ok((request.command_line.config.ports, fields))
+    }
+
+    /// `reserve` and `scan` build the same port layer, recording exactly the
+    /// typed leaves (`--max` also clears `max_offset`), and reject the same
+    /// bounds as invalid arguments.
+    #[test]
+    fn reserve_and_scan_build_the_same_port_layer() {
+        for bounds in [
+            vec![],
+            vec!["--min", "6000"],
+            vec!["--max", "6100"],
+            vec!["--min", "1", "--max", "65535"],
+            vec!["--min", "6000", "--max", "6000"],
+        ] {
+            let mut reserve = vec!["trop", "reserve"];
+            reserve.extend(&bounds);
+            let mut scan = vec!["trop", "scan"];
+            scan.extend(&bounds);
+            let (ports, fields) = port_request(&reserve).unwrap();
+            assert_eq!(
+                (ports.clone(), fields.clone()),
+                port_request(&scan).unwrap()
+            );
+
+            let mut expected = Vec::new();
+            if bounds.contains(&"--min") {
+                expected.push(ConfigField::PortsMin);
+            }
+            if bounds.contains(&"--max") {
+                expected.push(ConfigField::PortsMax);
+                expected.push(ConfigField::PortsMaxOffset);
+            }
+            assert_eq!(fields, expected, "{bounds:?}");
+            assert_eq!(ports.is_some(), !bounds.is_empty(), "{bounds:?}");
+            if let Some(ports) = ports {
+                assert_eq!(ports.max_offset, None);
+            }
+        }
+
+        for bounds in [
+            ["--min", "6000", "--max", "5999"],
+            ["--min", "0", "--max", "5999"],
+            ["--min", "6000", "--max", "0"],
+        ] {
+            let mut reserve = vec!["trop", "reserve"];
+            reserve.extend(bounds);
+            let mut scan = vec!["trop", "scan"];
+            scan.extend(bounds);
+            let reserve_error = port_request(&reserve).unwrap_err();
+            let scan_error = port_request(&scan).unwrap_err();
+            assert_eq!(reserve_error.exit_code(), 4, "{bounds:?}");
+            assert_eq!(
+                scan_error.to_string(),
+                reserve_error.to_string(),
+                "{bounds:?}"
+            );
+        }
     }
 }

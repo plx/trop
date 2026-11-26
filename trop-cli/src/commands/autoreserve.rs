@@ -10,14 +10,15 @@ use clap::Args;
 use trop::operations::{AutoreserveOptions, AutoreservePlan};
 use trop::PlanExecutor;
 
-use super::reserve_group::OutputFormatArg;
+use super::reserve_group::{dry_run_database, report_dry_run, OutputFormatArg};
 
 /// Automatically discover and reserve ports from project config.
 #[derive(Args)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AutoreserveCommand {
-    /// Task identifier; omission preserves an existing value (clearing unsupported)
-    #[arg(long, env = "TROP_TASK")]
+    /// Task identifier (overrides TROP_TASK); omission preserves an existing
+    /// value (clearing unsupported)
+    #[arg(long)]
     pub task: Option<String>,
 
     /// Output format
@@ -89,7 +90,9 @@ impl AutoreserveCommand {
 
         // 2. Build AutoreserveOptions
         let options = AutoreserveOptions::new(start_dir.clone())
-            .with_task(self.task)
+            // The effective task: `--task`, else `TROP_TASK`, validated (and
+            // attributed to its source) like `reserve`'s.
+            .with_task(context.effective()?.task().map(str::to_owned))
             .with_force(self.force)
             .with_allow_unrelated_path(context.effective()?.allow_unrelated_path())
             .with_allow_project_change(context.effective()?.allow_project_change())
@@ -112,18 +115,22 @@ impl AutoreserveCommand {
 
         let discovered_config = planner.discovered_config_path();
 
-        // 4. Handle dry-run mode
-        if self.dry_run {
-            if !global.quiet {
-                eprintln!("Dry run - would perform the following actions:");
-                eprintln!("  1. Discovered config: {}", discovered_config.display());
-                eprintln!("  2. Reserve group of services from config");
-            }
-            return Ok(());
-        }
-
-        // 5. Validate the selected output format before opening a transaction.
+        // 4. Validate the selected output format before any database access,
+        // in live runs and dry runs alike.
         let output_format = self.format.to_output_format(self.shell.as_deref())?;
+
+        // 5. A dry run plans and executes exactly as a live run does, against
+        // a private in-memory copy of the database, and prints the result.
+        if self.dry_run {
+            let (database, timeout) = dry_run_database(context)?;
+            let result = planner
+                .dry_run(database.as_deref(), timeout)
+                .map_err(CliError::from)?;
+            if !global.quiet {
+                eprintln!("Discovered config: {}", discovered_config.display());
+            }
+            return report_dry_run(global.quiet, &output_format, planner.config(), &result);
+        }
 
         // 6. Load configuration and open database
         let mut db = context.open_database()?;

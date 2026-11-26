@@ -1,27 +1,29 @@
 //! Command to scan port range for occupied ports.
 
-use crate::commands::compact_exclusions::compact_exclusion_list;
+use crate::commands::exclude::{current_exclusions, read_config_document, write_exclusions};
 use crate::error::CliError;
 use crate::invocation::InvocationContext;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 use std::fmt::Write as _;
-use trop::config::{Config, PortExclusion, DEFAULT_MAX_PORT, DEFAULT_MIN_PORT};
-use trop::port::occupancy::{
-    OccupancyCheckConfig, OccupancyReport, OccupiedProbe, SystemOccupancyChecker,
-};
+use trop::cli_support::{delimited_record, scan_check_config, unreserved_ports};
+use trop::config::{Config, PortConfig};
+use trop::output::display_field;
+use trop::port::allocator::port_range_from_config;
+use trop::port::exclusions::{add_ports_to_list, compact_exclusions, is_compact, WriteScope};
+use trop::port::occupancy::{OccupancyReport, OccupiedProbe, SystemOccupancyChecker};
 use trop::{Database, Port, PortRange};
 
 /// Scan port range for occupied ports.
 #[derive(Args)]
 pub struct ScanCommand {
     /// Minimum port (uses config if not specified)
-    #[arg(long)]
-    pub min: Option<u16>,
+    #[arg(long, value_name = "MIN")]
+    pub min: Option<String>,
 
     /// Maximum port (uses config if not specified)
-    #[arg(long)]
-    pub max: Option<u16>,
+    #[arg(long, value_name = "MAX")]
+    pub max: Option<String>,
 
     /// Automatically add occupied, unreserved ports to exclusion list
     #[arg(long)]
@@ -106,13 +108,20 @@ impl ScanCommand {
         // 2. Open database
         let db = context.open_database()?;
 
-        // 3. Scan for occupied ports
+        // 3. Scan for occupied ports. Scanning is this command's purpose, so
+        // a configured global `skip` (meant for allocations) does not apply;
+        // the protocol and family switches do. When they leave no probe, the
+        // ports cannot be checked, and saying "nothing is occupied" would be
+        // false, so the scan fails instead (the verified
+        // `scan_check_config` decides both).
         let checker = SystemOccupancyChecker;
-        let check_config = config
-            .occupancy_check
-            .as_ref()
-            .map(OccupancyCheckConfig::from)
-            .unwrap_or_default();
+        let check_config = scan_check_config(config.occupancy_check.as_ref()).ok_or_else(|| {
+            CliError::Config(
+                "ports were not checked: the effective occupancy settings disable every \
+                 probe (both TCP and UDP, or both IPv4 and IPv6, are skipped)"
+                    .to_string(),
+            )
+        })?;
 
         let reports = checker
             .find_occupied_reports(&range, &check_config)
@@ -123,20 +132,13 @@ impl ScanCommand {
         let reserved_ports = Database::get_reserved_ports_in_range(db.connection(), &range)
             .map_err(CliError::from)?;
 
-        // 5. Find unreserved occupied ports
-        let unreserved_occupied: Vec<Port> = occupied_ports
-            .iter()
-            .filter(|p| !reserved_ports.contains(p))
-            .copied()
-            .collect();
+        // 5. Find unreserved occupied ports (verified: never a reserved port,
+        // so `--autoexclude` never excludes a reserved port).
+        let unreserved_occupied: Vec<Port> = unreserved_ports(&occupied_ports, &reserved_ports);
 
-        // 6. Auto-exclude if requested
+        // 6. Auto-exclude (and auto-compact) if requested
         if self.autoexclude && !unreserved_occupied.is_empty() {
             self.add_exclusions(&unreserved_occupied, context)?;
-
-            if self.autocompact {
-                self.compact_exclusions(context)?;
-            }
         }
 
         // 7. Format and output results
@@ -146,82 +148,65 @@ impl ScanCommand {
     }
 
     fn determine_range(&self, config: &Config) -> Result<PortRange, CliError> {
-        let min = config
-            .ports
-            .as_ref()
-            .map(|p| p.min)
-            .unwrap_or(DEFAULT_MIN_PORT);
-        let max = config
-            .ports
-            .as_ref()
-            .and_then(|p| p.max)
-            .unwrap_or(DEFAULT_MAX_PORT);
-
-        let min_port =
-            Port::try_from(min).map_err(|e| CliError::InvalidArguments(e.to_string()))?;
-        let max_port =
-            Port::try_from(max).map_err(|e| CliError::InvalidArguments(e.to_string()))?;
-
-        PortRange::new(min_port, max_port).map_err(|e| CliError::Library(e.into()))
+        // Resolve the configured bounds exactly as the allocator does: an
+        // explicit `max`, or `min + max_offset`. Without a `ports` section the
+        // built-in default range applies.
+        let default_ports = PortConfig::default();
+        let ports = config.ports.as_ref().unwrap_or(&default_ports);
+        port_range_from_config(ports).map_err(|error| match error {
+            trop::Error::InvalidPort { .. } => CliError::InvalidArguments(error.to_string()),
+            other => CliError::Library(other),
+        })
     }
 
+    /// Excludes the occupied, unreserved `ports` in the write target (the
+    /// loaded `trop.local.yaml` or `trop.yaml`, else the global
+    /// `config.yaml`) and, with `--autocompact`, compacts the list when it
+    /// changed. The file is rewritten at most once, and only its
+    /// `excluded_ports` key changes.
     fn add_exclusions(&self, ports: &[Port], context: &InvocationContext) -> Result<(), CliError> {
-        let config_path = context.config_file_for_write(false)?;
-        let mut config = load_raw_config(&config_path)?;
+        let config_path = context.config_file_for_write(WriteScope::ProjectOrGlobal)?;
+        let document = read_config_document(&config_path)?;
+        let current = current_exclusions(&config_path, &document)?;
+        let quiet = context.global().quiet;
 
-        // Ensure excluded_ports exists
-        if config.excluded_ports.is_none() {
-            config.excluded_ports = Some(Vec::new());
+        // Ports the list already excludes are skipped; `added` counts the
+        // ports newly excluded (verified by the exclusions kernel).
+        let (mut updated, added) = add_ports_to_list(&current, ports);
+        if added == 0 {
+            if !quiet {
+                eprintln!("Added 0 exclusions to {}", config_path.display());
+            }
+            return Ok(());
         }
 
-        // Add new exclusions
-        if let Some(ref mut exclusions) = config.excluded_ports {
-            for port in ports {
-                let exclusion = PortExclusion::Single(port.value());
-                if !exclusions.contains(&exclusion) {
-                    exclusions.push(exclusion);
-                }
+        // `--autocompact` compacts the list because it changed. Invalid
+        // entries are reported; the list is rewritten in canonical form when
+        // it is not already canonical. (The loader validates the write
+        // target's list before any command runs, so the error is a defensive
+        // check.)
+        let mut compaction = None;
+        if self.autocompact {
+            let compacted = compact_exclusions(&updated).map_err(|error| {
+                CliError::Config(format!(
+                    "cannot compact the exclusions in {}: {error}",
+                    config_path.display()
+                ))
+            })?;
+            if !is_compact(&updated) {
+                compaction = Some((updated.len(), compacted.len()));
+                updated = compacted;
             }
         }
 
-        // Save config
-        let yaml = serde_yaml::to_string(&config)
-            .map_err(|e| CliError::Config(format!("Failed to serialize config: {e}")))?;
-        std::fs::write(&config_path, yaml)?;
-
-        if !context.global().quiet {
-            eprintln!(
-                "Added {} exclusions to {}",
-                ports.len(),
-                config_path.display()
-            );
-        }
-
-        Ok(())
-    }
-
-    fn compact_exclusions(&self, context: &InvocationContext) -> Result<(), CliError> {
-        let config_path = context.config_file_for_write(false)?;
-        let mut config = load_raw_config(&config_path)?;
-        if let Some(ref mut exclusions) = config.excluded_ports {
-            let original_count = exclusions.len();
-            let compacted = compact_exclusion_list(exclusions);
-            let new_count = compacted.len();
-
-            if original_count != new_count {
-                *exclusions = compacted;
-
-                // Save compacted config
-                let yaml = serde_yaml::to_string(&config)
-                    .map_err(|e| CliError::Config(format!("Failed to serialize config: {e}")))?;
-                std::fs::write(&config_path, yaml)?;
-
-                if !context.global().quiet {
-                    eprintln!("Compacted {original_count} exclusions to {new_count}");
-                }
+        // Report only once the file has been written.
+        write_exclusions(&config_path, &document, &updated)?;
+        if !quiet {
+            eprintln!("Added {added} exclusions to {}", config_path.display());
+            if let Some((before, after)) = compaction {
+                eprintln!("Compacted {before} exclusions to {after}");
             }
         }
-
         Ok(())
     }
 
@@ -253,10 +238,10 @@ impl ScanCommand {
                 println!("{json}");
             }
             ScanOutputFormat::Csv => {
-                print!("{}", render_delimited(&results, b',')?);
+                print!("{}", render_delimited(&results, ','));
             }
             ScanOutputFormat::Tsv => {
-                print!("{}", render_delimited(&results, b'\t')?);
+                print!("{}", render_delimited(&results, '\t'));
             }
         }
 
@@ -271,6 +256,12 @@ impl ScanCommand {
 
 fn optional_display<T: ToString>(value: Option<T>) -> String {
     value.map_or_else(|| "unavailable".to_string(), |value| value.to_string())
+}
+
+/// An owner field reported by the operating system (process name, user),
+/// escaped for the table so it cannot break the row's line or columns.
+fn owner_cell(value: Option<&str>) -> String {
+    value.map_or_else(|| "unavailable".to_string(), display_field)
 }
 
 fn render_table(results: &[ScanResult]) -> String {
@@ -303,8 +294,8 @@ fn render_table(results: &[ScanResult]) -> String {
             result.scope,
             result.address,
             optional_display(result.process_id),
-            optional_display(result.process_name.as_deref()),
-            optional_display(result.user.as_deref()),
+            owner_cell(result.process_name.as_deref()),
+            owner_cell(result.user.as_deref()),
             result.owner_status,
         )
         .expect("writing to a String cannot fail");
@@ -312,12 +303,13 @@ fn render_table(results: &[ScanResult]) -> String {
     output
 }
 
-fn render_delimited(results: &[ScanResult], delimiter: u8) -> Result<String, CliError> {
-    let mut writer = csv::WriterBuilder::new()
-        .delimiter(delimiter)
-        .from_writer(Vec::new());
-    writer
-        .write_record([
+/// The delimited (CSV/TSV) output, written by the verified
+/// `delimited_record` (byte for byte the `csv` crate's default writer): a
+/// field containing the delimiter, a quote, or a line break is quoted, so
+/// every probe is one record of eleven fields.
+fn render_delimited(results: &[ScanResult], delimiter: char) -> String {
+    let mut output = delimited_record(
+        &[
             "port",
             "status",
             "reserved",
@@ -329,45 +321,152 @@ fn render_delimited(results: &[ScanResult], delimiter: u8) -> Result<String, Cli
             "process_name",
             "user",
             "owner_status",
-        ])
-        .map_err(|error| CliError::Config(format!("Delimited output failed: {error}")))?;
+        ],
+        delimiter,
+    );
     for result in results {
-        writer
-            .write_record([
-                result.port.to_string(),
-                result.status.clone(),
-                result.reserved.to_string(),
-                result.protocol.clone(),
-                result.address_family.clone(),
-                result.scope.clone(),
-                result.address.clone(),
-                optional_display(result.process_id),
-                optional_display(result.process_name.as_deref()),
-                optional_display(result.user.as_deref()),
-                result.owner_status.clone(),
-            ])
-            .map_err(|error| CliError::Config(format!("Delimited output failed: {error}")))?;
+        let port = result.port.to_string();
+        let reserved = result.reserved.to_string();
+        let process_id = optional_display(result.process_id);
+        let process_name = optional_display(result.process_name.as_deref());
+        let user = optional_display(result.user.as_deref());
+        output.push_str(&delimited_record(
+            &[
+                &port,
+                &result.status,
+                &reserved,
+                &result.protocol,
+                &result.address_family,
+                &result.scope,
+                &result.address,
+                &process_id,
+                &process_name,
+                &user,
+                &result.owner_status,
+            ],
+            delimiter,
+        ));
     }
-    let bytes = writer
-        .into_inner()
-        .map_err(|error| CliError::Config(format!("Delimited output failed: {error}")))?;
-    let output = String::from_utf8(bytes)
-        .map_err(|error| CliError::Config(format!("Delimited output was not UTF-8: {error}")))?;
-    Ok(output)
-}
-
-fn load_raw_config(path: &std::path::Path) -> Result<Config, CliError> {
-    if !path.exists() {
-        return Ok(Config::default());
-    }
-    let contents = std::fs::read_to_string(path)?;
-    serde_yaml::from_str(&contents)
-        .map_err(|error| CliError::Config(format!("Failed to parse config: {error}")))
+    output
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scan_command() -> ScanCommand {
+        ScanCommand {
+            min: None,
+            max: None,
+            autoexclude: false,
+            autocompact: false,
+            format: ScanOutputFormat::Json,
+            skip_tcp: false,
+            skip_udp: false,
+            skip_ipv4: false,
+            skip_ipv6: false,
+            check_all_interfaces: false,
+        }
+    }
+
+    fn config_with_ports(min: u16, max: Option<u16>, max_offset: Option<u16>) -> Config {
+        Config {
+            ports: Some(PortConfig {
+                min,
+                max,
+                max_offset,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn bounds(range: &PortRange) -> (u16, u16) {
+        (range.min().value(), range.max().value())
+    }
+
+    #[test]
+    fn determine_range_honors_max_offset() {
+        // Regression: `max_offset` used to be ignored, so this scanned (or,
+        // with min above 7000, failed on) the default maximum instead.
+        let range = scan_command()
+            .determine_range(&config_with_ports(8000, None, Some(100)))
+            .unwrap();
+        assert_eq!(bounds(&range), (8000, 8100));
+
+        let range = scan_command()
+            .determine_range(&config_with_ports(6000, None, Some(100)))
+            .unwrap();
+        assert_eq!(bounds(&range), (6000, 6100));
+    }
+
+    #[test]
+    fn determine_range_matches_the_allocator_range() {
+        for (min, max, max_offset) in [
+            (5000, Some(7000), None),
+            (8000, None, Some(100)),
+            (1, Some(65535), None),
+            (65535, None, Some(0)),
+            (65000, None, Some(535)),
+            (5000, Some(5100), Some(1)),
+        ] {
+            let config = config_with_ports(min, max, max_offset);
+            let scanned = scan_command().determine_range(&config).unwrap();
+            let allocator = trop::port::allocator::allocator_from_config(&config).unwrap();
+            assert_eq!(scanned, *allocator.range(), "{min} {max:?} {max_offset:?}");
+        }
+    }
+
+    #[test]
+    fn determine_range_defaults_without_ports_section() {
+        let range = scan_command().determine_range(&Config::default()).unwrap();
+        assert_eq!(
+            bounds(&range),
+            (
+                trop::config::DEFAULT_MIN_PORT,
+                trop::config::DEFAULT_MAX_PORT
+            )
+        );
+    }
+
+    #[test]
+    fn determine_range_error_kinds_are_preserved() {
+        let error = scan_command()
+            .determine_range(&config_with_ports(0, Some(10), None))
+            .unwrap_err();
+        assert!(
+            matches!(&error, CliError::InvalidArguments(message) if message == "invalid port 0: port 0 is invalid"),
+            "{error:?}"
+        );
+        assert_eq!(error.exit_code(), 4);
+
+        let error = scan_command()
+            .determine_range(&config_with_ports(10, Some(0), None))
+            .unwrap_err();
+        assert!(matches!(error, CliError::InvalidArguments(_)), "{error:?}");
+
+        let error = scan_command()
+            .determine_range(&config_with_ports(6000, Some(5000), None))
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                CliError::Library(trop::Error::InvalidPortRange {
+                    min: 6000,
+                    max: 5000,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+
+        let error = scan_command()
+            .determine_range(&config_with_ports(65000, None, Some(1000)))
+            .unwrap_err();
+        assert!(
+            matches!(&error, CliError::Library(trop::Error::Validation { field, .. }) if field == "ports.max_offset"),
+            "{error:?}"
+        );
+    }
 
     fn unavailable_result() -> ScanResult {
         ScanResult {
@@ -412,15 +511,30 @@ mod tests {
     fn delimited_schema_snapshots_append_deterministic_evidence_columns() {
         let results = [unavailable_result()];
         assert_eq!(
-            render_delimited(&results, b',').unwrap(),
+            render_delimited(&results, ','),
             "port,status,reserved,protocol,address_family,scope,address,process_id,process_name,user,owner_status\n\
              5050,occupied,false,tcp,ipv4,localhost,127.0.0.1,unavailable,unavailable,unavailable,unavailable\n"
         );
         assert_eq!(
-            render_delimited(&results, b'\t').unwrap(),
+            render_delimited(&results, '\t'),
             "port\tstatus\treserved\tprotocol\taddress_family\tscope\taddress\tprocess_id\tprocess_name\tuser\towner_status\n\
              5050\toccupied\tfalse\ttcp\tipv4\tlocalhost\t127.0.0.1\tunavailable\tunavailable\tunavailable\tunavailable\n"
         );
+    }
+
+    /// Regression: an owner process name or user with a newline or tab
+    /// broke the scan table's one-line-per-probe layout.
+    #[test]
+    fn table_cells_from_the_os_are_escaped() {
+        let mut result = unavailable_result();
+        result.process_name = Some("evil\nproc".to_string());
+        result.user = Some("a\tb\u{1b}[31m".to_string());
+        let rendered = render_table(&[result]);
+        assert_eq!(rendered.lines().count(), 3, "{rendered}");
+        assert!(rendered.contains("\"evil\\nproc\""), "{rendered}");
+        assert!(rendered.contains("\"a\\tb\\x1b[31m\""), "{rendered}");
+        assert!(!rendered.contains('\t'));
+        assert!(!rendered.contains('\u{1b}'));
     }
 
     #[test]

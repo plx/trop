@@ -41,6 +41,41 @@ fmt:
 fmt-check:
     cargo fmt -- --check
 
+# Install the pinned Verus verifier release and the Rust toolchain it needs
+install-verus:
+    ./scripts/install-verus.sh
+
+# Formally verify trop/src/verified with Verus (run `just install-verus` first)
+verify *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    verus_bin="$(./scripts/install-verus.sh --print-path)"
+    cd trop-verification
+    # Cargo replays a fresh crate's cached output without running the
+    # verifier (`cargo verus` checks freshness by content checksum), so drop
+    # the harness crate's own build first; dependencies stay cached.
+    cargo clean --quiet --package trop-verification
+    log="$(mktemp)"
+    trap 'rm -f "$log"' EXIT
+    PATH="$verus_bin:$PATH" cargo verus verify "$@" 2>&1 | tee "$log"
+    ../scripts/check-verus-results.sh "$log"
+
+# Verify one kernel module while iterating, e.g. `just verify-module exclusions`
+verify-module module *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    shift # "$1" is the module; the rest are extra verifier arguments
+    verus_bin="$(./scripts/install-verus.sh --print-path)"
+    cd trop-verification
+    # As in `verify`; `cargo verus focus` builds under `<target>/verus-partial`.
+    target_dir="$(cargo metadata --no-deps --format-version 1 \
+        | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+    cargo clean --quiet --package trop-verification --target-dir "$target_dir/verus-partial"
+    log="$(mktemp)"
+    trap 'rm -f "$log"' EXIT
+    PATH="$verus_bin:$PATH" cargo verus focus -- --verify-module "verified::{{module}}" "$@" 2>&1 | tee "$log"
+    ../scripts/check-verus-results.sh "$log"
+
 # Build the project in debug mode
 build:
     cargo build
@@ -102,6 +137,19 @@ preflight-pr:
     fi
     echo "✓ Production-readiness selector tests passed"
 
+    # Verus proofs (only when the pinned verifier is installed locally; CI
+    # always runs them)
+    if ./scripts/install-verus.sh --print-path &>/dev/null; then
+        if ! output=$(just verify 2>&1); then
+            echo "✗ Verus verification failed"
+            echo "$output" | grep -v "Checking\|Compiling\|Finished" | tail -40
+            exit 1
+        fi
+        echo "✓ Verus verification passed"
+    else
+        echo "- Verus verification skipped (run 'just install-verus' to enable)"
+    fi
+
     echo ""
     echo "All pre-flight checks passed!"
 
@@ -161,6 +209,14 @@ ci-check-format:
 # CI: test the production-readiness work selector
 ci-test-production-readiness-selector:
     python3 -m unittest discover -s scripts/tests -p "test_*.py" -v
+
+# CI: install the pinned Verus release (adds it to GITHUB_PATH)
+ci-install-verus:
+    ./scripts/install-verus.sh
+
+# CI: formally verify trop/src/verified with Verus
+ci-verify:
+    just verify
 
 # CI: check documentation
 ci-check-docs:

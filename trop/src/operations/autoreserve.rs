@@ -3,12 +3,15 @@
 //! This module implements auto-discovery of configuration files and delegation
 //! to reserve group logic for batch port reservations.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::config::{Config, ConfigField, ConfigFileKind, ConfigLoader, EffectiveConfig};
 use crate::error::{Error, Result};
+use crate::verified::group::{first_present, select_highest_precedence};
 use rusqlite::Connection;
 
+use super::executor::ExecutionResult;
 use super::plan::OperationPlan;
 use super::reserve_group::{ReserveGroupOptions, ReserveGroupPlan};
 
@@ -143,10 +146,17 @@ impl AutoreservePlan {
     /// ```
     pub fn new(options: AutoreserveOptions) -> Result<Self> {
         // Discover project configs
-        let configs = ConfigLoader::discover_project_configs(&options.start_dir)?;
+        let mut configs = ConfigLoader::discover_project_configs(&options.start_dir)?;
 
-        // We need at least one config file
-        if configs.is_empty() {
+        // Use the highest-precedence config (the last one on ties, as
+        // `Iterator::max_by_key` would); the verified kernel
+        // `verified::group::select_highest_precedence` decides. No config
+        // file at all is an error.
+        let precedences = configs
+            .iter()
+            .map(|config| config.precedence)
+            .collect::<Vec<_>>();
+        let Some(selected) = select_highest_precedence(&precedences) else {
             return Err(Error::InvalidPath {
                 path: options.start_dir.clone(),
                 reason: format!(
@@ -154,17 +164,8 @@ impl AutoreservePlan {
                     options.start_dir.display()
                 ),
             });
-        }
-
-        // Use the highest precedence config (last in the sorted list)
-        // ConfigLoader::discover_project_configs returns configs sorted by precedence
-        let selected_config = configs
-            .into_iter()
-            .max_by_key(|c| c.precedence)
-            .ok_or_else(|| Error::InvalidPath {
-                path: options.start_dir.clone(),
-                reason: "Failed to determine config path".to_string(),
-            })?;
+        };
+        let selected_config = configs.swap_remove(selected);
         let reserve_group_options = options.into_reserve_group_options(selected_config.path);
         let reserve_group =
             ReserveGroupPlan::from_config(reserve_group_options, selected_config.config)?;
@@ -183,12 +184,19 @@ impl AutoreservePlan {
     /// Returns an error if no project configuration file participated in the
     /// effective configuration or if the effective values are invalid.
     pub fn from_effective(options: AutoreserveOptions, config: &EffectiveConfig) -> Result<Self> {
-        let reservation_file = config
-            .provenance(ConfigField::Reservations)
-            .and_then(|provenance| provenance.winner().file_path());
-        let discovered_config_path = reservation_file
-            .or_else(|| config.loaded_file(ConfigFileKind::Local))
-            .or_else(|| config.loaded_file(ConfigFileKind::Project))
+        // Candidates in order: the reservation group's winning file, then the
+        // loaded local file, then the loaded project file. The verified kernel
+        // `verified::group::first_present` picks the first one present.
+        let candidates = [
+            config
+                .provenance(ConfigField::Reservations)
+                .and_then(|provenance| provenance.winner().file_path()),
+            config.loaded_file(ConfigFileKind::Local),
+            config.loaded_file(ConfigFileKind::Project),
+        ];
+        let present = candidates.map(|candidate| candidate.is_some());
+        let discovered_config_path = first_present(&present)
+            .and_then(|index| candidates[index])
             .ok_or_else(|| Error::InvalidPath {
                 path: options.start_dir.clone(),
                 reason: format!(
@@ -229,6 +237,22 @@ impl AutoreservePlan {
     /// ```
     pub fn build_plan(&self, conn: &Connection) -> Result<OperationPlan> {
         self.reserve_group.build_plan(conn)
+    }
+
+    /// Runs this autoreserve request as a dry run against a private
+    /// in-memory copy of `database` (`None` when no database exists yet);
+    /// see [`ReserveGroupPlan::dry_run`].
+    ///
+    /// # Errors
+    ///
+    /// Returns every error a live run would return, and an error if the
+    /// database cannot be read.
+    pub fn dry_run(
+        &self,
+        database: Option<&Path>,
+        busy_timeout: Duration,
+    ) -> Result<ExecutionResult> {
+        self.reserve_group.dry_run(database, busy_timeout)
     }
 
     /// Returns the discovered configuration file path.
@@ -441,5 +465,36 @@ reservations:
 
         let path = planner.discovered_config_path();
         assert!(path.ends_with("trop.yaml"));
+    }
+
+    #[test]
+    fn test_precedence_selection_matches_max_by_key() {
+        // The verified selection agrees with `Iterator::max_by_key`, which
+        // returns the last of several equally high precedences.
+        for precedences in [
+            vec![],
+            vec![2],
+            vec![2, 3],
+            vec![3, 2],
+            vec![2, 2],
+            vec![1, 3, 3, 2],
+            vec![u8::MAX, 0, u8::MAX],
+        ] {
+            let expected = precedences
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, precedence)| **precedence)
+                .map(|(index, _)| index);
+            assert_eq!(select_highest_precedence(&precedences), expected);
+        }
+    }
+
+    #[test]
+    fn test_first_present_candidate_wins() {
+        assert_eq!(first_present(&[]), None);
+        assert_eq!(first_present(&[false, false, false]), None);
+        assert_eq!(first_present(&[false, true, true]), Some(1));
+        assert_eq!(first_present(&[true, false, true]), Some(0));
+        assert_eq!(first_present(&[false, false, true]), Some(2));
     }
 }

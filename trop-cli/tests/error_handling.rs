@@ -331,8 +331,11 @@ fn every_database_mutating_command_uses_the_timeout_exit_contract() {
         &env,
         "starting an immediate database transaction",
         |command| {
+            // The test runs from an unrelated working directory, so the
+            // unrelated-path guard must be waived to reach the lock.
             command
                 .arg("migrate")
+                .arg("--allow-unrelated-path")
                 .arg("--from")
                 .arg(&source)
                 .arg("--to")
@@ -682,21 +685,19 @@ fn test_conflicting_flags_exit_code() {
     );
 }
 
-/// Test unknown subcommand returns exit code 4 (or 2 from clap).
+/// Test unknown subcommand returns exit code 4.
 ///
-/// Invalid subcommands should be caught by argument parsing.
+/// Invalid subcommands should be caught by argument parsing. Usage errors
+/// exit 4 (invalid arguments), never clap's default 2, which the
+/// specification reserves for lock timeouts.
 #[test]
 fn test_unknown_subcommand_exit_code() {
     let env = TestEnv::new();
 
     let output = env.command().arg("invalid-command").output().unwrap();
 
-    // Clap typically returns 2 for usage errors, but we document this
     let code = output.status.code().unwrap();
-    assert!(
-        code == 2 || code == 4,
-        "Unknown subcommand should fail with code 2 or 4"
-    );
+    assert_eq!(code, 4, "Unknown subcommand should fail with code 4");
 
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(

@@ -676,6 +676,49 @@ fn test_assert_data_dir_validate_inaccessible_database_is_internal_error_even_wh
     }
 }
 
+/// A data-directory path that holds a regular file, or that lies below one,
+/// is neither a present nor an absent data directory: with or without
+/// `--not` and `--validate`, the assertion is an internal error rather than
+/// a verdict. (`Path::exists` used to call the first present and the second
+/// absent, so `--not` succeeded below a file and the plain assertion
+/// succeeded on a file.)
+#[test]
+fn test_assert_data_dir_on_a_non_directory_is_internal_error() {
+    let env = TestEnv::new();
+    let file = env.temp_path.join("plain-file");
+    fs::write(&file, "not a directory").unwrap();
+    for data_dir in [file.clone(), file.join("below")] {
+        for flags in [
+            &[][..],
+            &["--not"],
+            &["--validate"],
+            &["--validate", "--not"],
+        ] {
+            let output = env
+                .command_bare()
+                .current_dir(&env.temp_path)
+                .arg("assert-data-dir")
+                .arg("--data-dir")
+                .arg(&data_dir)
+                .args(flags)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(6),
+                "{} {flags:?}: {output:?}",
+                data_dir.display()
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("cannot access the selected data directory"),
+                "{stderr}"
+            );
+        }
+    }
+    assert_eq!(fs::read_to_string(&file).unwrap(), "not a directory");
+}
+
 /// Test assert-data-dir with --not flag.
 ///
 /// Useful for checking that trop is NOT initialized in a fresh environment.
@@ -1619,6 +1662,72 @@ fn test_exclude_duplicate_detection() {
     assert_eq!(count, 1, "Should not create duplicate exclusions");
 }
 
+/// Regression: `trop exclude` used to write reversed ranges and port 0 to the
+/// config file, which then failed validation on every later load.
+///
+/// **Invariant**: An invalid exclusion is rejected before anything is written.
+#[test]
+fn test_exclude_rejects_invalid_exclusions_without_writing() {
+    let env = TestEnv::new();
+
+    let config_path = env.path().join("trop.yaml");
+    let initial = "project: test\n";
+    fs::write(&config_path, initial).expect("Failed to write config");
+
+    for (argument, reason) in [
+        ("8090..8080", "end < start"),
+        ("0", "Invalid port: 0"),
+        ("0..10", "Invalid start port: 0"),
+    ] {
+        let output = env
+            .command_bare()
+            .arg("exclude")
+            .arg(argument)
+            .current_dir(env.path())
+            .output()
+            .expect("Failed to run exclude");
+
+        assert_eq!(output.status.code(), Some(4), "{argument}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).expect("Invalid UTF-8");
+        assert!(stderr.contains(reason), "{argument}: {stderr}");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("Failed to read config"),
+            initial,
+            "{argument}: config must be unchanged"
+        );
+    }
+
+    // The configuration still loads.
+    env.command_bare()
+        .arg("validate")
+        .arg(&config_path)
+        .assert()
+        .success();
+}
+
+/// `trop exclude` accepts the same text as the YAML string form, including
+/// whitespace around `..`.
+#[test]
+fn test_exclude_accepts_whitespace_around_range_separator() {
+    let env = TestEnv::new();
+
+    let config_path = env.path().join("trop.yaml");
+    fs::write(&config_path, "project: test\n").expect("Failed to write config");
+
+    env.command_bare()
+        .arg("exclude")
+        .arg(" 8080 .. 8090 ")
+        .current_dir(env.path())
+        .assert()
+        .success();
+
+    let parsed: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&config_path).expect("Failed to read config"))
+            .expect("Failed to parse config");
+    assert_eq!(parsed["excluded_ports"][0]["start"], 8080);
+    assert_eq!(parsed["excluded_ports"][0]["end"], 8090);
+}
+
 // ============================================================================
 // Configuration Command Tests: compact-exclusions
 // ============================================================================
@@ -1768,6 +1877,80 @@ excluded_ports:
     );
 }
 
+/// Regression: compact-exclusions used to silently drop a reversed range
+/// (`[5010..5000, 6000]` was rewritten to `[6000]`), changing the set of
+/// excluded ports, and kept port 0.
+///
+/// **Invariant**: compaction never changes the excluded set; invalid entries
+/// are reported as a configuration error and the file is left untouched.
+#[test]
+fn test_compact_exclusions_rejects_invalid_entries_without_writing() {
+    let env = TestEnv::new();
+
+    let config_path = env.path().join("trop.yaml");
+    for config in [
+        "project: test\nexcluded_ports:\n  - \"5010..5000\"\n  - 6000\n",
+        "project: test\nexcluded_ports:\n  - \"5010..5000\"\n",
+        "project: test\nexcluded_ports:\n  - 0\n  - 1\n",
+    ] {
+        fs::write(&config_path, config).expect("Failed to write config");
+
+        let output = env
+            .command()
+            .arg("compact-exclusions")
+            .arg(&config_path)
+            .output()
+            .expect("Failed to run compact-exclusions");
+
+        assert_eq!(output.status.code(), Some(7), "{config}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).expect("Invalid UTF-8");
+        assert!(stderr.contains("excluded_ports[0]"), "{config}: {stderr}");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("Failed to read config"),
+            config,
+            "config must be unchanged"
+        );
+    }
+}
+
+/// Compaction output is the canonical form: sorted, merged, and `Single`
+/// for one-port runs (a one-port range `5000..5000` becomes `5000`).
+#[test]
+fn test_compact_exclusions_writes_canonical_form() {
+    let env = TestEnv::new();
+
+    let config_path = env.path().join("trop.yaml");
+    let config = r#"
+project: test
+
+excluded_ports:
+  - 9000
+  - "5003..5005"
+  - 5000
+  - start: 5001
+    end: 5002
+  - "7000..7000"
+"#;
+    fs::write(&config_path, config).expect("Failed to write config");
+
+    env.command()
+        .arg("compact-exclusions")
+        .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Compacted 5 exclusions to 3"));
+
+    let parsed: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&config_path).expect("Failed to read config"))
+            .expect("Failed to parse config");
+    let excluded = &parsed["excluded_ports"];
+    assert_eq!(excluded[0]["start"], 5000);
+    assert_eq!(excluded[0]["end"], 5005);
+    assert_eq!(excluded[1], 7000);
+    assert_eq!(excluded[2], 9000);
+    assert!(excluded[3].is_null());
+}
+
 // ============================================================================
 // Scan Command Tests (Basic Functionality)
 // ============================================================================
@@ -1904,10 +2087,60 @@ fn test_scan_uses_config_range() {
     );
 }
 
-// Note: --autoexclude and --autocompact flags are difficult to test in
-// integration tests because they require actually occupied ports.
-// These are better tested manually or with mock occupancy checkers.
-// We've included unit tests for the compact_exclusion_list function below.
+/// Test scan resolves `ports.max_offset` exactly like the allocator.
+///
+/// Regression: scan used to ignore `max_offset` and fall back to the default
+/// maximum (7000), so a configured `min` above 7000 failed with an invalid
+/// range and a lower `min` scanned (and could auto-exclude) the wrong ports.
+#[test]
+fn test_scan_uses_configured_max_offset_range() {
+    let env = TestEnv::new();
+    let project = env.create_dir("max-offset-project");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("Failed to bind TCP fixture");
+    let port = listener.local_addr().unwrap().port();
+    // The range `port - 1 ..= port` (via max_offset) contains the bound port
+    // and cannot overflow. Ephemeral ports lie far above the default maximum.
+    let min = port - 1;
+    fs::write(
+        project.join("trop.yaml"),
+        format!("ports:\n  min: {min}\n  max_offset: 1\n"),
+    )
+    .expect("Failed to write max_offset config");
+
+    let output = env
+        .command()
+        .current_dir(&project)
+        .arg("scan")
+        .arg("--skip-udp")
+        .arg("--skip-ipv6")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("Failed to run scan");
+    assert!(
+        output.status.success(),
+        "scan must use min..=min+max_offset, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("scan output must be JSON");
+    let rows = rows.as_array().expect("scan output must be a JSON array");
+    assert!(
+        rows.iter().any(|row| row["port"] == port),
+        "the bound port {port} must be reported: {rows:?}"
+    );
+    for row in rows {
+        let scanned = row["port"].as_u64().expect("port must be a number");
+        assert!(
+            (u64::from(min)..=u64::from(port)).contains(&scanned),
+            "port {scanned} lies outside the configured range {min}..={port}"
+        );
+    }
+    drop(listener);
+}
+
+// Note: --autoexclude and --autocompact need actually occupied ports; they
+// are tested with a bound listener in exclusion_edits.rs.
 
 // ============================================================================
 // Edge Cases and Error Handling

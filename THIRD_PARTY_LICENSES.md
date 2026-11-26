@@ -12,7 +12,7 @@ See `LICENSE`, `LICENSE-APACHE`, and `LICENSE-MIT` for the full text.
 
 ## Overview
 
-- **MIT License** — 241 crate(s)
+- **MIT License** — 250 crate(s)
 - **Apache License 2.0** — 9 crate(s)
 - **Unicode License v3** — 2 crate(s)
 - **zlib License** — 2 crate(s)
@@ -2923,6 +2923,23 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- [synstructure 0.13.2](https://github.com/mystor/synstructure)
+
+```
+Copyright 2016 Nika Layzell
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### MIT License
+
+Used by:
+
 - [rand 0.10.3](https://github.com/rust-random/rand)
 - [rand_xorshift 0.5.0](https://github.com/rust-random/rngs)
 
@@ -3122,8 +3139,10 @@ SOFTWARE.
 
 Used by:
 
+- [trop-verification 0.0.0](https://github.com/plx/trop)
 - [anes 0.1.6](https://github.com/zrzka/anes-rs)
 - [chrono 0.4.45](https://github.com/chronotope/chrono)
+- [convert_case 0.4.0](https://github.com/rutrum/convert-case)
 - [difflib 0.4.0](https://github.com/DimaKudosh/difflib)
 - [netlink-packet-core 0.7.0](https://github.com/rust-netlink/netlink-packet-core)
 - [netlink-packet-sock-diag 0.4.2](https://github.com/rust-netlink/netlink-packet-sock-diag)
@@ -3132,6 +3151,10 @@ Used by:
 - [plotters-backend 0.3.7](https://github.com/plotters-rs/plotters)
 - [plotters-svg 0.3.7](https://github.com/plotters-rs/plotters.git)
 - [plotters 0.3.7](https://github.com/plotters-rs/plotters)
+- [verus_builtin 0.0.0-2026-11-22-0344](https://github.com/verus-lang/verus)
+- [verus_builtin_macros 0.0.0-2026-11-22-0344](https://github.com/verus-lang/verus)
+- [verus_state_machines_macros 0.0.0-2026-11-22-0344](https://github.com/verus-lang/verus)
+- [vstd 0.0.0-2026-11-22-0344](https://github.com/verus-lang/verus)
 - [windows-core 0.57.0](https://github.com/microsoft/windows-rs)
 - [windows-core 0.62.2](https://github.com/microsoft/windows-rs)
 - [windows-implement 0.57.0](https://github.com/microsoft/windows-rs)
@@ -3317,6 +3340,8 @@ Used by:
 - [thiserror 2.0.21](https://github.com/dtolnay/thiserror)
 - [unicode-ident 1.0.27](https://github.com/dtolnay/unicode-ident)
 - [unsafe-libyaml 0.2.11](https://github.com/dtolnay/unsafe-libyaml)
+- [verus_prettyplease 0.0.0-2026-11-01-0251](https://github.com/dtolnay/prettyplease)
+- [verus_syn 0.0.0-2026-11-01-0251](https://github.com/dtolnay/syn)
 - [zmij 1.0.23](https://github.com/dtolnay/zmij)
 
 ```

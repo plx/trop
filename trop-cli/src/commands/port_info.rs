@@ -5,6 +5,7 @@ use crate::invocation::InvocationContext;
 use crate::utils::format_timestamp;
 use clap::Args;
 use std::fmt::Write as _;
+use trop::output::display_field;
 use trop::port::occupancy::{OccupancyCheckConfig, SystemOccupancyChecker};
 use trop::{Database, Port};
 
@@ -13,7 +14,7 @@ use trop::{Database, Port};
 pub struct PortInfoCommand {
     /// Port number to query
     #[arg(value_name = "PORT")]
-    pub port: u16,
+    pub port: String,
 
     /// Include occupancy information
     #[arg(long)]
@@ -46,9 +47,9 @@ pub struct PortInfoCommand {
 
 impl PortInfoCommand {
     pub fn execute(self, context: &InvocationContext) -> Result<(), CliError> {
-        // 1. Parse port
-        let port =
-            Port::try_from(self.port).map_err(|e| CliError::InvalidArguments(e.to_string()))?;
+        // 1. Parse port (exactly as `reserve --port` parses it)
+        let port = Port::try_from(crate::commands::reserve::parse_port_string(&self.port)?)
+            .map_err(|e| CliError::InvalidArguments(e.to_string()))?;
 
         // 2. Open database and query
         let db = context.open_database()?;
@@ -58,17 +59,21 @@ impl PortInfoCommand {
             Database::get_reservation_by_port(db.connection(), port).map_err(CliError::from)?;
 
         // 4. Display reservation info
+        // Stored text is escaped so each field stays on its own line.
         if let Some(res) = reservation {
             println!("Port: {}", res.port());
-            println!("Path: {}", res.key().path.display());
+            println!(
+                "Path: {}",
+                display_field(&res.key().path.display().to_string())
+            );
             if let Some(tag) = &res.key().tag {
-                println!("Tag: {tag}");
+                println!("Tag: {}", display_field(tag));
             }
             if let Some(project) = res.project() {
-                println!("Project: {project}");
+                println!("Project: {}", display_field(project));
             }
             if let Some(task) = res.task() {
-                println!("Task: {task}");
+                println!("Task: {}", display_field(task));
             }
             println!("Created: {}", format_timestamp(res.created_at()));
             println!("Last used: {}", format_timestamp(res.last_used_at()));
@@ -129,13 +134,13 @@ fn render_occupancy_report(report: &trop::port::occupancy::OccupancyReport) -> S
             writeln!(
                 output,
                 "    Process: {}",
-                optional_display(probe.owner.process_name.as_deref())
+                owner_text(probe.owner.process_name.as_deref())
             )
             .expect("writing to a String cannot fail");
             writeln!(
                 output,
                 "    User: {}",
-                optional_display(probe.owner.user.as_deref())
+                owner_text(probe.owner.user.as_deref())
             )
             .expect("writing to a String cannot fail");
             writeln!(output, "    Owner metadata: {}", probe.owner.status)
@@ -149,6 +154,11 @@ fn render_occupancy_report(report: &trop::port::occupancy::OccupancyReport) -> S
 
 fn optional_display<T: ToString>(value: Option<T>) -> String {
     value.map_or_else(|| "unavailable".to_string(), |value| value.to_string())
+}
+
+/// Owner text reported by the operating system, escaped for display.
+fn owner_text(value: Option<&str>) -> String {
+    value.map_or_else(|| "unavailable".to_string(), display_field)
 }
 
 #[cfg(test)]
@@ -185,6 +195,33 @@ mod tests {
                 "    Owner metadata: unavailable\n",
             )
         );
+    }
+
+    #[test]
+    fn occupancy_output_escapes_owner_text() {
+        let report = OccupancyReport {
+            port: Port::try_from(5050).unwrap(),
+            enabled_probe_count: 4,
+            occupied_probes: vec![OccupiedProbe {
+                protocol: OccupancyProtocol::Tcp,
+                address_family: OccupancyAddressFamily::Ipv4,
+                scope: OccupancyScope::Localhost,
+                address: Ipv4Addr::LOCALHOST.into(),
+                owner: OccupancyOwner {
+                    process_id: Some(7),
+                    process_name: Some("a\nUser: root".to_string()),
+                    user: Some("x\u{1b}[2J".to_string()),
+                    ..OccupancyOwner::default()
+                },
+            }],
+        };
+        let rendered = render_occupancy_report(&report);
+        assert!(
+            rendered.contains("    Process: \"a\\nUser: root\"\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("    User: \"x\\x1b[2J\"\n"), "{rendered}");
+        assert_eq!(rendered.lines().count(), 6, "{rendered}");
     }
 
     #[test]

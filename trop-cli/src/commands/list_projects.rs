@@ -25,12 +25,14 @@ impl ListProjectsCommand {
         // 3. Query projects
         let projects = Database::list_projects(db.connection()).map_err(CliError::from)?;
 
-        // 4. Output one per line to stdout
+        // 4. Output one per line to stdout. Each project is shown with
+        // `display_field`, so a project containing a newline (or another
+        // control character) stays on its own line.
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
 
         for project in projects {
-            writeln!(handle, "{project}")?;
+            writeln!(handle, "{}", trop::output::display_field(&project))?;
         }
 
         Ok(())

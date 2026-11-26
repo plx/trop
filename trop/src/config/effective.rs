@@ -9,18 +9,23 @@ use std::path::{Path, PathBuf};
 use crate::config::merger::ConfigMerger;
 use crate::config::schema::{
     CleanupConfig, Config, OccupancyConfig, OutputFormat, PortConfig, PortExclusion,
-    ReservationGroup, DEFAULT_MAX_PORT, DEFAULT_MIN_PORT,
+    ReservationGroup,
 };
 use crate::config::validator::ConfigValidator;
 use crate::error::Result;
-
-static BUILT_IN_PORTS: PortConfig = PortConfig {
-    min: DEFAULT_MIN_PORT,
-    max: Some(DEFAULT_MAX_PORT),
-    max_offset: None,
+use crate::verified::config::{
+    derive_permissions, flag_enabled, overlay_leaf, DEFAULT_EXPIRE_AFTER_DAYS,
+    DEFAULT_LOCK_WAIT_SECONDS, DEFAULT_OUTPUT_FORMAT,
 };
+use crate::verified::port_bounds::{default_port_bounds, overlay_port_bounds, PortLayer};
+
+/// The built-in `ports` section, as the verified kernel defines it (and
+/// proves canonical and valid).
+static BUILT_IN_PORTS: PortConfig = PortConfig::from_bounds(default_port_bounds());
+/// The built-in `cleanup` section (the verified configuration kernel's
+/// default, proved valid).
 static BUILT_IN_CLEANUP: CleanupConfig = CleanupConfig {
-    expire_after_days: Some(30),
+    expire_after_days: Some(DEFAULT_EXPIRE_AFTER_DAYS),
 };
 static BUILT_IN_OCCUPANCY: OccupancyConfig = OccupancyConfig {
     skip: Some(false),
@@ -427,52 +432,72 @@ impl EffectiveConfig {
     }
 
     /// Return whether automatic database initialization is disabled.
+    ///
+    /// Unset means `false`; the flags are decided by the verified kernel's
+    /// `flag_enabled`.
     #[must_use]
     pub fn disable_autoinit(&self) -> bool {
-        self.config.disable_autoinit.unwrap_or(false)
+        flag_enabled(self.config.disable_autoinit)
     }
 
     /// Return whether automatic pruning is disabled.
     #[must_use]
     pub fn disable_autoprune(&self) -> bool {
-        self.config.disable_autoprune.unwrap_or(false)
+        flag_enabled(self.config.disable_autoprune)
     }
 
     /// Return whether automatic expiration is disabled.
     #[must_use]
     pub fn disable_autoexpire(&self) -> bool {
-        self.config.disable_autoexpire.unwrap_or(false)
+        flag_enabled(self.config.disable_autoexpire)
     }
 
     /// Return whether operations on unrelated paths are allowed.
     #[must_use]
     pub fn allow_unrelated_path(&self) -> bool {
-        self.config.allow_unrelated_path.unwrap_or(false)
+        flag_enabled(self.config.allow_unrelated_path)
     }
 
     /// Return the effective project-change permission.
+    ///
+    /// `allow_change` or `allow_change_project`; decided by the verified
+    /// kernel's `derive_permissions` (monotone, deny by default).
     #[must_use]
     pub fn allow_project_change(&self) -> bool {
-        self.config.allow_change.unwrap_or(false)
-            || self.config.allow_change_project.unwrap_or(false)
+        self.permissions().0
     }
 
     /// Return the effective task-change permission.
+    ///
+    /// `allow_change` or `allow_change_task`; decided by the verified
+    /// kernel's `derive_permissions` (monotone, deny by default).
     #[must_use]
     pub fn allow_task_change(&self) -> bool {
-        self.config.allow_change.unwrap_or(false) || self.config.allow_change_task.unwrap_or(false)
+        self.permissions().1
+    }
+
+    const fn permissions(&self) -> (bool, bool) {
+        derive_permissions(
+            self.config.allow_change,
+            self.config.allow_change_project,
+            self.config.allow_change_task,
+        )
     }
 
     /// Return the effective database lock wait in seconds.
     #[must_use]
     pub fn maximum_lock_wait_seconds(&self) -> u64 {
-        self.config.maximum_lock_wait_seconds.unwrap_or(5)
+        self.config
+            .maximum_lock_wait_seconds
+            .unwrap_or(DEFAULT_LOCK_WAIT_SECONDS)
     }
 
     /// Return the effective list output format.
     #[must_use]
     pub fn output_format(&self) -> OutputFormat {
-        self.config.output_format.unwrap_or(OutputFormat::Table)
+        self.config
+            .output_format
+            .unwrap_or(OutputFormat::from_code(DEFAULT_OUTPUT_FORMAT))
     }
 
     /// Apply precise command-line fields to this effective configuration.
@@ -485,20 +510,58 @@ impl EffectiveConfig {
     /// # Errors
     ///
     /// Returns a validation error if the resulting configuration is invalid.
+    /// This configuration is then left unchanged.
     pub fn apply_cli_config<I>(&mut self, config: &Config, explicit_fields: I) -> Result<()>
     where
         I: IntoIterator<Item = ConfigField>,
     {
-        self.apply_precise(
+        // Apply to a copy and commit only a valid result, so an
+        // `EffectiveConfig` never holds a rejected layer (which a later
+        // `min`-only layer could otherwise re-anchor).
+        let mut next = self.clone();
+        next.apply_precise(
             config,
             explicit_fields.into_iter().collect(),
             &ConfigValueSource::CommandLine,
         );
-        self.validate(true)
+        next.validate(true)?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Check that `reservations.base` lies within the range the current
+    /// `ports` section names.
+    ///
+    /// [`crate::config::ConfigBuilder`] calls this once the built-in defaults
+    /// and every configuration file are laid, before environment,
+    /// programmatic, and command-line overrides, which apply to one
+    /// invocation. The decision is the verified port-bounds kernel's
+    /// (`group_base_outside_range`). A violation is attributed to the source
+    /// that last set the group or a port bound.
+    pub(crate) fn validate_configured_group_base(&self) -> Result<()> {
+        let Some(group) = &self.config.reservations else {
+            return Ok(());
+        };
+        ConfigValidator::validate_group_base_in_range(group, Some(self.ports())).map_err(|error| {
+            let source = [
+                ConfigField::Reservations,
+                ConfigField::PortsMin,
+                ConfigField::PortsMax,
+                ConfigField::PortsMaxOffset,
+            ]
+            .iter()
+            .filter_map(|field| self.provenance.get(field))
+            .max_by_key(|provenance| provenance.winner_order)
+            .map(FieldProvenance::winner);
+            match source {
+                Some(source) => ConfigValidator::annotate(error, source),
+                None => error,
+            }
+        })
     }
 
     pub(crate) fn validate(&self, is_tropfile: bool) -> Result<()> {
-        ConfigValidator::validate(&self.config, is_tropfile)
+        ConfigValidator::validate_effective(&self.config, is_tropfile)
             .and_then(|()| {
                 self.task.as_deref().map_or(Ok(()), |task| {
                     ConfigValidator::validate_runtime_identifier("task", task)
@@ -554,22 +617,95 @@ impl EffectiveConfig {
             .map(FieldProvenance::winner)
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Lay the selected port leaves of `source_config` over the effective
+    /// `ports` section as one layer, and record the leaves it set.
+    ///
+    /// The overlay is decided by the verified port-bounds kernel
+    /// (`overlay_port_bounds`): a selected `max_offset` is resolved against the
+    /// `min` in effect at this layer, and an upper bound this layer does not
+    /// set stays where it is when only `min` changes.
+    fn apply_port_layer(
+        &mut self,
+        source_config: &Config,
+        fields: &BTreeSet<ConfigField>,
+        source: &ConfigValueSource,
+    ) {
+        let Some(source_ports) = &source_config.ports else {
+            return;
+        };
+        let layer = PortLayer {
+            min: fields
+                .contains(&ConfigField::PortsMin)
+                .then_some(source_ports.min),
+            max: source_ports
+                .max
+                .filter(|_| fields.contains(&ConfigField::PortsMax)),
+            max_offset: source_ports
+                .max_offset
+                .filter(|_| fields.contains(&ConfigField::PortsMaxOffset)),
+        };
+        let lower = self.config.ports.clone().unwrap_or_default();
+        let (bounds, leaves) = overlay_port_bounds(lower.bounds(), layer);
+        if leaves.min || leaves.upper {
+            self.config.ports = Some(PortConfig::from_bounds(bounds));
+        }
+        if leaves.min {
+            self.record(ConfigField::PortsMin, source.clone());
+        }
+        if leaves.upper {
+            self.record(ConfigField::PortsMax, source.clone());
+            self.record(ConfigField::PortsMaxOffset, source.clone());
+        }
+    }
+
+    /// Lay the selected leaves of `source_config` over this configuration at
+    /// command-line precedence, and record the leaves it set.
+    ///
+    /// Every scalar, occupancy, and cleanup leaf goes through the verified
+    /// kernel's `overlay_leaf`: a selected leaf the source sets replaces the
+    /// effective value and records `source` as its provenance; a leaf the
+    /// source leaves unset changes nothing (`lemma_fold_overlay_precedence`).
     pub(crate) fn apply_precise(
         &mut self,
         source_config: &Config,
         fields: BTreeSet<ConfigField>,
         source: &ConfigValueSource,
     ) {
-        let both_port_bounds = fields.contains(&ConfigField::PortsMax)
-            && fields.contains(&ConfigField::PortsMaxOffset)
-            && source_config
-                .ports
-                .as_ref()
-                .is_some_and(|ports| ports.max.is_some() && ports.max_offset.is_some());
+        self.apply_port_layer(source_config, &fields, source);
 
         for field in fields {
             let mut changed = Vec::new();
+
+            // A top-level scalar leaf.
+            macro_rules! leaf {
+                ($leaf:ident) => {{
+                    let (value, set) = overlay_leaf(self.config.$leaf, source_config.$leaf);
+                    self.config.$leaf = value;
+                    if set {
+                        changed.push(field);
+                    }
+                }};
+            }
+            // A leaf of a nested section; the section is created only when
+            // the leaf is set.
+            macro_rules! nested_leaf {
+                ($section:ident, $default:path, $leaf:ident) => {{
+                    let (value, set) = overlay_leaf(
+                        self.config
+                            .$section
+                            .as_ref()
+                            .and_then(|section| section.$leaf),
+                        source_config
+                            .$section
+                            .as_ref()
+                            .and_then(|section| section.$leaf),
+                    );
+                    if set {
+                        self.config.$section.get_or_insert_with($default).$leaf = value;
+                        changed.push(field);
+                    }
+                }};
+            }
 
             match field {
                 ConfigField::Project => {
@@ -578,96 +714,21 @@ impl EffectiveConfig {
                         changed.push(field);
                     }
                 }
-                ConfigField::Task => {}
-                ConfigField::DisableAutoinit => {
-                    if let Some(value) = source_config.disable_autoinit {
-                        self.config.disable_autoinit = Some(value);
-                        changed.push(field);
-                    }
-                }
-                ConfigField::DisableAutoprune => {
-                    if let Some(value) = source_config.disable_autoprune {
-                        self.config.disable_autoprune = Some(value);
-                        changed.push(field);
-                    }
-                }
-                ConfigField::DisableAutoexpire => {
-                    if let Some(value) = source_config.disable_autoexpire {
-                        self.config.disable_autoexpire = Some(value);
-                        changed.push(field);
-                    }
-                }
-                ConfigField::OutputFormat => {
-                    if let Some(value) = source_config.output_format {
-                        self.config.output_format = Some(value);
-                        changed.push(field);
-                    }
-                }
-                ConfigField::AllowUnrelatedPath => {
-                    if let Some(value) = source_config.allow_unrelated_path {
-                        self.config.allow_unrelated_path = Some(value);
-                        changed.push(field);
-                    }
-                }
-                ConfigField::AllowChangeProject => {
-                    if let Some(value) = source_config.allow_change_project {
-                        self.config.allow_change_project = Some(value);
-                        changed.push(field);
-                    }
-                }
-                ConfigField::AllowChangeTask => {
-                    if let Some(value) = source_config.allow_change_task {
-                        self.config.allow_change_task = Some(value);
-                        changed.push(field);
-                    }
-                }
-                ConfigField::AllowChange => {
-                    if let Some(value) = source_config.allow_change {
-                        self.config.allow_change = Some(value);
-                        changed.push(field);
-                    }
-                }
-                ConfigField::MaximumLockWaitSeconds => {
-                    if let Some(value) = source_config.maximum_lock_wait_seconds {
-                        self.config.maximum_lock_wait_seconds = Some(value);
-                        changed.push(field);
-                    }
-                }
-                ConfigField::PortsMin => {
-                    if let Some(source_ports) = &source_config.ports {
-                        self.config
-                            .ports
-                            .get_or_insert_with(PortConfig::default)
-                            .min = source_ports.min;
-                        changed.push(field);
-                    }
-                }
-                ConfigField::PortsMax => {
-                    if let Some(value) = source_config.ports.as_ref().and_then(|ports| ports.max) {
-                        let ports = self.config.ports.get_or_insert_with(PortConfig::default);
-                        ports.max = Some(value);
-                        changed.push(ConfigField::PortsMax);
-                        if !both_port_bounds {
-                            ports.max_offset = None;
-                            changed.push(ConfigField::PortsMaxOffset);
-                        }
-                    }
-                }
-                ConfigField::PortsMaxOffset => {
-                    if let Some(value) = source_config
-                        .ports
-                        .as_ref()
-                        .and_then(|ports| ports.max_offset)
-                    {
-                        let ports = self.config.ports.get_or_insert_with(PortConfig::default);
-                        ports.max_offset = Some(value);
-                        changed.push(ConfigField::PortsMaxOffset);
-                        if !both_port_bounds {
-                            ports.max = None;
-                            changed.push(ConfigField::PortsMax);
-                        }
-                    }
-                }
+                // Task is not a `Config` field. The selected port leaves form
+                // one layer, applied above by `apply_port_layer`.
+                ConfigField::Task
+                | ConfigField::PortsMin
+                | ConfigField::PortsMax
+                | ConfigField::PortsMaxOffset => {}
+                ConfigField::DisableAutoinit => leaf!(disable_autoinit),
+                ConfigField::DisableAutoprune => leaf!(disable_autoprune),
+                ConfigField::DisableAutoexpire => leaf!(disable_autoexpire),
+                ConfigField::OutputFormat => leaf!(output_format),
+                ConfigField::AllowUnrelatedPath => leaf!(allow_unrelated_path),
+                ConfigField::AllowChangeProject => leaf!(allow_change_project),
+                ConfigField::AllowChangeTask => leaf!(allow_change_task),
+                ConfigField::AllowChange => leaf!(allow_change),
+                ConfigField::MaximumLockWaitSeconds => leaf!(maximum_lock_wait_seconds),
                 ConfigField::ExcludedPorts => {
                     if let Some(exclusions) = &source_config.excluded_ports {
                         self.config
@@ -678,95 +739,29 @@ impl EffectiveConfig {
                     }
                 }
                 ConfigField::CleanupExpireAfterDays => {
-                    if let Some(value) = source_config
-                        .cleanup
-                        .as_ref()
-                        .and_then(|cleanup| cleanup.expire_after_days)
-                    {
-                        self.config
-                            .cleanup
-                            .get_or_insert_with(CleanupConfig::default)
-                            .expire_after_days = Some(value);
-                        changed.push(field);
-                    }
+                    nested_leaf!(cleanup, CleanupConfig::default, expire_after_days);
                 }
                 ConfigField::OccupancySkip => {
-                    if let Some(value) = source_config
-                        .occupancy_check
-                        .as_ref()
-                        .and_then(|occupancy| occupancy.skip)
-                    {
-                        self.config
-                            .occupancy_check
-                            .get_or_insert_with(OccupancyConfig::default)
-                            .skip = Some(value);
-                        changed.push(field);
-                    }
+                    nested_leaf!(occupancy_check, OccupancyConfig::default, skip);
                 }
                 ConfigField::OccupancySkipIp4 => {
-                    if let Some(value) = source_config
-                        .occupancy_check
-                        .as_ref()
-                        .and_then(|occupancy| occupancy.skip_ip4)
-                    {
-                        self.config
-                            .occupancy_check
-                            .get_or_insert_with(OccupancyConfig::default)
-                            .skip_ip4 = Some(value);
-                        changed.push(field);
-                    }
+                    nested_leaf!(occupancy_check, OccupancyConfig::default, skip_ip4);
                 }
                 ConfigField::OccupancySkipIp6 => {
-                    if let Some(value) = source_config
-                        .occupancy_check
-                        .as_ref()
-                        .and_then(|occupancy| occupancy.skip_ip6)
-                    {
-                        self.config
-                            .occupancy_check
-                            .get_or_insert_with(OccupancyConfig::default)
-                            .skip_ip6 = Some(value);
-                        changed.push(field);
-                    }
+                    nested_leaf!(occupancy_check, OccupancyConfig::default, skip_ip6);
                 }
                 ConfigField::OccupancySkipTcp => {
-                    if let Some(value) = source_config
-                        .occupancy_check
-                        .as_ref()
-                        .and_then(|occupancy| occupancy.skip_tcp)
-                    {
-                        self.config
-                            .occupancy_check
-                            .get_or_insert_with(OccupancyConfig::default)
-                            .skip_tcp = Some(value);
-                        changed.push(field);
-                    }
+                    nested_leaf!(occupancy_check, OccupancyConfig::default, skip_tcp);
                 }
                 ConfigField::OccupancySkipUdp => {
-                    if let Some(value) = source_config
-                        .occupancy_check
-                        .as_ref()
-                        .and_then(|occupancy| occupancy.skip_udp)
-                    {
-                        self.config
-                            .occupancy_check
-                            .get_or_insert_with(OccupancyConfig::default)
-                            .skip_udp = Some(value);
-                        changed.push(field);
-                    }
+                    nested_leaf!(occupancy_check, OccupancyConfig::default, skip_udp);
                 }
                 ConfigField::OccupancyCheckAllInterfaces => {
-                    if let Some(value) = source_config
-                        .occupancy_check
-                        .as_ref()
-                        .and_then(|occupancy| occupancy.check_all_interfaces)
-                    {
-                        self.config
-                            .occupancy_check
-                            .get_or_insert_with(OccupancyConfig::default)
-                            .check_all_interfaces = Some(value);
-                        changed.push(field);
-                    }
+                    nested_leaf!(
+                        occupancy_check,
+                        OccupancyConfig::default,
+                        check_all_interfaces
+                    );
                 }
                 ConfigField::Reservations => {
                     if source_config.reservations.is_some() {
@@ -803,6 +798,73 @@ mod tests {
                 .provenance(ConfigField::Project)
                 .map(FieldProvenance::winner),
             Some(&ConfigValueSource::CommandLine)
+        );
+    }
+
+    /// `apply_precise` lays only the selected leaves the source sets; a
+    /// nested section is created only when one of its leaves is set.
+    #[test]
+    fn apply_precise_records_exactly_the_selected_leaves_the_source_sets() {
+        let mut effective = EffectiveConfig::from_defaults(Config {
+            output_format: Some(OutputFormat::Table),
+            ..Default::default()
+        });
+        let source = Config {
+            output_format: Some(OutputFormat::Json),
+            disable_autoinit: Some(true),
+            occupancy_check: Some(OccupancyConfig {
+                skip_tcp: Some(true),
+                ..Default::default()
+            }),
+            cleanup: Some(CleanupConfig {
+                expire_after_days: None,
+            }),
+            ..Default::default()
+        };
+        effective.apply_precise(
+            &source,
+            BTreeSet::from([
+                ConfigField::OutputFormat,
+                ConfigField::OccupancySkip,
+                ConfigField::CleanupExpireAfterDays,
+            ]),
+            &ConfigValueSource::CommandLine,
+        );
+        assert_eq!(effective.config().output_format, Some(OutputFormat::Json));
+        // Not selected.
+        assert_eq!(effective.config().disable_autoinit, None);
+        // Selected but unset in the source: no section is created.
+        assert_eq!(effective.config().occupancy_check, None);
+        assert_eq!(effective.config().cleanup, None);
+        let winner = |field| {
+            effective
+                .provenance(field)
+                .map(FieldProvenance::winner)
+                .cloned()
+        };
+        assert_eq!(
+            winner(ConfigField::OutputFormat),
+            Some(ConfigValueSource::CommandLine)
+        );
+        for field in [
+            ConfigField::DisableAutoinit,
+            ConfigField::OccupancySkip,
+            ConfigField::CleanupExpireAfterDays,
+        ] {
+            assert_eq!(winner(field), Some(ConfigValueSource::BuiltIn), "{field:?}");
+        }
+
+        effective.apply_precise(
+            &source,
+            BTreeSet::from([ConfigField::OccupancySkipTcp]),
+            &ConfigValueSource::CommandLine,
+        );
+        assert_eq!(
+            effective.config().occupancy_check,
+            Some(OccupancyConfig {
+                skip_tcp: Some(true),
+                ..Default::default()
+            })
         );
     }
 

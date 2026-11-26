@@ -32,6 +32,10 @@ pub enum PlanAction {
     UpdateReservation(Reservation),
 
     /// Update the `last_used_at` timestamp for a reservation.
+    ///
+    /// Execution fails if no reservation is stored under the key. The action
+    /// reports the port the reservation holds when it is refreshed (a dry
+    /// run reads the stored port); a failed read is an error.
     UpdateLastUsed(ReservationKey),
 
     /// Delete a reservation.
@@ -57,7 +61,8 @@ impl PlanAction {
         match self {
             Self::CreateReservation(r) if r.requires_allocation_at_execution() => {
                 format!(
-                    "Retry reservation for {} with enabled automatic cleanup after exhaustion",
+                    "Run automatic cleanup after exhaustion and, if it freed anything, \
+                     retry reservation for {}",
                     r.key()
                 )
             }
@@ -66,7 +71,8 @@ impl PlanAction {
             }
             Self::UpdateReservation(r) if r.requires_allocation_at_execution() => {
                 format!(
-                    "Retry replacement for {} with enabled automatic cleanup after exhaustion",
+                    "Run automatic cleanup after exhaustion and, if it freed anything, \
+                     retry replacement for {}",
                     r.key()
                 )
             }

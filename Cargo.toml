@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["trop", "trop-cli"]
+members = ["trop", "trop-cli", "trop-verification"]
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -14,3 +14,8 @@ log = "0.4"
 serde_json = "1.0"
 tempfile = "3.13"
 home = "0.5"
+# Verus standard library. Pinned exactly: it must match the Verus release used
+# for verification (see scripts/install-verus.sh). In ordinary builds the
+# `verus!` macro erases all specifications and proofs, so only plain Rust
+# reaches the compiled binary.
+vstd = "=0.0.0-2026-11-22-0344"

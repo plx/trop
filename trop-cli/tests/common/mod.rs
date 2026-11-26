@@ -56,9 +56,16 @@ impl TestEnv {
     /// that parallel tests do not all share `~/.trop` (which causes SQLite
     /// "database is locked" failures under contention). The `--data-dir`
     /// CLI flag still takes precedence over the env var.
+    ///
+    /// The shell seen by `--format export` auto-detection is pinned too:
+    /// `SHELL` is `/bin/bash` and the shell version variables are removed,
+    /// so tests that rely on the default export syntax do not depend on the
+    /// invoking environment (detection fails when no shell can be
+    /// determined). Tests of detection itself override these variables.
     pub fn command_bare(&self) -> Command {
         let mut cmd = Command::cargo_bin("trop").expect("Failed to find trop binary");
         cmd.env("TROP_DATA_DIR", &self.data_dir);
+        pin_detected_shell(&mut cmd);
         cmd
     }
 
@@ -84,6 +91,7 @@ impl TestEnv {
         cmd.env("TROP_DATA_DIR", &self.data_dir)
             .arg("--data-dir")
             .arg(&self.data_dir);
+        pin_detected_shell(&mut cmd);
         cmd
     }
 
@@ -293,4 +301,16 @@ pub fn parse_port(output: &str) -> u16 {
 #[allow(dead_code)]
 pub fn contains_port(haystack: &str, port: u16) -> bool {
     haystack.contains(&port.to_string())
+}
+
+/// Pins the environment that `--format export` shell auto-detection reads:
+/// `SHELL=/bin/bash`, with `ZSH_VERSION`, `FISH_VERSION` and `PSModulePath`
+/// removed, so the detected shell is bash on every host (including CI
+/// containers and `env -i` runs that have no `SHELL`).
+#[allow(dead_code)]
+pub fn pin_detected_shell(cmd: &mut Command) {
+    for variable in ["ZSH_VERSION", "FISH_VERSION", "PSModulePath"] {
+        cmd.env_remove(variable);
+    }
+    cmd.env("SHELL", "/bin/bash");
 }

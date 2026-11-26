@@ -9,6 +9,10 @@ use crate::config::schema::{CleanupConfig, Config, OccupancyConfig, OutputFormat
 use crate::config::validator::ConfigValidator;
 use crate::config::{ConfigField, ConfigFileKind, ConfigValueSource, EffectiveConfig};
 use crate::error::Result;
+use crate::verified::config::{
+    kind_for_precedence, FileKind, DEFAULT_EXPIRE_AFTER_DAYS, DEFAULT_LOCK_WAIT_SECONDS,
+    DEFAULT_OUTPUT_FORMAT, PROJECT_PRECEDENCE,
+};
 use std::collections::BTreeSet;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -101,7 +105,9 @@ impl ConfigBuilder {
     /// Add additional configuration to merge (highest precedence).
     ///
     /// This configuration will be merged last, giving it the highest precedence
-    /// after environment variables.
+    /// after environment variables. Like a configuration file, it must be
+    /// valid on its own; [`Self::build`] reports its first violation,
+    /// annotated with `<programmatic override>`.
     #[must_use]
     pub fn with_config(mut self, config: Config) -> Self {
         self.additional_config = Some(config);
@@ -169,9 +175,10 @@ impl ConfigBuilder {
     ///
     /// Performs the following steps:
     /// 1. Starts with default configuration
-    /// 2. Loads and merges file-based configurations (if not skipped)
+    /// 2. Loads and merges file-based configurations (if not skipped), and
+    ///    checks `reservations.base` against the port range they name
     /// 3. Applies environment variable overrides (if not skipped)
-    /// 4. Applies additional configuration (if provided)
+    /// 4. Validates and applies additional configuration (if provided)
     /// 5. Applies command-line configuration (if provided)
     /// 6. Validates the final configuration
     ///
@@ -213,35 +220,30 @@ impl ConfigBuilder {
         let is_tropfile = self.additional_config.is_some()
             || self.cli_config.is_some()
             || self.project_file.is_some()
-            || sources.iter().any(|source| source.precedence >= 2);
+            || sources
+                .iter()
+                .any(|source| source.precedence >= PROJECT_PRECEDENCE);
 
         let mut effective = EffectiveConfig::from_defaults(Self::default_config());
 
         for source in sources {
-            let kind = match source.precedence {
-                1 => ConfigFileKind::User,
-                3 => ConfigFileKind::Local,
-                _ => ConfigFileKind::Project,
+            let kind = match kind_for_precedence(source.precedence) {
+                FileKind::User => ConfigFileKind::User,
+                FileKind::Project => ConfigFileKind::Project,
+                FileKind::Local => ConfigFileKind::Local,
             };
             let value_source = ConfigValueSource::File {
                 kind,
                 path: source.path.clone(),
             };
-            let reservation_overlay = if kind == ConfigFileKind::User
-                && source.reservations == ReservationOverlay::Clear
-            {
-                // Existing generated global files can contain null for
-                // absent optional fields. User config cannot own a group,
-                // so this is inert rather than a project-level clear.
-                ReservationOverlay::Inherit
-            } else {
-                source.reservations
-            };
-
-            ConfigValidator::validate_source_document(
+            // The placement rules (verified) also make a user file's
+            // `reservations: null` inert: existing generated global files can
+            // contain null for absent optional fields, and user config cannot
+            // own a group, so it is not a project-level clear.
+            let reservation_overlay = ConfigValidator::validate_source_document(
                 &source.config,
                 &value_source,
-                reservation_overlay != ReservationOverlay::Inherit,
+                source.reservations,
             )?;
             effective.record_file(kind, source.path);
             effective.merge_config(&source.config, &value_source);
@@ -249,6 +251,11 @@ impl ConfigBuilder {
                 effective.clear_reservations(&value_source);
             }
         }
+
+        // `reservations.base` must lie in the range the configuration files
+        // name. Later overrides apply to one invocation; `reserve-group`
+        // checks the base against the range it actually scans.
+        effective.validate_configured_group_base()?;
 
         if !self.skip_env {
             let mut changes = Vec::new();
@@ -269,6 +276,10 @@ impl ConfigBuilder {
         }
 
         if let Some(additional) = self.additional_config {
+            // Like every configuration file, the programmatic layer must be
+            // valid on its own, so its port bounds resolve where it declares
+            // them and a later layer cannot rescue or re-anchor them.
+            ConfigValidator::validate_source(&additional, &ConfigValueSource::Programmatic)?;
             effective.merge_config(&additional, &ConfigValueSource::Programmatic);
         }
 
@@ -305,14 +316,14 @@ impl ConfigBuilder {
     fn default_config() -> Config {
         Config {
             project: None,
-            ports: Some(PortConfig {
-                min: 5000,
-                max: Some(7000),
-                max_offset: None,
-            }),
+            // The built-in range, defined once by the verified port-bounds
+            // kernel (which proves it valid).
+            ports: Some(PortConfig::default()),
             excluded_ports: None,
+            // The remaining defaults are the verified configuration kernel's
+            // constants (`lemma_builtin_defaults_valid`).
             cleanup: Some(CleanupConfig {
-                expire_after_days: Some(30),
+                expire_after_days: Some(DEFAULT_EXPIRE_AFTER_DAYS),
             }),
             occupancy_check: Some(OccupancyConfig {
                 skip: Some(false),
@@ -330,8 +341,8 @@ impl ConfigBuilder {
             allow_change_project: Some(false),
             allow_change_task: Some(false),
             allow_change: Some(false),
-            maximum_lock_wait_seconds: Some(5),
-            output_format: Some(OutputFormat::Table),
+            maximum_lock_wait_seconds: Some(DEFAULT_LOCK_WAIT_SECONDS),
+            output_format: Some(OutputFormat::from_code(DEFAULT_OUTPUT_FORMAT)),
         }
     }
 }
@@ -543,9 +554,11 @@ mod tests {
             .build()
             .unwrap();
 
+        // The document's offset is resolved against its own min into the
+        // absolute max it names; it replaces the default max.
         let ports = config.ports.unwrap();
         assert_eq!(ports.min, 8000);
-        assert_eq!(ports.max, None);
-        assert_eq!(ports.max_offset, Some(25));
+        assert_eq!(ports.max, Some(8025));
+        assert_eq!(ports.max_offset, None);
     }
 }

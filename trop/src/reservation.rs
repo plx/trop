@@ -46,6 +46,15 @@ pub struct ReservationKey {
 impl ReservationKey {
     /// Creates a new reservation key.
     ///
+    /// A provided tag is trimmed of leading and trailing Unicode whitespace,
+    /// and the trimmed value is stored.
+    ///
+    /// This constructor is deliberately lenient: it is also how stored rows,
+    /// migrations, and lookups rebuild keys, and earlier versions of trop
+    /// stored tags without a length limit. Code that accepts a tag for a NEW
+    /// reservation should use [`Self::new_validated`], which applies the full
+    /// identifier rule.
+    ///
     /// # Errors
     ///
     /// Returns an error if the tag is provided but is empty after trimming whitespace.
@@ -75,15 +84,55 @@ impl ReservationKey {
     pub fn new(path: PathBuf, tag: Option<String>) -> Result<Self, ValidationError> {
         let tag = match tag {
             Some(t) => {
-                let trimmed = t.trim();
+                let trimmed = crate::identifier::trim_identifier(&t);
                 if trimmed.is_empty() {
-                    return Err(ValidationError {
-                        field: "tag".into(),
-                        message: "tag must be non-empty after trimming whitespace".into(),
-                    });
+                    return Err(blank_tag_error());
                 }
-                Some(trimmed.to_string())
+                Some(trimmed.to_owned())
             }
+            None => None,
+        };
+
+        Ok(Self { path, tag })
+    }
+
+    /// Creates a key for a new reservation, applying the identifier rule
+    /// that project and task identifiers follow.
+    ///
+    /// A provided tag is trimmed of leading and trailing Unicode whitespace,
+    /// and the trimmed value is stored. The CLI builds the key of every new
+    /// `trop reserve` reservation with this constructor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tag is provided and, after trimming whitespace,
+    /// it is empty, contains a NUL character, or is longer than 255 UTF-8
+    /// bytes (checked in that order).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// use trop::ReservationKey;
+    ///
+    /// let key = ReservationKey::new_validated(PathBuf::from("/path"), Some(" web ".to_string()));
+    /// assert_eq!(key.unwrap().tag.as_deref(), Some("web"));
+    ///
+    /// // Invalid: longer than 255 bytes
+    /// let key = ReservationKey::new_validated(PathBuf::from("/path"), Some("a".repeat(256)));
+    /// assert!(key.is_err());
+    ///
+    /// // Invalid: contains NUL
+    /// let key = ReservationKey::new_validated(PathBuf::from("/path"), Some("we\0b".to_string()));
+    /// assert!(key.is_err());
+    /// ```
+    pub fn new_validated(path: PathBuf, tag: Option<String>) -> Result<Self, ValidationError> {
+        let tag = match tag {
+            Some(t) => Some(
+                crate::identifier::check_identifier(&t)
+                    .map_err(tag_validation_error)?
+                    .to_owned(),
+            ),
             None => None,
         };
 
@@ -157,13 +206,22 @@ impl ReservationKey {
         Self::new(resolved_path.into_path_buf(), tag).map_err(crate::error::Error::from)
     }
 
-    /// Converts the path to a string for database operations.
+    /// The key's stored form: the `path` and `tag` columns of its row.
     ///
-    /// This helper provides a consistent way to convert paths to strings
-    /// for storage in the database. It uses `to_string_lossy()` to handle
-    /// paths that may contain invalid UTF-8.
-    pub(crate) fn path_as_string(&self) -> String {
-        self.path.to_string_lossy().to_string()
+    /// The verified storage kernel decides (`encode_storage_key`): the path
+    /// must be valid UTF-8 and in canonical absolute form, and the tag absent
+    /// or exact trimmed non-empty text, which is exactly what the database
+    /// accepts when it reads a row back. The stored path is the path's own
+    /// text, so distinct keys never share a stored key (no lossy UTF-8
+    /// conversion), and no tag aliases the untagged sentinel `""`.
+    pub(crate) fn storage_key(
+        &self,
+    ) -> Result<crate::verified::storage::StoredKey<'_>, crate::verified::storage::KeyError> {
+        crate::verified::storage::encode_storage_key(
+            self.path.to_str(),
+            crate::path::storage_platform(&self.path),
+            self.tag.as_deref(),
+        )
     }
 }
 
@@ -261,6 +319,10 @@ impl Reservation {
     }
 
     /// Returns whether this reservation is sticky.
+    ///
+    /// The flag is not persisted: the database schema has no column for it,
+    /// so a reservation read back from the database always reports `false`,
+    /// whatever was set when it was built.
     #[must_use]
     pub const fn sticky(&self) -> bool {
         self.sticky
@@ -304,7 +366,10 @@ impl Reservation {
     /// Checks if the reservation has expired based on the given maximum age.
     ///
     /// A reservation is considered expired if it hasn't been used for longer
-    /// than `max_age`.
+    /// than `max_age`. The age is measured from the current time with
+    /// sub-second precision, while `Database::find_expired_reservations`
+    /// compares whole seconds, so the two can disagree for up to one second
+    /// around the boundary.
     ///
     /// # Examples
     ///
@@ -322,9 +387,17 @@ impl Reservation {
     /// ```
     #[must_use]
     pub fn is_expired(&self, max_age: Duration) -> bool {
+        // A last use in the future has no age and is never expired.
         SystemTime::now()
             .duration_since(self.last_used_at)
-            .is_ok_and(|age| age > max_age)
+            .is_ok_and(|age| {
+                crate::verified::expiry::duration_exceeds(
+                    age.as_secs(),
+                    age.subsec_nanos(),
+                    max_age.as_secs(),
+                    max_age.subsec_nanos(),
+                )
+            })
     }
 }
 
@@ -380,7 +453,7 @@ impl ReservationBuilder {
     /// The project string will be trimmed of leading/trailing whitespace.
     #[must_use]
     pub fn project(mut self, project: Option<String>) -> Self {
-        self.project = project.map(|p| p.trim().to_string());
+        self.project = project.map(|p| crate::identifier::trim_identifier(&p).to_owned());
         self
     }
 
@@ -389,11 +462,14 @@ impl ReservationBuilder {
     /// The task string will be trimmed of leading/trailing whitespace.
     #[must_use]
     pub fn task(mut self, task: Option<String>) -> Self {
-        self.task = task.map(|t| t.trim().to_string());
+        self.task = task.map(|t| crate::identifier::trim_identifier(&t).to_owned());
         self
     }
 
     /// Sets whether the reservation is sticky.
+    ///
+    /// The flag lives only in memory: it is not persisted, so the database
+    /// stores and reads back the reservation with `sticky() == false`.
     #[must_use]
     pub const fn sticky(mut self, sticky: bool) -> Self {
         self.sticky = sticky;
@@ -415,6 +491,11 @@ impl ReservationBuilder {
     }
 
     /// Builds the reservation.
+    ///
+    /// The project and task must be canonical identifiers (non-empty and
+    /// already trimmed), the form stored rows are required to have. The
+    /// setters trim, so in practice this rejects exactly the values that are
+    /// empty after trimming.
     ///
     /// # Errors
     ///
@@ -446,7 +527,7 @@ impl ReservationBuilder {
     pub fn build(self) -> Result<Reservation, ValidationError> {
         // Validate project
         if let Some(ref project) = self.project {
-            if project.is_empty() {
+            if !crate::identifier::is_canonical_identifier(project) {
                 return Err(ValidationError {
                     field: "project".into(),
                     message: "project must be non-empty after trimming whitespace".into(),
@@ -456,7 +537,7 @@ impl ReservationBuilder {
 
         // Validate task
         if let Some(ref task) = self.task {
-            if task.is_empty() {
+            if !crate::identifier::is_canonical_identifier(task) {
                 return Err(ValidationError {
                     field: "task".into(),
                     message: "task must be non-empty after trimming whitespace".into(),
@@ -475,6 +556,29 @@ impl ReservationBuilder {
             last_used_at: self.last_used_at.unwrap_or(now),
             deferred_reserve: None,
         })
+    }
+}
+
+/// The error for a tag that is empty after trimming whitespace.
+fn blank_tag_error() -> ValidationError {
+    ValidationError {
+        field: "tag".into(),
+        message: "tag must be non-empty after trimming whitespace".into(),
+    }
+}
+
+/// Maps a tag rejected by the identifier rule to its validation error.
+///
+/// A blank tag keeps the message [`ReservationKey::new`] has always used; the
+/// other violations use the identifier rule's shared constant messages, so a
+/// tag and a project or task report the same rule in the same words.
+fn tag_validation_error(error: crate::identifier::IdentifierError) -> ValidationError {
+    match error {
+        crate::identifier::IdentifierError::Blank => blank_tag_error(),
+        error => ValidationError {
+            field: "tag".into(),
+            message: crate::identifier::identifier_error_message(error).into(),
+        },
     }
 }
 
@@ -543,6 +647,113 @@ mod tests {
         let result =
             ReservationKey::new(PathBuf::from("/path/to/project"), Some("   ".to_string()));
         assert!(result.is_err());
+    }
+
+    /// Regression: tags for new reservations used to bypass the shared
+    /// identifier length limit.
+    #[test]
+    fn test_validated_key_rejects_tag_over_255_bytes() {
+        let path = PathBuf::from("/path/to/project");
+        let err = ReservationKey::new_validated(path.clone(), Some("a".repeat(256))).unwrap_err();
+        assert_eq!(err.field, "tag");
+        assert_eq!(err.message, "Cannot exceed 255 bytes");
+
+        // Bytes, not characters: 128 two-byte characters are 256 bytes.
+        assert!(ReservationKey::new_validated(path.clone(), Some("é".repeat(128))).is_err());
+        assert!(ReservationKey::new_validated(path, Some("é".repeat(127))).is_ok());
+    }
+
+    /// Regression: tags for new reservations used to bypass the shared
+    /// identifier NUL check.
+    #[test]
+    fn test_validated_key_rejects_tag_with_nul() {
+        let path = PathBuf::from("/path/to/project");
+        for tag in ["web\0", "\0", " we\0b ", "\0 "] {
+            let err =
+                ReservationKey::new_validated(path.clone(), Some(tag.to_string())).unwrap_err();
+            assert_eq!(err.field, "tag");
+            assert_eq!(err.message, "Cannot contain null bytes");
+        }
+    }
+
+    #[test]
+    fn test_validated_key_tag_rule_boundaries() {
+        let path = PathBuf::from("/path");
+        assert_eq!(
+            ReservationKey::new_validated(path.clone(), None).unwrap(),
+            ReservationKey::new(path.clone(), None).unwrap()
+        );
+        let maximal = "a".repeat(255);
+        let key =
+            ReservationKey::new_validated(path.clone(), Some(format!("\u{3000} {maximal}\u{a0}")))
+                .unwrap();
+        assert_eq!(key.tag.as_deref(), Some(maximal.as_str()));
+
+        // Blank is reported before NUL and length, with the message
+        // `ReservationKey::new` uses.
+        let err = ReservationKey::new_validated(path.clone(), Some("\u{2003}\t".to_string()))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ReservationKey::new(path.clone(), Some(String::new())).unwrap_err()
+        );
+        assert_eq!(
+            err.message,
+            "tag must be non-empty after trimming whitespace"
+        );
+        // NUL is reported before length.
+        let err =
+            ReservationKey::new_validated(path.clone(), Some(format!("\0{}", "a".repeat(300))))
+                .unwrap_err();
+        assert_eq!(err.message, "Cannot contain null bytes");
+
+        // Unicode whitespace is trimmed exactly like `str::trim`; other
+        // invisible characters (zero-width space) are kept.
+        let key =
+            ReservationKey::new_validated(path, Some("\u{200b}web\u{85}".to_string())).unwrap();
+        assert_eq!(key.tag.as_deref(), Some("\u{200b}web"));
+    }
+
+    /// `ReservationKey::new` rebuilds stored rows, migrations, and lookups,
+    /// so it stays as lenient as before: it trims and rejects only blank
+    /// tags, keeping legacy tags (overlong, or containing NUL) addressable.
+    #[test]
+    fn test_reservation_key_new_stays_lenient_for_legacy_tags() {
+        let path = PathBuf::from("/path");
+        for tag in ["a".repeat(300), "é".repeat(200), "we\0b".to_string()] {
+            let key = ReservationKey::new(path.clone(), Some(format!(" {tag}\u{3000}"))).unwrap();
+            assert_eq!(key.tag, Some(tag.clone()));
+            assert!(ReservationKey::new_validated(path.clone(), Some(tag)).is_err());
+        }
+        for tag in ["", " ", "\u{3000}\t\u{85}"] {
+            let err = ReservationKey::new(path.clone(), Some(tag.to_string())).unwrap_err();
+            assert_eq!(err.field, "tag");
+            assert_eq!(
+                err.message,
+                "tag must be non-empty after trimming whitespace"
+            );
+        }
+        let key = ReservationKey::new(path, Some("\u{200b}web\u{85}".to_string())).unwrap();
+        assert_eq!(key.tag.as_deref(), Some("\u{200b}web"));
+    }
+
+    #[test]
+    fn test_reservation_builder_trims_unicode_whitespace() {
+        let key = ReservationKey::new(PathBuf::from("/path"), None).unwrap();
+        let port = Port::try_from(8080).unwrap();
+        let reservation = Reservation::builder(key.clone(), port)
+            .project(Some("\u{3000}my-project\u{a0}".to_string()))
+            .task(Some("\u{2028}task\n".to_string()))
+            .build()
+            .unwrap();
+        assert_eq!(reservation.project(), Some("my-project"));
+        assert_eq!(reservation.task(), Some("task"));
+
+        let err = Reservation::builder(key, port)
+            .project(Some("\u{2009}".to_string()))
+            .build()
+            .unwrap_err();
+        assert_eq!(err.field, "project");
     }
 
     #[test]

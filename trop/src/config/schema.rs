@@ -5,12 +5,24 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
+
+use crate::identifier::trim_identifier;
+use crate::verified::config::{output_format_keyword, parse_output_format, OutputFormatCode};
+use crate::verified::exclusions::{find_range_separator, parse_u16};
+use crate::verified::port_bounds::{
+    check_override_bounds, default_port_bounds, PortBounds, PortBoundsViolation,
+};
 
 /// Default minimum port for port allocation ranges.
-pub const DEFAULT_MIN_PORT: u16 = 5000;
+///
+/// The built-in range `DEFAULT_MIN_PORT..=DEFAULT_MAX_PORT` is defined once,
+/// in the verified port-bounds kernel, which proves it valid.
+pub const DEFAULT_MIN_PORT: u16 = crate::verified::port_bounds::DEFAULT_MIN_PORT;
 
 /// Default maximum port for port allocation ranges.
-pub const DEFAULT_MAX_PORT: u16 = 7000;
+pub const DEFAULT_MAX_PORT: u16 = crate::verified::port_bounds::DEFAULT_MAX_PORT;
 
 /// Complete configuration structure.
 ///
@@ -88,6 +100,19 @@ pub struct Config {
 /// Specifies the range of ports available for allocation. Either `max` or
 /// `max_offset` can be specified, but not both.
 ///
+/// When configuration sources are layered (see
+/// [`crate::config::ConfigBuilder`]), a `max_offset` that resolves at the
+/// `min` in effect at the layer that sets it is stored as the absolute `max`
+/// it names, so a higher layer that changes only `min` never moves it.
+/// `ConfigBuilder` checks every layer below the command line on its own
+/// (configuration files and the programmatic layer are validated, the
+/// environment's upper bound must resolve), and validates the result, so
+/// every configuration it builds, and every [`crate::config::EffectiveConfig`]
+/// after a successful `apply_cli_config`, holds `max` and no `max_offset`.
+/// (A bare [`crate::config::ConfigMerger`] merge validates nothing: there, an
+/// unresolvable `max_offset` is kept as written, and a later `min`-only
+/// section re-evaluates it at its new `min`.)
+///
 /// # Examples
 ///
 /// ```
@@ -114,11 +139,75 @@ pub struct PortConfig {
 
 impl Default for PortConfig {
     fn default() -> Self {
-        Self {
-            min: DEFAULT_MIN_PORT,
-            max: Some(DEFAULT_MAX_PORT),
-            max_offset: None,
+        Self::from_bounds(default_port_bounds())
+    }
+}
+
+impl PortConfig {
+    /// The section's bounds as the verified port-bounds kernel sees them
+    /// (a field-for-field copy).
+    pub(crate) const fn bounds(&self) -> PortBounds {
+        PortBounds {
+            min: self.min,
+            max: self.max,
+            max_offset: self.max_offset,
         }
+    }
+
+    /// The section holding `bounds` (a field-for-field copy).
+    pub(crate) const fn from_bounds(bounds: PortBounds) -> Self {
+        Self {
+            min: bounds.min,
+            max: bounds.max,
+            max_offset: bounds.max_offset,
+        }
+    }
+
+    /// Check command-line `--min` / `--max` port overrides.
+    ///
+    /// Each given bound must be a valid port (1-65535) and, when both are
+    /// given, `min <= max` — the rules a `ports` section with these bounds
+    /// must satisfy. The decision is made by a verified kernel (see
+    /// `docs/verification.md`). Used by the `trop` CLI; not a stable API.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Validation`] whose message names the offending
+    /// flag.
+    #[doc(hidden)]
+    pub fn check_command_line_bounds(
+        min: Option<u16>,
+        max: Option<u16>,
+    ) -> crate::error::Result<()> {
+        const PORT_ZERO: &str = "Invalid port number: port 0 is reserved and cannot be used";
+        check_override_bounds(min, max).map_err(|violation| {
+            let (field, message) = match violation {
+                PortBoundsViolation::InvalidMin => {
+                    ("ports.min", format!("invalid --min value: {PORT_ZERO}"))
+                }
+                PortBoundsViolation::InvalidMax => {
+                    ("ports.max", format!("invalid --max value: {PORT_ZERO}"))
+                }
+                // `MaxBelowMin` is reported only when both bounds are given.
+                // The kernel never reports the `max_offset` violations for
+                // command-line overrides (they set no offset).
+                PortBoundsViolation::MaxBelowMin
+                | PortBoundsViolation::ZeroOffset
+                | PortBoundsViolation::OffsetOverflow { .. }
+                | PortBoundsViolation::BothMaxAndOffset => (
+                    "ports",
+                    format!(
+                        "Invalid port range: min ({}) must be less than or equal to max ({})",
+                        min.unwrap_or_default(),
+                        max.unwrap_or_default()
+                    ),
+                ),
+            };
+            crate::error::Error::Validation {
+                field: field.into(),
+                message,
+            }
+        })
     }
 }
 
@@ -166,25 +255,73 @@ impl<'de> Deserialize<'de> for PortExclusion {
         match Helper::deserialize(deserializer)? {
             Helper::Single(port) => Ok(PortExclusion::Single(port)),
             Helper::Range { start, end } => Ok(PortExclusion::Range { start, end }),
-            Helper::String(s) => {
-                // Parse "5000..5010" format
-                if let Some((start_str, end_str)) = s.split_once("..") {
-                    let start = start_str.trim().parse().map_err(|_| {
-                        D::Error::custom(format!("Invalid port in range: {start_str}"))
-                    })?;
-                    let end = end_str.trim().parse().map_err(|_| {
-                        D::Error::custom(format!("Invalid port in range: {end_str}"))
-                    })?;
-                    Ok(PortExclusion::Range { start, end })
-                } else {
-                    // Try parsing as a single port
-                    let port = s
-                        .trim()
-                        .parse()
-                        .map_err(|_| D::Error::custom(format!("Invalid port: {s}")))?;
-                    Ok(PortExclusion::Single(port))
-                }
-            }
+            // "5001" or "5000..5010": the shared exclusion-text parser.
+            Helper::String(s) => s.parse().map_err(D::Error::custom),
+        }
+    }
+}
+
+/// Error returned when text is neither a port (`"5001"`) nor an inclusive
+/// port range (`"5000..5010"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsePortExclusionError {
+    message: String,
+}
+
+impl fmt::Display for ParsePortExclusionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ParsePortExclusionError {}
+
+impl FromStr for PortExclusion {
+    type Err = ParsePortExclusionError;
+
+    /// Parses a port (`"5001"`) or an inclusive port range (`"5000..5010"`).
+    ///
+    /// This one parser serves the YAML string form, `TROP_EXCLUDED_PORTS`,
+    /// and `trop exclude`. The text splits at its first `..`; whitespace
+    /// around the whole text and around each side of `..` is ignored. Each
+    /// number has the verified kernel's syntax (an optional `+`, then ASCII
+    /// digits, at most 65535); that this is also `u16::from_str`'s syntax is
+    /// trusted, pinned by `test_parse_u16_kernel_matches_from_str`. The
+    /// separator search, the trimming (Unicode `White_Space`, the verified
+    /// trim the identifier rule uses, equal to `str::trim`) and the number
+    /// parsing are verified kernels. Parsing does not validate:
+    /// `"0"` and `"5010..5000"` parse, and validation rejects them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trop::config::PortExclusion;
+    ///
+    /// assert_eq!("5001".parse(), Ok(PortExclusion::Single(5001)));
+    /// assert_eq!(
+    ///     " 5000 .. 5010 ".parse(),
+    ///     Ok(PortExclusion::Range { start: 5000, end: 5010 })
+    /// );
+    /// assert!("5000..".parse::<PortExclusion>().is_err());
+    /// ```
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let port = |part: &str| parse_u16(trim_identifier(part).as_bytes());
+        if let Some(at) = find_range_separator(text.as_bytes()) {
+            // `text[at..at + 2]` is the ASCII `..`, so both slice bounds are
+            // character boundaries.
+            let (start_text, end_text) = (&text[..at], &text[at + 2..]);
+            let invalid = |part: &str| ParsePortExclusionError {
+                message: format!("Invalid port in range: {part}"),
+            };
+            let start = port(start_text).ok_or_else(|| invalid(start_text))?;
+            let end = port(end_text).ok_or_else(|| invalid(end_text))?;
+            Ok(Self::Range { start, end })
+        } else {
+            port(text)
+                .map(Self::Single)
+                .ok_or_else(|| ParsePortExclusionError {
+                    message: format!("Invalid port: {text}"),
+                })
         }
     }
 }
@@ -342,14 +479,42 @@ pub enum OutputFormat {
     Table,
 }
 
-impl std::fmt::Display for OutputFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl OutputFormat {
+    /// The verified kernel's code for this format (a variant-for-variant
+    /// copy).
+    pub(crate) const fn code(self) -> OutputFormatCode {
         match self {
-            Self::Json => write!(f, "json"),
-            Self::Csv => write!(f, "csv"),
-            Self::Tsv => write!(f, "tsv"),
-            Self::Table => write!(f, "table"),
+            Self::Json => OutputFormatCode::Json,
+            Self::Csv => OutputFormatCode::Csv,
+            Self::Tsv => OutputFormatCode::Tsv,
+            Self::Table => OutputFormatCode::Table,
         }
+    }
+
+    /// The format with the verified kernel's `code` (a variant-for-variant
+    /// copy).
+    pub(crate) const fn from_code(code: OutputFormatCode) -> Self {
+        match code {
+            OutputFormatCode::Json => Self::Json,
+            OutputFormatCode::Csv => Self::Csv,
+            OutputFormatCode::Tsv => Self::Tsv,
+            OutputFormatCode::Table => Self::Table,
+        }
+    }
+
+    /// Parses a format keyword (`json`, `csv`, `tsv`, `table`), ignoring
+    /// ASCII case, as `TROP_OUTPUT_FORMAT` does. The decision is the verified
+    /// kernel's, which proves that every format's `Display` text parses back
+    /// to it.
+    pub(crate) fn parse_keyword(text: &str) -> Option<Self> {
+        parse_output_format(text.as_bytes()).map(Self::from_code)
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    /// Writes the format's keyword (`json`, `csv`, `tsv`, or `table`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(output_format_keyword(self.code()))
     }
 }
 
@@ -468,6 +633,230 @@ cleanup:
         assert_eq!(config.output_format, Some(OutputFormat::Json));
         assert!(config.ports.is_some());
         assert!(config.cleanup.is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // The unified exclusion-text parser.
+    // ------------------------------------------------------------------
+
+    /// The YAML string-form parser before unification.
+    fn previous_yaml_parse(text: &str) -> Option<PortExclusion> {
+        if let Some((start, end)) = text.split_once("..") {
+            Some(PortExclusion::Range {
+                start: start.trim().parse().ok()?,
+                end: end.trim().parse().ok()?,
+            })
+        } else {
+            text.trim().parse().ok().map(PortExclusion::Single)
+        }
+    }
+
+    /// The `TROP_EXCLUDED_PORTS` item parser before unification (applied to
+    /// the trimmed item).
+    fn previous_env_parse(item: &str) -> Option<PortExclusion> {
+        if let Some((start, end)) = item.split_once("..") {
+            Some(PortExclusion::Range {
+                start: start.parse().ok()?,
+                end: end.parse().ok()?,
+            })
+        } else {
+            item.parse().ok().map(PortExclusion::Single)
+        }
+    }
+
+    /// The `trop exclude` argument parser before unification.
+    fn previous_cli_parse(text: &str) -> Option<PortExclusion> {
+        if let Some(at) = text.find("..") {
+            Some(PortExclusion::Range {
+                start: text[..at].parse().ok()?,
+                end: text[at + 2..].parse().ok()?,
+            })
+        } else {
+            text.parse().ok().map(PortExclusion::Single)
+        }
+    }
+
+    /// Every string of up to four characters over an alphabet with digits,
+    /// signs, dots, ASCII and Unicode whitespace, and a letter, plus longer
+    /// hand-picked cases.
+    fn exclusion_text_corpus() -> Vec<String> {
+        let alphabet = [
+            '0', '1', '5', '9', '+', '-', '.', ' ', '\t', 'a', '\u{a0}', '\u{3000}',
+        ];
+        let mut corpus = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for c in alphabet {
+                    let mut text = prefix.clone();
+                    text.push(c);
+                    next.push(text);
+                }
+            }
+            corpus.extend(next.iter().cloned());
+            frontier = next;
+        }
+        for text in [
+            "5000..5010",
+            " 5000 .. 5010 ",
+            "5000 ..5010",
+            "\u{a0}5000..5010\u{3000}",
+            "+5000..+5010",
+            "0005000",
+            "65535",
+            "65536",
+            "99999999999999999999",
+            "00000000000000065535",
+            "1..2..3",
+            "...",
+            "5000...5010",
+            "5000..",
+            "..5010",
+            "-1",
+            "+",
+            "5000..5000",
+            "5010..5000",
+            "0..0",
+        ] {
+            corpus.push(text.to_string());
+        }
+        corpus
+    }
+
+    #[test]
+    fn test_unified_parser_is_exactly_the_previous_yaml_parser() {
+        for text in exclusion_text_corpus() {
+            assert_eq!(
+                text.parse::<PortExclusion>().ok(),
+                previous_yaml_parse(&text),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// Regression for the divergent parsers: everything the previous
+    /// `TROP_EXCLUDED_PORTS` and `trop exclude` parsers accepted still parses
+    /// to the same entry, and whitespace around `..` is now accepted by all.
+    #[test]
+    fn test_unified_parser_accepts_everything_previously_accepted() {
+        for text in exclusion_text_corpus() {
+            let parsed = text.parse::<PortExclusion>().ok();
+            if let Some(previous) = previous_env_parse(text.trim()) {
+                assert_eq!(parsed, Some(previous), "env {text:?}");
+            }
+            if let Some(previous) = previous_cli_parse(&text) {
+                assert_eq!(parsed, Some(previous), "cli {text:?}");
+            }
+        }
+        assert_eq!(previous_env_parse("5000 .. 5010"), None);
+        assert_eq!(previous_cli_parse(" 5000"), None);
+        assert_eq!(
+            "5000 .. 5010".parse(),
+            Ok(PortExclusion::Range {
+                start: 5000,
+                end: 5010
+            })
+        );
+        assert_eq!(" 5000".parse(), Ok(PortExclusion::Single(5000)));
+    }
+
+    #[test]
+    fn test_parse_u16_kernel_matches_from_str() {
+        use crate::verified::exclusions::parse_u16;
+        let check = |text: &str| {
+            assert_eq!(
+                parse_u16(text.as_bytes()),
+                text.parse::<u16>().ok(),
+                "{text:?}"
+            );
+        };
+        for value in 0..=70_000_u32 {
+            check(&value.to_string());
+            check(&format!("+{value}"));
+            check(&format!("00{value}"));
+            check(&format!("-{value}"));
+            check(&format!(" {value}"));
+            check(&format!("{value}."));
+        }
+        for text in exclusion_text_corpus() {
+            check(&text);
+        }
+    }
+
+    /// The exclusion-text parser trims with the verified whitespace trim
+    /// (`crate::identifier::trim_identifier`). Pins that this is exactly the
+    /// previous `str::trim` behavior: every Unicode scalar value, as padding
+    /// around a port and around each side of `..`, parses as the `str::trim`
+    /// reference does.
+    #[test]
+    fn test_exclusion_text_trim_matches_str_trim() {
+        fn reference(text: &str) -> Option<PortExclusion> {
+            let port = |part: &str| part.trim().parse::<u16>().ok();
+            match text.split_once("..") {
+                Some((start, end)) => Some(PortExclusion::Range {
+                    start: port(start)?,
+                    end: port(end)?,
+                }),
+                None => port(text).map(PortExclusion::Single),
+            }
+        }
+        let mut whitespace = 0;
+        for c in (0..=0x0010_FFFF_u32).filter_map(char::from_u32) {
+            if c.is_whitespace() {
+                whitespace += 1;
+            }
+            for text in [
+                format!("{c}8080{c}"),
+                format!("{c}{c}8080..{c}8090{c}{c}"),
+                format!("8080{c}..8090"),
+            ] {
+                assert_eq!(text.parse().ok(), reference(&text), "{text:?}");
+            }
+        }
+        // Every `White_Space` code point was exercised (and accepted).
+        assert_eq!(whitespace, 25);
+        assert_eq!(
+            "\u{3000}8080\u{85}..\u{2029}8090\u{a0}".parse(),
+            Ok(PortExclusion::Range {
+                start: 8080,
+                end: 8090
+            })
+        );
+        // Zero-width and BOM characters are not whitespace.
+        assert!("\u{200b}8080".parse::<PortExclusion>().is_err());
+        assert!("\u{feff}8080".parse::<PortExclusion>().is_err());
+    }
+
+    #[test]
+    fn test_exclusion_text_round_trip() {
+        for value in 0..=u16::MAX {
+            assert_eq!(value.to_string().parse(), Ok(PortExclusion::Single(value)));
+        }
+        for (start, end) in [(0, 0), (1, 65_535), (5000, 5010), (65_535, 1), (7, 7)] {
+            assert_eq!(
+                format!("{start}..{end}").parse(),
+                Ok(PortExclusion::Range { start, end })
+            );
+        }
+    }
+
+    #[test]
+    fn test_exclusion_text_error_messages() {
+        let message = |text: &str| text.parse::<PortExclusion>().unwrap_err().to_string();
+        assert_eq!(message("abc"), "Invalid port: abc");
+        assert_eq!(message(" 70000 "), "Invalid port:  70000 ");
+        assert_eq!(message("x ..5010"), "Invalid port in range: x ");
+        assert_eq!(message("5000.. y"), "Invalid port in range:  y");
+        assert_eq!(message("1..2..3"), "Invalid port in range: 2..3");
+
+        let yaml_error = serde_yaml::from_str::<PortExclusion>(r#""5000..x""#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            yaml_error.contains("Invalid port in range: x"),
+            "{yaml_error}"
+        );
     }
 }
 

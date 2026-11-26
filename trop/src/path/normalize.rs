@@ -5,22 +5,47 @@
 //! - Converting relative paths to absolute paths
 //! - Resolving `.` and `..` components
 //! - Normalizing path separators for the platform
+//!
+//! The decisions are made by the verified kernel `verified::path`: the tilde
+//! classifier, the `.`/`..` stack over component kinds, and (on Unix) the
+//! byte-level normalizer whose results are canonical, idempotent, and
+//! independent of the working directory for absolute input.
 
 use std::env;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::path::component_kind;
+use crate::verified::path::{classify_tilde, resolve_component_kinds, CompKind, TildeForm};
 
 /// Expand tilde (~) to the home directory.
 ///
 /// This function handles `~` and `~/path` but does not support `~user` syntax.
+/// Every separator after `~` is skipped, so `~//etc` names `etc` under the
+/// home directory (never `/etc`). On Unix a backslash is an ordinary filename
+/// byte, so `~\x` is not a tilde form and is returned unchanged; on Windows
+/// `~\x` is home-relative, and a remainder that starts with a drive prefix
+/// (`~/C:x`) is rejected, because joining it would replace the home
+/// directory.
+///
+/// The home directory comes from the `home` crate (`HOME`, if set, on Unix; on
+/// Windows, `USERPROFILE` or the profile folder). It must be absolute: a
+/// relative one (for example `HOME=relhome` on Unix) is treated as
+/// undeterminable and the expansion fails, because expanding against it
+/// would resolve `~/x` under whatever the current directory is. (The
+/// data-directory rule instead reads `HOME` and then `USERPROFILE` on every
+/// platform, skipping an unusable one, and never consults the user database
+/// or the profile folder, so `~` and the default data directory can name
+/// different home directories.) With an absolute home directory every
+/// expansion is absolute (the verified `lemma_tilde_join_segments`).
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The path contains invalid UTF-8
-/// - The home directory cannot be determined
+/// - The home directory cannot be determined, or is not absolute
 /// - The path uses `~user` syntax (not supported)
+/// - On Windows, the part after `~/` starts with a drive prefix
 ///
 /// # Examples
 ///
@@ -47,38 +72,79 @@ pub fn expand_tilde(path: &Path) -> Result<PathBuf> {
         reason: "Path contains invalid UTF-8".to_string(),
     })?;
 
-    if !path_str.starts_with('~') {
+    let form = classify_tilde(path_str.as_bytes(), cfg!(windows));
+    if matches!(form, TildeForm::NotTilde) {
         return Ok(path.to_path_buf());
     }
 
-    // Get home directory using the home crate
-    let home = home::home_dir().ok_or_else(|| Error::InvalidPath {
-        path: path.to_path_buf(),
-        reason: "Cannot determine home directory".to_string(),
-    })?;
+    // Get home directory using the home crate. A relative one is unusable:
+    // the expansion would be relative too, and normalization would resolve
+    // it against the current directory.
+    let home = home::home_dir()
+        .filter(|home| home.is_absolute())
+        .ok_or_else(|| Error::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "Cannot determine home directory (it must be an absolute path)".to_string(),
+        })?;
 
-    if path_str == "~" {
-        Ok(home)
-    } else if path_str.starts_with("~/") || path_str.starts_with("~\\") {
-        Ok(home.join(&path_str[2..]))
-    } else {
-        // ~user syntax not supported
-        Err(Error::InvalidPath {
+    match form {
+        TildeForm::HomeOnly => Ok(home),
+        // `rest_start` is past every separator that follows `~`. Those bytes
+        // are ASCII, so it is a char boundary, and the rest never starts with
+        // a separator.
+        TildeForm::HomeRelative { rest_start } => {
+            let rest = &path_str[rest_start..];
+            // Without a leading separator the rest can only replace the home
+            // directory on `join` by starting with a prefix (`C:x` on
+            // Windows); std never parses a prefix on Unix.
+            if matches!(
+                Path::new(rest).components().next(),
+                Some(Component::Prefix(_))
+            ) {
+                return Err(Error::InvalidPath {
+                    path: path.to_path_buf(),
+                    reason: "The path after '~' names a drive; use ~/path relative to the home \
+                             directory"
+                        .to_string(),
+                });
+            }
+            Ok(join_home(&home, rest))
+        }
+        TildeForm::NotTilde | TildeForm::UserSyntax => Err(Error::InvalidPath {
             path: path.to_path_buf(),
             reason: "~user syntax is not supported; use ~ or ~/path".to_string(),
-        })
+        }),
     }
 }
 
-/// Resolve `.` and `..` components in an absolute path.
+/// Joins the separator-free `rest` of a `~/rest` path onto `home`, exactly as
+/// `PathBuf::push` joins a relative path (verified kernel `tilde_join`).
+#[cfg(unix)]
+fn join_home(home: &Path, rest: &str) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let joined = crate::verified::path::tilde_join(home.as_os_str().as_bytes(), rest.as_bytes());
+    PathBuf::from(OsString::from_vec(joined))
+}
+
+/// Joins the separator-free `rest` of a `~/rest` path onto `home`.
+#[cfg(not(unix))]
+fn join_home(home: &Path, rest: &str) -> PathBuf {
+    home.join(rest)
+}
+
+/// Resolve `.` and `..` components in a path.
 ///
 /// This function processes path components to remove current directory (`.`)
-/// references and resolve parent directory (`..`) references.
+/// references and resolve parent directory (`..`) references. A `..` cancels
+/// the preceding named component; the root (or prefix) is always kept.
 ///
 /// # Errors
 ///
-/// Returns an error if the path contains too many `..` components that would
-/// escape the root directory.
+/// Returns an error if a `..` has no named component to cancel: it would
+/// escape the root (`/..`), or climb above the start of a relative path
+/// (`a/../..`).
 ///
 /// # Examples
 ///
@@ -95,45 +161,26 @@ pub fn expand_tilde(path: &Path) -> Result<PathBuf> {
 /// assert_eq!(resolved, PathBuf::from("/c"));
 /// ```
 pub fn resolve_components(path: &Path) -> Result<PathBuf> {
-    let mut result = PathBuf::new();
-    let mut has_root = false;
+    let components: Vec<Component<'_>> = path.components().collect();
+    let kinds: Vec<CompKind> = components.iter().map(|c| component_kind(*c)).collect();
+    // The kernel returns the surviving component indices, in order; it keeps
+    // every root/prefix and only roots, prefixes, and named components.
+    let kept = resolve_component_kinds(&kinds).map_err(|_| too_many_parents(path))?;
+    Ok(kept.into_iter().map(|index| components[index]).collect())
+}
 
-    for component in path.components() {
-        match component {
-            Component::RootDir => {
-                result.push(component);
-                has_root = true;
-            }
-            Component::Prefix(prefix) => {
-                // Windows prefix
-                result.push(prefix.as_os_str());
-                has_root = true;
-            }
-            Component::Normal(c) => {
-                result.push(c);
-            }
-            Component::CurDir => {
-                // Skip "." - it doesn't change the path
-            }
-            Component::ParentDir => {
-                // Try to pop the last component for ".."
-                if !result.pop() {
-                    // Already at root - can't go up further
-                    return Err(Error::InvalidPath {
-                        path: path.to_path_buf(),
-                        reason: "Path contains too many '..' components (escapes root)".to_string(),
-                    });
-                }
-            }
-        }
+fn too_many_parents(path: &Path) -> Error {
+    Error::InvalidPath {
+        path: path.to_path_buf(),
+        reason: "Path contains too many '..' components (escapes root)".to_string(),
     }
+}
 
-    // Ensure we at least have a root if we started with one
-    if has_root && result.as_os_str().is_empty() {
-        result.push(Component::RootDir);
-    }
-
-    Ok(result)
+fn current_dir(path: &Path) -> Result<PathBuf> {
+    env::current_dir().map_err(|e| Error::InvalidPath {
+        path: path.to_path_buf(),
+        reason: format!("Cannot get current directory: {e}"),
+    })
 }
 
 /// Normalize a path to absolute form.
@@ -142,6 +189,11 @@ pub fn resolve_components(path: &Path) -> Result<PathBuf> {
 /// 1. Expands tilde (~) if present
 /// 2. Converts relative paths to absolute (using current directory)
 /// 3. Resolves `.` and `..` components
+///
+/// On Unix the result is the canonical spelling `/` or `/a/b/c` (no `.`,
+/// `..`, empty components, or trailing separator), normalizing it again
+/// returns it unchanged, and the current directory is consulted only for
+/// relative paths.
 ///
 /// # Errors
 ///
@@ -172,19 +224,50 @@ pub fn resolve_components(path: &Path) -> Result<PathBuf> {
 pub fn normalize(path: &Path) -> Result<PathBuf> {
     // First expand tilde if present
     let expanded = expand_tilde(path)?;
+    normalize_expanded(path, expanded)
+}
 
-    // Make absolute if not already
+/// Unix: the verified byte-level normalizer `normalize_unix`.
+#[cfg(unix)]
+fn normalize_expanded(path: &Path, expanded: PathBuf) -> Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    use crate::verified::path::{is_absolute_unix, normalize_unix, NormError};
+
+    let bytes = expanded.as_os_str().as_bytes();
+    // The kernel ignores the working directory for absolute paths, so it is
+    // only read for relative ones.
+    let cwd = if is_absolute_unix(bytes) {
+        None
+    } else {
+        Some(current_dir(path)?)
+    };
+    let cwd_bytes = cwd
+        .as_deref()
+        .map_or(&[][..], |dir| dir.as_os_str().as_bytes());
+    match normalize_unix(bytes, cwd_bytes) {
+        Ok(normalized) => Ok(PathBuf::from(OsString::from_vec(normalized))),
+        Err(NormError::EscapesRoot) => Err(too_many_parents(&match cwd {
+            Some(dir) => dir.join(&expanded),
+            None => expanded,
+        })),
+        Err(NormError::BaseNotAbsolute) => Err(Error::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "Current directory is not absolute".to_string(),
+        }),
+    }
+}
+
+/// Other platforms: make the path absolute, then resolve `.` and `..` with the
+/// verified component-kind stack.
+#[cfg(not(unix))]
+fn normalize_expanded(path: &Path, expanded: PathBuf) -> Result<PathBuf> {
     let absolute = if expanded.is_absolute() {
         expanded
     } else {
-        let cwd = env::current_dir().map_err(|e| Error::InvalidPath {
-            path: path.to_path_buf(),
-            reason: format!("Cannot get current directory: {e}"),
-        })?;
-        cwd.join(expanded)
+        current_dir(path)?.join(expanded)
     };
-
-    // Resolve . and .. components
     resolve_components(&absolute)
 }
 
@@ -215,6 +298,31 @@ mod tests {
     fn test_expand_tilde_user_syntax_not_supported() {
         let result = expand_tilde(Path::new("~user/path"));
         assert!(result.is_err());
+    }
+
+    // On Windows a drive prefix right after the separators that follow `~`
+    // would make `join` replace the home directory, so it is rejected.
+    #[test]
+    #[cfg(windows)]
+    fn test_expand_tilde_rejects_a_drive_prefix_on_windows() {
+        for input in [r"~/C:x", r"~\C:\x", r"~//D:", r"~\/c:"] {
+            assert!(
+                matches!(
+                    expand_tilde(Path::new(input)),
+                    Err(Error::InvalidPath { .. })
+                ),
+                "{input}"
+            );
+        }
+    }
+
+    // On Unix `C:` is an ordinary name, so it stays under the home directory.
+    #[test]
+    #[cfg(unix)]
+    fn test_expand_tilde_drive_like_name_on_unix() {
+        let home = home::home_dir().unwrap();
+        assert_eq!(expand_tilde(Path::new("~/C:x")).unwrap(), home.join("C:x"));
+        assert_eq!(expand_tilde(Path::new("~//C:")).unwrap(), home.join("C:"));
     }
 
     #[test]

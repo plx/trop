@@ -2,9 +2,17 @@
 //!
 //! This module provides a simple stderr-based logging system with
 //! configurable log levels.
+//!
+//! Level names, the CLI/`TROP_LOG_MODE` precedence (`--quiet`, then
+//! `--verbose`, then `TROP_LOG_MODE`), and the severity filter are decided by
+//! the formally verified kernel `verified::verbosity` (see
+//! `docs/verification.md`); this module maps its results onto [`LogLevel`].
 
 use std::env;
 use std::fmt;
+
+use crate::output::display_field;
+use crate::verified::verbosity::{self, Severity, Verbosity};
 
 /// Logging level for controlling output verbosity.
 ///
@@ -24,7 +32,9 @@ use std::fmt;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
-    /// Suppress all non-essential output.
+    /// Suppress all non-essential output: the logger prints nothing, not
+    /// even error messages. (The CLI reports a command's fatal error itself,
+    /// not through the logger.)
     Quiet,
     /// Normal output level (errors and warnings).
     Normal,
@@ -43,13 +53,33 @@ impl fmt::Display for LogLevel {
 }
 
 impl LogLevel {
+    /// The kernel's verbosity.
+    const fn verbosity(self) -> Verbosity {
+        match self {
+            Self::Quiet => Verbosity::Quiet,
+            Self::Normal => Verbosity::Normal,
+            Self::Verbose => Verbosity::Verbose,
+        }
+    }
+
+    /// The level of a kernel verbosity.
+    const fn from_verbosity(verbosity: Verbosity) -> Self {
+        match verbosity {
+            Verbosity::Quiet => Self::Quiet,
+            Verbosity::Normal => Self::Normal,
+            Verbosity::Verbose => Self::Verbose,
+        }
+    }
+
     /// Parses a log level from a string.
     ///
-    /// Recognizes: "quiet", "normal", "verbose" (case-insensitive).
+    /// Recognizes: "quiet", "normal", "verbose" (ASCII case-insensitive, no
+    /// surrounding whitespace).
     ///
     /// # Errors
     ///
-    /// Returns an error if the string is not recognized.
+    /// Returns an error if the string is not recognized. The error shows the
+    /// input with control characters escaped.
     ///
     /// # Examples
     ///
@@ -61,19 +91,17 @@ impl LogLevel {
     /// assert!(LogLevel::parse("invalid").is_err());
     /// ```
     pub fn parse(s: &str) -> Result<Self, String> {
-        match s.to_lowercase().as_str() {
-            "quiet" => Ok(Self::Quiet),
-            "normal" => Ok(Self::Normal),
-            "verbose" => Ok(Self::Verbose),
-            _ => Err(format!("invalid log level: {s}")),
-        }
+        verbosity::parse_verbosity(s.as_bytes())
+            .map(Self::from_verbosity)
+            .ok_or_else(|| format!("invalid log level: {}", display_field(s)))
     }
 }
 
 /// A simple stderr-based logger.
 ///
-/// The logger respects the configured log level and only outputs messages
-/// at or above that level.
+/// The logger prints a message when the configured level reaches the
+/// message's severity: `Quiet` prints nothing, `Normal` prints errors and
+/// warnings, and `Verbose` also prints info and debug messages.
 ///
 /// # Examples
 ///
@@ -109,6 +137,11 @@ impl Logger {
         self.level
     }
 
+    /// Whether a message of this severity is printed at this logger's level.
+    const fn emits(&self, severity: Severity) -> bool {
+        verbosity::should_emit(self.level.verbosity(), severity)
+    }
+
     /// Logs an error message.
     ///
     /// Error messages are always displayed unless the level is Quiet.
@@ -122,7 +155,7 @@ impl Logger {
     /// logger.error("Something went wrong");
     /// ```
     pub fn error(&self, message: &str) {
-        if self.level >= LogLevel::Normal {
+        if self.emits(Severity::Error) {
             eprintln!("ERROR: {message}");
         }
     }
@@ -140,7 +173,7 @@ impl Logger {
     /// logger.warn("This might be a problem");
     /// ```
     pub fn warn(&self, message: &str) {
-        if self.level >= LogLevel::Normal {
+        if self.emits(Severity::Warn) {
             eprintln!("WARN: {message}");
         }
     }
@@ -158,7 +191,7 @@ impl Logger {
     /// logger.info("Processing started");
     /// ```
     pub fn info(&self, message: &str) {
-        if self.level >= LogLevel::Verbose {
+        if self.emits(Severity::Info) {
             eprintln!("INFO: {message}");
         }
     }
@@ -176,7 +209,7 @@ impl Logger {
     /// logger.debug("Port 8080 checked and available");
     /// ```
     pub fn debug(&self, message: &str) {
-        if self.level >= LogLevel::Verbose {
+        if self.emits(Severity::Debug) {
             eprintln!("DEBUG: {message}");
         }
     }
@@ -186,6 +219,42 @@ impl Default for Logger {
     fn default() -> Self {
         Self::new(LogLevel::Normal)
     }
+}
+
+/// Resolves the effective log level from the CLI flags and a raw
+/// `TROP_LOG_MODE` value.
+///
+/// The priority order is:
+/// 1. `--quiet` (it wins over `--verbose` when both are given: a request to
+///    suppress output is never overridden)
+/// 2. `--verbose`
+/// 3. `log_mode`, when it names a level (ASCII case-insensitive); any other
+///    value is ignored
+/// 4. Default (Normal)
+///
+/// The `trop` CLI derives both its logger and its commands' quiet/verbose
+/// behavior from this one level.
+///
+/// # Examples
+///
+/// ```
+/// use trop::logging::resolve_log_level;
+/// use trop::LogLevel;
+///
+/// assert_eq!(resolve_log_level(true, true, Some("verbose")), LogLevel::Quiet);
+/// assert_eq!(resolve_log_level(true, false, Some("quiet")), LogLevel::Verbose);
+/// assert_eq!(resolve_log_level(false, true, Some("verbose")), LogLevel::Quiet);
+/// assert_eq!(resolve_log_level(false, false, Some("QUIET")), LogLevel::Quiet);
+/// assert_eq!(resolve_log_level(false, false, Some("loud")), LogLevel::Normal);
+/// assert_eq!(resolve_log_level(false, false, None), LogLevel::Normal);
+/// ```
+#[must_use]
+pub fn resolve_log_level(verbose: bool, quiet: bool, log_mode: Option<&str>) -> LogLevel {
+    LogLevel::from_verbosity(verbosity::resolve_verbosity(
+        verbose,
+        quiet,
+        log_mode.map(str::as_bytes),
+    ))
 }
 
 /// Initializes a logger based on environment variables and CLI flags.
@@ -200,7 +269,8 @@ impl Default for Logger {
 /// * `verbose` - If true, sets level to Verbose
 /// * `quiet` - If true, sets level to Quiet
 ///
-/// If both `verbose` and `quiet` are true, `verbose` takes precedence.
+/// If both `verbose` and `quiet` are true, `quiet` takes precedence. See
+/// [`resolve_log_level`].
 ///
 /// # Examples
 ///
@@ -218,23 +288,8 @@ impl Default for Logger {
 /// ```
 #[must_use]
 pub fn init_logger(verbose: bool, quiet: bool) -> Logger {
-    // CLI flags take precedence
-    if verbose {
-        return Logger::new(LogLevel::Verbose);
-    }
-    if quiet {
-        return Logger::new(LogLevel::Quiet);
-    }
-
-    // Check environment variable
-    if let Ok(env_value) = env::var("TROP_LOG_MODE") {
-        if let Ok(level) = LogLevel::parse(&env_value) {
-            return Logger::new(level);
-        }
-    }
-
-    // Default to Normal
-    Logger::new(LogLevel::Normal)
+    let log_mode = env::var("TROP_LOG_MODE").ok();
+    Logger::new(resolve_log_level(verbose, quiet, log_mode.as_deref()))
 }
 
 #[cfg(test)]
@@ -313,9 +368,9 @@ mod tests {
     }
 
     #[test]
-    fn test_init_logger_verbose_takes_precedence() {
+    fn test_init_logger_quiet_takes_precedence() {
         let logger = init_logger(true, true);
-        assert_eq!(logger.level(), LogLevel::Verbose);
+        assert_eq!(logger.level(), LogLevel::Quiet);
     }
 
     #[test]
@@ -375,4 +430,112 @@ mod tests {
     // Note: We can't easily test the actual output of the logging methods
     // without capturing stderr, which is complex in unit tests. The methods
     // are simple enough that visual/integration testing is more appropriate.
+
+    #[test]
+    fn test_log_level_display_round_trips_through_parse() {
+        for level in [LogLevel::Quiet, LogLevel::Normal, LogLevel::Verbose] {
+            assert_eq!(LogLevel::parse(&level.to_string()).unwrap(), level);
+            assert_eq!(
+                LogLevel::parse(&level.to_string().to_ascii_uppercase()).unwrap(),
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn test_log_level_parse_matches_previous_unicode_lowercase_matching() {
+        fn previous(s: &str) -> Option<LogLevel> {
+            match s.to_lowercase().as_str() {
+                "quiet" => Some(LogLevel::Quiet),
+                "normal" => Some(LogLevel::Normal),
+                "verbose" => Some(LogLevel::Verbose),
+                _ => None,
+            }
+        }
+        for input in [
+            "quiet",
+            "QUIET",
+            "Quiet",
+            "normal",
+            "NoRmAl",
+            "verbose",
+            "VERBOSE",
+            "",
+            " quiet",
+            "quiet ",
+            "quie",
+            "quiett",
+            "loud",
+            "\u{130}",
+            "\u{212a}",
+            "verbos\u{e9}",
+            "nor\nmal",
+        ] {
+            assert_eq!(LogLevel::parse(input).ok(), previous(input), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn test_log_level_parse_error_escapes_control_characters() {
+        let message = LogLevel::parse("loud\n\u{1b}[2J").unwrap_err();
+        assert!(!message.contains('\n'));
+        assert!(!message.contains('\u{1b}'));
+        assert_eq!(message, "invalid log level: \"loud\\n\\x1b[2J\"");
+        assert_eq!(
+            LogLevel::parse("loud").unwrap_err(),
+            "invalid log level: loud"
+        );
+    }
+
+    #[test]
+    fn test_resolve_log_level_precedence_table() {
+        let envs = [
+            None,
+            Some("quiet"),
+            Some("NORMAL"),
+            Some("Verbose"),
+            Some("bogus"),
+            Some(""),
+        ];
+        for verbose in [false, true] {
+            for quiet in [false, true] {
+                for env in envs {
+                    // `--quiet` wins over `--verbose`; either flag wins
+                    // over the environment.
+                    let expected = if quiet {
+                        LogLevel::Quiet
+                    } else if verbose {
+                        LogLevel::Verbose
+                    } else {
+                        env.and_then(|value| LogLevel::parse(value).ok())
+                            .unwrap_or(LogLevel::Normal)
+                    };
+                    assert_eq!(
+                        resolve_log_level(verbose, quiet, env),
+                        expected,
+                        "{verbose} {quiet} {env:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_logger_severity_filter_table() {
+        let cases = [
+            (LogLevel::Quiet, [false, false, false, false]),
+            (LogLevel::Normal, [true, true, false, false]),
+            (LogLevel::Verbose, [true, true, true, true]),
+        ];
+        for (level, expected) in cases {
+            let logger = Logger::new(level);
+            let actual = [
+                logger.emits(Severity::Error),
+                logger.emits(Severity::Warn),
+                logger.emits(Severity::Info),
+                logger.emits(Severity::Debug),
+            ];
+            assert_eq!(actual, expected, "{level}");
+        }
+    }
 }

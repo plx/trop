@@ -51,7 +51,7 @@ Use `--data-dir` or `TROP_DATA_DIR` to select another data directory. Callers mu
 
 ## Cleanup
 
-When `trop reserve` runs out of candidates, it prunes reservations whose directories are gone, expires unused reservations according to the configured age, and retries once. The default expiration threshold is 30 days.
+When `trop reserve` runs out of candidates, it prunes reservations whose directories are gone, expires unused reservations according to the configured age, and, if that freed anything, retries once. The default expiration threshold is 30 days.
 
 Set `disable_autoprune: true` or `disable_autoexpire: true` to disable the corresponding automatic step. These settings do not schedule background cleanup. You can also [run cleanup explicitly](../usage/#inspect-and-clean-up).
 

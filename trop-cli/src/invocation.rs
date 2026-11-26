@@ -9,6 +9,7 @@ use crate::utils::GlobalOptions;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use trop::cli_support::metadata_intent;
 use trop::config::{Config, ConfigBuilder, ConfigField, ConfigFileKind, EffectiveConfig};
 use trop::{Database, DatabaseConfig, MetadataIntent, PathResolver};
 
@@ -105,6 +106,17 @@ impl InvocationContext {
             reservation_metadata,
         } = command_line;
         let data_dir = data_dir_override.or_else(|| global.data_dir.clone());
+        // The user configuration lives in the data directory, so a command
+        // that reads configuration files needs one: without it, report the
+        // missing data directory (exit 3) rather than a configuration error.
+        if data_dir.is_none()
+            && matches!(
+                scope,
+                ConfigScope::Discover | ConfigScope::ExplicitProject(_)
+            )
+        {
+            return Err(crate::utils::undetermined_data_dir_error());
+        }
         let path_resolver = PathResolver::new();
         let process_working_dir = std::env::current_dir().map_err(CliError::Io)?;
         let working_dir = path_resolver
@@ -235,21 +247,10 @@ impl InvocationContext {
             CliError::Config("reserve requires effective configuration".to_string())
         })?;
 
-        let project = if request.clear_project {
-            MetadataIntent::Clear
-        } else {
-            effective
-                .project()
-                .map_or(MetadataIntent::Preserve, MetadataIntent::set)
-        };
-
-        let task = if request.clear_task {
-            MetadataIntent::Clear
-        } else {
-            effective
-                .task()
-                .map_or(MetadataIntent::Preserve, MetadataIntent::set)
-        };
+        // `--clear-*` clears; otherwise an effective value is set; otherwise
+        // the stored value is kept (decided by the verified kernel).
+        let project = metadata_intent(request.clear_project, effective.project());
+        let task = metadata_intent(request.clear_task, effective.task());
 
         Ok(ResolvedReservationMetadata { project, task })
     }
@@ -298,33 +299,61 @@ impl InvocationContext {
         Database::validate(&db_config).map_err(CliError::from)
     }
 
-    /// Choose the current legacy YAML write target without flattening layers.
+    /// Choose the YAML file an exclusion edit writes to, without flattening
+    /// layers.
     ///
-    /// Atomic and comment-preserving mutation is handled by the dedicated YAML
-    /// writer remediation. This method only centralizes source selection.
-    pub(crate) fn config_file_for_write(&self, force_global: bool) -> Result<PathBuf, CliError> {
-        if force_global {
-            return Ok(self.data_dir()?.join("config.yaml"));
-        }
+    /// The verified `select_write_target` kernel decides: the global
+    /// `config.yaml` for the global scope; otherwise the loaded
+    /// `trop.local.yaml`, then the loaded `trop.yaml`; with neither, the
+    /// global file only for `WriteScope::ProjectOrGlobal`. `trop exclude`
+    /// uses `WriteScope::Project` (it fails without a project file unless
+    /// `--global` is given); `trop scan --autoexclude` falls back to the
+    /// global file.
+    pub(crate) fn config_file_for_write(
+        &self,
+        scope: trop::port::exclusions::WriteScope,
+    ) -> Result<PathBuf, CliError> {
+        use trop::port::exclusions::{select_write_target, WriteScope, WriteTarget};
 
-        let effective = self.effective()?;
-        for kind in [ConfigFileKind::Local, ConfigFileKind::Project] {
-            if let Some(path) = effective.loaded_file(kind) {
-                return Ok(path.to_path_buf());
-            }
-        }
+        let (local, project) = if scope == WriteScope::Global {
+            (None, None)
+        } else {
+            let effective = self.effective()?;
+            (
+                effective.loaded_file(ConfigFileKind::Local),
+                effective.loaded_file(ConfigFileKind::Project),
+            )
+        };
 
-        Ok(self.data_dir()?.join("config.yaml"))
+        match (
+            select_write_target(scope, local.is_some(), project.is_some()),
+            local,
+            project,
+        ) {
+            (Some(WriteTarget::Local), Some(path), _)
+            | (Some(WriteTarget::Project), _, Some(path)) => Ok(path.to_path_buf()),
+            (Some(WriteTarget::Global), ..) => Ok(self.data_dir()?.join("config.yaml")),
+            // `None`: the project scope found no project file. (The kernel
+            // never selects a project-level file that was not loaded.)
+            _ => Err(CliError::Config(format!(
+                "no project configuration (trop.yaml or trop.local.yaml) found in {} or its \
+                 parent directories; create a trop.yaml or use --global",
+                self.working_dir().display()
+            ))),
+        }
     }
 
     /// Resolve the selected data directory for special commands and writers.
+    ///
+    /// Fails with exit code 3 when no data directory could be determined.
     pub(crate) fn data_dir(&self) -> Result<&Path, CliError> {
-        self.data_dir.as_deref().ok_or_else(|| {
-            CliError::Config("Could not determine the trop data directory".to_string())
-        })
+        self.data_dir
+            .as_deref()
+            .ok_or_else(crate::utils::undetermined_data_dir_error)
     }
 
-    fn database_path(&self) -> Result<PathBuf, CliError> {
+    /// The selected database file (`trop.db` in the data directory).
+    pub(crate) fn database_path(&self) -> Result<PathBuf, CliError> {
         Ok(self.data_dir()?.join("trop.db"))
     }
 }

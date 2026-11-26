@@ -16,7 +16,9 @@ use trop::config::{CleanupConfig, Config, PortConfig, PortExclusion};
 
 use trop::operations::CleanupOperations;
 
-use trop::port::allocator::{AllocationOptions, AllocationResult, PortAllocator};
+use trop::port::allocator::{
+    port_range_from_config, AllocationOptions, AllocationResult, PortAllocator,
+};
 
 use trop::port::exclusions::ExclusionManager;
 
@@ -24,9 +26,10 @@ use trop::port::group::{GroupAllocationRequest, ServiceAllocationRequest};
 
 use trop::port::occupancy::{MockOccupancyChecker, OccupancyCheckConfig};
 
-use trop::{Port, PortRange, Reservation, ReservationKey};
+use trop::{Port, Reservation, ReservationKey};
 
-// Helper to create a test allocator with mock occupancy checker
+// Helper to create a test allocator with mock occupancy checker. The range is
+// resolved exactly as production resolves it (`allocator_from_config`).
 fn create_test_allocator_with_config(
     occupied: HashSet<Port>,
     config: &Config,
@@ -41,19 +44,7 @@ fn create_test_allocator_with_config(
             message: "Port configuration is required".into(),
         })?;
 
-    let min = Port::try_from(port_config.min)?;
-    let max_value = if let Some(max) = port_config.max {
-        max
-    } else if let Some(offset) = port_config.max_offset {
-        port_config.min.saturating_add(offset)
-    } else {
-        return Err(trop::Error::Validation {
-            field: "ports".into(),
-            message: "Either max or max_offset must be specified".into(),
-        });
-    };
-    let max = Port::try_from(max_value)?;
-    let range = PortRange::new(min, max)?;
+    let range = port_range_from_config(port_config)?;
 
     let exclusions = if let Some(ref excluded_ports) = config.excluded_ports {
         ExclusionManager::from_config(excluded_ports)?
@@ -62,6 +53,46 @@ fn create_test_allocator_with_config(
     };
 
     Ok(PortAllocator::new(checker, exclusions, range))
+}
+
+#[test]
+fn test_helper_resolves_ranges_like_production() {
+    // Regression: the helper used to resolve `max_offset` with
+    // `saturating_add`, building 65000..=65535 for a configuration production
+    // rejects as overflowing.
+    let overflowing = Config {
+        ports: Some(PortConfig {
+            min: 65000,
+            max: None,
+            max_offset: Some(1000),
+        }),
+        ..Default::default()
+    };
+    let error = create_test_allocator_with_config(HashSet::new(), &overflowing).unwrap_err();
+    assert!(
+        matches!(&error, trop::Error::Validation { field, .. } if field == "ports.max_offset"),
+        "{error:?}"
+    );
+    assert!(trop::port::allocator::allocator_from_config(&overflowing).is_err());
+
+    for (min, max, max_offset) in [
+        (5000, Some(5010), None),
+        (8000, None, Some(100)),
+        (65000, None, Some(535)),
+        (5000, Some(6000), Some(0)),
+    ] {
+        let config = Config {
+            ports: Some(PortConfig {
+                min,
+                max,
+                max_offset,
+            }),
+            ..Default::default()
+        };
+        let helper = create_test_allocator_with_config(HashSet::new(), &config).unwrap();
+        let production = trop::port::allocator::allocator_from_config(&config).unwrap();
+        assert_eq!(helper.range(), production.range());
+    }
 }
 
 #[test]

@@ -16,6 +16,7 @@
   - workflows/site-check.yml # Validates the Astro/Starlight site on pull requests
   - workflows/site-publish.yml # Builds and deploys the Astro/Starlight site to GitHub Pages
 - docs/ # Maintainer-facing project records and operational guidance
+  - verification.md # Verus architecture, trusted base, verified-property inventory, and workflow
   - audits/ # Production-readiness baselines, remediation execution, and re-audit guidance
     - 2026-07-25-pre-release-due-diligence.md # Historical baseline audit and release verdict
     - 2026-07-25-remediation-roadmap.md # GitHub epic, label, ticket, and dependency index
@@ -26,6 +27,8 @@
     - production-readiness-work-selection.md # Live GitHub scheduling contract and selector operations
 - scripts/ # Dependency-free maintainer automation
   - get_next_production_readiness_issue.py # Selects one ready audit issue from complete live GitHub snapshots
+  - check-verus-results.sh # Fails a Verus run whose log has no clean "verification results:: N verified, 0 errors" line
+  - install-verus.sh # Installs the pinned, checksum-verified Verus release and its Rust toolchain
   - tests/test_get_next_production_readiness_issue.py # Selector taxonomy, dependency, PR-coverage, race, and CLI tests
 - reference/ # Authoritative project specifications (DO NOT MODIFY)
   - ImplementationSpecification.md # Complete spec - SOURCE OF TRUTH
@@ -47,15 +50,54 @@
 - trop/ # Library workspace member - core functionality
   - README.md # Library-specific, human-readable README
   - src/ # Library source code
+    - cli_support.rs # #[doc(hidden)] wrappers exposing the verified CLI decisions to trop-cli
     - error.rs # Error types using thiserror
     - lib.rs # Library root - exports public API
     - logging.rs # Logging infrastructure (stderr output)
     - port.rs # Port and PortRange types with validation
     - reservation.rs # Reservation and ReservationKey types
+    - verified/ # Verus-verified kernels (specs + proofs); production code delegates to these
+      - mod.rs # Kernel list and the rules for code in this tree
+      - allocation.rs # Port availability classification (oracle-generic), reserved_by_other ownership rule, forward scan, single-port allocation, preferred-then-scan fallback, exact exhaustion blockers
+      - civil_time.rs # Unix instant -> UTC civil date/time (proleptic Gregorian, exact inverse, overflow-free) and the `%Y-%m-%d %H:%M:%S` text
+      - cleanup.rs # Cleanup selection (days->secs, 30-day automatic default), Prune/Expire/Keep reasons, fail-closed prune probe classification, probe-once, removal plan, revalidate-then-delete fates
+      - cli.rs # CLI decisions: exit-code table (usage errors 4, 2 only for lock timeouts), SQLite lock-contention codes, data-dir selection, init plan, assertion verdicts, cleanup/occupancy flag derivations, scan probes, list filters, port-argument parsing
+      - config.rs # Configuration kernel: TROP_* text (decimal/bool/format), reservations group rules (order-independent), lock-wait bounds, defaults, leaf overlay, placement, nearest-level discovery and per-level load order
+      - config_rewrite.rs # Key-preserving YAML rewrite plan (only excluded_ports changes) and exclusion write-target selection
+      - env_name.rs # Portable env-var grammar + shell-inertness, tag derivation, explicit-mapping resolution, collision keys
+      - escape.rs # char::escape_default for diagnostics: printable ASCII, quote-safe, injective
+      - exclusions.rs # Exclusion validation, ExclusionSet (canonical run list), O(n log n) minimal/unique compaction, exclusion text parsing, list edits, is_compact, reserved-port guard, unreserved_ports for scan
+      - expiry.rs # Expiry rule, exact SQL cutoff (no wrap), Duration comparison agreement
+      - group.rs # Group requests via the shared identifier rule, offset-pattern search and fresh plans with exact error precedence, stored-group matching/compatibility, lazy reconcile_group, reserve-group/autoreserve output selection
+      - identifier.rs # Unicode trim spec + verified &str trim, identifier rule (blank > NUL > 255 bytes), canonical form, stored-tag sentinel lemmas
+      - inference.rs # Git inference name steps: repository name (.git parent rule, one .git suffix) and refs/heads/ branch names
+      - json.rs # JSON port map: serde_json string escaping, RFC 8259 string scanner and object reader with round trips, pretty layout, sorted rendering
+      - migrate.rs # Migration conflict classification with exact first-problem key errors, all-deletes-then-creates schedule, guard over every source/destination key, canonical path rebasing
+      - occupancy.rs # Occupancy policy: effective skip flags, probe matrix (set/order/count), fail-closed probe fold, ascending range scan, owner status
+      - path.rs # Path normalization: `.`/`..` stack, Unix byte normalizer + canonical-form recognizer, tilde classifier/join, deepest-existing-prefix search, provenance policy
+      - path_relation.rs # Path relationships (Same/Ancestor/Descendant/Unrelated), component prefix and rebasing on canonical paths, home-relative display
+      - port.rs # Port validity/arithmetic, PortSpan (range invariant), PortCursor (iteration)
+      - port_bounds.rs # Configured port bounds: validation, resolution, layer overlay (max_offset anchoring), env/CLI checks, defaults, reservations.base rules
+      - release.rs # Release tag table, row selection by stored target identity (other spellings select nothing) fused with the unrelated-path guard (physical fallback as oracle)
+      - render.rs # Decimal ports, stable byte-order sort, fail-closed export/dotenv group blocks, display-field escaping, tab rows, CSV/TSV record writer (RFC 4180 round trip)
+      - reserve.rs # Single-reservation decisions: metadata intents, sticky decision table, reserve policy (== policy_of, shared cleanup_policy), cleanup-then-retry only after a cleanup that freed something (shared with groups), deferred step, reported port
+      - schema_version.rs # Schema-version classification (corrupt metadata never restamped), i32 parsing, v1 preflight completeness, column layouts
+      - shell.rs # --shell alias table, SHELL basename classification and detection precedence, export lines with injection-freedom proofs
+      - sort.rs # Stable merge sort of positions by u64 key and the cleanup removal order (prune in scan order, then expire oldest-first)
+      - sql_schema.rs # Schema-SQL tokenizer (byte-level spec + exec), injective normalization, token-run containment, coverage, whitespace and bare-word-case robustness
+      - sticky.rs # Sticky project/task rules for group refresh and forced replacement (shared can_change_field)
+      - storage.rs # Stored ports/timestamps/paths/tags/rows: write predicate == read predicate, injective keys, exact lookups, row round trip, metadata-update encoder, prefix-query key
+      - symlink.rs # Bounded symlink following over step/same oracles: exactly max_depth links, sound and complete loop detection, ghost walk
+      - text.rs # ASCII case folding and byte comparisons, ASCII/UTF-8 bridging lemmas, char-offset &str slicing
+      - verbosity.rs # Log-level names, single precedence rule (--quiet, then --verbose, then TROP_LOG_MODE), invalid TROP_LOG_MODE detection, logger severity filter
+      - wal.rs # WAL enablement: journal-mode acceptance, ticket-chained clock/busy-timeout/attempt/pause oracles, exact retry run shape
   - tests/ # Integration tests
     - common/ # Shared test utilities
       - mod.rs # Common test helpers
     - integration_test.rs # Integration test suite
+- trop-verification/ # Unpublished harness: mounts trop/src/verified for `cargo verus verify`
+  - Cargo.toml # vstd dependency and [package.metadata.verus] verify = true
+  - src/lib.rs # #[path] mount of trop/src/verified
 - trop-cli/ # Binary workspace member - CLI interface
   - Cargo.toml # Binary manifest with dependencies
   - README.md # CLI documentation

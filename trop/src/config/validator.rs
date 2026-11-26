@@ -3,12 +3,17 @@
 //! This module provides comprehensive validation for all configuration fields,
 //! ensuring that values are valid and consistent.
 
+use crate::config::loader::ReservationOverlay;
 use crate::config::schema::{CleanupConfig, Config, PortConfig, PortExclusion, ReservationGroup};
 use crate::config::{ConfigFileKind, ConfigValueSource};
 use crate::error::{Error, Result};
-use crate::identifier::EnvironmentVariableName;
-use crate::port::Port;
-use std::collections::HashSet;
+use crate::verified::config::{
+    check_config_group, check_placement, expire_after_days_ok, lock_wait_seconds_ok, GroupIssue,
+    PlacementError, ServiceEntry,
+};
+use crate::verified::port_bounds::{
+    check_port_bounds, group_base_outside_range, PortBoundsViolation,
+};
 
 /// Validates configuration according to spec rules.
 ///
@@ -34,14 +39,26 @@ impl ConfigValidator {
     /// Returns a source-annotated validation error when the document is invalid
     /// for its source or contains an invalid value.
     pub fn validate_source(config: &Config, source: &ConfigValueSource) -> Result<()> {
-        Self::validate_source_document(config, source, config.reservations.is_some())
+        let reservations = if config.reservations.is_some() {
+            ReservationOverlay::Replace
+        } else {
+            ReservationOverlay::Inherit
+        };
+        Self::validate_source_document(config, source, reservations).map(drop)
     }
 
+    /// Validate one document for its source, and return what it does to the
+    /// effective reservation group.
+    ///
+    /// The placement rules are the verified kernel's (`check_placement`): the
+    /// user `config.yaml` may name neither a project nor a reservation group,
+    /// and its `reservations: null` is inert (`Inherit`); other sources keep
+    /// their overlay.
     pub(crate) fn validate_source_document(
         config: &Config,
         source: &ConfigValueSource,
-        reservations_declared: bool,
-    ) -> Result<()> {
+        reservations: ReservationOverlay,
+    ) -> Result<ReservationOverlay> {
         let is_user_file = matches!(
             source,
             ConfigValueSource::File {
@@ -50,23 +67,22 @@ impl ConfigValidator {
             }
         );
 
-        if is_user_file && config.project.is_some() {
-            return Err(Self::source_error(
-                "project",
-                "project is only valid in trop.yaml/trop.local.yaml, not user config.yaml",
-                source,
-            ));
-        }
+        let overlay = check_placement(is_user_file, config.project.is_some(), reservations.code())
+            .map_err(|error| match error {
+                PlacementError::ProjectInUserFile => Self::source_error(
+                    "project",
+                    "project is only valid in trop.yaml/trop.local.yaml, not user config.yaml",
+                    source,
+                ),
+                PlacementError::ReservationsInUserFile => Self::source_error(
+                    "reservations",
+                    "reservations are only valid in trop.yaml/trop.local.yaml, not user config.yaml",
+                    source,
+                ),
+            })?;
 
-        if is_user_file && reservations_declared {
-            return Err(Self::source_error(
-                "reservations",
-                "reservations are only valid in trop.yaml/trop.local.yaml, not user config.yaml",
-                source,
-            ));
-        }
-
-        Self::validate(config, !is_user_file).map_err(|error| Self::annotate(error, source))
+        Self::validate(config, !is_user_file).map_err(|error| Self::annotate(error, source))?;
+        Ok(ReservationOverlay::from_code(overlay))
     }
 
     /// Validate a complete configuration.
@@ -80,6 +96,22 @@ impl ConfigValidator {
     ///
     /// Returns validation errors for invalid configurations.
     pub fn validate(config: &Config, is_tropfile: bool) -> Result<()> {
+        Self::validate_with(config, is_tropfile, true)
+    }
+
+    /// Validate an effective (layered) configuration: every rule of
+    /// [`Self::validate`] except the `reservations.base` range rule.
+    ///
+    /// Environment, programmatic, and command-line port overrides apply to
+    /// one invocation and do not make a group's base invalid. The base is
+    /// checked against the range the configuration files name
+    /// (`EffectiveConfig::validate_configured_group_base`), and
+    /// `reserve-group` checks it against the range it scans.
+    pub(crate) fn validate_effective(config: &Config, is_tropfile: bool) -> Result<()> {
+        Self::validate_with(config, is_tropfile, false)
+    }
+
+    fn validate_with(config: &Config, is_tropfile: bool, check_group_base: bool) -> Result<()> {
         // Validate project field
         // Note: We allow project from any source (env vars, CLI flags, trop.yaml)
         // The tropfile restriction was overly strict and prevented valid CLI usage
@@ -96,6 +128,9 @@ impl ConfigValidator {
                 });
             }
             Self::validate_reservation_group(reservations)?;
+            if check_group_base {
+                Self::validate_group_base_in_range(reservations, config.ports.as_ref())?;
+            }
         }
 
         // Validate port configuration
@@ -115,9 +150,11 @@ impl ConfigValidator {
 
         // SQLite stores the timeout as signed 32-bit milliseconds. Zero is
         // deliberate and disables waiting; larger values would make
-        // rusqlite panic during connection configuration.
+        // rusqlite panic during connection configuration. The verified
+        // kernel proves the bound tight (`timeout * 1000 <= i32::MAX`) and
+        // that every accepted value passes the database's own check.
         if let Some(timeout) = config.maximum_lock_wait_seconds {
-            if timeout > crate::database::MAX_BUSY_TIMEOUT_SECONDS {
+            if !lock_wait_seconds_ok(timeout) {
                 return Err(Error::Validation {
                     field: "maximum_lock_wait_seconds".into(),
                     message: format!(
@@ -159,33 +196,14 @@ impl ConfigValidator {
     /// Validate string identifiers (project, task, tags).
     ///
     /// Checks that the identifier is non-empty after trimming, contains no
-    /// null bytes, and is not longer than 255 characters.
+    /// null bytes, and is not longer than 255 UTF-8 bytes after trimming.
     fn validate_identifier(field: &str, value: &str) -> Result<()> {
-        let trimmed = value.trim();
-
-        if trimmed.is_empty() {
-            return Err(Error::Validation {
+        crate::identifier::check_identifier(value)
+            .map(|_| ())
+            .map_err(|error| Error::Validation {
                 field: field.into(),
-                message: "Cannot be empty or only whitespace".into(),
-            });
-        }
-
-        // Additional checks for security/safety
-        if trimmed.contains('\0') {
-            return Err(Error::Validation {
-                field: field.into(),
-                message: "Cannot contain null bytes".into(),
-            });
-        }
-
-        if trimmed.len() > 255 {
-            return Err(Error::Validation {
-                field: field.into(),
-                message: "Cannot exceed 255 characters".into(),
-            });
-        }
-
-        Ok(())
+                message: crate::identifier::identifier_error_message(error).into(),
+            })
     }
 
     pub(crate) fn validate_runtime_identifier(field: &str, value: &str) -> Result<()> {
@@ -194,104 +212,58 @@ impl ConfigValidator {
 
     /// Validate port configuration.
     ///
-    /// Ensures min and max are valid ports, max >= min, and that max and
-    /// `max_offset` are not both specified.
+    /// Ensures min and max are valid ports, max >= min, `max_offset` is
+    /// strictly positive and lands on a valid port, and that max and
+    /// `max_offset` are not both specified. The decision (and the precedence
+    /// among errors) is made by the verified port-bounds kernel; this maps
+    /// each violation to its historical field and message.
     fn validate_port_config(config: &PortConfig) -> Result<()> {
-        // Validate min port
-        Port::try_from(config.min).map_err(|_| Error::Validation {
-            field: "ports.min".into(),
-            message: format!("Invalid port number: {}", config.min),
-        })?;
-
-        // Validate max if present
-        if let Some(max) = config.max {
-            Port::try_from(max).map_err(|_| Error::Validation {
-                field: "ports.max".into(),
-                message: format!("Invalid port number: {max}"),
-            })?;
-
-            if max < config.min {
-                return Err(Error::Validation {
-                    field: "ports".into(),
-                    message: "max must be >= min".into(),
-                });
-            }
-        }
-
-        // Validate max_offset if present
-        if let Some(offset) = config.max_offset {
-            if offset == 0 {
-                return Err(Error::Validation {
-                    field: "ports.max_offset".into(),
-                    message: "max_offset must be > 0".into(),
-                });
-            }
-
-            let Some(computed_max) = config.min.checked_add(offset) else {
-                return Err(Error::Validation {
-                    field: "ports.max_offset".into(),
-                    message: format!(
-                        "Offset {} would overflow when added to min port {}",
-                        offset, config.min
+        check_port_bounds(config.min, config.max, config.max_offset)
+            .map(drop)
+            .map_err(|violation| {
+                let (field, message) = match violation {
+                    PortBoundsViolation::InvalidMin => {
+                        ("ports.min", format!("Invalid port number: {}", config.min))
+                    }
+                    PortBoundsViolation::InvalidMax => (
+                        "ports.max",
+                        format!("Invalid port number: {}", config.max.unwrap_or_default()),
                     ),
-                });
-            };
-            Port::try_from(computed_max).map_err(|_| Error::Validation {
-                field: "ports.max_offset".into(),
-                message: format!("Offset would create invalid max port: {computed_max}"),
-            })?;
-        }
-
-        // Can't have both max and max_offset
-        if config.max.is_some() && config.max_offset.is_some() {
-            return Err(Error::Validation {
-                field: "ports".into(),
-                message: "Cannot specify both max and max_offset".into(),
-            });
-        }
-
-        Ok(())
+                    PortBoundsViolation::MaxBelowMin => ("ports", "max must be >= min".into()),
+                    PortBoundsViolation::ZeroOffset => {
+                        ("ports.max_offset", "max_offset must be > 0".into())
+                    }
+                    PortBoundsViolation::OffsetOverflow { offset } => (
+                        "ports.max_offset",
+                        format!(
+                            "Offset {offset} would overflow when added to min port {}",
+                            config.min
+                        ),
+                    ),
+                    PortBoundsViolation::BothMaxAndOffset => {
+                        ("ports", "Cannot specify both max and max_offset".into())
+                    }
+                };
+                Error::Validation {
+                    field: field.into(),
+                    message,
+                }
+            })
     }
 
     /// Validate excluded ports list.
     ///
-    /// Ensures all ports are valid and ranges are properly ordered.
+    /// Ensures all ports are valid and ranges are properly ordered. The
+    /// decision (and the precedence among errors) is made by the verified
+    /// exclusion kernel through [`crate::port::exclusions::validate_exclusions`].
     fn validate_excluded_ports(excluded: &[PortExclusion]) -> Result<()> {
-        for (i, exclusion) in excluded.iter().enumerate() {
-            match exclusion {
-                PortExclusion::Single(port) => {
-                    Port::try_from(*port).map_err(|_| Error::Validation {
-                        field: format!("excluded_ports[{i}]"),
-                        message: format!("Invalid port: {port}"),
-                    })?;
-                }
-                PortExclusion::Range { start, end } => {
-                    Port::try_from(*start).map_err(|_| Error::Validation {
-                        field: format!("excluded_ports[{i}]"),
-                        message: format!("Invalid start port: {start}"),
-                    })?;
-
-                    Port::try_from(*end).map_err(|_| Error::Validation {
-                        field: format!("excluded_ports[{i}]"),
-                        message: format!("Invalid end port: {end}"),
-                    })?;
-
-                    if end < start {
-                        return Err(Error::Validation {
-                            field: format!("excluded_ports[{i}]"),
-                            message: format!("Invalid range: {start}..{end} (end < start)"),
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
+        crate::port::exclusions::validate_exclusions(excluded)
     }
 
-    /// Validate cleanup configuration.
+    /// Validate cleanup configuration (`expire_after_days` is at least 1).
     fn validate_cleanup(cleanup: &CleanupConfig) -> Result<()> {
         if let Some(days) = cleanup.expire_after_days {
-            if days == 0 {
+            if !expire_after_days_ok(days) {
                 return Err(Error::Validation {
                     field: "cleanup.expire_after_days".into(),
                     message: "Must be > 0".into(),
@@ -301,85 +273,121 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate that a reservation group's base lies within the ports that a
+    /// `ports` section admits.
+    ///
+    /// Decided by the verified port-bounds kernel. A section that names a
+    /// complete range admits that range; a section that names only `min`
+    /// admits no base below `min`. An invalid section is left to its own
+    /// checks, and a configuration without a `ports` section is checked once
+    /// layered over the other configuration files
+    /// (`EffectiveConfig::validate_configured_group_base`).
+    pub(crate) fn validate_group_base_in_range(
+        group: &ReservationGroup,
+        ports: Option<&PortConfig>,
+    ) -> Result<()> {
+        let Some(outside) = ports.and_then(|ports| {
+            group_base_outside_range(group.base, ports.min, ports.max, ports.max_offset)
+        }) else {
+            return Ok(());
+        };
+        let message = match outside.max {
+            Some(max) => format!(
+                "Base port {} must be within port range {}..{max}",
+                outside.base, outside.min
+            ),
+            None => format!(
+                "Base port {} must not be below the minimum port {}",
+                outside.base, outside.min
+            ),
+        };
+        Err(Error::Validation {
+            field: "reservations.base".into(),
+            message,
+        })
+    }
+
     /// Validate reservation group.
     ///
-    /// Ensures all service tags are valid identifiers, offsets are unique,
-    /// preferred ports are unique and valid, and environment variable names
-    /// are valid and unique.
+    /// Ensures the base is a valid port, all service tags are valid
+    /// identifiers and unique after trimming, (defaulted) offsets are unique,
+    /// preferred ports are valid and unique, and environment variable names
+    /// are valid and unique ignoring ASCII case.
+    ///
+    /// The decision is the verified kernel's `check_config_group`, which
+    /// accepts exactly the groups satisfying these rules -- independently of
+    /// the order of the services -- and reports the first violation in the
+    /// order given. The services are checked in tag order, so the reported
+    /// violation does not depend on `HashMap` iteration order.
     fn validate_reservation_group(group: &ReservationGroup) -> Result<()> {
-        // Validate base port if present
-        if let Some(base) = group.base {
-            Port::try_from(base).map_err(|_| Error::Validation {
-                field: "reservations.base".into(),
-                message: format!("Invalid port: {base}"),
-            })?;
-        }
+        let mut services: Vec<_> = group.services.iter().collect();
+        services.sort_unstable_by_key(|(tag, _)| *tag);
+        let entries: Vec<ServiceEntry<'_>> = services
+            .iter()
+            .map(|(tag, service)| ServiceEntry {
+                tag: tag.as_str(),
+                offset: service.offset,
+                preferred: service.preferred,
+                env: service.env.as_deref(),
+            })
+            .collect();
 
-        // Track uniqueness constraints
-        let mut seen_offsets = HashSet::new();
-        let mut seen_preferred = HashSet::new();
-        let mut seen_env_vars = HashSet::new();
-        let mut seen_tags = HashSet::new();
-
-        for (tag, service) in &group.services {
-            // Validate tag
-            Self::validate_identifier("reservations.services.tag", tag)?;
-            if !seen_tags.insert(tag.trim()) {
-                return Err(Error::Validation {
-                    field: "reservations.services.tag".into(),
-                    message: "Service tags must be unique after trimming whitespace".into(),
-                });
+        check_config_group(group.base, &entries).map_err(|issue| {
+            let (field, message) = match issue {
+                GroupIssue::InvalidBase => (
+                    "reservations.base",
+                    format!("Invalid port: {}", group.base.unwrap_or_default()),
+                ),
+                GroupIssue::Tag { issue, .. } => (
+                    "reservations.services.tag",
+                    crate::identifier::identifier_error_message(issue).to_owned(),
+                ),
+                GroupIssue::DuplicateTag { .. } => (
+                    "reservations.services.tag",
+                    "Service tags must be unique after trimming whitespace".to_owned(),
+                ),
+                GroupIssue::DuplicateOffset { offset, .. } => (
+                    "reservations.services.offset",
+                    format!("Duplicate offset: {offset}"),
+                ),
+                GroupIssue::InvalidPreferred { index } => (
+                    "reservations.services.preferred",
+                    format!(
+                        "Invalid port: {}",
+                        entries[index].preferred.unwrap_or_default()
+                    ),
+                ),
+                GroupIssue::DuplicatePreferred { port, .. } => (
+                    "reservations.services.preferred",
+                    format!("Duplicate preferred port: {port}"),
+                ),
+                GroupIssue::InvalidEnv { error, .. } => (
+                    "reservations.services.env",
+                    crate::identifier::environment_variable_name_message(error).to_owned(),
+                ),
+                GroupIssue::NonConvertibleTag { .. } => (
+                    "reservations.services.tag",
+                    crate::identifier::NON_CONVERTIBLE_SERVICE_TAG_MESSAGE.to_owned(),
+                ),
+                GroupIssue::DuplicateEnv { .. } => (
+                    "reservations.services.env",
+                    "resolved environment-variable names must be unique when compared without ASCII case".to_owned(),
+                ),
+            };
+            Error::Validation {
+                field: field.into(),
+                message,
             }
-
-            // Every service has an offset fallback. Omission defaults to zero
-            // even when a preferred port is also configured.
-            let offset = service.offset.unwrap_or(0);
-            if !seen_offsets.insert(offset) {
-                return Err(Error::Validation {
-                    field: "reservations.services.offset".into(),
-                    message: format!("Duplicate offset: {offset}"),
-                });
-            }
-
-            // Check preferred port uniqueness
-            if let Some(preferred) = service.preferred {
-                Port::try_from(preferred).map_err(|_| Error::Validation {
-                    field: "reservations.services.preferred".into(),
-                    message: format!("Invalid port: {preferred}"),
-                })?;
-
-                if !seen_preferred.insert(preferred) {
-                    return Err(Error::Validation {
-                        field: "reservations.services.preferred".into(),
-                        message: format!("Duplicate preferred port: {preferred}"),
-                    });
-                }
-            }
-
-            // Resolve every output identifier during configuration validation.
-            // Explicit names and implicit derivations use the same shared grammar.
-            if let Some(env) = service.env.as_deref() {
-                Self::validate_env_var_name("reservations.services.env", env)?;
-            }
-            let variable_name = EnvironmentVariableName::resolve(tag, service.env.as_deref())?;
-
-            if !seen_env_vars.insert(variable_name.collision_key()) {
-                return Err(Error::Validation {
-                    field: "reservations.services.env".into(),
-                    message: "resolved environment-variable names must be unique when compared without ASCII case".into(),
-                });
-            }
-        }
-
-        Ok(())
+        })
     }
 
     /// Validate environment variable name.
     ///
     /// Ensures the name is at most 255 bytes and matches the portable grammar
-    /// `[A-Za-z_][A-Za-z0-9_]*`.
+    /// `[A-Za-z_][A-Za-z0-9_]*`. Test oracle for the group glue's messages.
+    #[cfg(test)]
     fn validate_env_var_name(field: &str, env: &str) -> Result<()> {
-        EnvironmentVariableName::parse(env)
+        crate::identifier::EnvironmentVariableName::parse(env)
             .map(|_| ())
             .map_err(|error| match error {
                 Error::Validation { message, .. } => Error::Validation {
@@ -939,6 +947,434 @@ mod tests {
 
         assert!(ConfigValidator::validate_reservation_group(&group).is_err());
     }
+
+    /// The pre-kernel group validation, iterating the services in the order
+    /// given. An independent oracle for the glue: it uses `HashSet`s and the
+    /// production identifier and env-name adapters, not the group kernel.
+    fn reference_validate_group(
+        base: Option<u16>,
+        services: &[(&str, &ServiceDefinition)],
+    ) -> Result<()> {
+        use crate::identifier::EnvironmentVariableName;
+        use std::collections::HashSet;
+
+        if let Some(base) = base {
+            crate::port::Port::try_from(base).map_err(|_| Error::Validation {
+                field: "reservations.base".into(),
+                message: format!("Invalid port: {base}"),
+            })?;
+        }
+        let mut seen_offsets = HashSet::new();
+        let mut seen_preferred = HashSet::new();
+        let mut seen_env_vars = HashSet::new();
+        let mut seen_tags = HashSet::new();
+        for (tag, service) in services {
+            ConfigValidator::validate_identifier("reservations.services.tag", tag)?;
+            let trimmed_tag = crate::identifier::trim_identifier(tag);
+            if !seen_tags.insert(trimmed_tag) {
+                return Err(Error::Validation {
+                    field: "reservations.services.tag".into(),
+                    message: "Service tags must be unique after trimming whitespace".into(),
+                });
+            }
+            let offset = service.offset.unwrap_or(0);
+            if !seen_offsets.insert(offset) {
+                return Err(Error::Validation {
+                    field: "reservations.services.offset".into(),
+                    message: format!("Duplicate offset: {offset}"),
+                });
+            }
+            if let Some(preferred) = service.preferred {
+                crate::port::Port::try_from(preferred).map_err(|_| Error::Validation {
+                    field: "reservations.services.preferred".into(),
+                    message: format!("Invalid port: {preferred}"),
+                })?;
+                if !seen_preferred.insert(preferred) {
+                    return Err(Error::Validation {
+                        field: "reservations.services.preferred".into(),
+                        message: format!("Duplicate preferred port: {preferred}"),
+                    });
+                }
+            }
+            if let Some(env) = service.env.as_deref() {
+                ConfigValidator::validate_env_var_name("reservations.services.env", env)?;
+            }
+            let variable_name =
+                EnvironmentVariableName::resolve(trimmed_tag, service.env.as_deref())?;
+            if !seen_env_vars.insert(variable_name.collision_key()) {
+                return Err(Error::Validation {
+                    field: "reservations.services.env".into(),
+                    message: "resolved environment-variable names must be unique when compared without ASCII case".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The `(field, message)` of a validation result.
+    fn verdict(result: &Result<()>) -> Option<(String, String)> {
+        match result {
+            Ok(()) => None,
+            Err(Error::Validation { field, message }) => Some((field.clone(), message.clone())),
+            Err(other) => panic!("unexpected error kind: {other}"),
+        }
+    }
+
+    /// A small pool of service variants that exercises every rule: tags that
+    /// collide after trimming or deriving, blank/NUL/overlong/non-convertible
+    /// tags, omitted and repeated offsets, preferred port 0 and repeats, and
+    /// explicit names that are invalid or collide ignoring ASCII case.
+    fn service_pool() -> Vec<(String, ServiceDefinition)> {
+        let tags = [
+            "web".to_string(),
+            " web ".to_string(),
+            "WEB".to_string(),
+            "web-x".to_string(),
+            "web_x".to_string(),
+            "  ".to_string(),
+            "a\0b".to_string(),
+            "\u{e9}".repeat(128),
+            "api".to_string(),
+        ];
+        let offsets = [None, Some(0), Some(1)];
+        let preferred = [None, Some(0), Some(5000)];
+        let envs = [None, Some("PORT"), Some("port"), Some("1X"), Some("WEB")];
+        let mut pool = Vec::new();
+        for tag in &tags {
+            for &offset in &offsets {
+                for &preferred in &preferred {
+                    for env in envs {
+                        pool.push((
+                            tag.clone(),
+                            ServiceDefinition {
+                                offset,
+                                preferred,
+                                env: env.map(str::to_string),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        pool
+    }
+
+    #[test]
+    fn group_glue_matches_the_reference_validator_on_every_pair() {
+        let pool = service_pool();
+        for base in [None, Some(0), Some(5000)] {
+            for (i, (tag_a, def_a)) in pool.iter().enumerate() {
+                for (tag_b, def_b) in pool.iter().skip(i) {
+                    if tag_a == tag_b {
+                        continue;
+                    }
+                    let group = ReservationGroup {
+                        base,
+                        services: HashMap::from([
+                            (tag_a.clone(), def_a.clone()),
+                            (tag_b.clone(), def_b.clone()),
+                        ]),
+                    };
+                    let mut sorted = [(tag_a.as_str(), def_a), (tag_b.as_str(), def_b)];
+                    sorted.sort_by_key(|(tag, _)| *tag);
+                    let expected = reference_validate_group(base, &sorted);
+                    let actual = ConfigValidator::validate_reservation_group(&group);
+                    assert_eq!(verdict(&actual), verdict(&expected), "{tag_a:?} {tag_b:?}");
+
+                    // Acceptance does not depend on the order of the services.
+                    sorted.reverse();
+                    let reversed = reference_validate_group(base, &sorted);
+                    assert_eq!(actual.is_ok(), reversed.is_ok(), "{tag_a:?} {tag_b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn group_glue_matches_the_reference_validator_on_sampled_triples() {
+        let pool = service_pool();
+        // A fixed linear congruential sequence: deterministic sampling.
+        let mut state: u64 = 0x5eed;
+        let mut next = |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(state >> 33).unwrap() % bound
+        };
+        for _ in 0..20_000 {
+            let picks = [next(pool.len()), next(pool.len()), next(pool.len())];
+            let mut services: Vec<(&str, &ServiceDefinition)> = picks
+                .iter()
+                .map(|&k| (pool[k].0.as_str(), &pool[k].1))
+                .collect();
+            services.sort_by_key(|(tag, _)| *tag);
+            services.dedup_by_key(|(tag, _)| *tag);
+            let group = ReservationGroup {
+                base: Some(5000),
+                services: services
+                    .iter()
+                    .map(|(tag, def)| ((*tag).to_string(), (*def).clone()))
+                    .collect(),
+            };
+            let expected = reference_validate_group(Some(5000), &services);
+            let actual = ConfigValidator::validate_reservation_group(&group);
+            assert_eq!(verdict(&actual), verdict(&expected), "{services:?}");
+            services.reverse();
+            let reversed = reference_validate_group(Some(5000), &services);
+            assert_eq!(actual.is_ok(), reversed.is_ok(), "{services:?}");
+        }
+    }
+
+    /// The group checks report the env-name diagnostics from the one message
+    /// table in `crate::identifier`; pins the exact field and text of each.
+    #[test]
+    fn group_env_diagnostics_have_the_shared_field_and_text() {
+        let check = |tag: &str, env: Option<&str>, field: &str, message: &str| {
+            let group = ReservationGroup {
+                base: Some(5000),
+                services: HashMap::from([(
+                    tag.to_string(),
+                    ServiceDefinition {
+                        offset: Some(0),
+                        preferred: None,
+                        env: env.map(str::to_string),
+                    },
+                )]),
+            };
+            let error = ConfigValidator::validate_reservation_group(&group).unwrap_err();
+            assert_eq!(
+                verdict(&Err(error)),
+                Some((field.to_string(), message.to_string())),
+                "{tag:?} {env:?}"
+            );
+        };
+        let long = "A".repeat(256);
+        for (env, message) in [
+            (
+                "",
+                "must not be empty and must match [A-Za-z_][A-Za-z0-9_]*",
+            ),
+            (long.as_str(), "must not exceed 255 bytes"),
+            ("1A", "must start with an ASCII letter or underscore"),
+            (
+                "A-B",
+                "must contain only ASCII letters, digits, and underscores",
+            ),
+        ] {
+            check("web", Some(env), "reservations.services.env", message);
+            // The same text `EnvironmentVariableName::parse` reports.
+            let Err(Error::Validation {
+                message: parsed, ..
+            }) = crate::identifier::EnvironmentVariableName::parse(env)
+            else {
+                panic!("{env:?} must be rejected");
+            };
+            assert_eq!(parsed, message);
+        }
+        check(
+            "not portable",
+            None,
+            "reservations.services.tag",
+            "service tag cannot be converted to a portable environment-variable name; \
+             provide an explicit valid env mapping",
+        );
+    }
+
+    /// Regression: the reported violation of a group with several violations
+    /// used to depend on `HashMap` iteration order (random per map). Services
+    /// are now checked in tag order, so every map reports the same error.
+    #[test]
+    fn group_with_several_violations_reports_the_same_error_every_time() {
+        for _ in 0..64 {
+            // A fresh map (fresh hash keys, so a fresh iteration order) each
+            // time. In tag order, `b` repeats `a`'s offset before `c`'s
+            // preferred port 0 is reached.
+            let services = HashMap::from([
+                (
+                    "c".to_string(),
+                    ServiceDefinition {
+                        offset: Some(5),
+                        preferred: Some(0),
+                        env: None,
+                    },
+                ),
+                (
+                    "a".to_string(),
+                    ServiceDefinition {
+                        offset: Some(0),
+                        preferred: None,
+                        env: None,
+                    },
+                ),
+                (
+                    "b".to_string(),
+                    ServiceDefinition {
+                        offset: Some(0),
+                        preferred: None,
+                        env: None,
+                    },
+                ),
+            ]);
+            let group = ReservationGroup {
+                base: Some(5000),
+                services,
+            };
+            let error = ConfigValidator::validate_reservation_group(&group).unwrap_err();
+            assert_eq!(
+                verdict(&Err(error)),
+                Some((
+                    "reservations.services.offset".to_string(),
+                    "Duplicate offset: 0".to_string()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn trimmed_tag_without_mapping_derives_its_name_from_the_trimmed_tag() {
+        let services = HashMap::from([
+            (
+                " web ".to_string(),
+                ServiceDefinition {
+                    offset: Some(0),
+                    preferred: None,
+                    env: None,
+                },
+            ),
+            (
+                "api".to_string(),
+                ServiceDefinition {
+                    offset: Some(1),
+                    preferred: None,
+                    env: Some("WEB".to_string()),
+                },
+            ),
+        ]);
+        let group = ReservationGroup {
+            base: None,
+            services,
+        };
+        // " web " derives WEB (from "web"), which collides with api's WEB.
+        let error = ConfigValidator::validate_reservation_group(&group).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("resolved environment-variable names"));
+
+        let services = HashMap::from([(
+            " web ".to_string(),
+            ServiceDefinition {
+                offset: None,
+                preferred: None,
+                env: None,
+            },
+        )]);
+        let group = ReservationGroup {
+            base: None,
+            services,
+        };
+        ConfigValidator::validate_reservation_group(&group).unwrap();
+    }
+
+    #[test]
+    fn identifier_length_message_states_bytes() {
+        // 128 two-byte chars: 128 characters but 256 bytes.
+        let error =
+            ConfigValidator::validate_identifier("project", &"\u{e9}".repeat(128)).unwrap_err();
+        assert!(error.to_string().contains("255 bytes"), "{error}");
+        ConfigValidator::validate_identifier("project", &"\u{e9}".repeat(127)).unwrap();
+    }
+
+    #[test]
+    fn lock_wait_bound_is_the_sqlite_millisecond_limit() {
+        let config = |seconds| Config {
+            maximum_lock_wait_seconds: Some(seconds),
+            ..Default::default()
+        };
+        for accepted in [0, 1, 5, 2_147_483] {
+            ConfigValidator::validate(&config(accepted), false).unwrap();
+        }
+        for rejected in [2_147_484, u64::from(u32::MAX), u64::MAX] {
+            let error = ConfigValidator::validate(&config(rejected), false).unwrap_err();
+            assert_eq!(
+                verdict(&Err(error)),
+                Some((
+                    "maximum_lock_wait_seconds".to_string(),
+                    "Timeout must not exceed 2147483 seconds".to_string()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn placement_rules_for_user_and_project_files() {
+        let user = ConfigValueSource::File {
+            kind: ConfigFileKind::User,
+            path: "config.yaml".into(),
+        };
+        let project = ConfigValueSource::File {
+            kind: ConfigFileKind::Project,
+            path: "trop.yaml".into(),
+        };
+        let group = ReservationGroup {
+            base: None,
+            services: HashMap::new(),
+        };
+        let with_group = Config {
+            reservations: Some(group),
+            ..Default::default()
+        };
+        let with_project = Config {
+            project: Some("p".into()),
+            reservations: with_group.reservations.clone(),
+            ..Default::default()
+        };
+        let plain = Config::default();
+
+        // A user file may not name a project (checked first) or a group.
+        let error = ConfigValidator::validate_source_document(
+            &with_project,
+            &user,
+            ReservationOverlay::Replace,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("project is only valid"),
+            "{error}"
+        );
+        let error = ConfigValidator::validate_source_document(
+            &with_group,
+            &user,
+            ReservationOverlay::Replace,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("reservations are only valid"),
+            "{error}"
+        );
+        // Its `reservations: null` is inert.
+        for overlay in [ReservationOverlay::Clear, ReservationOverlay::Inherit] {
+            assert_eq!(
+                ConfigValidator::validate_source_document(&plain, &user, overlay).unwrap(),
+                ReservationOverlay::Inherit
+            );
+        }
+        // Project files keep their overlay.
+        for overlay in [
+            ReservationOverlay::Clear,
+            ReservationOverlay::Inherit,
+            ReservationOverlay::Replace,
+        ] {
+            let config = if overlay == ReservationOverlay::Replace {
+                &with_project
+            } else {
+                &plain
+            };
+            assert_eq!(
+                ConfigValidator::validate_source_document(config, &project, overlay).unwrap(),
+                overlay
+            );
+        }
+    }
 }
 
 // Property-based tests for configuration validation
@@ -954,7 +1390,7 @@ mod property_tests {
     // PROPERTY TESTS FOR IDENTIFIER VALIDATION
     // ==================================================================================
 
-    /// Property: Non-empty strings without null bytes and <= 255 chars should validate
+    /// Property: Non-empty strings without null bytes and <= 255 bytes should validate
     ///
     /// Mathematical Property: For all strings s where:
     /// - s.trim().len() > 0
@@ -1007,7 +1443,7 @@ mod property_tests {
         }
     }
 
-    /// Property: Strings longer than 255 characters should fail
+    /// Property: Strings longer than 255 bytes should fail
     ///
     /// Mathematical Property: For all strings s where s.trim().len() > 255,
     /// validate_identifier(s) returns Err.
@@ -1016,7 +1452,7 @@ mod property_tests {
         fn prop_too_long_identifiers_rejected(extra_chars in 1usize..=50) {
             let s = "a".repeat(255 + extra_chars);
             let result = ConfigValidator::validate_identifier("test", &s);
-            prop_assert!(result.is_err(), "Identifier longer than 255 chars should fail");
+            prop_assert!(result.is_err(), "Identifier longer than 255 bytes should fail");
         }
     }
 

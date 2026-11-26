@@ -19,12 +19,12 @@ clap_complete = "4.5"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-chrono = { workspace = true }
-csv = "1.4"
 home = "0.5"
 
 [dev-dependencies]
 assert_cmd = "2.0"
+# Differential tests of the verified CSV/TSV writer against the `csv` crate.
+csv = "1.4"
 predicates = "3.1"
 tempfile = { workspace = true }
 rusqlite = { workspace = true }

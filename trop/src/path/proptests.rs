@@ -3,10 +3,95 @@
 //! Note: The normalize module already has property tests for normalization.
 //! This module focuses on path relationships and resolver behavior.
 
-use super::normalize::normalize;
+use super::normalize::{normalize, resolve_components};
 use super::relationship::PathRelationship;
+use super::verified_glue_tests::legacy;
 use proptest::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+// Paths mixing names, `.`, `..`, empty pieces (repeated separators), and
+// an optional leading root.
+fn messy_path_strategy() -> impl Strategy<Value = String> {
+    (
+        any::<bool>(),
+        prop::collection::vec(
+            prop_oneof![
+                Just(String::new()),
+                Just(".".to_string()),
+                Just("..".to_string()),
+                "[a-z0-9_.-]{1,6}",
+            ],
+            0..10,
+        ),
+    )
+        .prop_map(|(rooted, parts)| {
+            let joined = parts.join("/");
+            if rooted {
+                format!("/{joined}")
+            } else {
+                joined
+            }
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 5000,
+        .. ProptestConfig::default()
+    })]
+
+    // Differential check of the trusted `std::path` model: outside the
+    // deliberately changed tilde forms, the verified normalizer agrees
+    // byte-for-byte with the implementation it replaced.
+    #[test]
+    fn normalize_agrees_with_legacy(path in messy_path_strategy()) {
+        let new = normalize(Path::new(&path));
+        let old = legacy::normalize(Path::new(&path));
+        match (&new, &old) {
+            (Ok(a), Ok(b)) => prop_assert_eq!(a.as_os_str(), b.as_os_str()),
+            (Err(a), Err(b)) => prop_assert_eq!(a.to_string(), b.to_string()),
+            _ => prop_assert!(false, "{:?}: {:?} vs {:?}", path, new, old),
+        }
+    }
+
+    #[test]
+    fn resolve_components_agrees_with_legacy(path in messy_path_strategy()) {
+        let new = resolve_components(Path::new(&path));
+        let old = legacy::resolve_components(Path::new(&path));
+        match (&new, &old) {
+            (Ok(a), Ok(b)) => prop_assert_eq!(a.as_os_str(), b.as_os_str()),
+            (Err(a), Err(b)) => prop_assert_eq!(a.to_string(), b.to_string()),
+            _ => prop_assert!(false, "{:?}: {:?} vs {:?}", path, new, old),
+        }
+    }
+
+    // Normalized paths are canonical and normalization is idempotent.
+    #[test]
+    fn normalize_output_is_a_fixed_point(path in messy_path_strategy()) {
+        if let Ok(normalized) = normalize(Path::new(&path)) {
+            prop_assert!(super::is_canonical_absolute(&normalized));
+            let again = normalize(&normalized).unwrap();
+            prop_assert_eq!(again.as_os_str(), normalized.as_os_str());
+        }
+    }
+
+    // Outside `.`/`..` and with equal anchors, the verified relationship
+    // agrees with the implementation it replaced.
+    #[test]
+    fn between_agrees_with_legacy_on_plain_paths(
+        rooted in any::<bool>(),
+        left in prop::collection::vec("[a-c]{1,2}", 0..5),
+        right in prop::collection::vec("[a-c]{1,2}", 0..5),
+    ) {
+        let root = if rooted { "/" } else { "" };
+        let left = format!("{root}{}", left.join("/"));
+        let right = format!("{root}{}", right.join("/"));
+        prop_assert_eq!(
+            PathRelationship::between(Path::new(&left), Path::new(&right)),
+            legacy::between(Path::new(&left), Path::new(&right))
+        );
+    }
+}
 
 // Strategy for generating path-like strings
 fn path_component_strategy() -> impl Strategy<Value = String> {

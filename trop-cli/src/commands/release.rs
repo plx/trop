@@ -7,6 +7,7 @@ use crate::error::CliError;
 use crate::invocation::InvocationContext;
 use clap::Args;
 use std::path::PathBuf;
+use trop::operations::release::ReleaseTagSelection;
 use trop::{
     Database, ExecutionResult, OperationPlan, PlanExecutor, ReleaseOptions, ReleasePlan,
     ReservationKey,
@@ -96,20 +97,16 @@ impl ReleaseCommand {
         // 1. Resolve path
         let path = context.resolve_path(self.path.as_deref())?;
 
-        // 2. Validate option combinations
-        if self.tag.is_some() && self.untagged_only {
-            return Err(CliError::InvalidArguments(
-                "Cannot specify both --tag and --untagged-only".to_string(),
-            ));
-        }
+        // 2. Resolve the tag flags (both together are an error).
+        let selection = ReleaseTagSelection::from_flags(self.tag, self.untagged_only)
+            .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
 
         // 3. Consume the path permission from the shared effective configuration.
         let allow_unrelated_path = context.effective()?.allow_unrelated_path();
 
         // 4. Build one selector with the exact tag semantics shared by exact
         // and recursive release.
-        let all_tags = self.tag.is_none() && !self.untagged_only;
-        let tag = if self.untagged_only { None } else { self.tag };
+        let (tag, all_tags) = selection.into_key_tag_and_all_tags();
         let key = ReservationKey::new(path, tag)
             .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
         let options = ReleaseOptions::new(key)

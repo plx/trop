@@ -4,8 +4,13 @@
 //! override configuration file values.
 
 use crate::config::effective::ConfigField;
-use crate::config::schema::{Config, OutputFormat, PortExclusion};
+use crate::config::schema::{Config, OutputFormat, PortConfig, PortExclusion};
 use crate::error::{Error, Result};
+use crate::verified::config::{parse_bool_word, parse_u32_decimal, parse_u64_decimal};
+use crate::verified::exclusions::parse_u16;
+use crate::verified::port_bounds::{
+    check_upper_declaration, overlay_port_bounds, PortBoundsViolation, PortLayer,
+};
 use std::env;
 
 /// Handles environment variable overrides for configuration.
@@ -75,9 +80,9 @@ impl EnvironmentConfig {
             on_field(ConfigField::ExcludedPorts, "TROP_EXCLUDED_PORTS");
         }
 
-        // TROP_EXPIRE_AFTER_DAYS
+        // TROP_EXPIRE_AFTER_DAYS (`u32` decimal text; validation rejects 0)
         if let Ok(days) = env::var("TROP_EXPIRE_AFTER_DAYS") {
-            let days = days.parse().map_err(|_| Error::Validation {
+            let days = parse_u32_decimal(days.as_bytes()).ok_or_else(|| Error::Validation {
                 field: "TROP_EXPIRE_AFTER_DAYS".into(),
                 message: "Must be a positive integer".into(),
             })?;
@@ -94,29 +99,25 @@ impl EnvironmentConfig {
         if let Some((seconds, variable)) =
             Self::read_with_alias("TROP_BUSY_TIMEOUT", &["TROP_MAXIMUM_LOCK_WAIT_SECONDS"])
         {
-            config.maximum_lock_wait_seconds =
-                Some(seconds.parse().map_err(|_| Error::Validation {
+            config.maximum_lock_wait_seconds = Some(
+                parse_u64_decimal(seconds.as_bytes()).ok_or_else(|| Error::Validation {
                     field: variable.into(),
                     message: "Must be a positive integer".into(),
-                })?);
+                })?,
+            );
             on_field(ConfigField::MaximumLockWaitSeconds, variable);
         }
 
         if let Ok(format) = env::var("TROP_OUTPUT_FORMAT") {
-            config.output_format = Some(match format.to_ascii_lowercase().as_str() {
-                "table" => OutputFormat::Table,
-                "json" => OutputFormat::Json,
-                "csv" => OutputFormat::Csv,
-                "tsv" => OutputFormat::Tsv,
-                _ => {
-                    return Err(Error::Validation {
+            config.output_format =
+                Some(
+                    OutputFormat::parse_keyword(&format).ok_or_else(|| Error::Validation {
                         field: "TROP_OUTPUT_FORMAT".into(),
                         message: format!(
                             "Invalid output format: '{format}' (expected table/json/csv/tsv)"
                         ),
-                    });
-                }
-            });
+                    })?,
+                );
             on_field(ConfigField::OutputFormat, "TROP_OUTPUT_FORMAT");
         }
 
@@ -153,49 +154,92 @@ impl EnvironmentConfig {
     }
 
     /// Apply port-related environment variable overrides.
+    ///
+    /// `TROP_PORT_MIN`, `TROP_PORT_MAX`, and `TROP_PORT_MAX_OFFSET` form one
+    /// layer. Like a YAML document, the layer must not set both `max` and
+    /// `max_offset`, and its `max_offset` must land on a valid port above the
+    /// `min` in effect at this layer; it is then resolved to an absolute
+    /// `max`. An upper bound the layer does not set stays where it is when
+    /// only `TROP_PORT_MIN` is set. The checks and the overlay are decided by
+    /// the verified port-bounds kernel.
     fn apply_port_overrides(
         config: &mut Config,
         on_field: &mut impl FnMut(ConfigField, &'static str),
     ) -> Result<()> {
-        let mut port_config = config.ports.clone().unwrap_or_default();
-        let mut modified = false;
+        let min = Self::read_port_variable("TROP_PORT_MIN", "Invalid port number")?;
+        let max = Self::read_port_variable("TROP_PORT_MAX", "Invalid port number")?;
+        let max_offset = Self::read_port_variable("TROP_PORT_MAX_OFFSET", "Invalid port offset")?;
 
-        if let Ok(min) = env::var("TROP_PORT_MIN") {
-            port_config.min = min.parse().map_err(|_| Error::Validation {
-                field: "TROP_PORT_MIN".into(),
-                message: "Invalid port number".into(),
-            })?;
-            modified = true;
+        let lower = config.ports.clone().unwrap_or_default().bounds();
+        let layer = PortLayer {
+            min,
+            max,
+            max_offset,
+        };
+        let (bounds, leaves) = overlay_port_bounds(lower, layer);
+        // The overlay's `min` is the one in effect at this layer.
+        let anchor = bounds.min;
+        check_upper_declaration(anchor, max, max_offset).map_err(|violation| {
+            let (field, message) = match violation {
+                PortBoundsViolation::OffsetOverflow { offset } => (
+                    "ports.max_offset (TROP_PORT_MAX_OFFSET)",
+                    format!("Offset {offset} would overflow when added to min port {anchor}"),
+                ),
+                PortBoundsViolation::BothMaxAndOffset => (
+                    "ports (TROP_PORT_MAX, TROP_PORT_MAX_OFFSET)",
+                    "Cannot specify both max and max_offset".to_string(),
+                ),
+                // `ZeroOffset` is the only other violation the kernel reports
+                // for an upper-bound declaration.
+                PortBoundsViolation::ZeroOffset
+                | PortBoundsViolation::InvalidMin
+                | PortBoundsViolation::InvalidMax
+                | PortBoundsViolation::MaxBelowMin => (
+                    "ports.max_offset (TROP_PORT_MAX_OFFSET)",
+                    "max_offset must be > 0".to_string(),
+                ),
+            };
+            Error::Validation {
+                field: field.into(),
+                message,
+            }
+        })?;
+
+        if leaves.min || leaves.upper {
+            config.ports = Some(PortConfig::from_bounds(bounds));
+        }
+        if leaves.min {
             on_field(ConfigField::PortsMin, "TROP_PORT_MIN");
         }
-
-        if let Ok(max) = env::var("TROP_PORT_MAX") {
-            port_config.max = Some(max.parse().map_err(|_| Error::Validation {
-                field: "TROP_PORT_MAX".into(),
-                message: "Invalid port number".into(),
-            })?);
-            port_config.max_offset = None;
-            modified = true;
-            on_field(ConfigField::PortsMax, "TROP_PORT_MAX");
-            on_field(ConfigField::PortsMaxOffset, "TROP_PORT_MAX");
-        }
-
-        if let Ok(max_offset) = env::var("TROP_PORT_MAX_OFFSET") {
-            port_config.max_offset = Some(max_offset.parse().map_err(|_| Error::Validation {
-                field: "TROP_PORT_MAX_OFFSET".into(),
-                message: "Invalid port offset".into(),
-            })?);
-            port_config.max = None;
-            modified = true;
-            on_field(ConfigField::PortsMaxOffset, "TROP_PORT_MAX_OFFSET");
-            on_field(ConfigField::PortsMax, "TROP_PORT_MAX_OFFSET");
-        }
-
-        if modified {
-            config.ports = Some(port_config);
+        if leaves.upper {
+            // Exactly one upper-bound variable is set (the check above
+            // rejects both).
+            let upper_variable = if max_offset.is_some() {
+                "TROP_PORT_MAX_OFFSET"
+            } else {
+                "TROP_PORT_MAX"
+            };
+            on_field(ConfigField::PortsMax, upper_variable);
+            on_field(ConfigField::PortsMaxOffset, upper_variable);
         }
 
         Ok(())
+    }
+
+    /// Read and parse one port-valued `TROP_PORT_*` variable, if it is set.
+    ///
+    /// The value is `u16` decimal text (`u16::from_str`'s syntax), decided by
+    /// the verified decimal parser that every numeric `TROP_*` variable uses.
+    fn read_port_variable(variable: &'static str, message: &str) -> Result<Option<u16>> {
+        env::var(variable)
+            .ok()
+            .map(|value| {
+                parse_u16(value.as_bytes()).ok_or_else(|| Error::Validation {
+                    field: variable.into(),
+                    message: message.into(),
+                })
+            })
+            .transpose()
     }
 
     /// Apply occupancy check environment variable overrides.
@@ -268,54 +312,44 @@ impl EnvironmentConfig {
 
     /// Parse a boolean value from a string.
     ///
-    /// Accepts: true/1/yes/on for true, false/0/no/off for false (case-insensitive).
+    /// Accepts: true/1/yes/on for true, false/0/no/off for false
+    /// (case-insensitive). The decision is the verified kernel's
+    /// `parse_bool_word`, which ignores ASCII case. The words are ASCII, so
+    /// this is exactly matching `s.to_lowercase()` against them: the only
+    /// non-ASCII char whose lowercase is ASCII is the Kelvin sign (`k`), and
+    /// no word contains `k` (pinned by
+    /// `test_parse_bool_ascii_folding_matches_unicode_lowercase`).
     fn parse_bool(field: &str, s: &str) -> Result<bool> {
-        match s.to_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Ok(true),
-            "false" | "0" | "no" | "off" => Ok(false),
-            _ => Err(Error::Validation {
-                field: field.into(),
-                message: format!(
-                    "Invalid boolean value: '{s}' (expected true/false/1/0/yes/no/on/off)"
-                ),
-            }),
-        }
+        parse_bool_word(s.as_bytes()).ok_or_else(|| Error::Validation {
+            field: field.into(),
+            message: format!(
+                "Invalid boolean value: '{s}' (expected true/false/1/0/yes/no/on/off)"
+            ),
+        })
     }
 
     /// Parse excluded ports from comma-separated string.
     ///
     /// Supports both individual ports (e.g., "5001") and ranges (e.g., "5000..5010").
+    /// Each item uses the same parser as the YAML string form and
+    /// `trop exclude` (`PortExclusion`'s `FromStr`), so whitespace around
+    /// each side of `..` is ignored here too. Items are trimmed with the
+    /// same verified whitespace trim (equal to `str::trim`); blank items are
+    /// skipped.
     fn parse_excluded_ports(s: &str) -> Result<Vec<PortExclusion>> {
         let mut exclusions = Vec::new();
 
         for part in s.split(',') {
-            let part = part.trim();
+            let part = crate::identifier::trim_identifier(part);
             if part.is_empty() {
                 continue;
             }
 
-            if let Some((start_str, end_str)) = part.split_once("..") {
-                // Range format: "5000..5010"
-                let start: u16 = start_str.parse().map_err(|_| Error::Validation {
-                    field: "TROP_EXCLUDED_PORTS".into(),
-                    message: format!("Invalid port in range: {start_str}"),
-                })?;
-
-                let end: u16 = end_str.parse().map_err(|_| Error::Validation {
-                    field: "TROP_EXCLUDED_PORTS".into(),
-                    message: format!("Invalid port in range: {end_str}"),
-                })?;
-
-                exclusions.push(PortExclusion::Range { start, end });
-            } else {
-                // Single port
-                let port_num: u16 = part.parse().map_err(|_| Error::Validation {
-                    field: "TROP_EXCLUDED_PORTS".into(),
-                    message: format!("Invalid port: {part}"),
-                })?;
-
-                exclusions.push(PortExclusion::Single(port_num));
-            }
+            let exclusion = part.parse().map_err(|error| Error::Validation {
+                field: "TROP_EXCLUDED_PORTS".into(),
+                message: format!("{error}"),
+            })?;
+            exclusions.push(exclusion);
         }
 
         Ok(exclusions)
@@ -396,6 +430,34 @@ mod tests {
         assert_eq!(result[2], PortExclusion::Single(5020));
     }
 
+    /// `TROP_EXCLUDED_PORTS` items are trimmed with the verified whitespace
+    /// trim. Pins that this is exactly the previous `str::trim` behavior:
+    /// with every Unicode scalar value as padding, the items, and which of
+    /// them are blank, are what the `str::trim` reference reads.
+    #[test]
+    fn test_parse_excluded_ports_trim_matches_str_trim() {
+        fn reference(s: &str) -> Option<Vec<PortExclusion>> {
+            s.split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(|part| part.parse().ok())
+                .collect()
+        }
+        for c in (0..=0x0010_FFFF_u32).filter_map(char::from_u32) {
+            for text in [format!("{c}5001{c},{c},5002..{c}5003"), format!("{c}")] {
+                assert_eq!(
+                    EnvironmentConfig::parse_excluded_ports(&text).ok(),
+                    reference(&text),
+                    "{text:?}"
+                );
+            }
+        }
+        assert_eq!(
+            EnvironmentConfig::parse_excluded_ports("\u{3000},\u{2028}5001\u{85}").unwrap(),
+            [PortExclusion::Single(5001)]
+        );
+    }
+
     #[test]
     fn test_parse_excluded_ports_whitespace() {
         let result = EnvironmentConfig::parse_excluded_ports(" 5001 , 5002 ").unwrap();
@@ -418,6 +480,41 @@ mod tests {
     fn test_parse_excluded_ports_invalid_range() {
         let result = EnvironmentConfig::parse_excluded_ports("5000..invalid");
         assert!(result.is_err());
+    }
+
+    /// Regression: the env var used to reject whitespace around `..`, which
+    /// the YAML string form accepts. All sources now share one parser.
+    #[test]
+    fn test_parse_excluded_ports_whitespace_around_range_separator() {
+        let result = EnvironmentConfig::parse_excluded_ports("5000 .. 5010, 6000 ..6001").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                PortExclusion::Range {
+                    start: 5000,
+                    end: 5010
+                },
+                PortExclusion::Range {
+                    start: 6000,
+                    end: 6001
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_excluded_ports_error_messages_unchanged() {
+        let message = |s: &str| match EnvironmentConfig::parse_excluded_ports(s) {
+            Err(Error::Validation { field, message }) => {
+                assert_eq!(field, "TROP_EXCLUDED_PORTS");
+                message
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        };
+        assert_eq!(message("5001, abc"), "Invalid port: abc");
+        assert_eq!(message("x..5010"), "Invalid port in range: x");
+        assert_eq!(message("5000..y "), "Invalid port in range: y");
+        assert_eq!(message("70000"), "Invalid port: 70000");
     }
 
     #[test]
@@ -444,9 +541,188 @@ mod tests {
         EnvironmentConfig::apply_overrides(&mut config).unwrap();
         std::env::remove_var("TROP_PORT_MAX_OFFSET");
 
+        // The offset replaces the explicit max and is resolved against the
+        // `min` in effect (8000) into the absolute max it names.
         let ports = config.ports.unwrap();
-        assert_eq!(ports.max, None);
-        assert_eq!(ports.max_offset, Some(25));
+        assert_eq!(ports.min, 8000);
+        assert_eq!(ports.max, Some(8025));
+        assert_eq!(ports.max_offset, None);
+    }
+
+    /// The pre-kernel boolean parser (Unicode lowercasing), as an oracle.
+    pub(super) fn reference_parse_bool(s: &str) -> Option<bool> {
+        match s.to_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// The kernel folds only ASCII case; the old parser used Unicode
+    /// `to_lowercase`. They agree because the only non-ASCII char whose
+    /// lowercase is all-ASCII is the Kelvin sign (to `k`), and no boolean word
+    /// contains `k`.
+    #[test]
+    fn test_parse_bool_ascii_folding_matches_unicode_lowercase() {
+        let lowers_to_ascii: Vec<char> = (0..=0x10_FFFF_u32)
+            .filter_map(char::from_u32)
+            .filter(|c| !c.is_ascii() && c.to_lowercase().all(|l| l.is_ascii()))
+            .collect();
+        assert_eq!(lowers_to_ascii, ['\u{212A}']);
+        assert_eq!('\u{212A}'.to_lowercase().to_string(), "k");
+        let words = ["true", "1", "yes", "on", "false", "0", "no", "off"];
+        assert!(words.iter().all(|word| !word.contains('k')));
+
+        let mut inputs: Vec<String> = Vec::new();
+        for word in words {
+            inputs.push(word.to_string());
+            inputs.push(word.to_ascii_uppercase());
+            inputs.push(format!(" {word}"));
+            inputs.push(format!("{word} "));
+            inputs.push(format!("{word}\n"));
+            inputs.push(word.replace('o', "\u{d8}"));
+            inputs.push(word.replace('e', "\u{c9}"));
+        }
+        inputs.extend(
+            [
+                "",
+                "\u{212A}",
+                "o\u{212A}",
+                "\u{130}",
+                "TrUe",
+                "yEs",
+                "ON",
+                "nO",
+                "OfF",
+                "2",
+                "10",
+                "00",
+                "truee",
+                "fals",
+                "y",
+                "n",
+                "t",
+                "f",
+            ]
+            .map(str::to_string),
+        );
+        for input in &inputs {
+            assert_eq!(
+                EnvironmentConfig::parse_bool("TEST", input).ok(),
+                reference_parse_bool(input),
+                "{input:?}"
+            );
+        }
+    }
+
+    /// The verified decimal parsers accept exactly what the unsigned
+    /// `from_str` implementations accept, with the same values.
+    #[test]
+    fn test_decimal_parsers_match_std_at_the_edges() {
+        use crate::verified::config::{parse_u32_decimal, parse_u64_decimal};
+        use crate::verified::exclusions::parse_u16;
+
+        for text in [
+            "",
+            "+",
+            "-",
+            "-0",
+            "0",
+            "+0",
+            "00",
+            "007",
+            "1",
+            "65535",
+            "65536",
+            "+65535",
+            "0065535",
+            "4294967295",
+            "4294967296",
+            "18446744073709551615",
+            "18446744073709551616",
+            "99999999999999999999999",
+            " 1",
+            "1 ",
+            "1_000",
+            "1e3",
+            "0x10",
+            "++1",
+            "+-1",
+            "\u{663}",
+            "\u{ff11}",
+            "1\0",
+            "/",
+            ":",
+        ] {
+            assert_eq!(
+                parse_u16(text.as_bytes()),
+                text.parse::<u16>().ok(),
+                "{text:?}"
+            );
+            assert_eq!(
+                parse_u32_decimal(text.as_bytes()),
+                text.parse::<u32>().ok(),
+                "{text:?}"
+            );
+            assert_eq!(
+                parse_u64_decimal(text.as_bytes()),
+                text.parse::<u64>().ok(),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_output_format_keywords_round_trip_and_ignore_ascii_case() {
+        use crate::config::OutputFormat;
+
+        let reference = |text: &str| match text.to_ascii_lowercase().as_str() {
+            "table" => Some(OutputFormat::Table),
+            "json" => Some(OutputFormat::Json),
+            "csv" => Some(OutputFormat::Csv),
+            "tsv" => Some(OutputFormat::Tsv),
+            _ => None,
+        };
+        for format in [
+            OutputFormat::Json,
+            OutputFormat::Csv,
+            OutputFormat::Tsv,
+            OutputFormat::Table,
+        ] {
+            let keyword = format.to_string();
+            assert_eq!(OutputFormat::parse_keyword(&keyword), Some(format));
+            assert_eq!(
+                OutputFormat::parse_keyword(&keyword.to_ascii_uppercase()),
+                Some(format)
+            );
+            // Display agrees with the YAML (serde) spelling.
+            assert_eq!(
+                serde_yaml::to_string(&format).unwrap().trim(),
+                keyword.as_str()
+            );
+        }
+        for text in [
+            "json",
+            "JSON",
+            "Csv",
+            "tSv",
+            "TABLE",
+            "",
+            "jso",
+            "jsonn",
+            " json",
+            "json ",
+            "csv\n",
+            "t\u{e1}ble",
+            "\u{212A}",
+            "yaml",
+        ] {
+            assert_eq!(
+                OutputFormat::parse_keyword(text),
+                reference(text),
+                "{text:?}"
+            );
+        }
     }
 }
 
@@ -767,6 +1043,45 @@ mod property_tests {
             for exclusion in result {
                 prop_assert_eq!(exclusion, PortExclusion::Single(port), "All should be same port");
             }
+        }
+    }
+
+    /// Property: the verified decimal parsers are differentially equal to
+    /// `u16`/`u32`/`u64::from_str` on arbitrary text, including digit-heavy
+    /// text near the overflow boundaries.
+    proptest! {
+        #[test]
+        fn prop_decimal_parsers_match_std(
+            text in prop_oneof![
+                any::<String>(),
+                "[+-]?[0-9]{0,25}",
+                "[ +0-9a-f_.-]{0,8}",
+            ]
+        ) {
+            use crate::verified::config::{parse_u32_decimal, parse_u64_decimal};
+            use crate::verified::exclusions::parse_u16;
+            prop_assert_eq!(parse_u16(text.as_bytes()), text.parse::<u16>().ok());
+            prop_assert_eq!(parse_u32_decimal(text.as_bytes()), text.parse::<u32>().ok());
+            prop_assert_eq!(parse_u64_decimal(text.as_bytes()), text.parse::<u64>().ok());
+        }
+    }
+
+    /// Property: the verified boolean parser agrees with the pre-kernel
+    /// (Unicode-lowercasing) parser on arbitrary text and on case mixes of
+    /// the words.
+    proptest! {
+        #[test]
+        fn prop_bool_parser_matches_reference(
+            text in prop_oneof![
+                any::<String>(),
+                "(?i)(true|false|yes|no|on|off|1|0)",
+                "[tTrRuUeEfFaAlLsSyYnNoO01\u{212A}\u{130} ]{0,6}",
+            ]
+        ) {
+            prop_assert_eq!(
+                EnvironmentConfig::parse_bool("TEST", &text).ok(),
+                super::tests::reference_parse_bool(&text)
+            );
         }
     }
 }

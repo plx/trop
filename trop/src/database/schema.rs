@@ -6,8 +6,10 @@
 /// Current schema version for the database.
 ///
 /// This version is stored in the metadata table and is used to ensure
-/// compatibility between the database and the application.
-pub const CURRENT_SCHEMA_VERSION: i32 = 2;
+/// compatibility between the database and the application. It is the
+/// verified schema-version kernel's constant, which its classification
+/// proofs are stated against.
+pub const CURRENT_SCHEMA_VERSION: i32 = crate::verified::schema_version::CURRENT_SCHEMA_VERSION;
 
 /// SQL statement to create the metadata table.
 ///
@@ -24,8 +26,11 @@ pub const CREATE_METADATA_TABLE: &str = r"
 /// The reservations table stores all port reservations with their associated
 /// metadata. Schema v2 stores an absent tag as the empty string, which is not a
 /// valid domain tag, so both tagged and untagged identities participate in the
-/// non-null primary key. The path representation remains unchanged pending the
-/// separate cross-platform path-storage contract.
+/// non-null primary key. A path is stored as its own exact UTF-8 text in
+/// canonical absolute form. The verified storage kernel
+/// (`verified::storage::encode_record`) decides both encodings and refuses
+/// any key that the row decoder would not read back. A reservation's
+/// in-memory `sticky` flag has no column and is not persisted.
 pub const CREATE_RESERVATIONS_TABLE: &str = r"
     CREATE TABLE IF NOT EXISTS reservations (
         path TEXT NOT NULL,
@@ -84,9 +89,3 @@ pub const DELETE_RESERVATION: &str = r"
     DELETE FROM reservations
     WHERE path = ? AND tag = ?
 ";
-
-/// Encodes the domain-level optional tag in schema v2's non-null storage form.
-#[must_use]
-pub(super) fn encode_tag(tag: Option<&str>) -> &str {
-    tag.unwrap_or("")
-}

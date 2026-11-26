@@ -6,12 +6,17 @@
 
 use rusqlite::Connection;
 
+use crate::config::PortConfig;
 use crate::database::Database;
 use crate::error::{Error, PortUnavailableReason};
-use crate::{Port, PortExhaustionBlockers, PortRange, ReservationKey, Result};
+use crate::verified::allocation::{self, Blocker, Checks, Holder, SingleOutcome};
+use crate::verified::port::PortSpan;
+use crate::verified::port_bounds::{resolve_port_bounds, PortBoundsError};
+use crate::{PortExhaustionBlockers, PortRange, ReservationKey, Result};
 
 use super::exclusions::ExclusionManager;
 use super::occupancy::{OccupancyCheckConfig, PortOccupancyChecker, SystemOccupancyChecker};
+use super::{InvalidPortError, Port};
 
 /// Options for port allocation.
 ///
@@ -165,8 +170,11 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     /// 1. If a preferred port is specified and available, use it
     /// 2. Otherwise, scan forward from range minimum
     /// 3. For each candidate port, check it's not reserved, excluded, or occupied
-    /// 4. If exhausted and cleanup is enabled, try cleanup and retry
-    /// 5. Return the first available port or exhaustion
+    /// 4. Return the first available port or exhaustion
+    ///
+    /// Automatic cleanup is not run here: after an exhaustion the reserve
+    /// operation cleans up once and retries only when the cleanup freed
+    /// something (verified `verified::reserve::allocate_with_cleanup_retry`).
     ///
     /// # Errors
     ///
@@ -230,26 +238,29 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     ///
     /// This repeats the same ordered availability checks as the forward scan
     /// and is used only to attach typed diagnostics to a terminal failure.
+    /// The fold is the verified `verified::allocation::exhaustion_blockers`
+    /// kernel: a flag is set only if some port of the range was classified
+    /// that way, every port's classification is reflected in the flags, and
+    /// errors propagate.
     pub(crate) fn exhaustion_blockers(
         &self,
         conn: &Connection,
         occupancy_config: &OccupancyCheckConfig,
         ignored_key: Option<&ReservationKey>,
     ) -> Result<PortExhaustionBlockers> {
-        let mut reserved = false;
-        let mut excluded = false;
-        let mut occupied = false;
+        let blockers = allocation::exhaustion_blockers(
+            self.range.span,
+            &Self::reservation_oracle(conn, ignored_key),
+            &self.exclusion_oracle(),
+            &self.occupancy_oracle(occupancy_config),
+        )
+        .map_err(|failure| failure.error)?;
 
-        for port in self.range {
-            match self.port_availability(port, conn, occupancy_config, true, ignored_key)? {
-                PortAvailability::Available => {}
-                PortAvailability::Reserved => reserved = true,
-                PortAvailability::Excluded => excluded = true,
-                PortAvailability::Occupied => occupied = true,
-            }
-        }
-
-        Ok(PortExhaustionBlockers::new(reserved, excluded, occupied))
+        Ok(PortExhaustionBlockers::new(
+            blockers.reserved,
+            blockers.excluded,
+            blockers.occupied,
+        ))
     }
 
     fn allocate_single_ignoring(
@@ -259,56 +270,39 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         occupancy_config: &OccupancyCheckConfig,
         ignored_key: Option<&ReservationKey>,
     ) -> Result<AllocationResult> {
-        // If a preferred port is specified, try it first
-        if let Some(preferred) = options.preferred {
-            // Check if the preferred port is in range
-            if !self.range.contains(preferred) {
-                return Ok(AllocationResult::PreferredUnavailable {
-                    port: preferred,
-                    reason: PortUnavailableReason::Excluded,
-                });
-            }
+        // The verified `verified::allocation::allocate_single` kernel decides:
+        // a preferred port is checked for being in range, then for a
+        // reservation by another key (absolute: no flag bypasses it), then -
+        // each independently bypassable - against the exclusions and the
+        // occupancy probe. Without a preferred port, the forward scan from the
+        // range minimum applies, with every check.
+        let outcome = allocation::allocate_single(
+            self.range.span,
+            options.preferred.map(Port::value),
+            options.ignore_exclusions,
+            options.ignore_occupied,
+            &Self::reservation_oracle(conn, ignored_key),
+            &self.exclusion_oracle(),
+            &self.occupancy_oracle(occupancy_config),
+        )
+        .map_err(|failure| failure.error)?;
 
-            // Reservation ownership is absolute, while the exclusion and
-            // occupancy guards are independently bypassable. Checking them
-            // separately prevents one narrow ignore flag from accidentally
-            // hiding the other reason a preferred port is unavailable.
-            if Self::is_reserved_by_other(conn, preferred, ignored_key)? {
-                return Ok(AllocationResult::PreferredUnavailable {
-                    port: preferred,
-                    reason: PortUnavailableReason::Reserved,
-                });
+        // Both ports below are valid: an allocated port lies in the range,
+        // and an unavailable one is the preferred `Port` itself.
+        Ok(match outcome {
+            SingleOutcome::Allocated(port) => AllocationResult::Allocated(Port(port)),
+            SingleOutcome::PreferredUnavailable(port, blocker) => {
+                AllocationResult::PreferredUnavailable {
+                    port: Port(port),
+                    reason: reason_for(blocker),
+                }
             }
-            if self.exclusions.is_excluded(preferred) && !options.ignore_exclusions {
-                return Ok(AllocationResult::PreferredUnavailable {
-                    port: preferred,
-                    reason: PortUnavailableReason::Excluded,
-                });
-            }
-            if !options.ignore_occupied && self.checker.is_occupied(preferred, occupancy_config)? {
-                return Ok(AllocationResult::PreferredUnavailable {
-                    port: preferred,
-                    reason: PortUnavailableReason::Occupied,
-                });
-            }
-            return Ok(AllocationResult::Allocated(preferred));
-        }
-
-        // Forward scan from minimum
-        if let Some(port) = self.find_next_available_ignoring(
-            self.range.min(),
-            conn,
-            occupancy_config,
-            ignored_key,
-        )? {
-            Ok(AllocationResult::Allocated(port))
-        } else {
             // No ports available - suggest cleanup might help
-            Ok(AllocationResult::Exhausted {
+            SingleOutcome::Exhausted => AllocationResult::Exhausted {
                 cleanup_suggested: true,
                 tried_cleanup: false,
-            })
-        }
+            },
+        })
     }
 
     /// Find the next available port starting from the given port.
@@ -338,25 +332,31 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         occupancy_config: &OccupancyCheckConfig,
         ignored_key: Option<&ReservationKey>,
     ) -> Result<Option<Port>> {
-        // Scan from start to range max
-        let scan_range = PortRange::new(start, self.range.max())?;
+        // A start above the range maximum is reported as an invalid range.
+        PortRange::new(start, self.range.max())?;
 
-        for port in scan_range {
-            if let PortAvailability::Available =
-                self.port_availability(port, conn, occupancy_config, true, ignored_key)?
-            {
-                return Ok(Some(port));
-            }
-        }
+        // Verified forward scan: the lowest port in `start..=max` whose
+        // classification (with every check) is `Available`.
+        let found = allocation::first_available(
+            start.value(),
+            self.range.span,
+            &Self::reservation_oracle(conn, ignored_key),
+            &self.exclusion_oracle(),
+            &self.occupancy_oracle(occupancy_config),
+        )
+        .map_err(|failure| failure.error)?;
 
-        Ok(None)
+        // A found port lies in the range, so it is a valid port.
+        Ok(found.map(Port))
     }
 
     /// Find the next available port that can be atomically allocated.
     ///
-    /// This method performs allocation without checking occupancy or reservations
-    /// in advance. Instead, it relies on the atomic insertion with UNIQUE constraint
-    /// to detect conflicts. This is suitable for use within a reservation transaction.
+    /// This method performs allocation without checking reservations in
+    /// advance (its reservation oracle never reports a port reserved).
+    /// Instead, it relies on the atomic insertion with UNIQUE constraint to
+    /// detect conflicts. This is suitable for use within a reservation
+    /// transaction.
     ///
     /// The method scans forward from `start` checking only exclusions and occupancy,
     /// then returns the first candidate port. The caller should attempt to insert
@@ -364,38 +364,35 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
     ///
     /// # Errors
     ///
-    /// Returns an error if occupancy checks fail.
+    /// Returns an error if `start` is above the range maximum, or if an
+    /// occupancy check fails: the scan stops at the first port whose probe
+    /// failed.
     pub fn find_next_allocatable(
         &self,
         start: Port,
         occupancy_config: &OccupancyCheckConfig,
     ) -> Result<Option<Port>> {
-        // Scan from start to range max
-        let scan_range = PortRange::new(start, self.range.max())?;
+        // A start above the range maximum is reported as an invalid range.
+        PortRange::new(start, self.range.max())?;
 
-        for port in scan_range {
-            // Check if in range (already guaranteed by scan_range, but explicit)
-            if !self.range.contains(port) {
-                continue;
-            }
+        // The verified forward scan with a reservation oracle that never
+        // blocks: ports outside the range or excluded are skipped without a
+        // probe, and the first port the probe reports free is returned. Probe
+        // failures are returned with their diagnostic instead of being erased;
+        // this remains fail-closed because no port is allocated after an
+        // uncertain result.
+        let never_reserved = |_port: u16| -> Result<bool> { Ok(false) };
+        let found = allocation::first_available(
+            start.value(),
+            self.range.span,
+            &never_reserved,
+            &self.exclusion_oracle(),
+            &self.occupancy_oracle(occupancy_config),
+        )
+        .map_err(|failure| failure.error)?;
 
-            // Check if excluded
-            if self.exclusions.is_excluded(port) {
-                continue;
-            }
-
-            // Check if occupied on system. Probe failures are returned with
-            // their diagnostic instead of being erased; this remains
-            // fail-closed because no port is allocated after an uncertain
-            // result.
-            let occupied = self.checker.is_occupied(port, occupancy_config)?;
-
-            if !occupied {
-                return Ok(Some(port));
-            }
-        }
-
-        Ok(None)
+        // A found port lies in the range, so it is a valid port.
+        Ok(found.map(Port))
     }
 
     /// Check if a specific port is available for allocation.
@@ -440,65 +437,181 @@ impl<C: PortOccupancyChecker> PortAllocator<C> {
         require_in_range: bool,
         ignored_key: Option<&ReservationKey>,
     ) -> Result<PortAvailability> {
-        if require_in_range && !self.range.contains(port) {
-            return Ok(PortAvailability::Excluded);
-        }
-
-        // Check if reserved in database
-        if Self::is_reserved_by_other(conn, port, ignored_key)? {
-            return Ok(PortAvailability::Reserved);
-        }
-
-        // Check if excluded
-        if self.exclusions.is_excluded(port) {
-            return Ok(PortAvailability::Excluded);
-        }
-
-        // Check if occupied on system. Returning a probe failure is
-        // fail-closed (the port cannot become Available) and preserves the
-        // actionable protocol/family/scope/address diagnostic.
-        let occupied = self.checker.is_occupied(port, occupancy_config)?;
-
-        if occupied {
-            Ok(PortAvailability::Occupied)
-        } else {
-            Ok(PortAvailability::Available)
-        }
+        // Verified classification: out of range (when required) is
+        // `Excluded`; then reservations by another key, then exclusions, then
+        // the occupancy probe, each consulted only if the earlier ones passed.
+        // Returning a probe failure is fail-closed (the port cannot become
+        // Available) and preserves the actionable
+        // protocol/family/scope/address diagnostic.
+        allocation::classify_port(
+            port.value(),
+            Checks {
+                require_in_range,
+                ignore_exclusions: false,
+                ignore_occupied: false,
+            },
+            self.range.span,
+            &Self::reservation_oracle(conn, ignored_key),
+            &self.exclusion_oracle(),
+            &self.occupancy_oracle(occupancy_config),
+        )
     }
 
+    /// Whether `port` is reserved by a key other than `ignored_key` (the key
+    /// being replaced). The glue looks up the port's holder and compares its
+    /// whole key (path and tag) with `ignored_key`; that comparison is
+    /// trusted, pinned by `test_reserved_by_other_glue_exempts_only_the_replaced_key`.
+    /// The verified `reserved_by_other` then maps the holder to the answer
+    /// (only an `OtherKey` holder blocks).
     fn is_reserved_by_other(
         conn: &Connection,
         port: Port,
         ignored_key: Option<&ReservationKey>,
     ) -> Result<bool> {
-        Ok(Database::get_reservation_by_port(conn, port)?
-            .is_some_and(|reservation| ignored_key != Some(reservation.key())))
+        let holder = match Database::get_reservation_by_port(conn, port)? {
+            None => Holder::Nobody,
+            Some(reservation) if ignored_key == Some(reservation.key()) => Holder::ReplacedKey,
+            Some(_) => Holder::OtherKey,
+        };
+        Ok(allocation::reserved_by_other(holder))
+    }
+
+    // Oracles for the verified kernels. A kernel consults its oracles only at
+    // valid ports (its precondition grants the oracles' preconditions on
+    // `1..=65535` alone), so rebuilding a `Port` from the `u16` is sound.
+
+    /// Reservation oracle: whether a port is reserved by a key other than
+    /// `ignored_key`.
+    fn reservation_oracle<'a>(
+        conn: &'a Connection,
+        ignored_key: Option<&'a ReservationKey>,
+    ) -> impl Fn(u16) -> Result<bool> + 'a {
+        move |port| Self::is_reserved_by_other(conn, Port(port), ignored_key)
+    }
+
+    /// Exclusion oracle: whether a port is on the exclusion list.
+    fn exclusion_oracle(&self) -> impl Fn(u16) -> bool + '_ {
+        |port| self.exclusions.is_excluded(Port(port))
+    }
+
+    /// Occupancy oracle: the operating-system probe.
+    fn occupancy_oracle<'a>(
+        &'a self,
+        occupancy_config: &'a OccupancyCheckConfig,
+    ) -> impl Fn(u16) -> Result<bool> + 'a {
+        move |port| self.checker.is_occupied(Port(port), occupancy_config)
     }
 }
 
-/// Internal enum for tracking why a port is unavailable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PortAvailability {
-    /// Port is available for allocation.
-    Available,
-    /// Port is already reserved in the database.
-    Reserved,
-    /// Port is in the exclusion list.
-    Excluded,
-    /// Port is occupied on the system.
-    Occupied,
-}
+/// Why a port is (un)available: the verified kernel's classification
+/// (`Available`, `Reserved`, `Excluded` - on the exclusion list, or outside
+/// the range when the range applies - or `Occupied`).
+pub(super) use crate::verified::allocation::Availability as PortAvailability;
 
 impl PortAvailability {
     /// Return the public reason for an unavailable port.
+    ///
+    /// Verified total: `None` exactly for `Available`.
     pub(super) const fn unavailable_reason(self) -> Option<PortUnavailableReason> {
-        match self {
-            Self::Available => None,
-            Self::Reserved => Some(PortUnavailableReason::Reserved),
-            Self::Excluded => Some(PortUnavailableReason::Excluded),
-            Self::Occupied => Some(PortUnavailableReason::Occupied),
+        match self.blocker() {
+            None => None,
+            Some(blocker) => Some(reason_for(blocker)),
         }
     }
+}
+
+/// The public reason for a kernel blocker (a one-to-one mapping).
+const fn reason_for(blocker: Blocker) -> PortUnavailableReason {
+    match blocker {
+        Blocker::Reserved => PortUnavailableReason::Reserved,
+        Blocker::Excluded => PortUnavailableReason::Excluded,
+        Blocker::Occupied => PortUnavailableReason::Occupied,
+    }
+}
+
+/// Resolve a port configuration to the range it describes.
+///
+/// An explicit `max` wins; otherwise the range ends at `min + max_offset`
+/// (computed without overflow). This is the one resolution
+/// [`allocator_from_config`], `trop scan`, and `reserve-group`'s
+/// `reservations.base` narrowing use, decided by a verified kernel (see
+/// `docs/verification.md`). It is more permissive than configuration
+/// validation, which also rejects giving both `max` and `max_offset`, and a
+/// zero `max_offset`. The `ports` section of an effective configuration
+/// (built by [`crate::config::ConfigBuilder`]) always holds exactly one
+/// absolute `max`, so the "neither bound" error below arises only for raw
+/// sections.
+///
+/// # Errors
+///
+/// The first applicable of:
+/// - `min` is 0: [`Error::InvalidPort`];
+/// - an explicit `max` is 0: [`Error::InvalidPort`];
+/// - an explicit `max` is below `min`: [`Error::InvalidPortRange`];
+/// - `min + max_offset` exceeds 65535: [`Error::Validation`] on
+///   `ports.max_offset`;
+/// - neither `max` nor `max_offset` is given: [`Error::Validation`] on
+///   `ports`.
+///
+/// # Examples
+///
+/// ```
+/// use trop::config::PortConfig;
+/// use trop::port::allocator::port_range_from_config;
+///
+/// let ports = PortConfig { min: 8000, max: None, max_offset: Some(100) };
+/// let range = port_range_from_config(&ports).unwrap();
+/// assert_eq!((range.min().value(), range.max().value()), (8000, 8100));
+///
+/// let overflow = PortConfig { min: 65000, max: None, max_offset: Some(1000) };
+/// assert!(port_range_from_config(&overflow).is_err());
+/// ```
+pub fn port_range_from_config(port_config: &PortConfig) -> Result<PortRange> {
+    port_span_from_config(port_config).map(|span| PortRange {
+        span,
+        exhaustion_details: None,
+    })
+}
+
+/// [`port_range_from_config`]'s resolution, as the verified span (for glue
+/// that hands the range to another kernel, such as `reserve-group`'s base
+/// narrowing).
+pub(crate) fn port_span_from_config(port_config: &PortConfig) -> Result<PortSpan> {
+    resolve_port_bounds(port_config.min, port_config.max, port_config.max_offset)
+        .map_err(|error| port_bounds_error(port_config.min, error))
+}
+
+/// The error value `allocator_from_config` has always reported for each
+/// port-bounds resolution failure.
+fn port_bounds_error(min: u16, error: PortBoundsError) -> Error {
+    match error {
+        // The kernel reports `InvalidMin` only for `min == 0`, and
+        // `InvalidMax` only for an explicit `max` of 0.
+        PortBoundsError::InvalidMin => invalid_port_error(min),
+        PortBoundsError::InvalidMax => invalid_port_error(0),
+        PortBoundsError::MaxBelowMin { max } => Error::InvalidPortRange {
+            min,
+            max,
+            reason: "max must be greater than or equal to min".into(),
+        },
+        PortBoundsError::OffsetOverflow { offset } => Error::Validation {
+            field: "ports.max_offset".into(),
+            message: format!("Offset {offset} would overflow when added to min port {min}"),
+        },
+        PortBoundsError::MissingMax => Error::Validation {
+            field: "ports".into(),
+            message: "Either max or max_offset must be specified".into(),
+        },
+    }
+}
+
+/// The error `Port::try_from` reports for an invalid port number.
+fn invalid_port_error(value: u16) -> Error {
+    InvalidPortError {
+        value,
+        reason: "port 0 is invalid".into(),
+    }
+    .into()
 }
 
 /// Helper to create an allocator from configuration.
@@ -520,28 +633,7 @@ pub fn allocator_from_config(
         message: "Port configuration is required".into(),
     })?;
 
-    let min = Port::try_from(port_config.min)?;
-    let max_value = if let Some(max) = port_config.max {
-        max
-    } else if let Some(offset) = port_config.max_offset {
-        port_config
-            .min
-            .checked_add(offset)
-            .ok_or_else(|| Error::Validation {
-                field: "ports.max_offset".into(),
-                message: format!(
-                    "Offset {offset} would overflow when added to min port {}",
-                    port_config.min
-                ),
-            })?
-    } else {
-        return Err(Error::Validation {
-            field: "ports".into(),
-            message: "Either max or max_offset must be specified".into(),
-        });
-    };
-    let max = Port::try_from(max_value)?;
-    let range = PortRange::new(min, max)?;
+    let range = port_range_from_config(port_config)?;
 
     // Create exclusion manager
     let exclusions = if let Some(ref excluded_ports) = config.excluded_ports {
@@ -1062,6 +1154,52 @@ mod tests {
         );
     }
 
+    /// The reservation oracle's glue: the holder lookup and key comparison
+    /// feed the verified `reserved_by_other`. Only the exact replaced key
+    /// (same path and tag) is exempt; a sibling tag of the same path, or any
+    /// holder when nothing is replaced, blocks; an unheld port never does.
+    /// Covers the port domain's edges (1 and 65535).
+    #[test]
+    fn test_reserved_by_other_glue_exempts_only_the_replaced_key() {
+        let mut db = create_test_database();
+        let replaced =
+            ReservationKey::new(PathBuf::from("/test/owner"), Some("web".to_string())).unwrap();
+        let sibling =
+            ReservationKey::new(PathBuf::from("/test/owner"), Some("api".to_string())).unwrap();
+        let untagged = ReservationKey::new(PathBuf::from("/test/owner"), None).unwrap();
+        let lowest = Port::try_from(1).unwrap();
+        let highest = Port::try_from(65535).unwrap();
+        let middle = Port::try_from(5000).unwrap();
+        let free = Port::try_from(5001).unwrap();
+        for (key, port) in [
+            (&replaced, highest),
+            (&sibling, lowest),
+            (&untagged, middle),
+        ] {
+            db.create_reservation(&Reservation::builder(key.clone(), port).build().unwrap())
+                .unwrap();
+        }
+        let conn = db.connection();
+        let blocks = |port: Port, ignored: Option<&ReservationKey>| {
+            PortAllocator::<MockOccupancyChecker>::is_reserved_by_other(conn, port, ignored)
+                .unwrap()
+        };
+
+        // Replacing `replaced`: only its own port is exempt.
+        assert!(!blocks(highest, Some(&replaced)));
+        assert!(blocks(lowest, Some(&replaced)));
+        assert!(blocks(middle, Some(&replaced)));
+        assert!(!blocks(free, Some(&replaced)));
+        // Nothing replaced: every holder blocks, an unheld port never does.
+        for port in [highest, lowest, middle] {
+            assert!(blocks(port, None));
+        }
+        assert!(!blocks(free, None));
+        // Replacing the untagged key does not exempt the tagged siblings.
+        assert!(!blocks(middle, Some(&untagged)));
+        assert!(blocks(highest, Some(&untagged)));
+    }
+
     #[test]
     fn test_preferred_port_out_of_range() {
         // Test that a preferred port outside the allocator's range is rejected
@@ -1349,6 +1487,511 @@ mod tests {
         assert_eq!(
             result,
             AllocationResult::Allocated(Port::try_from(5005).unwrap())
+        );
+    }
+}
+
+/// Tests for the glue between the allocator and its verified kernels, at the
+/// boundaries the kernels' specifications do not reach (error values, `Port`
+/// reconstruction, oracle wiring).
+#[cfg(test)]
+mod kernel_glue_tests {
+    use super::*;
+    use crate::config::{Config, ConfigValidator};
+    use crate::database::test_util::create_test_database;
+    use crate::port::occupancy::MockOccupancyChecker;
+    use crate::reservation::{Reservation, ReservationKey};
+    use crate::verified::port_bounds::{check_port_bounds, PortBoundsViolation};
+    use std::collections::HashSet;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// Interesting `u16` values for port-bound grids.
+    const EDGES: [u16; 10] = [0, 1, 2, 999, 1000, 5000, 64535, 65000, 65534, 65535];
+
+    fn options() -> impl Iterator<Item = Option<u16>> {
+        std::iter::once(None).chain(EDGES.into_iter().map(Some))
+    }
+
+    /// `allocator_from_config`'s range resolution before it was delegated to
+    /// the verified kernel (reference model).
+    fn historical_range(port_config: &PortConfig) -> Result<PortRange> {
+        let min = Port::try_from(port_config.min)?;
+        let max_value = if let Some(max) = port_config.max {
+            max
+        } else if let Some(offset) = port_config.max_offset {
+            port_config
+                .min
+                .checked_add(offset)
+                .ok_or_else(|| Error::Validation {
+                    field: "ports.max_offset".into(),
+                    message: format!(
+                        "Offset {offset} would overflow when added to min port {}",
+                        port_config.min
+                    ),
+                })?
+        } else {
+            return Err(Error::Validation {
+                field: "ports".into(),
+                message: "Either max or max_offset must be specified".into(),
+            });
+        };
+        let max = Port::try_from(max_value)?;
+        Ok(PortRange::new(min, max)?)
+    }
+
+    fn describe(result: &Result<PortRange>) -> String {
+        match result {
+            Ok(range) => format!("Ok({range})"),
+            Err(error) => format!("Err({error:?})"),
+        }
+    }
+
+    #[test]
+    fn port_range_from_config_matches_historical_resolution() {
+        for min in EDGES {
+            for max in options() {
+                for max_offset in options() {
+                    let ports = PortConfig {
+                        min,
+                        max,
+                        max_offset,
+                    };
+                    assert_eq!(
+                        describe(&port_range_from_config(&ports)),
+                        describe(&historical_range(&ports)),
+                        "{ports:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn port_range_from_config_boundaries() {
+        let resolve = |min, max, max_offset| {
+            port_range_from_config(&PortConfig {
+                min,
+                max,
+                max_offset,
+            })
+            .map(|range| (range.min().value(), range.max().value()))
+        };
+        assert_eq!(resolve(1, Some(65535), None).unwrap(), (1, 65535));
+        assert_eq!(resolve(65535, Some(65535), None).unwrap(), (65535, 65535));
+        assert_eq!(resolve(65000, None, Some(535)).unwrap(), (65000, 65535));
+        assert_eq!(resolve(1, None, Some(65534)).unwrap(), (1, 65535));
+        // Lenient shapes kept from `allocator_from_config`: a zero offset, and
+        // an explicit max that wins over an offset.
+        assert_eq!(resolve(5000, None, Some(0)).unwrap(), (5000, 5000));
+        assert_eq!(resolve(5000, Some(6000), Some(1)).unwrap(), (5000, 6000));
+        assert!(matches!(
+            resolve(65000, None, Some(536)),
+            Err(Error::Validation { field, .. }) if field == "ports.max_offset"
+        ));
+        assert!(matches!(
+            resolve(0, Some(10), None),
+            Err(Error::InvalidPort { value: 0, .. })
+        ));
+        assert!(matches!(
+            resolve(10, Some(0), None),
+            Err(Error::InvalidPort { value: 0, .. })
+        ));
+        assert!(matches!(
+            resolve(10, Some(9), None),
+            Err(Error::InvalidPortRange {
+                min: 10,
+                max: 9,
+                ..
+            })
+        ));
+        assert!(matches!(
+            resolve(10, None, None),
+            Err(Error::Validation { field, .. }) if field == "ports"
+        ));
+        // The error values are the ones `Port::try_from` reports.
+        assert_eq!(
+            invalid_port_error(0).to_string(),
+            Error::from(Port::try_from(0).unwrap_err()).to_string()
+        );
+    }
+
+    /// The (field, message) `ConfigValidator::validate_port_config` reports
+    /// for each violation.
+    fn validator_error(
+        min: u16,
+        max: Option<u16>,
+        violation: PortBoundsViolation,
+    ) -> (String, String) {
+        match violation {
+            PortBoundsViolation::InvalidMin => {
+                ("ports.min".into(), format!("Invalid port number: {min}"))
+            }
+            PortBoundsViolation::InvalidMax => (
+                "ports.max".into(),
+                format!("Invalid port number: {}", max.unwrap()),
+            ),
+            PortBoundsViolation::MaxBelowMin => ("ports".into(), "max must be >= min".into()),
+            PortBoundsViolation::ZeroOffset => {
+                ("ports.max_offset".into(), "max_offset must be > 0".into())
+            }
+            PortBoundsViolation::OffsetOverflow { offset } => (
+                "ports.max_offset".into(),
+                format!("Offset {offset} would overflow when added to min port {min}"),
+            ),
+            PortBoundsViolation::BothMaxAndOffset => (
+                "ports".into(),
+                "Cannot specify both max and max_offset".into(),
+            ),
+        }
+    }
+
+    #[test]
+    fn strict_port_bounds_kernel_agrees_with_config_validator() {
+        for min in EDGES {
+            for max in options() {
+                for max_offset in options() {
+                    let ports = PortConfig {
+                        min,
+                        max,
+                        max_offset,
+                    };
+                    let config = Config {
+                        ports: Some(ports.clone()),
+                        ..Default::default()
+                    };
+                    let validated = ConfigValidator::validate(&config, true);
+                    match check_port_bounds(min, max, max_offset) {
+                        Ok(span) => {
+                            assert!(validated.is_ok(), "{ports:?}: {validated:?}");
+                            // Every validated shape that names a bound
+                            // resolves to the same range.
+                            let resolved = port_range_from_config(&ports).ok();
+                            assert_eq!(
+                                span.map(|span| (span.min(), span.max())),
+                                resolved.map(|range| (range.min().value(), range.max().value())),
+                                "{ports:?}"
+                            );
+                        }
+                        Err(violation) => match validated {
+                            Err(Error::Validation { field, message }) => assert_eq!(
+                                (field, message),
+                                validator_error(min, max, violation),
+                                "{ports:?}"
+                            ),
+                            other => {
+                                panic!("{ports:?}: kernel {violation:?}, validator {other:?}")
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    /// An occupancy checker that records every probed port, fails at
+    /// `failing`, and reports `occupied` ports as occupied.
+    #[derive(Debug, Default)]
+    struct RecordingChecker {
+        probed: Mutex<Vec<u16>>,
+        occupied: HashSet<u16>,
+        failing: HashSet<u16>,
+    }
+
+    impl RecordingChecker {
+        fn probed(&self) -> Vec<u16> {
+            self.probed.lock().unwrap().clone()
+        }
+    }
+
+    impl PortOccupancyChecker for RecordingChecker {
+        fn is_occupied(&self, port: Port, _config: &OccupancyCheckConfig) -> Result<bool> {
+            self.probed.lock().unwrap().push(port.value());
+            if self.failing.contains(&port.value()) {
+                return Err(Error::OccupancyCheckFailed {
+                    port,
+                    source: Box::new(io::Error::other("synthetic probe failure")),
+                });
+            }
+            Ok(self.occupied.contains(&port.value()))
+        }
+    }
+
+    fn port(value: u16) -> Port {
+        Port::try_from(value).unwrap()
+    }
+
+    fn recording_allocator(
+        min: u16,
+        max: u16,
+        occupied: &[u16],
+        failing: &[u16],
+        excluded: &[u16],
+    ) -> PortAllocator<RecordingChecker> {
+        let checker = RecordingChecker {
+            probed: Mutex::default(),
+            occupied: occupied.iter().copied().collect(),
+            failing: failing.iter().copied().collect(),
+        };
+        let mut exclusions = ExclusionManager::empty();
+        for &value in excluded {
+            exclusions.add_port(port(value));
+        }
+        PortAllocator::new(
+            checker,
+            exclusions,
+            PortRange::new(port(min), port(max)).unwrap(),
+        )
+    }
+
+    fn reserve(db: &mut Database, path: &str, value: u16) {
+        let key = ReservationKey::new(PathBuf::from(path), None).unwrap();
+        db.create_reservation(&Reservation::builder(key, port(value)).build().unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn scan_probes_each_candidate_once_in_order_and_skips_blocked_ports() {
+        let mut db = create_test_database();
+        reserve(&mut db, "/test/reserved", 5001);
+        let allocator = recording_allocator(5000, 5005, &[5000, 5003], &[], &[5002]);
+        let result = allocator
+            .allocate_single(
+                db.connection(),
+                &AllocationOptions::default(),
+                &OccupancyCheckConfig::default(),
+            )
+            .unwrap();
+        assert_eq!(result, AllocationResult::Allocated(port(5004)));
+        // 5001 (reserved) and 5002 (excluded) are never probed.
+        assert_eq!(allocator.checker.probed(), vec![5000, 5003, 5004]);
+    }
+
+    #[test]
+    fn probe_failures_on_blocked_ports_do_not_abort_allocation() {
+        let mut db = create_test_database();
+        reserve(&mut db, "/test/reserved", 5000);
+        // The probe would fail at 5000 (reserved) and 5001 (excluded).
+        let allocator = recording_allocator(5000, 5002, &[], &[5000, 5001], &[5001]);
+        let config = OccupancyCheckConfig::default();
+        assert_eq!(
+            allocator
+                .allocate_single(db.connection(), &AllocationOptions::default(), &config)
+                .unwrap(),
+            AllocationResult::Allocated(port(5002))
+        );
+        for (preferred, reason) in [
+            (5000, PortUnavailableReason::Reserved),
+            (5001, PortUnavailableReason::Excluded),
+        ] {
+            let options = AllocationOptions {
+                preferred: Some(port(preferred)),
+                ..Default::default()
+            };
+            assert_eq!(
+                allocator
+                    .allocate_single(db.connection(), &options, &config)
+                    .unwrap(),
+                AllocationResult::PreferredUnavailable {
+                    port: port(preferred),
+                    reason,
+                }
+            );
+        }
+        let blockers = allocator
+            .exhaustion_blockers(db.connection(), &config, None)
+            .unwrap();
+        assert!(blockers.reserved() && blockers.excluded() && !blockers.occupied());
+        assert_eq!(allocator.checker.probed(), vec![5002, 5002]);
+    }
+
+    #[test]
+    fn ignored_probe_is_never_run_and_ignored_exclusion_still_probes() {
+        let db = create_test_database();
+        let allocator = recording_allocator(5000, 5002, &[], &[5001], &[5001]);
+        let config = OccupancyCheckConfig::default();
+        let forced = AllocationOptions {
+            preferred: Some(port(5001)),
+            ignore_occupied: true,
+            ignore_exclusions: true,
+        };
+        assert_eq!(
+            allocator
+                .allocate_single(db.connection(), &forced, &config)
+                .unwrap(),
+            AllocationResult::Allocated(port(5001))
+        );
+        assert_eq!(allocator.checker.probed(), Vec::<u16>::new());
+
+        let ignore_exclusions_only = AllocationOptions {
+            preferred: Some(port(5001)),
+            ignore_exclusions: true,
+            ..Default::default()
+        };
+        let error = allocator
+            .allocate_single(db.connection(), &ignore_exclusions_only, &config)
+            .unwrap_err();
+        assert!(matches!(error, Error::OccupancyCheckFailed { .. }));
+        assert_eq!(allocator.checker.probed(), vec![5001]);
+    }
+
+    #[test]
+    fn scan_errors_stop_at_the_first_failing_candidate() {
+        let db = create_test_database();
+        let allocator = recording_allocator(5000, 5004, &[5000], &[5001, 5003], &[]);
+        let config = OccupancyCheckConfig::default();
+        let error = allocator
+            .allocate_single(db.connection(), &AllocationOptions::default(), &config)
+            .unwrap_err();
+        assert!(matches!(error, Error::OccupancyCheckFailed { port: p, .. } if p == port(5001)));
+        assert_eq!(allocator.checker.probed(), vec![5000, 5001]);
+
+        let error = allocator
+            .exhaustion_blockers(db.connection(), &config, None)
+            .unwrap_err();
+        assert!(matches!(error, Error::OccupancyCheckFailed { port: p, .. } if p == port(5001)));
+    }
+
+    #[test]
+    fn scans_reach_the_top_of_the_port_domain() {
+        let db = create_test_database();
+        let config = OccupancyCheckConfig::default();
+        let allocator = recording_allocator(65533, 65535, &[65533, 65534], &[], &[]);
+        assert_eq!(
+            allocator
+                .allocate_single(db.connection(), &AllocationOptions::default(), &config)
+                .unwrap(),
+            AllocationResult::Allocated(port(65535))
+        );
+        assert_eq!(
+            allocator
+                .find_next_allocatable(port(65535), &config)
+                .unwrap(),
+            Some(port(65535))
+        );
+
+        let full = recording_allocator(65534, 65535, &[65534, 65535], &[], &[]);
+        assert_eq!(
+            full.allocate_single(db.connection(), &AllocationOptions::default(), &config)
+                .unwrap(),
+            AllocationResult::Exhausted {
+                cleanup_suggested: true,
+                tried_cleanup: false,
+            }
+        );
+        assert_eq!(
+            full.find_next_allocatable(port(65534), &config).unwrap(),
+            None
+        );
+        let blockers = full
+            .exhaustion_blockers(db.connection(), &config, None)
+            .unwrap();
+        assert!(!blockers.reserved() && !blockers.excluded() && blockers.occupied());
+
+        let single = recording_allocator(1, 1, &[], &[], &[]);
+        assert_eq!(
+            single
+                .allocate_single(db.connection(), &AllocationOptions::default(), &config)
+                .unwrap(),
+            AllocationResult::Allocated(port(1))
+        );
+    }
+
+    #[test]
+    fn scan_starts_are_handled_as_before() {
+        let db = create_test_database();
+        let config = OccupancyCheckConfig::default();
+        let allocator = recording_allocator(5000, 5010, &[], &[], &[]);
+        // Below the range: the ports below are skipped without probing.
+        assert_eq!(
+            allocator
+                .find_next_available(port(1), db.connection(), &config)
+                .unwrap(),
+            Some(port(5000))
+        );
+        assert_eq!(
+            allocator
+                .find_next_allocatable(port(4000), &config)
+                .unwrap(),
+            Some(port(5000))
+        );
+        assert_eq!(allocator.checker.probed(), vec![5000, 5000]);
+        // At the top of the range, and above it (an invalid range, as before).
+        assert_eq!(
+            allocator
+                .find_next_available(port(5010), db.connection(), &config)
+                .unwrap(),
+            Some(port(5010))
+        );
+        assert!(matches!(
+            allocator.find_next_available(port(5011), db.connection(), &config),
+            Err(Error::InvalidPortRange {
+                min: 5011,
+                max: 5010,
+                ..
+            })
+        ));
+        assert!(matches!(
+            allocator.find_next_allocatable(port(6000), &config),
+            Err(Error::InvalidPortRange {
+                min: 6000,
+                max: 5010,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn find_next_allocatable_ignores_reservations() {
+        let mut db = create_test_database();
+        reserve(&mut db, "/test/reserved", 5000);
+        let allocator = recording_allocator(5000, 5002, &[], &[], &[]);
+        assert_eq!(
+            allocator
+                .find_next_allocatable(port(5000), &OccupancyCheckConfig::default())
+                .unwrap(),
+            Some(port(5000))
+        );
+    }
+
+    #[test]
+    fn preferred_availability_uses_the_full_port_domain() {
+        let db = create_test_database();
+        let allocator = PortAllocator::new(
+            MockOccupancyChecker::empty(),
+            ExclusionManager::empty(),
+            PortRange::new(port(5000), port(5010)).unwrap(),
+        );
+        let config = OccupancyCheckConfig::default();
+        assert_eq!(
+            allocator
+                .is_preferred_port_available(port(65535), db.connection(), &config)
+                .unwrap(),
+            PortAvailability::Available
+        );
+        assert_eq!(
+            allocator
+                .is_port_available(port(65535), db.connection(), &config)
+                .unwrap(),
+            PortAvailability::Excluded
+        );
+    }
+
+    #[test]
+    fn unavailable_reason_is_none_exactly_for_available() {
+        assert_eq!(PortAvailability::Available.unavailable_reason(), None);
+        assert_eq!(
+            PortAvailability::Reserved.unavailable_reason(),
+            Some(PortUnavailableReason::Reserved)
+        );
+        assert_eq!(
+            PortAvailability::Excluded.unavailable_reason(),
+            Some(PortUnavailableReason::Excluded)
+        );
+        assert_eq!(
+            PortAvailability::Occupied.unavailable_reason(),
+            Some(PortUnavailableReason::Occupied)
         );
     }
 }

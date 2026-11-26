@@ -32,6 +32,8 @@
 //! assert_eq!(range.len(), 11);
 //! ```
 
+#[doc(hidden)]
+pub mod cli_support;
 pub mod config;
 pub mod database;
 pub mod error;
@@ -42,6 +44,7 @@ pub mod output;
 pub mod path;
 pub mod port;
 pub mod reservation;
+mod verified;
 
 // Re-export key types at crate root for convenience
 pub use config::{

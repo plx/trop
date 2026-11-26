@@ -1,11 +1,24 @@
 //! Output formatter implementations.
+//!
+//! The export and dotenv blocks are rendered by the verified kernel
+//! `verified::render::render_group`: it orders services by tag, fails closed
+//! on the first service (in tag order) whose environment-variable name did
+//! not resolve or collides, ignoring ASCII case, with an earlier one, and
+//! renders one statement per line. The human-readable format orders tags
+//! with the kernel's `sort_order` and escapes them with `display_field`.
+//! The JSON format is rendered entirely by the verified kernel
+//! `verified::json` (`render_port_map_pretty`). This module only resolves
+//! names through `crate::identifier` and maps kernel errors onto trop's
+//! errors.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::identifier::EnvironmentVariableName;
+use crate::verified::json;
+use crate::verified::render::{self, AssignmentStyle, GroupEntry, GroupError};
 use crate::{Error, Port, Result};
 
-use super::{OutputFormatter, ShellType};
+use super::{display_field, OutputFormatter, ShellType};
 
 /// Validates that a string is a valid environment variable name.
 ///
@@ -38,38 +51,47 @@ fn resolve_env_var_name(
     EnvironmentVariableName::resolve(tag, explicit).map(EnvironmentVariableName::into_string)
 }
 
-/// Resolves and validates an entire allocation set before any output is rendered.
-fn resolve_allocations(
+/// Renders an allocation set as an export or dotenv block, or fails as a
+/// whole before any output exists.
+///
+/// Each service's name is resolved through `crate::identifier`; the kernel
+/// decides the order, the first failure, and the text. An unresolved
+/// service reports its own resolution error.
+fn render_assignments(
+    style: AssignmentStyle,
     allocations: &HashMap<String, Port>,
     env_mappings: Option<&HashMap<String, String>>,
-) -> Result<Vec<(Port, String)>> {
-    let mut tags: Vec<_> = allocations.keys().collect();
-    tags.sort();
+) -> Result<String> {
+    let services: Vec<(&String, Port)> =
+        allocations.iter().map(|(tag, port)| (tag, *port)).collect();
+    let names: Vec<Result<String>> = services
+        .iter()
+        .map(|(tag, _)| resolve_env_var_name(tag, env_mappings))
+        .collect();
+    let entries: Vec<GroupEntry> = services
+        .iter()
+        .zip(&names)
+        .map(|((tag, port), name)| GroupEntry {
+            tag: tag.as_bytes().to_vec(),
+            name: name.as_ref().ok().map(|name| name.as_bytes().to_vec()),
+            port: port.value(),
+        })
+        .collect();
 
-    let mut collision_keys = HashSet::with_capacity(tags.len());
-    let mut resolved = Vec::with_capacity(tags.len());
-
-    for tag in tags {
-        let variable_name = resolve_env_var_name(tag, env_mappings)?;
-        let validated = EnvironmentVariableName::parse(&variable_name)?;
-
-        if !collision_keys.insert(validated.collision_key()) {
-            return Err(Error::Validation {
+    render::render_group(style, &entries).map_err(|error| match error {
+        GroupError::Unresolved { source } => names
+            .into_iter()
+            .nth(source)
+            .and_then(Result::err)
+            .unwrap_or_else(|| Error::Validation {
                 field: "environment_variable".to_owned(),
-                message: "resolved environment-variable names must be unique when compared without ASCII case".to_owned(),
-            });
-        }
-
-        resolved.push((allocations[tag], validated.into_string()));
-    }
-
-    Ok(resolved)
-}
-
-/// Formats one dotenv assignment after revalidating the identifier boundary.
-fn format_dotenv_assignment(variable_name: &str, port: Port) -> Result<String> {
-    let validated = EnvironmentVariableName::parse(variable_name)?;
-    Ok(format!("{}={}", validated.as_str(), port.value()))
+                message: "must not be empty and must match [A-Za-z_][A-Za-z0-9_]*".to_owned(),
+            }),
+        GroupError::Collision { .. } => Error::Validation {
+            field: "environment_variable".to_owned(),
+            message: "resolved environment-variable names must be unique when compared without ASCII case".to_owned(),
+        },
+    })
 }
 
 /// Formatter for shell-specific export statements.
@@ -98,36 +120,32 @@ impl ExportFormatter {
 
 impl OutputFormatter for ExportFormatter {
     fn format(&self, allocations: &HashMap<String, Port>) -> Result<String> {
-        let resolved = resolve_allocations(allocations, self.env_mappings.as_ref())?;
-        let mut exports = Vec::with_capacity(resolved.len());
-
-        for (port, variable_name) in resolved {
-            exports.push(
-                self.shell
-                    .format_export(&variable_name, &port.value().to_string())?,
-            );
-        }
-
-        Ok(exports.join("\n"))
+        render_assignments(
+            AssignmentStyle::Export(self.shell.kind()),
+            allocations,
+            self.env_mappings.as_ref(),
+        )
     }
 }
 
 /// Formatter for JSON output.
+///
+/// The object is rendered by the verified kernel `verified::json`: tags in
+/// byte order (so identical mappings are byte-stable across processes with
+/// independently randomized `HashMap` iteration order), each tag a JSON
+/// string token that decodes back to exactly the tag, each port its decimal
+/// text, in `serde_json`'s pretty layout. Formatting never fails. Ordering
+/// costs `O(n^2)` in the number of services (the kernel's insertion sort, as
+/// for the other formats), which is negligible at group sizes.
 pub struct JsonFormatter;
 
 impl OutputFormatter for JsonFormatter {
     fn format(&self, allocations: &HashMap<String, Port>) -> Result<String> {
-        // Sort service tags so identical mappings are byte-stable across
-        // processes with independently randomized HashMap iteration order.
-        let json_map: BTreeMap<String, u16> = allocations
+        let entries: Vec<(&str, u16)> = allocations
             .iter()
-            .map(|(k, v)| (k.clone(), v.value()))
+            .map(|(tag, port)| (tag.as_str(), port.value()))
             .collect();
-
-        serde_json::to_string_pretty(&json_map).map_err(|e| Error::Validation {
-            field: "json_output".to_string(),
-            message: format!("failed to serialize to JSON: {e}"),
-        })
+        Ok(json::render_port_map_pretty(&entries))
     }
 }
 
@@ -152,18 +170,22 @@ impl DotenvFormatter {
 
 impl OutputFormatter for DotenvFormatter {
     fn format(&self, allocations: &HashMap<String, Port>) -> Result<String> {
-        let resolved = resolve_allocations(allocations, self.env_mappings.as_ref())?;
-        let mut lines = Vec::with_capacity(resolved.len());
-
-        for (port, variable_name) in resolved {
-            lines.push(format_dotenv_assignment(&variable_name, port)?);
-        }
-
-        Ok(lines.join("\n"))
+        render_assignments(
+            AssignmentStyle::Dotenv,
+            allocations,
+            self.env_mappings.as_ref(),
+        )
     }
 }
 
 /// Formatter for human-readable output.
+///
+/// Tags are listed in byte order, one per line, and shown with
+/// [`display_field`], so a tag containing a control character (newline,
+/// carriage return, tab, a terminal escape), a line or paragraph separator,
+/// or a bidi control is quoted and escaped, so it cannot forge or restyle a
+/// line or reorder it with bidi controls. Ports are shown as their canonical
+/// decimal text.
 pub struct HumanFormatter;
 
 impl OutputFormatter for HumanFormatter {
@@ -172,15 +194,15 @@ impl OutputFormatter for HumanFormatter {
             return Ok("No ports reserved.".to_string());
         }
 
+        let services: Vec<(&String, Port)> =
+            allocations.iter().map(|(tag, port)| (tag, *port)).collect();
+        let keys: Vec<&[u8]> = services.iter().map(|(tag, _)| tag.as_bytes()).collect();
+
         let mut lines = vec!["Reserved ports:".to_string()];
-
-        // Sort by tag for consistent output
-        let mut tags: Vec<_> = allocations.keys().collect();
-        tags.sort();
-
-        for tag in tags {
-            let port = allocations[tag];
-            lines.push(format!("  {}: {}", tag, port.value()));
+        for index in render::sort_order(&keys) {
+            let (tag, port) = services[index];
+            let port = render::u16_decimal_string(port.value());
+            lines.push(format!("  {}: {}", display_field(tag), port));
         }
 
         Ok(lines.join("\n"))
@@ -1325,10 +1347,385 @@ mod tests {
 
     #[test]
     fn test_dotenv_assignment_revalidates_its_identifier_boundary() {
+        let allocations = HashMap::from([("api".to_string(), Port::try_from(5000).unwrap())]);
+        let valid = HashMap::from([("api".to_string(), "_PRIVATE_PORT".to_string())]);
         assert_eq!(
-            format_dotenv_assignment("_PRIVATE_PORT", Port::try_from(5000).unwrap()).unwrap(),
+            DotenvFormatter::new(Some(valid))
+                .format(&allocations)
+                .unwrap(),
             "_PRIVATE_PORT=5000"
         );
-        assert!(format_dotenv_assignment("PORT\nATTACK=1", Port::try_from(5000).unwrap()).is_err());
+        let hostile = HashMap::from([("api".to_string(), "PORT\nATTACK=1".to_string())]);
+        assert!(DotenvFormatter::new(Some(hostile))
+            .format(&allocations)
+            .is_err());
+    }
+
+    // ========================================================================
+    // Verified-kernel glue tests
+    // ========================================================================
+
+    /// A tag containing a newline cannot forge a line in human output: it
+    /// is shown escaped, on its own line.
+    #[test]
+    fn test_human_formatter_escapes_hostile_tags() {
+        let allocations = HashMap::from([
+            (
+                "evil\nservice: 1".to_string(),
+                Port::try_from(5001).unwrap(),
+            ),
+            ("web".to_string(), Port::try_from(5000).unwrap()),
+            ("\u{1b}[31mred".to_string(), Port::try_from(5002).unwrap()),
+            ("tab\there".to_string(), Port::try_from(5003).unwrap()),
+            ("\"quoted".to_string(), Port::try_from(5004).unwrap()),
+            ("c1\u{9b}31m".to_string(), Port::try_from(5005).unwrap()),
+        ]);
+        let output = HumanFormatter.format(&allocations).unwrap();
+        assert_eq!(
+            output,
+            "Reserved ports:\n  \"\\x1b[31mred\": 5002\n  \"\\\"quoted\": 5004\n  \"c1\\x9b31m\": 5005\n  \"evil\\nservice: 1\": 5001\n  \"tab\\there\": 5003\n  web: 5000"
+        );
+        assert_eq!(output.lines().count(), 7);
+        assert!(!output.chars().any(|c| c.is_control() && c != '\n'));
+    }
+
+    /// Clean tags, including non-ASCII text and backslashes, are shown
+    /// unchanged and in byte order.
+    #[test]
+    fn test_human_formatter_keeps_clean_tags_and_byte_order() {
+        let allocations = HashMap::from([
+            ("é".to_string(), Port::try_from(1).unwrap()),
+            ("z".to_string(), Port::try_from(2).unwrap()),
+            ("Z".to_string(), Port::try_from(3).unwrap()),
+            ("a\\b".to_string(), Port::try_from(4).unwrap()),
+            ("a".to_string(), Port::try_from(65535).unwrap()),
+            ("ab".to_string(), Port::try_from(6).unwrap()),
+        ]);
+        assert_eq!(
+            HumanFormatter.format(&allocations).unwrap(),
+            "Reserved ports:\n  Z: 3\n  a: 65535\n  a\\b: 4\n  ab: 6\n  z: 2\n  é: 1"
+        );
+    }
+
+    /// The kernel's decimal rendering is `u16::to_string` for every value.
+    #[test]
+    fn test_kernel_decimal_matches_to_string_for_every_u16() {
+        for value in 0..=u16::MAX {
+            assert_eq!(render::u16_decimal(value), value.to_string().into_bytes());
+        }
+    }
+
+    /// The kernel's byte order is Rust's `str` order.
+    #[test]
+    fn test_kernel_lex_order_matches_str_order() {
+        let samples = [
+            "",
+            "a",
+            "A",
+            "ab",
+            "a\u{0}",
+            "b",
+            "é",
+            "e\u{301}",
+            "\u{10000}",
+            "\u{ffff}",
+            "z",
+            "Z",
+            "web-server",
+            "web_server",
+            "web",
+            "WEB",
+        ];
+        for a in samples {
+            for b in samples {
+                assert_eq!(
+                    render::lex_less(a.as_bytes(), b.as_bytes()),
+                    a < b,
+                    "{a:?} < {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Escaping is the identity on clean text and otherwise quotes and
+    /// escapes exactly the documented characters.
+    #[test]
+    fn test_display_field_escaping() {
+        use super::display_field;
+
+        for clean in [
+            "",
+            "web",
+            "a b",
+            "C:\\Users\\x",
+            "café",
+            "a\"b",
+            "-",
+            "日本",
+        ] {
+            assert_eq!(display_field(clean), clean);
+        }
+        assert_eq!(display_field("\"x"), "\"\\\"x\"");
+        assert_eq!(display_field("a\nb"), "\"a\\nb\"");
+        assert_eq!(display_field("a\rb"), "\"a\\rb\"");
+        assert_eq!(display_field("a\tb"), "\"a\\tb\"");
+        assert_eq!(display_field("a\\b\n"), "\"a\\\\b\\n\"");
+        assert_eq!(display_field("\u{0}"), "\"\\x00\"");
+        assert_eq!(display_field("\u{7f}"), "\"\\x7f\"");
+        assert_eq!(display_field("\u{9f}"), "\"\\x9f\"");
+        assert_eq!(display_field("\u{a0}"), "\u{a0}");
+        assert_eq!(display_field("\u{85}"), "\"\\x85\"");
+        assert_eq!(display_field("a\u{2028}b"), "\"a\\u{2028}b\"");
+        assert_eq!(display_field("\u{2029}"), "\"\\u{2029}\"");
+        assert_eq!(display_field("\u{61c}"), "\"\\u{061c}\"");
+        assert_eq!(display_field("\u{202e}abc"), "\"\\u{202e}abc\"");
+        assert_eq!(display_field("\u{2069}"), "\"\\u{2069}\"");
+        // Neighbours of the escaped ranges are shown as they are.
+        for clean in [
+            "\u{61b}", "\u{200d}", "\u{2027}", "\u{202f}", "\u{2065}", "\u{206a}",
+        ] {
+            assert_eq!(display_field(clean), clean);
+        }
+        for code in 0..=0x10_FFFF_u32 {
+            let Some(c) = char::from_u32(code) else {
+                continue;
+            };
+            let shown = display_field(&c.to_string());
+            assert!(!shown.chars().any(is_escaped_char), "{code:#x}");
+            assert_eq!(
+                shown == c.to_string(),
+                !is_escaped_char(c) && c != '"',
+                "{code:#x}"
+            );
+            if is_layout_control(c) {
+                assert_eq!(shown, format!("\"\\u{{{code:04x}}}\""), "{code:#x}");
+            }
+        }
+    }
+
+    /// The Unicode bidi controls (property `Bidi_Control`) and the line and
+    /// paragraph separators (the only characters of categories `Zl` and
+    /// `Zp`), listed independently of the kernel.
+    fn is_layout_control(c: char) -> bool {
+        matches!(
+            c,
+            '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        ) || matches!(c, '\u{2028}' | '\u{2029}')
+    }
+
+    /// The characters `display_field` escapes (besides a leading `"`).
+    fn is_escaped_char(c: char) -> bool {
+        c.is_control() || is_layout_control(c)
+    }
+
+    mod differential {
+        use std::collections::{HashMap, HashSet};
+
+        use proptest::prelude::*;
+
+        use super::super::{DotenvFormatter, ExportFormatter};
+        use crate::identifier::EnvironmentVariableName;
+        use crate::output::{display_field, tab_row, OutputFormatter, ShellType};
+        use crate::Port;
+
+        /// The pre-kernel group rendering, kept as a differential oracle.
+        fn previous(
+            shell: Option<ShellType>,
+            allocations: &HashMap<String, Port>,
+            env_mappings: Option<&HashMap<String, String>>,
+        ) -> Result<String, String> {
+            let mut tags: Vec<_> = allocations.keys().collect();
+            tags.sort();
+            let mut collision_keys = HashSet::new();
+            let mut lines = Vec::new();
+            for tag in tags {
+                let explicit = env_mappings
+                    .and_then(|mappings| mappings.get(tag))
+                    .map(String::as_str);
+                let name = EnvironmentVariableName::resolve(tag, explicit)
+                    .map_err(|error| error.to_string())?
+                    .into_string();
+                if !collision_keys.insert(name.to_ascii_uppercase()) {
+                    return Err("collision".to_owned());
+                }
+                let port = allocations[tag].value();
+                lines.push(match shell {
+                    Some(ShellType::Bash | ShellType::Zsh) => format!("export {name}={port}"),
+                    Some(ShellType::Fish) => format!("set -x {name} {port}"),
+                    Some(ShellType::PowerShell) => format!("$env:{name}=\"{port}\""),
+                    None => format!("{name}={port}"),
+                });
+            }
+            Ok(lines.join("\n"))
+        }
+
+        fn tag() -> impl Strategy<Value = String> {
+            proptest::collection::vec(
+                prop_oneof![
+                    Just('a'),
+                    Just('b'),
+                    Just('A'),
+                    Just('B'),
+                    Just('-'),
+                    Just('_'),
+                    Just('1'),
+                    Just(' '),
+                    Just('é'),
+                    Just('\n'),
+                ],
+                1..5,
+            )
+            .prop_map(|chars| chars.into_iter().collect())
+        }
+
+        fn mapping() -> impl Strategy<Value = Option<String>> {
+            prop_oneof![
+                Just(None),
+                Just(Some("PORT".to_owned())),
+                Just(Some("port".to_owned())),
+                Just(Some("A".to_owned())),
+                Just(Some("1BAD".to_owned())),
+                Just(Some("B_2".to_owned())),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn group_rendering_matches_previous_implementation(
+                services in proptest::collection::vec((tag(), 1u16..=u16::MAX, mapping()), 0..6),
+                with_mappings in any::<bool>(),
+            ) {
+                let allocations: HashMap<String, Port> = services
+                    .iter()
+                    .map(|(tag, port, _)| (tag.clone(), Port::try_from(*port).unwrap()))
+                    .collect();
+                let mappings: HashMap<String, String> = services
+                    .iter()
+                    .filter_map(|(tag, _, mapping)| mapping.clone().map(|m| (tag.clone(), m)))
+                    .collect();
+                let env_mappings = with_mappings.then_some(mappings);
+                for shell in [ShellType::Bash, ShellType::Zsh, ShellType::Fish, ShellType::PowerShell] {
+                    let actual = ExportFormatter::new(shell, env_mappings.clone())
+                        .format(&allocations)
+                        .map_err(|error| error.to_string());
+                    let expected = previous(Some(shell), &allocations, env_mappings.as_ref());
+                    match (&actual, &expected) {
+                        (Ok(a), Ok(e)) => prop_assert_eq!(a, e),
+                        (Err(a), Err(e)) if e == "collision" => prop_assert!(a.contains("unique")),
+                        (Err(a), Err(e)) => prop_assert_eq!(a, e),
+                        _ => prop_assert!(false, "{:?} vs {:?}", actual, expected),
+                    }
+                }
+                let actual = DotenvFormatter::new(env_mappings.clone())
+                    .format(&allocations)
+                    .map_err(|error| error.to_string());
+                let expected = previous(None, &allocations, env_mappings.as_ref());
+                match (&actual, &expected) {
+                    (Ok(a), Ok(e)) => prop_assert_eq!(a, e),
+                    (Err(a), Err(e)) if e == "collision" => prop_assert!(a.contains("unique")),
+                    (Err(a), Err(e)) => prop_assert_eq!(a, e),
+                    _ => prop_assert!(false, "{:?} vs {:?}", actual, expected),
+                }
+            }
+
+            #[test]
+            fn display_field_round_trips_and_is_line_safe(text in any::<String>()) {
+                let shown = display_field(&text);
+                prop_assert!(!shown.chars().any(super::is_escaped_char));
+                prop_assert_eq!(unescape(&shown), text);
+            }
+
+            #[test]
+            fn display_field_round_trips_layout_controls(
+                text in "[a\\\\\"\u{2028}\u{2029}\u{202a}-\u{202e}\u{2066}-\u{2069}\u{61c}\u{200e}\u{200f}\n\u{1b}]{0,8}",
+            ) {
+                let shown = display_field(&text);
+                prop_assert!(!shown.chars().any(super::is_escaped_char));
+                prop_assert_eq!(unescape(&shown), text);
+            }
+
+            #[test]
+            fn tab_rows_keep_one_column_per_field(
+                fields in proptest::collection::vec(any::<String>(), 1..5),
+            ) {
+                let views: Vec<&str> = fields.iter().map(String::as_str).collect();
+                let row = tab_row(&views);
+                prop_assert!(!row.contains('\n') && !row.contains('\r'));
+                let separators = ['\u{2028}', '\u{2029}'];
+                prop_assert!(!row.contains(separators), "{:?}", row);
+                let columns: Vec<String> = row.split('\t').map(unescape).collect();
+                prop_assert_eq!(columns, fields);
+            }
+
+            #[test]
+            fn group_output_does_not_depend_on_map_iteration_order(
+                services in proptest::collection::vec((tag(), 1u16..=u16::MAX), 0..6),
+            ) {
+                let build = || -> HashMap<String, Port> {
+                    services
+                        .iter()
+                        .map(|(tag, port)| (tag.clone(), Port::try_from(*port).unwrap()))
+                        .collect()
+                };
+                let first = build();
+                for _ in 0..4 {
+                    let again = build();
+                    for shell in [ShellType::Bash, ShellType::Fish, ShellType::PowerShell] {
+                        let formatter = ExportFormatter::new(shell, None);
+                        prop_assert_eq!(
+                            formatter.format(&first).map_err(|e| e.to_string()),
+                            formatter.format(&again).map_err(|e| e.to_string())
+                        );
+                    }
+                    prop_assert_eq!(
+                        super::super::HumanFormatter.format(&first).unwrap(),
+                        super::super::HumanFormatter.format(&again).unwrap()
+                    );
+                }
+            }
+        }
+
+        /// An independent decoder for `display_field` (the spec's
+        /// `unescape_field`).
+        fn unescape(shown: &str) -> String {
+            let chars: Vec<char> = shown.chars().collect();
+            if !(chars.len() >= 2 && chars[0] == '"' && chars[chars.len() - 1] == '"') {
+                return shown.to_owned();
+            }
+            let body = &chars[1..chars.len() - 1];
+            let mut out = String::new();
+            let mut i = 0;
+            while i < body.len() {
+                if body[i] == '\\' && i + 1 < body.len() {
+                    match body[i + 1] {
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        'x' => {
+                            let hex: String = body[i + 2..i + 4].iter().collect();
+                            out.push(
+                                char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap(),
+                            );
+                            i += 2;
+                        }
+                        'u' => {
+                            assert_eq!(body[i + 2], '{');
+                            assert_eq!(body[i + 7], '}');
+                            let hex: String = body[i + 3..i + 7].iter().collect();
+                            out.push(
+                                char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap(),
+                            );
+                            i += 6;
+                        }
+                        other => out.push(other),
+                    }
+                    i += 2;
+                } else {
+                    out.push(body[i]);
+                    i += 1;
+                }
+            }
+            out
+        }
     }
 }
