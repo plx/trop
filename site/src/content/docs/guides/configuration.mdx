@@ -2,16 +2,20 @@
 title: "Configuration"
 sidebar:
   label: "Configuration"
-description: "YAML settings, port ranges, exclusions, and defaults."
+description: "Port ranges, excluded ports, local overrides, occupancy probes, and how settings layer together."
 ---
 
-No configuration file is required for `trop reserve`. The default allocation range is 5000–7000.
+You don't need any configuration file to use `trop reserve`. Out of the box, `trop` allocates from ports `5000`–`7000`, stores its database in `~/.trop/trop.db`, checks TCP and UDP on both IPv4 and IPv6 localhost before handing out a new port, and expires unused entries after 30 days if the port range ever fills up.
 
-## Project configuration
+Configuration files are there for when you want a different port range, need to keep `trop` away from ports used by other local tools, or want to define [multi-service groups](../usage/#service-groups).
 
-Put settings in `trop.yaml` at the project root:
+## `trop.yaml` and `trop.local.yaml`
+
+Place a `trop.yaml` file at the root of a repository for shared project settings, and optionally add a gitignored `trop.local.yaml` beside it for machine-specific tweaks:
 
 ```yaml
+project: my-app
+
 ports:
   min: 5000
   max: 7000
@@ -24,39 +28,58 @@ cleanup:
   expire_after_days: 30
 ```
 
-Exclusion ranges include both endpoints. Exclusions keep known service ports out of new allocations; they do not move existing reservations.
+Ranges in `excluded_ports` include both endpoints (`6000` through `6010` above). Exclusions prevent _new_ allocations from picking known ports (like Postgres on `5432` or Redis on `6379`); they do not evict reservations that already exist in your database.
 
-Check a file before using it:
+You can validate a config file's syntax and rules at any time without touching the database:
 
 ```bash
 trop validate ./trop.yaml
 ```
 
-To define several tagged ports together, add a `reservations` mapping as shown in [Service groups](../usage/#service-groups).
+You can also append exclusions from the command line with `trop exclude 5432` (for the project config) or `trop exclude --global 5432` (for `~/.trop/config.yaml`), and merge adjacent entries with `trop compact-exclusions ./trop.yaml`. Note that both commands rewrite the target YAML file through a serializer, which strips YAML comments—edit the file by hand if you keep comments in it.
 
-## Setting precedence
+## How settings layer together
 
-From highest to lowest:
+When `trop` resolves its effective configuration, higher sources override lower ones:
 
-1. Command-line flags
-2. Environment variables
-3. `trop.local.yaml` at the project boundary
-4. `trop.yaml` at the project boundary
-5. `config.yaml` in the data directory (`~/.trop` by default)
-6. Built-in defaults
+1. **Command-line flags** (for example `--min`, `--max`, `--skip-udp`)
+2. **Environment variables** (`TROP_PROJECT`, `TROP_BUSY_TIMEOUT`, `TROP_OUTPUT_FORMAT`, etc.)
+3. **`trop.local.yaml`** at the nearest project directory
+4. **`trop.yaml`** at that same project directory
+5. **`config.yaml`** inside the data directory (`~/.trop/config.yaml` by default)
+6. **Built-in defaults**
 
-Omitted settings inherit from the next source. Exclusions accumulate across files. A `reservations` mapping replaces the whole inherited group; `reservations: null` clears the configured group without deleting stored reservations.
+When `trop` walks upward from your working directory, it stops at the _nearest_ ancestor containing `trop.yaml` or `trop.local.yaml` and merges those two sibling files if both exist.
 
-Use `--data-dir` or `TROP_DATA_DIR` to select another data directory. Callers must use the same database to coordinate.
+Two merge behaviors are worth knowing so they don't catch you off guard:
 
-## Cleanup
+- **Exclusions accumulate.** `excluded_ports` from `~/.trop/config.yaml`, `trop.yaml`, and `trop.local.yaml` are combined into one union rather than replacing each other.
+- **Service groups replace as a unit.** Combining half a service map from one file with half from another would produce surprising port layouts, so a `reservations` block in `trop.local.yaml` replaces the whole group from `trop.yaml`. Setting `reservations: null` clears the configured group without deleting already-stored database rows.
 
-When `trop reserve` runs out of candidates, it prunes reservations whose directories are gone, expires unused reservations according to the configured age, and retries once. The default expiration threshold is 30 days.
+Use `--data-dir <path>` or `TROP_DATA_DIR` if you want an isolated database and user `config.yaml` (for example in tests). Remember that only processes pointing at the same data directory coordinate with each other.
 
-Set `disable_autoprune: true` or `disable_autoexpire: true` to disable the corresponding automatic step. These settings do not schedule background cleanup. You can also [run cleanup explicitly](../usage/#inspect-and-clean-up).
+## Occupancy checks
 
-## Project metadata
+Before creating a new reservation, `trop` tries binding TCP and UDP sockets on `127.0.0.1` and `::1` (with `IPV6_V6ONLY` set so IPv4 and IPv6 probes stay independent). If a bind reports a conflict—or fails unexpectedly because of permissions—`trop` conservatively treats the port as unavailable and moves on.
 
-`project` and `task` label reservations for inspection. The directory and tag still identify the reservation. You can set `project` in `trop.yaml`, or pass `--project` and `--task` when reserving.
+You can narrow or widen those checks either on the CLI or under `occupancy_check` in YAML:
 
-For the remaining options, use `trop --help` and `trop reserve --help`.
+```yaml
+occupancy_check:
+  skip_udp: true
+  check_all_interfaces: true
+```
+
+The matching CLI flags are `--skip-tcp`, `--skip-udp`, `--skip-ipv4`, `--skip-ipv6`, `--check-all-interfaces` (which adds `0.0.0.0` and `::` wildcard probes), and `--skip-occupancy-check` to skip probing altogether.
+
+## Fallback cleanup when a range fills up
+
+`trop` does not run a background cleanup daemon. Instead, if `trop reserve` scans your entire range and finds every candidate reserved, excluded, or occupied, it runs a cleanup pass inside the same transaction—first pruning entries whose directories no longer exist, then expiring entries older than `cleanup.expire_after_days`—and retries the scan once.
+
+Set `disable_autoprune: true` or `disable_autoexpire: true` in YAML (or pass `--disable-autoprune`, `--disable-autoexpire`, or `--disable-autoclean` on `trop reserve`) if you want exhaustion to fail immediately without touching old records.
+
+## `project` and `task` labels
+
+Reservations are always keyed by path and tag, never by metadata. Still, `trop` supports optional `project` and `task` strings so `trop list` is easier to read when you have dozens of worktrees open.
+
+When you create a new reservation without passing `--project` or `--task`, `trop` makes a best-effort guess from Git: the repository's directory name becomes `project`, and the linked worktree name or current branch becomes `task`. Outside a Git repo (or on detached `HEAD`), those fields are simply left blank. Once stored, both labels are sticky—changing or clearing them on an existing reservation requires `--allow-project-change`, `--allow-task-change`, or `--allow-change`.

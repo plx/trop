@@ -1,0 +1,91 @@
+---
+title: "Commands & release notes"
+sidebar:
+  label: "Commands & release notes"
+description: "Summary of all subcommands, exit codes, and upgrade notes for v0.2.0 and database schema v2."
+---
+
+Run `trop --help` or `trop <command> --help` (or `man trop` when manpages are installed from a build) for the full flag list on any subcommand. Global flags `--data-dir <PATH>`, `--busy-timeout <SECONDS>`, `--disable-autoinit`, `--quiet`, and `--verbose` work with every command.
+
+## Subcommands by task
+
+### Reserving and releasing
+
+| Command                     | Summary                                                                                                     |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `trop reserve`              | Reserve or look up a port for a directory and optional `--tag`, printing the port on stdout.                |
+| `trop autoreserve`          | Discover the nearest `trop.yaml` / `trop.local.yaml` and reserve its full service group atomically.         |
+| `trop reserve-group <FILE>` | Reserve the service group declared in a specific config file path.                                          |
+| `trop release`              | Remove reservations at the target directory (`--tag <TAG>`, `--untagged-only`, `--recursive`, `--dry-run`). |
+
+### Inspecting and scanning
+
+| Command                 | Summary                                                                                                 |
+| ----------------------- | ------------------------------------------------------------------------------------------------------- |
+| `trop list`             | Display stored reservations (`--format table`, `json`, `csv`, or `tsv`, plus project/tag/path filters). |
+| `trop list-projects`    | Print the distinct `project` identifiers currently present in the database.                             |
+| `trop port-info <PORT>` | Show reservation details for one port; add `--include-occupancy` to probe live listeners too.           |
+| `trop scan`             | Probe a port range (`--min`, `--max`) for active listeners and best-effort process owners.              |
+| `trop show-data-dir`    | Print the resolved data directory path (`~/.trop` unless overridden).                                   |
+| `trop show-path`        | Print how `trop` resolves and normalizes a reservation path (`--canonicalize` to follow symlinks).      |
+
+### Housekeeping and configuration
+
+| Command                          | Summary                                                                                           |
+| -------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `trop prune`                     | Delete reservations whose target paths no longer resolve to directories (`--dry-run` to preview). |
+| `trop expire`                    | Delete reservations unused for more than `--days <N>` (or configured `expire_after_days`).        |
+| `trop autoclean`                 | Run `prune` and `expire` together in one atomic transaction.                                      |
+| `trop migrate`                   | Move reservations `--from <OLD>` `--to <NEW>` (`--recursive`, `--force`, `--dry-run`).            |
+| `trop init`                      | Explicitly create the data directory, database, and optional default `config.yaml`.               |
+| `trop validate <FILE>`           | Check a `trop.yaml` file for schema or validation errors without modifying state.                 |
+| `trop exclude <PORT_OR_RANGE>`   | Add a port or `START..END` range to project `trop.yaml` or `--global` user config.                |
+| `trop compact-exclusions <FILE>` | Merge adjacent or overlapping exclusion entries in a config file (`--dry-run` to preview).        |
+| `trop completions <SHELL>`       | Emit shell completions for `bash`, `zsh`, `fish`, `powershell`, or `elvish`.                      |
+
+### Scripting assertions
+
+Assertion commands are read-only checks meant for shell scripts and CI hooks:
+
+```bash wrap
+if trop assert-reservation --tag web --quiet; then
+  echo "web port already assigned"
+fi
+```
+
+- `trop assert-reservation` — exits `0` (and prints the port unless `--quiet`) if the path/tag reservation exists, or `1` if not. Pass `--not` to invert.
+- `trop assert-port <PORT>` — exits `0` if `<PORT>` is currently reserved in the database, or `1` if not (`--not` inverts).
+- `trop assert-data-dir` — checks that the data directory exists; add `--validate` to run a full read-only integrity check over SQLite tables, constraints, indexes, and stored rows without initializing or migrating the file.
+
+## Exit codes
+
+| Code | Meaning                                                                                                                                         |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0`  | Success.                                                                                                                                        |
+| `1`  | False assertion or semantic guard failure (such as attempting to overwrite sticky metadata or operate on an unrelated path without permission). |
+| `2`  | Timed out waiting for the SQLite writer lock (5 seconds by default; configurable via `--busy-timeout` or `TROP_BUSY_TIMEOUT`).                  |
+| `3`  | Data directory does not exist (when automatic initialization is disabled).                                                                      |
+| `4`  | Invalid command-line arguments.                                                                                                                 |
+| `5`  | Filesystem or I/O error.                                                                                                                        |
+| `6`  | Database or library error, including failed `assert-data-dir --validate` integrity checks.                                                      |
+| `7`  | Configuration file parse or validation error.                                                                                                   |
+
+## Release and upgrade notes
+
+### Upgrading from `0.1.0` to `0.2.0`
+
+Version `0.1.0` did not strictly validate every environment variable name emitted by `autoreserve` and `reserve-group` in `--format export` and `--format dotenv` output. Both `0.1.0` crates (`trop` and `trop-cli`) have been yanked on crates.io, and `0.2.0` enforces portable identifier rules before committing or printing group output.
+
+Because yanking a crate on crates.io does not replace already-installed binaries or existing `Cargo.lock` entries, anyone who installed `0.1.0` should upgrade explicitly:
+
+```bash wrap
+cargo install trop-cli --version 0.2.0 --locked --force
+```
+
+See GitHub security advisory [GHSA-h2jc-jr86-m5vq](https://github.com/plx/trop/security/advisories/GHSA-h2jc-jr86-m5vq) for details. Until upgraded, avoid sourcing or evaluating `export`/`dotenv` output from `0.1.0`—stick to `--format human` or `--format json`.
+
+### Automatic SQLite schema v1 → v2 upgrade
+
+If you have an older `~/.trop/trop.db` created by an earlier build (schema v1), the first writable command from `0.2.0` upgrades it to schema v2 in a single transaction. Schema v2 uses `STRICT` SQLite tables and enforces unique `(path, tag)` keys, globally unique port numbers, and valid timestamps at the database level.
+
+`trop` inspects existing rows before migrating and stops with recovery details—leaving the v1 file untouched—rather than guessing or dropping rows if legacy state contains duplicates or invalid values. No automatic backup file or downgrade command is provided, so copy `~/.trop` beforehand if you might need an older binary to open that database again.

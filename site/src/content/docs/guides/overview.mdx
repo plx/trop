@@ -1,27 +1,51 @@
 ---
-title: "Overview"
+title: "Overview & scope"
 sidebar:
-  label: "Overview"
-description: "How directory and tag pairs identify a reservation."
+  label: "Overview & scope"
+description: "Why trop exists, how the local reservation table works, where its guarantees stop, and current project status."
 ---
 
-`trop` assigns port numbers to directories. It is useful when you run development servers in several worktrees and want each one to keep its own port.
+## Why `trop` exists
+
+Most local dev setups start with a hardcoded port like `3000`, `5173`, or `8080`. That works fine while you have a single checkout of a repository, and starts getting in the way as soon as you keep several Git worktrees active at once or let a couple of local coding agents run dev servers and integration tests side by side.
+
+Letting the operating system pick a random free port (`0`) avoids collisions, at the cost of a different annoyance: the port changes every time you restart the process. Open browser tabs go dead, local OAuth redirect URLs and CORS origins stop matching, and frontend/backend pairs lose track of each other.
+
+`trop` takes the middle path. You ask it for a port from a directory; it finds an unused port in your configured range, writes the choice into a small SQLite database in `~/.trop`, and hands back that same number the next time you ask from there.
 
 ```bash
 PORT=$(trop reserve) &&
   npm run dev -- --port "$PORT"
 ```
 
-This example assumes an npm dev script that accepts `--port`. `trop reserve` prints the port to stdout; diagnostics go to stderr. The `&&` starts the server only if the reservation succeeds.
+`trop reserve` prints only the port number to stdout and sends warnings or errors to stderr, so it fits into ordinary command substitution.
 
-## Model
+## How the reservation table works
 
-A reservation is a record in a local SQLite database, keyed by a directory and an optional tag:
+A reservation is a row in `~/.trop/trop.db` keyed by a **resolved directory path** and an **optional tag**:
 
-- Repeating `trop reserve` in the same directory returns the stored port.
-- A different directory or tag gets a separate reservation.
-- Reservations persist when a server stops. Release or prune them when you no longer need them.
+- **First call in a directory:** `trop` scans your configured range (`5000`–`7000` by default), probes TCP and UDP on IPv4 and IPv6 localhost to avoid ports already in use, stores the lowest available candidate, and prints it.
+- **Subsequent calls:** Repeating `trop reserve` in that directory returns the stored port immediately—even when your server is stopped.
+- **Separate slots via tags:** Passing `--tag web` or `--tag api` creates distinct reservations under the same directory. An untagged `trop reserve` call has its own slot alongside any tagged ones.
+- **Safe under concurrent callers:** Concurrent processes (such as parallel test runners or independent coding agents) serialize writes through SQLite transactions, so two callers will not be assigned the same port from the same database.
 
-Any directory works; it does not have to be a Git worktree. Concurrent callers coordinate through the same database, stored in `~/.trop` by default.
+Any directory works; `trop` does not require Git, though it will optionally note the repository and branch or worktree name as labels for `trop list` when Git metadata is present.
 
-The record does not hold a socket open or prevent another program from taking the port. See [Scope](../scope/) for the limits, or [Usage](../usage/) for installation and commands.
+## Where the guarantees stop
+
+`trop` is intentionally just local bookkeeping. Before wiring it into scripts, it helps to be clear about what a reservation does _not_ do:
+
+- **No socket is held open.** `trop` checks whether a port is free when creating a new reservation and then exits. An unrelated program can bind that port five minutes later. Likewise, reusing an existing reservation returns its recorded port without re-probing, so your server can still fail to bind if something else took the port in the meantime.
+- **One database, one user, one machine.** Coordination only happens among callers reading and writing the same SQLite file (`~/.trop/trop.db` by default, or a custom path via `--data-dir` / `TROP_DATA_DIR`). Other OS user accounts, containers with separate home directories, or isolated `--data-dir` trees will not know about your reservations.
+- **Independent of process lifetime.** `trop` does not start, supervise, or stop servers. Stopping a server leaves its reservation in place for the next run, and running `trop release` only removes the database record—it will not stop a listening process.
+- **Mappings last only as long as the record.** Once a reservation is released, pruned after its directory is deleted, expired for age, or explicitly overwritten with `--overwrite`, a later call can pick a different port.
+
+## Project status
+
+`trop` is a personal side project—built partly to solve an everyday annoyance with multi-worktree development, and partly as an experiment in spec-driven, high-autonomy agentic Rust development.
+
+Because of how it was built, quite a bit of care went into its internal specification, SQLite integrity constraints, symlink and path-identity rules, and automated test suite, and it tries to fail safely rather than corrupt state or guess silently.
+
+At the same time, it is `v0.2.0` (pre-`1.0`) software that has not yet seen wide real-world use across many machines or workflows. If this solves a problem you have, feel free to use it or borrow ideas from it—just treat it as a personal utility rather than battle-tested infrastructure, and expect occasional rough edges or CLI/config changes before `1.0`. Bug reports and notes from real usage are welcome on [GitHub](https://github.com/plx/trop).
+
+Next, see [Common workflows](../usage/) for installation and day-to-day commands, or [Configuration](../configuration/) for port ranges and `trop.yaml` files.

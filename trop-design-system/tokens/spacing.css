@@ -14,7 +14,7 @@
   --space-12: 3rem;
 
   /* Fluid section rhythm */
-  --section-pad: clamp(4rem, 8vw, 6rem);
+  --section-pad: clamp(2.5rem, 5vw, 3.5rem);
   --hero-pad: clamp(4rem, 10vw, 7rem);
 
   /* ---- Radii ---- */

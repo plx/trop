@@ -21,8 +21,8 @@
 
   /* ---- Type scale (fluid where the brand uses it) ---- */
   --text-hero: clamp(4.75rem, 12vw, 7.5rem);   /* huge display H1 */
-  --text-display: clamp(2rem, 5vw, 3.5rem);    /* section headings */
-  --text-lede: clamp(1.5rem, 4vw, 2.85rem);    /* hero lede */
+  --text-display: clamp(1.45rem, 2.6vw, 1.9rem); /* section headings */
+  --text-lede: clamp(1.2rem, 2.2vw, 1.6rem);   /* hero lede */
   --text-h3: 1.18rem;
   --text-lg: 1.2rem;
   --text-body-lg: 1.08rem;

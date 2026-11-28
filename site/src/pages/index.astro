@@ -9,12 +9,15 @@ import { siteConfig } from "../site.config.mjs";
 const siteBase = import.meta.env.BASE_URL.endsWith("/")
   ? import.meta.env.BASE_URL
   : `${import.meta.env.BASE_URL}/`;
-const sitePath = (path: string = "") => `${siteBase}${path.replace(/^\/+/, "")}`;
+const sitePath = (path: string = "") =>
+  `${siteBase}${path.replace(/^\/+/, "")}`;
 const isExternal = (href: string) => /^https?:\/\//.test(href);
 const resolveHref = (href: string) =>
   isExternal(href) || href.startsWith("#") ? href : sitePath(href);
-const externalRel = (href: string) => (isExternal(href) ? "noopener noreferrer" : undefined);
-const externalTarget = (href: string) => (isExternal(href) ? "_blank" : undefined);
+const externalRel = (href: string) =>
+  isExternal(href) ? "noopener noreferrer" : undefined;
+const externalTarget = (href: string) =>
+  isExternal(href) ? "_blank" : undefined;
 ---
 
 <!doctype html>
@@ -62,22 +65,28 @@ const externalTarget = (href: string) => (isExternal(href) ? "_blank" : undefine
 
     <header class="site-header" data-site-header>
       <nav class="site-nav" aria-label="Primary navigation">
-        <a class="site-nav__brand" href={sitePath()} aria-label={`${siteConfig.project.title} home`}>
+        <a
+          class="site-nav__brand"
+          href={sitePath()}
+          aria-label={`${siteConfig.project.title} home`}
+        >
           <img src={markUrl} alt="" width="36" height="36" />
           <span>{siteConfig.project.title}</span>
         </a>
 
         <div class="site-nav__links">
-          {siteConfig.landing.nav.map((link) => (
-            <a
-              class="site-nav__link"
-              href={resolveHref(link.href)}
-              target={externalTarget(link.href)}
-              rel={externalRel(link.href)}
-            >
-              {link.label}
-            </a>
-          ))}
+          {
+            siteConfig.landing.nav.map((link) => (
+              <a
+                class="site-nav__link"
+                href={resolveHref(link.href)}
+                target={externalTarget(link.href)}
+                rel={externalRel(link.href)}
+              >
+                {link.label}
+              </a>
+            ))
+          }
         </div>
 
         <div class="site-nav__actions">
@@ -88,14 +97,24 @@ const externalTarget = (href: string) => (isExternal(href) ? "_blank" : undefine
             data-ds-component="ThemeToggle"
             data-theme-toggle
           >
-            <button type="button" role="radio" data-theme-mode="system" title="System">
+            <button
+              type="button"
+              role="radio"
+              data-theme-mode="system"
+              title="System"
+            >
               <span class="sr-only">System</span>
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <rect x="2" y="3" width="20" height="14" rx="2"></rect>
                 <path d="M8 21h8M12 17v4"></path>
               </svg>
             </button>
-            <button type="button" role="radio" data-theme-mode="light" title="Light">
+            <button
+              type="button"
+              role="radio"
+              data-theme-mode="light"
+              title="Light"
+            >
               <span class="sr-only">Light</span>
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <circle cx="12" cy="12" r="4"></circle>
@@ -104,7 +123,12 @@ const externalTarget = (href: string) => (isExternal(href) ? "_blank" : undefine
                 ></path>
               </svg>
             </button>
-            <button type="button" role="radio" data-theme-mode="dark" title="Dark">
+            <button
+              type="button"
+              role="radio"
+              data-theme-mode="dark"
+              title="Dark"
+            >
               <span class="sr-only">Dark</span>
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path>
@@ -127,35 +151,50 @@ const externalTarget = (href: string) => (isExternal(href) ? "_blank" : undefine
       </nav>
 
       <div class="mobile-nav" id="mobile-nav" data-nav-panel hidden>
-        {siteConfig.landing.nav.map((link) => (
-          <a
-            class="mobile-nav__link"
-            href={resolveHref(link.href)}
-            target={externalTarget(link.href)}
-            rel={externalRel(link.href)}
-            data-nav-link
-          >
-            {link.label}
-          </a>
-        ))}
+        {
+          siteConfig.landing.nav.map((link) => (
+            <a
+              class="mobile-nav__link"
+              href={resolveHref(link.href)}
+              target={externalTarget(link.href)}
+              rel={externalRel(link.href)}
+              data-nav-link
+            >
+              {link.label}
+            </a>
+          ))
+        }
       </div>
     </header>
 
     <main id="main">
       <section class="hero section-shell" aria-labelledby="hero-title">
         <div class="hero__copy">
-          <p class="eyebrow" data-ds-component="Eyebrow">{siteConfig.project.category}</p>
           <div class="hero__brand-line">
             <img src={markUrl} alt="" width="64" height="64" />
             <h1 id="hero-title">{siteConfig.project.title}</h1>
           </div>
           <p class="hero__lede">{siteConfig.project.tagline}</p>
-          <p class="hero__body">{siteConfig.project.description}</p>
+          <p class="hero__body">
+            If you keep several Git worktrees checked out at once—or have a
+            couple of coding agents running dev servers and test suites in
+            parallel—hardcoded localhost ports collide right away, while picking
+            a random port on every run breaks open browser tabs,
+            <code>.env</code> files, and OAuth callbacks.
+          </p>
+          <p class="hero__body">
+            <code>trop</code> is a small Rust CLI that keeps a local SQLite table
+            of directory-to-port assignments in <code>~/.trop</code>, handing each
+            checkout a free port the first time and returning that same number on
+            future runs.
+          </p>
 
           <div class="hero__actions">
             <a
               class="button button--primary"
               href={resolveHref(siteConfig.landing.primaryCta.href)}
+              target={externalTarget(siteConfig.landing.primaryCta.href)}
+              rel={externalRel(siteConfig.landing.primaryCta.href)}
               data-ds-component="Button"
               data-ds-variant="primary"
               data-ds-size="md"
@@ -187,12 +226,15 @@ const externalTarget = (href: string) => (isExternal(href) ? "_blank" : undefine
         >
           <div class="command-card__header">
             <div>
-              <h2 id="command-card-title">{siteConfig.landing.terminal.title}</h2>
+              <h2 id="command-card-title">
+                {siteConfig.landing.terminal.title}
+              </h2>
             </div>
             <span>{siteConfig.landing.terminal.meta}</span>
           </div>
-          <pre class="command-card__body"><code>{siteConfig.landing.terminal.lines.join("\n")}</code></pre>
-          <p>For an npm dev script that accepts <code>--port</code>.</p>
+          <pre
+            class="command-card__body"><code>{siteConfig.landing.terminal.lines.join("\n")}</code></pre>
+          <p class="command-card__note">{siteConfig.landing.terminal.note}</p>
           <button
             class="copy-button"
             type="button"
@@ -210,61 +252,102 @@ const externalTarget = (href: string) => (isExternal(href) ? "_blank" : undefine
         </div>
       </section>
 
-      <section class="section section-shell model-strip" id="model" aria-labelledby="model-title">
+      <section
+        class="section section-shell model-strip"
+        id="model"
+        aria-labelledby="model-title"
+      >
         <div class="section-heading">
-          <h2 id="model-title">How reservations work</h2>
+          <h2 id="model-title">How it works</h2>
           <p>
-            A directory and an optional tag identify a reservation. Repeated calls return its stored
-            port; another directory or tag gets a separate reservation. Use <code>--tag web</code> or
-            <code>--tag api</code> when one directory needs several ports.
+            <code>trop reserve</code> checks your configured port range
+            (5000–7000 by default), probes localhost on IPv4 and IPv6 to skip
+            ports already in use, writes the choice to
+            <code>~/.trop/trop.db</code>, and prints the port. Run it again from
+            the same directory later—even after your server has stopped—and it
+            returns that stored number.
           </p>
           <p>
-            Reservations live in a local SQLite database and persist when your server stops.
-            Run <code>trop prune</code> to remove records for deleted directories.
+            When one directory needs several ports, pass tags like
+            <code>trop reserve --tag web</code> and
+            <code>trop reserve --tag api</code>, or list the services in a
+            <code>trop.yaml</code> file and run <code>trop autoreserve</code>.
+            Run <code>trop prune</code> to clear out entries for deleted
+            worktrees.
           </p>
         </div>
       </section>
 
-      <section class="section section-shell scope-strip" aria-labelledby="scope-title">
-        <div class="scope-panel" data-ds-component="ScopePanel">
-          <div>
-            <h2 id="scope-title">One user, one machine</h2>
-          </div>
-          <div>
-            <p>
-              A reservation records a number; it does not hold a socket open. Programs outside
-              <code>trop</code> can still take the port.
-              <a class="text-link" href={sitePath("guides/scope/")}>Reservation limits</a>
-            </p>
-          </div>
+      <section
+        class="section section-shell scope-strip"
+        id="status"
+        aria-labelledby="status-title"
+      >
+        <div class="section-heading">
+          <h2 id="status-title">Limits and project status</h2>
+          <p>
+            <code>trop</code> only coordinates processes that read the same
+            local database—typically one user account on one machine. A
+            reservation records a number; it does not run a background daemon,
+            proxy traffic, or hold sockets open, so unrelated programs can still
+            bind the port.
+          </p>
+          <p>
+            This is a personal side project, built partly for multi-worktree
+            workflows and partly as an experiment in spec-driven, agent-assisted
+            Rust development. Its SQLite storage rules and test suite were put
+            together with care, though at <code>v0.2.0</code> it has seen
+            limited use outside its author's setup, and CLI flags or config
+            details may still change before <code>1.0</code>.{" "}
+            <a
+              class="text-link"
+              href={sitePath("guides/overview/#project-status")}
+            >
+              Overview &amp; scope
+            </a>
+          </p>
         </div>
       </section>
 
-      <section class="section section-shell docs-preview" aria-labelledby="docs-title">
+      <section
+        class="section section-shell docs-preview"
+        aria-labelledby="docs-title"
+      >
         <div class="section-heading">
           <h2 id="docs-title">Documentation</h2>
         </div>
         <div class="docs-grid">
-          {siteConfig.docs.pages.map((page) => (
-            <article class="doc-card" data-ds-component="DocCard">
-              <h3><a class="text-link" href={resolveHref(page.href)}>{page.title}</a></h3>
-              <p>{page.description}</p>
-            </article>
-          ))}
+          {
+            siteConfig.docs.pages.map((page) => (
+              <article class="doc-card" data-ds-component="DocCard">
+                <h3>
+                  <a class="text-link" href={resolveHref(page.href)}>
+                    {page.title}
+                  </a>
+                </h3>
+                <p>{page.description}</p>
+              </article>
+            ))
+          }
         </div>
       </section>
-
     </main>
 
     <footer class="site-footer">
       <div class="section-shell site-footer__inner">
-        <p>{siteConfig.project.title} / {siteConfig.project.category}</p>
+        <p>{siteConfig.project.title}</p>
         <nav aria-label="Footer">
-          {siteConfig.landing.footerLinks.map((link) => (
-            <a href={resolveHref(link.href)} target={externalTarget(link.href)} rel={externalRel(link.href)}>
-              {link.label}
-            </a>
-          ))}
+          {
+            siteConfig.landing.footerLinks.map((link) => (
+              <a
+                href={resolveHref(link.href)}
+                target={externalTarget(link.href)}
+                rel={externalRel(link.href)}
+              >
+                {link.label}
+              </a>
+            ))
+          }
         </nav>
       </div>
     </footer>

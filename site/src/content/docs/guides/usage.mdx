@@ -1,113 +1,116 @@
 ---
-title: "Usage"
+title: "Common workflows"
 sidebar:
-  label: "Usage"
-description: "Install, reserve ports, and clean up old reservations."
+  label: "Common workflows"
+description: "Installing the CLI, reserving single or tagged ports, setting up trop.yaml groups, and cleaning up old entries."
 ---
 
-## Install
+## Installing `trop`
 
-With Rust and Cargo installed:
+With a Rust toolchain installed, you can install the published binary crate from crates.io:
 
 ```bash
 cargo install trop-cli
 ```
 
-The package is `trop-cli`; the installed command is `trop`.
+The Cargo package is named `trop-cli`; the installed binary is `trop`. (If you happened to install the early `0.1.0` crate, see the [upgrade note](../reference/#release-and-upgrade-notes) to move to `0.2.0`.)
 
-## Reserve a port
+To build and install directly from a local checkout instead:
 
-Run this from the directory you want the reservation to belong to:
+```bash wrap
+git clone https://github.com/plx/trop.git
+cd trop
+cargo install --path trop-cli
+```
+
+## Reserving a single port
+
+Run `trop reserve` from the directory you want the port associated with, and pass the result to whatever flag or environment variable your server expects:
 
 ```bash
 PORT=$(trop reserve) &&
   npm run dev -- --port "$PORT"
 ```
 
-This Bash/Zsh example assumes an npm dev script that accepts `--port`. Use the returned number wherever your server expects a port argument.
+It works the same way in a `justfile` or `Makefile`:
 
-## Tags
+```makefile
+port := `trop reserve`
 
-Use tags when one worktree has multiple services:
+dev:
+    npm run dev -- --port {{port}}
+```
+
+A few useful options on `trop reserve`:
+
+- **Preferred port (`--port 8080`):** On a _new_ reservation, `trop` tries port `8080` first before falling back to scanning your configured range. On an existing reservation, `trop` keeps returning the already-stored port unless you also pass `--overwrite`.
+- **Pick a fresh port (`--overwrite`):** Re-runs allocation for the current key (preferring `--port` if supplied and free, or reusing/scanning within the range).
+- **Explicit target directory (`--path /path/to/dir`):** Reserves against a specific path rather than the current working directory. By default `trop` only lets you target the current directory, an ancestor, or a descendant unless you pass `--allow-unrelated-path`.
+
+## Multiple ports in one directory (`--tag`)
+
+When a single worktree runs more than one local process—say a frontend dev server, an API server, and a local mock or database—give each one a tag:
 
 ```bash wrap
 WEB_PORT=$(trop reserve --tag web)
 API_PORT=$(trop reserve --tag api)
+DB_PORT=$(trop reserve --tag db)
 ```
 
-Repeating a call with the same directory and tag returns the stored port. An untagged reservation is separate from every tagged reservation at that path.
-
-## Inspect and clean up
-
-| Command                           | Effect                                                                          |
-| --------------------------------- | ------------------------------------------------------------------------------- |
-| `trop list`                       | Show the reservations in the database.                                          |
-| `trop list --format json`         | Print the same records as JSON.                                                 |
-| `trop release --tag web`          | Release the `web` reservation for the current directory.                        |
-| `trop release`                    | Release all tags, including the untagged reservation, at the current directory. |
-| `trop prune --dry-run`            | Preview removal of records whose paths no longer resolve to directories.        |
-| `trop expire --days 30 --dry-run` | Preview removal of records unused for 30 days.                                  |
-
-Omit `--dry-run` to apply cleanup. Release leaves descendant directories alone unless you pass `--recursive`. Stopping a server does not release its reservation, and removing a reservation does not stop a server.
+Each `(directory, tag)` pair gets its own steady port, and all of them stay tied to that directory so they clean up together when the worktree is removed. An untagged `trop reserve` call remains separate from every tagged reservation at the same path.
 
 ## Service groups
 
-For recurring multi-service workflows, define reservations in `trop.yaml`:
+If you always reserve the same set of tagged ports in a repository, you can put them in a `trop.yaml` file at the project root instead of scripting multiple `trop reserve --tag` calls:
 
 ```yaml
 reservations:
   services:
     web:
       offset: 0
+      preferred: 8080
       env: WEB_PORT
     api:
       offset: 1
       env: API_PORT
+    db:
+      offset: 2
+      env: DB_PORT
 ```
 
-This requests two consecutive ports, stored as the `web` and `api` tags for the directory containing the file. The group is reserved in one transaction: either both reservations succeed or neither does.
+Here each service names an `env` variable, a unique `offset` within the group, and an optional `preferred` port. `trop` claims any available `preferred` ports first; for any service without a free preference, it finds the lowest base port in your range where all remaining offsets fit without colliding. The whole group is recorded in a single SQLite transaction—either every service gets a port or nothing changes.
 
-From that directory or a subdirectory:
+From the project root or any subdirectory inside it, run:
 
-```bash
+```bash wrap
 trop autoreserve --format human
 ```
 
-`autoreserve` searches upward for `trop.yaml` or `.trop.yaml`. Use `trop reserve-group ./trop.yaml --format human` to give an explicit path. Repeated calls reuse a complete, compatible group; a partial or incompatible stored group produces a conflict.
+`autoreserve` walks upward from your current directory until it finds `trop.yaml` or `trop.local.yaml`, and keys the reservations to the directory containing that file. (If you want to point at a specific file path directly, use `trop reserve-group ./trop.yaml`.) Repeating `autoreserve` reuses an existing compatible group; if you later edit `trop.yaml` to add or reshape services, pass `--force` to replace the directory's stored tagged group atomically.
 
-Use `--format json` for a tag-to-port mapping, `--format dotenv` for `VAR=value` lines, or `--format export --shell bash` for shell exports. These commands print output; they do not change the calling shell's environment.
+### Choosing an output format
 
-Each `env` name must be at most 255 bytes and match `[A-Za-z_][A-Za-z0-9_]*`. Without `env`, `trop` derives a name from an ASCII tag by converting letters to uppercase and replacing `-` with `_`. Other tags need an explicit valid mapping. Names must be unique ignoring ASCII case. These rules apply to every output format.
+Group commands print their mapping to stdout without mutating your current shell environment directly:
 
-## Upgrading from 0.1.0
+- `--format human` — readable summary for terminal inspection
+- `--format json` — structured service-to-port mapping
+- `--format dotenv` — `KEY=PORT` lines suitable for writing a `.env.local` file
+- `--format export --shell zsh` (or `bash`, `fish`, `powershell`) — shell export statements
 
-Version 0.1.0 does not safely validate every generated variable name in
-`export` or `dotenv` output from `autoreserve` and `reserve-group`. Both 0.1.0
-crates are yanked, but yanking does not remove installed binaries or update
-existing locked dependency resolutions. Upgrade the CLI explicitly:
+To keep `dotenv` and `export` output safe to consume, every service's environment variable name must be a valid portable identifier matching `[A-Za-z_][A-Za-z0-9_]*` (and unique ignoring ASCII case). If you omit `env`, `trop` derives one from simple ASCII tags by uppercasing letters and turning `-` into `_`; other tag names require an explicit `env` field.
 
-```bash wrap
-cargo install trop-cli --version 0.2.0 --locked --force
-```
+## Inspecting and cleaning up
 
-Version 0.2.0 rejects invalid identifiers. See
-[the GitHub security advisory](https://github.com/plx/trop/security/advisories/GHSA-h2jc-jr86-m5vq)
-for affected usage and remediation. Until upgraded, use human or JSON output,
-inspect the result, and set only trusted variables manually.
+Stopping a server leaves its reservation in `~/.trop/trop.db` so it is still waiting for you next time. When you actually want to inspect what is reserved or clear out old worktrees, use these commands:
 
-## Database schema upgrades
+| Command                                   | What it does                                                                                                      |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `trop list`                               | List active reservations as a table (`--format json`, `csv`, or `tsv` also work).                                 |
+| `trop port-info 5000 --include-occupancy` | Show whether port `5000` is reserved in `trop` and whether anything is currently listening on it.                 |
+| `trop release --tag web`                  | Drop just the `web` tag for the current directory.                                                                |
+| `trop release`                            | Drop all tagged and untagged reservations at the current directory (add `--recursive` to include subdirectories). |
+| `trop prune --dry-run`                    | Preview reservations whose directories have been deleted or turned into broken symlinks.                          |
+| `trop expire --days 30 --dry-run`         | Preview reservations that haven't been touched in 30 days.                                                        |
+| `trop autoclean --dry-run`                | Run both `prune` and `expire` together in one pass.                                                               |
 
-The first writable launch against a schema-v1 database automatically migrates
-it to schema v2 in one durable transaction. `trop` checks all legacy rows before
-making changes. Duplicate keys or ports, empty legacy tags, invalid values,
-unexpected SQLite value types, and unsupported layouts stop the migration with
-recovery details; trop never silently chooses or discards a row.
-
-A failed or interrupted migration leaves either the complete v1 database or
-the complete committed v2 database, never a hybrid. A read-only v1 database
-cannot be migrated, while read-only use works after a writable upgrade to v2.
-
-The migration does not create a persistent backup or support a reverse
-migration. Older clients reject schema v2 without changing it. If you may need
-to downgrade, stop processes using trop and copy the complete data directory
-before the first launch of the newer client, then restore that copy if needed.
+Drop `--dry-run` when you're ready to delete the matching rows. If you move or rename a worktree and want to keep its existing port assignments rather than allocating new ones, `trop migrate --from <old> --to <new> --recursive` updates the stored paths in place.

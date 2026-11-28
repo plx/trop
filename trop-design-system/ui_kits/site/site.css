@@ -395,17 +395,17 @@ a {
 }
 
 .hero__lede {
-  max-width: 15ch;
+  max-width: 32ch;
   margin: 0;
   color: var(--text-strong);
   font-size: var(--text-lede);
   font-weight: var(--weight-bold);
-  line-height: 1.08;
+  line-height: 1.22;
 }
 
 .hero__body {
-  max-width: 66ch;
-  margin: 1.1rem 0 0;
+  max-width: 56ch;
+  margin: 0.95rem 0 0;
   color: var(--text-body);
   font-size: var(--text-body-lg);
 }
@@ -507,6 +507,12 @@ a {
   min-height: 0;
 }
 
+.command-card__note {
+  margin: var(--space-4) 0 0;
+  color: var(--text-body);
+  font-size: var(--text-sm);
+}
+
 .copy-button {
   display: inline-flex;
   align-items: center;
@@ -538,6 +544,10 @@ a {
   padding-block: var(--section-pad);
 }
 
+.docs-preview {
+  border-top: var(--border-hairline);
+}
+
 .section--muted {
   border-block: var(--border-hairline);
   background: color-mix(in srgb, var(--surface-card) 45%, transparent);
@@ -546,6 +556,10 @@ a {
 .section-heading {
   max-width: 760px;
   margin-bottom: var(--space-8);
+}
+
+.section-heading:last-child {
+  margin-bottom: 0;
 }
 
 .section-heading h2 {
@@ -566,8 +580,15 @@ a {
 .feature-grid,
 .docs-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--space-6);
+}
+
+.feature-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.docs-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .feature-card,
@@ -609,6 +630,10 @@ a {
   color: var(--text-body);
 }
 
+.doc-card p {
+  margin: var(--space-3) 0 0;
+}
+
 .text-link {
   color: var(--text-accent);
   font-weight: var(--weight-heavy);
@@ -630,7 +655,7 @@ a {
 
 .scope-panel {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 0.78fr) minmax(0, 1.22fr);
   gap: clamp(var(--space-8), 4vw, var(--space-12));
   padding: clamp(1.25rem, 4vw, var(--space-10));
   background: color-mix(in srgb, var(--surface-wash) 54%, var(--surface-card));
@@ -649,8 +674,17 @@ a {
   color: var(--text-body);
 }
 
+.scope-panel h2 + p {
+  margin-top: var(--space-4);
+}
+
+.scope-panel__details {
+  display: grid;
+  gap: var(--space-6);
+}
+
 .scope-panel__label {
-  margin-bottom: var(--space-3) !important;
+  margin-bottom: var(--space-2) !important;
   color: var(--text-strong) !important;
   font-weight: var(--weight-heavy);
 }
